@@ -50,8 +50,7 @@ async fn texts(
 }
 
 #[test]
-fn native_sink_keeps_reasoning_signature_and_order_without_legacy_token_copy() -> anyhow::Result<()>
-{
+fn native_sink_keeps_reasoning_signature_and_original_envelope_order() -> anyhow::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(super::CHANNEL_EVENT_QUEUE_CAPACITY);
     let sink = ChannelSurfaceSink::new(tx, CancellationToken::new());
     let mut reasoning = block(AssistantPhase::Reasoning, "", 1, false);
@@ -68,11 +67,10 @@ fn native_sink_keeps_reasoning_signature_and_order_without_legacy_token_copy() -
     for event in &events {
         assert!(sink.on_event(event.clone()));
     }
-    assert!(sink.on_event(agent_event(3, AgentEvent::Token("兼容副本".into()))?));
     assert!(sink.on_event(agent_event(4, AgentEvent::FinalAnswer("确认回答".into()))?));
     for expected in events {
         let ChannelRenderEvent::Driver(actual) = rx.try_recv()? else {
-            return Err(anyhow::anyhow!("原生事件被降为匿名Token"));
+            return Err(anyhow::anyhow!("原生事件失去原envelope"));
         };
         assert_eq!(
             serde_json::to_value(actual)?,
@@ -80,7 +78,7 @@ fn native_sink_keeps_reasoning_signature_and_order_without_legacy_token_copy() -
         );
     }
     let ChannelRenderEvent::Driver(ChatDriverEvent::Agent(final_event)) = rx.try_recv()? else {
-        return Err(anyhow::anyhow!("兼容Token产生了第二份消息"));
+        return Err(anyhow::anyhow!("原确认回答未按顺序交付"));
     };
     assert!(matches!(final_event.payload, AgentEvent::FinalAnswer(_)));
     assert!(rx.try_recv().is_err());
@@ -120,7 +118,6 @@ async fn native_public_blocks_keep_tool_order_and_only_confirmed_answer_is_sent_
             4,
             block(AssistantPhase::FinalAnswer, "未校验候选，不能发送", 4, true),
         )?),
-        render(agent_event(5, AgentEvent::Token("最终确认回答🙂".into()))?),
         render(final_answer.clone()),
         render(final_answer),
         Ok(ChannelRenderEvent::Terminal(TurnOutcome::Completed)),
@@ -776,7 +773,7 @@ async fn native_execution_status_is_visible_but_never_confirms_an_answer_or_clos
 }
 
 // 只替代外部Agent源；驱动、envelope、sink和渠道发送投影全部使用原生产入口。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum OriginalExecutionTail {
     Clean,
     TypedError,
@@ -786,6 +783,7 @@ enum OriginalExecutionTail {
 
 struct OriginalTailAgent {
     tail: OriginalExecutionTail,
+    confirm_body: bool,
     reached_eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -799,15 +797,11 @@ impl echo_agent::agent::Agent for OriginalTailAgent {
     fn system_prompt(&self) -> &str {
         ""
     }
-    fn execute<'a>(
+    fn execute_stream_message_with_invocation_context<'a>(
         &'a self,
-        _task: &'a str,
-    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<String>> {
-        Box::pin(async { Ok(String::new()) })
-    }
-    fn execute_stream<'a>(
-        &'a self,
-        _task: &'a str,
+        _message: echo_agent::llm::types::Message,
+        _cancel: CancellationToken,
+        _invocation: echo_agent::agent::AgentInvocationContext,
     ) -> futures::future::BoxFuture<
         'a,
         echo_agent::error::Result<
@@ -815,18 +809,40 @@ impl echo_agent::agent::Agent for OriginalTailAgent {
         >,
     > {
         let tail = self.tail;
+        let confirm_body = self.confirm_body;
         let reached_eof = self.reached_eof.clone();
         Box::pin(async move {
             Ok(async_stream::stream! {
+                // v03只调用原生typed入口；外部source显式提供自身生命周期，不再借旧适配器补终态。
+                let status = |kind| AgentEvent::ExecutionStatus(echo_agent::agent::ExecutionStatus {
+                    adapter_generated: false,
+                    execution_id: "original-tail-execution".into(),
+                    request_id: None,
+                    sequence: if kind == echo_agent::agent::ExecutionStatusKind::Started { 0 } else { 1 },
+                    phase: if kind == echo_agent::agent::ExecutionStatusKind::Started {
+                        echo_agent::agent::AgentPhase::Thinking
+                    } else {
+                        echo_agent::agent::AgentPhase::Terminal
+                    },
+                    status: kind,
+                    reason: None,
+                });
+                yield Ok(status(echo_agent::agent::ExecutionStatusKind::Started));
                 yield Ok(block(AssistantPhase::FinalAnswer, "unconfirmed-tail-candidate", 1, true));
-                yield Ok(AgentEvent::FinalAnswer("original-tail-answer".into()));
+                if confirm_body {
+                    yield Ok(AgentEvent::FinalAnswer("original-tail-answer".into()));
+                }
                 match tail {
-                    OriginalExecutionTail::Clean => {},
+                    OriginalExecutionTail::Clean => {
+                        yield Ok(status(echo_agent::agent::ExecutionStatusKind::Settled));
+                    },
                     OriginalExecutionTail::TypedError => {
                         yield Ok(AgentEvent::error_message("original-tail", "original typed cleanup failed"));
+                        yield Ok(status(echo_agent::agent::ExecutionStatusKind::Failed));
                     },
                     OriginalExecutionTail::OrdinaryError => {
                         yield Err(echo_agent::error::ReactError::Other("original tail producer failed".into()));
+                        yield Ok(status(echo_agent::agent::ExecutionStatusKind::Failed));
                     },
                     OriginalExecutionTail::Unsettled => {
                         yield Err(echo_agent::error::ReactError::ExecutionNotSettled {
@@ -881,6 +897,7 @@ impl echo_agent::runtime::EventSink for OriginalTailChannelSink {
 
 async fn original_tail_channel_execution(
     tail: OriginalExecutionTail,
+    confirm_body: bool,
 ) -> anyhow::Result<(
     echo_agent::error::Result<echo_agent::runtime::TurnReceipt>,
     usize,
@@ -909,6 +926,7 @@ async fn original_tail_channel_execution(
         .drive(
             &OriginalTailAgent {
                 tail,
+                confirm_body,
                 reached_eof: reached_eof.clone(),
             },
             request,
@@ -975,14 +993,14 @@ async fn native_same_execution_tail_failures_never_publish_success_to_channel_si
         OriginalExecutionTail::Unsettled,
     ] {
         let (result, seen_final, reached_eof, delivered, _statuses) =
-            original_tail_channel_execution(tail).await?;
+            original_tail_channel_execution(tail, false).await?;
         assert!(
             reached_eof,
             "the original raw producer must reach physical EOF"
         );
         assert_eq!(
             seen_final, 0,
-            "a final followed by same-execution tail failure cannot reach the real channel sink"
+            "a candidate without runtime publication cannot reach the real channel sink"
         );
         assert!(!delivered.concat().contains("original-tail-answer"));
         assert!(!delivered.concat().contains("unconfirmed-tail-candidate"));
@@ -1002,7 +1020,7 @@ async fn native_same_execution_tail_failures_never_publish_success_to_channel_si
 async fn native_clean_execution_tail_publishes_one_confirmed_answer_through_original_channel()
 -> anyhow::Result<()> {
     let (result, seen_final, reached_eof, delivered, statuses) =
-        original_tail_channel_execution(OriginalExecutionTail::Clean).await?;
+        original_tail_channel_execution(OriginalExecutionTail::Clean, true).await?;
     assert!(reached_eof);
     assert!(matches!(result, Ok(receipt) if receipt.outcome == TurnOutcome::Completed));
     assert_eq!(seen_final, 1);
@@ -1034,6 +1052,53 @@ async fn native_clean_execution_tail_publishes_one_confirmed_answer_through_orig
         ]
     );
     assert!(!delivered.concat().contains("unconfirmed-tail-candidate"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_published_body_keeps_original_tail_failure_without_promoting_completion()
+-> anyhow::Result<()> {
+    for tail in [
+        OriginalExecutionTail::TypedError,
+        OriginalExecutionTail::OrdinaryError,
+        OriginalExecutionTail::Unsettled,
+    ] {
+        let (result, seen_final, reached_eof, delivered, statuses) =
+            original_tail_channel_execution(tail, true).await?;
+        assert!(
+            reached_eof,
+            "the original typed producer must reach physical EOF"
+        );
+        assert_eq!(
+            seen_final, 1,
+            "a legal runtime publication remains a single fact"
+        );
+        assert_eq!(
+            delivered
+                .iter()
+                .filter(|text| text.as_str() == "original-tail-answer")
+                .count(),
+            1,
+            "tail={tail:?}, delivered={delivered:?}, result={result:?}"
+        );
+        assert!(!delivered.concat().contains("unconfirmed-tail-candidate"));
+        assert!(
+            !statuses
+                .iter()
+                .any(|status| status.status == echo_agent::agent::ExecutionStatusKind::Settled)
+        );
+        match tail {
+            OriginalExecutionTail::Unsettled => assert!(matches!(result,
+                Err(echo_agent::error::ReactError::ExecutionNotSettled { run_id, execution_id })
+                    if run_id == "original-tail-run" && execution_id.as_deref() == Some("original-tail-execution"))),
+            _ => {
+                let receipt = result?;
+                assert!(matches!(receipt.outcome, TurnOutcome::Failed(_)));
+                assert!(receipt.final_answer.is_none());
+                assert!(receipt.final_message_id.is_none());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1149,6 +1214,198 @@ async fn native_hitl_response_target_and_settled_status_keep_original_foreground
             .map_err(|_| anyhow::anyhow!("original terminal receiver closed"))?;
         assert!(output.next().now_or_never().is_none(), "必须先排空原driver");
         drop(driver_tx);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
+                .await?
+                .is_none()
+        );
+        assert!(cancel.is_cancelled());
+    }
+    Ok(())
+}
+
+/// Generic final来自原运行时的验证和结算通知，无原生正文块也必须保留。
+#[tokio::test]
+async fn native_runtime_final_notice_without_blocks_is_deduplicated_for_all_im_channels()
+-> anyhow::Result<()> {
+    for channel in ["weixin", "qqbot", "feishu"] {
+        let final_event = agent_event(
+            1,
+            AgentEvent::FinalAnswer("original-runtime-notice🙂".to_string()),
+        )?;
+        let events = futures::stream::iter(vec![
+            render(final_event.clone()),
+            render(final_event),
+            Ok(ChannelRenderEvent::Terminal(TurnOutcome::Completed)),
+        ])
+        .boxed();
+        let output = aggregate_by_sentence(
+            events,
+            channel.to_string(),
+            "local-test".into(),
+            ChatType::Direct,
+        )
+        .await;
+        let messages: Vec<_> = output.map_ok(|message| message.text).try_collect().await?;
+        assert_eq!(messages, vec!["original-runtime-notice🙂"]);
+    }
+    Ok(())
+}
+
+/// 超时只结算该HITL请求；原foreground与发送观察必须继续由原owner物理收尾。
+#[tokio::test]
+async fn native_hitl_timeout_and_reused_request_id_keep_original_foreground_owner()
+-> anyhow::Result<()> {
+    use crate::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
+    use crate::hitl::{ChannelHumanLoopProvider, ChannelHumanLoopResolution};
+    use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
+    for channel in ["weixin", "qqbot", "feishu"] {
+        let foreground = ForegroundTurnControl::default();
+        let conversation = format!("native-timeout-{channel}");
+        let lease = foreground.begin(
+            ForegroundTurnSurface::Channel,
+            &conversation,
+            "original-root",
+        )?;
+        let cancel = lease.cancellation_token();
+        let hitl = ChannelHumanLoopProvider::new();
+        let (driver_tx, driver_rx) = tokio::sync::mpsc::channel(4);
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        let events = super::channel_render_event_stream(
+            driver_rx,
+            hitl.subscribe_prompts(),
+            terminal_rx,
+            super::ChannelStreamDropGuard(cancel.clone()),
+        );
+        let mut output = aggregate_by_sentence(
+            events,
+            channel.to_string(),
+            "local-test".into(),
+            ChatType::Direct,
+        )
+        .await;
+        let mut expiring = HumanLoopRequest::input("original expiring native request");
+        expiring.request_id = Some("same-request-id".into());
+        // 只缩短此夹具的请求期限；生产默认300s上限不变，也不主动sleep。
+        expiring.timeout = Some(std::time::Duration::from_millis(1));
+        // 注册后即允许合法超时；同时驱动原请求与已订阅提示，不要求首次poll必须Pending。
+        let (expired, first_prompt) = tokio::join!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), hitl.request(expiring)),
+            tokio::time::timeout(std::time::Duration::from_secs(1), output.next()),
+        );
+        assert!(matches!(expired??, HumanLoopResponse::Timeout));
+        let first_prompt = first_prompt?
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("original timeout prompt missing"))?;
+        let expired_target = first_prompt
+            .text
+            .split("Use /reply ")
+            .nth(1)
+            .and_then(|value| value.split_whitespace().next())
+            .ok_or_else(|| anyhow::anyhow!("expired target missing"))?
+            .to_string();
+        assert!(matches!(
+            hitl.try_resolve_message(&format!("/reply {expired_target} stale")),
+            ChannelHumanLoopResolution::Rejected(_)
+        ));
+        assert!(
+            foreground
+                .snapshot(ForegroundTurnSurface::Channel, &conversation)
+                .is_some()
+        );
+        assert!(!cancel.is_cancelled());
+        assert!(
+            output.next().now_or_never().is_none(),
+            "HITL超时不能制造foreground完成"
+        );
+
+        let mut replacement = HumanLoopRequest::input("replacement native request");
+        replacement.request_id = Some("same-request-id".into());
+        let pending = hitl.request(replacement);
+        futures::pin_mut!(pending);
+        assert!(pending.as_mut().now_or_never().is_none());
+        let second_prompt = tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
+            .await?
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("replacement prompt missing"))?;
+        let current_target = second_prompt
+            .text
+            .split("Use /reply ")
+            .nth(1)
+            .and_then(|value| value.split_whitespace().next())
+            .ok_or_else(|| anyhow::anyhow!("replacement target missing"))?
+            .to_string();
+        assert_ne!(expired_target, current_target);
+        for wrong in [expired_target.as_str(), "same-request-id"] {
+            assert!(matches!(
+                hitl.try_resolve_message(&format!("/reply {wrong} stale")),
+                ChannelHumanLoopResolution::Rejected(_)
+            ));
+            assert!(pending.as_mut().now_or_never().is_none());
+        }
+        assert!(matches!(
+            hitl.try_resolve_message(&format!("/reply {current_target} current🙂")),
+            ChannelHumanLoopResolution::Resolved(_)
+        ));
+        assert!(matches!(pending.await?, HumanLoopResponse::Text(text) if text == "current🙂"));
+        assert!(
+            foreground
+                .snapshot(ForegroundTurnSurface::Channel, &conversation)
+                .is_some()
+        );
+        assert!(!cancel.is_cancelled());
+
+        driver_tx
+            .try_send(ChannelRenderEvent::Driver(execution_event(
+                "original-stream",
+                "original-root",
+                "original-execution",
+                1,
+                AgentEvent::ExecutionStatus(echo_agent::agent::ExecutionStatus {
+                    execution_id: "original-execution".into(),
+                    request_id: None,
+                    sequence: 1,
+                    phase: AgentEvent::Cancelled.phase(),
+                    status: echo_agent::agent::ExecutionStatusKind::Cancelled,
+                    reason: None,
+                    adapter_generated: false,
+                }),
+            )?))
+            .map_err(|_| anyhow::anyhow!("original status observer closed"))?;
+        let observation = tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
+            .await?
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("original execution observation missing"))?;
+        assert_eq!(
+            observation.text,
+            "[execution:original-execution] agent_execution_cancelled"
+        );
+        assert!(
+            foreground
+                .snapshot(ForegroundTurnSurface::Channel, &conversation)
+                .is_some()
+        );
+        assert!(!cancel.is_cancelled());
+        assert!(output.next().now_or_never().is_none());
+        lease.settle_after_observers(TurnOutcome::Cancelled).await?;
+        assert!(
+            foreground
+                .snapshot(ForegroundTurnSurface::Channel, &conversation)
+                .is_none()
+        );
+        terminal_tx
+            .send(Ok(TurnOutcome::Cancelled))
+            .map_err(|_| anyhow::anyhow!("original terminal observer closed"))?;
+        assert!(
+            output.next().now_or_never().is_none(),
+            "原Terminal仍须排空driver"
+        );
+        drop(driver_tx);
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
+            .await?
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("original cancellation receipt missing"))?;
+        assert_eq!(terminal.text, "[cancelled] The channel turn was cancelled.");
         assert!(
             tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
                 .await?

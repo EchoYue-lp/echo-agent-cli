@@ -8,15 +8,12 @@ pub(super) const CHANNEL_EVENT_QUEUE_CAPACITY: usize = 64;
 const CHANNEL_TURN_EVENT_LIMIT: usize = 2_048;
 pub(super) const CHANNEL_TURN_EVENT_BYTES: usize = 512 * 1024;
 const CHANNEL_TURN_ENQUEUED_MESSAGES: usize = 512;
-pub(super) const CHANNEL_TOKEN_COALESCE_BYTES: usize = 1024;
 
 #[derive(Default)]
 struct ChannelSinkBudget {
     accepted_events: usize,
     accepted_bytes: usize,
     enqueued_messages: usize,
-    pending_token: String,
-    native_messages: bool,
 }
 
 /// Ephemeral bounded operation boundary over the canonical journal and tool projection.
@@ -40,32 +37,12 @@ impl ChannelSurfaceSink {
 
     fn deliver_driver(&self, event: crate::chat_driver::ChatDriverEvent) -> bool {
         let mut budget = lock_channel_sink_budget(&self.budget);
-        // 原生块携带完整身份与phase；兼容Token不再作为第二份正文投递。
-        if budget.native_messages
-            && matches!(&event, crate::chat_driver::ChatDriverEvent::Agent(envelope)
-                if matches!(&envelope.payload, echo_agent::agent::AgentEvent::Token(_)))
-        {
-            return true;
-        }
         let event_bytes = match channel_serialized_size(&event, CHANNEL_TURN_EVENT_BYTES) {
             Some(bytes) => bytes,
             None => return self.reject_delivery("channel event exceeds turn byte budget"),
         };
         if !accept_channel_event(&mut budget, event_bytes) {
             return self.reject_delivery("channel event budget exhausted");
-        }
-        if matches!(&event, crate::chat_driver::ChatDriverEvent::Agent(envelope)
-            if matches!(&envelope.payload, echo_agent::agent::AgentEvent::AssistantMessage { .. }))
-        {
-            budget.native_messages = true;
-        }
-        if let crate::chat_driver::ChatDriverEvent::Agent(envelope) = &event
-            && let echo_agent::agent::AgentEvent::Token(token) = &envelope.payload
-        {
-            return self.append_token(&mut budget, token);
-        }
-        if !self.flush_pending_token(&mut budget) {
-            return false;
         }
         self.try_send(&mut budget, ChannelRenderEvent::Driver(event))
     }
@@ -82,20 +59,11 @@ impl ChannelSurfaceSink {
         if !accept_channel_event(&mut budget, event_bytes) {
             return self.reject_delivery("channel projection budget exhausted");
         }
-        if !self.flush_pending_token(&mut budget) {
-            return false;
-        }
         self.try_send(&mut budget, ChannelRenderEvent::ToolProjection(update))
     }
 
     fn deliver_journaled(&self, envelope: crate::chat_event_log::ChatEventEnvelope) -> bool {
         let mut budget = lock_channel_sink_budget(&self.budget);
-        if budget.native_messages
-            && matches!(&envelope.payload, crate::chat_driver::ChatDriverEvent::Agent(agent)
-                if matches!(&agent.payload, echo_agent::agent::AgentEvent::Token(_)))
-        {
-            return true;
-        }
         let event_bytes = match channel_serialized_size(&envelope, CHANNEL_TURN_EVENT_BYTES) {
             Some(bytes) => bytes,
             None => return self.reject_delivery("journaled channel event exceeds byte budget"),
@@ -103,51 +71,10 @@ impl ChannelSurfaceSink {
         if !accept_channel_event(&mut budget, event_bytes) {
             return self.reject_delivery("journaled channel event budget exhausted");
         }
-        if matches!(&envelope.payload, crate::chat_driver::ChatDriverEvent::Agent(agent)
-            if matches!(&agent.payload, echo_agent::agent::AgentEvent::AssistantMessage { .. }))
-        {
-            budget.native_messages = true;
-        }
-        if let crate::chat_driver::ChatDriverEvent::Agent(agent) = &envelope.payload
-            && let echo_agent::agent::AgentEvent::Token(token) = &agent.payload
-        {
-            return self.append_token(&mut budget, token);
-        }
-        if !self.flush_pending_token(&mut budget) {
-            return false;
-        }
         self.try_send(
             &mut budget,
             ChannelRenderEvent::Journaled(Box::new(envelope)),
         )
-    }
-
-    fn append_token(&self, budget: &mut ChannelSinkBudget, token: &str) -> bool {
-        for character in token.chars() {
-            if !budget.pending_token.is_empty()
-                && budget
-                    .pending_token
-                    .len()
-                    .saturating_add(character.len_utf8())
-                    > CHANNEL_TOKEN_COALESCE_BYTES
-                && !self.flush_pending_token(budget)
-            {
-                return false;
-            }
-            budget.pending_token.push(character);
-        }
-        if budget.pending_token.len() >= CHANNEL_TOKEN_COALESCE_BYTES {
-            return self.flush_pending_token(budget);
-        }
-        true
-    }
-
-    fn flush_pending_token(&self, budget: &mut ChannelSinkBudget) -> bool {
-        if budget.pending_token.is_empty() {
-            return true;
-        }
-        let token = std::mem::take(&mut budget.pending_token);
-        self.try_send(budget, ChannelRenderEvent::Token(token))
     }
 
     fn try_send(&self, budget: &mut ChannelSinkBudget, event: ChannelRenderEvent) -> bool {

@@ -935,7 +935,6 @@ struct RunTurnPersistence {
 #[derive(Default)]
 struct EkoAgentTurnState {
     output: String,
-    in_thinking: bool,
     native_event_ids: HashMap<String, String>,
     pending_verification: HashMap<String, String>,
     pending_file_access: HashMap<String, (String, serde_json::Value)>,
@@ -1158,58 +1157,6 @@ impl EventSink for EkoAgentTurnSink {
                 .insert(source_event_id.clone(), source_hash);
         }
         match envelope.payload {
-            AgentEvent::Token(content) => {
-                if !self
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .native_event_ids
-                    .is_empty()
-                {
-                    return Ok(SinkControl::Continue);
-                }
-                let in_thinking = {
-                    let mut state = self
-                        .state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if !state.in_thinking {
-                        state.output.push_str(&content);
-                    }
-                    state.in_thinking
-                };
-                self.emit(
-                    if in_thinking {
-                        RuntimeEventKind::ThinkingDelta
-                    } else {
-                        RuntimeEventKind::TokenDelta
-                    },
-                    serde_json::json!({ "content": content }),
-                );
-            }
-            AgentEvent::ThinkStart => {
-                self.state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .in_thinking = true;
-                self.emit(RuntimeEventKind::ThinkingStarted, serde_json::json!({}));
-            }
-            AgentEvent::ThinkEnd {
-                prompt_tokens,
-                completion_tokens,
-            } => {
-                self.state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .in_thinking = false;
-                self.emit(
-                    RuntimeEventKind::ThinkingEnded,
-                    serde_json::json!({
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                    }),
-                );
-            }
             AgentEvent::LlmUsage {
                 model,
                 prompt_tokens,

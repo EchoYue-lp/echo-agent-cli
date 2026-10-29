@@ -186,6 +186,22 @@ mod tests {
         }
     }
 
+    fn native_progress_fixture(text: impl Into<String>, sequence: u64) -> AgentEvent {
+        AgentEvent::AssistantMessage {
+            block: echo_agent::agent::AssistantMessageBlock {
+                provider_source: None,
+                block_id: format!("eko-native-fixture-{sequence}"),
+                request_id: "eko-native-fixture-request".to_string(),
+                sequence,
+                phase: echo_agent::agent::AssistantPhase::Commentary,
+                delta: text.into(),
+                complete: false,
+                provider: Some("eko-native-test-fixture".to_string()),
+                reasoning: None,
+            },
+        }
+    }
+
     fn agent_event(turn: &str, sequence: u64, text: &str) -> Result<ChatDriverEvent, String> {
         let identity =
             EventIdentity::for_chat(Some("conversation-1".to_string()), turn, turn, None)
@@ -194,7 +210,7 @@ mod tests {
             &identity,
             sequence,
             None,
-            AgentEvent::Token(text.to_string()),
+            native_progress_fixture(text, sequence),
         )
         .map(|event| ChatDriverEvent::Agent(Box::new(event)))
         .map_err(|error| error.to_string())
@@ -524,7 +540,7 @@ mod tests {
             .first()
             .ok_or_else(|| "missing event".to_string())?;
         assert!(
-            matches!(&first.payload, ChatDriverEvent::Agent(agent) if matches!(&agent.payload, AgentEvent::Token(text) if text == "你好"))
+            matches!(&first.payload, ChatDriverEvent::Agent(agent) if matches!(&agent.payload, AgentEvent::AssistantMessage { block } if block.delta == "你好"))
         );
         Ok(())
     }
@@ -2359,7 +2375,7 @@ mod tests {
             &scope_b,
             1,
             None,
-            AgentEvent::Token("另一消息scope的原事件".into()),
+            native_progress_fixture("另一消息scope的原事件", 1),
         )
         .map_err(|error| error.to_string())?;
         log.append(

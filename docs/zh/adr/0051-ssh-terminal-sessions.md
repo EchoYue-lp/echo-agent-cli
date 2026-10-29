@@ -54,6 +54,10 @@ existing examples/lh6_product_soak.rs 不调用终端/SSH，无源码迁移；�
 
 GUI 认证测试返回时，仍须核对同一认证 PTY 是否已经退出。等待 `testSsh` 期间收到该 owner 的 `terminal-exit` 后，迟到的 `authenticated=true` 不能重新发布远程来源或恢复“登录已验证”；应保留断开状态并要求显式重连。其它 owner 的退出不影响当前 draft，已有独立 draft 转交、密码只写原 PTY、迟到视图清理与不重放规则不变。组件回归分别覆盖 echo 与 ubuntu 两个目标的事件顺序；这些公共测试数据不构成真实登录或远程交互验收。
 
+backend 转交在原 project creation lock 内保留 Arc／目标核对，并与原 session creation／退出发布边界串行。原 child 已观察到退出（即使 reader 仍待 join）、closing 连接或正在关闭的原 session 均拒绝转交；错误保留原 draft／资源，不补造目标 owner，也不把远端副作用当作停止。认证 master、普通 PTY 与 mux slave 的来源不能仅靠相同 id／目标判断。
+
+原 TerminalSession 在创建时保留只读 Weak master 来源，仅用于核对原物理连接身份；强资源、operation、child／reader 与结算仍归原 TerminalResources。该 Weak 不新增 owner，不证明认证或远端存活。原 waiter 在 `try_wait Some` 的真实退出观察处以 Release 发布 `child_exit_observed`，转交以 Acquire 读取；它不发布终态、不提前释放资源，原 wait／reader join 和完成事件不变。资源 mutex 贯穿原 child／reader 的物理观察，转交检查不等待它；session 登记、关闭请求和原创建边界继续提供本地准入事实。本机原 PTY／取消观察／mux／reader 待结算负控与真实 SSH、新 App 验收分别记录。
+
 ## 项目连接扩展
 
 用户已明确侧栏任务相当于项目，创建来源是现有本地目录、新建本地目录或远程项目。本扩展以项目工作环境设计和 Plan `plan:986e9191-1a18-454b-a8b8-59ae18ad3bc7` 为准，不再把独立终端验收当作远程项目验收。Workspace 仍拥有项目及位置，TaskRun 仍拥有执行事实；本 ADR 只负责原终端/SSH 资源适配。

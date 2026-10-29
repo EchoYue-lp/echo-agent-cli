@@ -259,12 +259,6 @@ impl Agent for ProjectAgentAdapter {
     ) -> std::result::Result<AgentSteerReceipt, AgentSteerError> {
         self.delegate.steer_input_tracked(turn, message)
     }
-    fn set_external_context(&self, context: &echo_agent::tools::ExternalRunContext) {
-        self.delegate.set_external_context(context);
-    }
-    fn clear_external_context(&self) {
-        self.delegate.clear_external_context();
-    }
     fn set_working_dir(&self, path: Option<PathBuf>) {
         self.delegate.set_working_dir(path);
     }

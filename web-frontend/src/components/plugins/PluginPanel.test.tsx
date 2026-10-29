@@ -9,7 +9,7 @@ const api = vi.hoisted(() => ({
     valid: true,
     name: 'mixed',
     components: ['skills'],
-    errors: ['LSP component has been retired from EKO'],
+    errors: ['Warning: current component warning from validation'],
   })),
 }));
 vi.mock('../../api/endpoints', () => ({
@@ -29,15 +29,15 @@ vi.mock('../../stores/uiStore', () => ({
 }));
 import { PluginPanel } from './PluginPanel';
 afterEach(cleanup);
-describe('retired plugin component diagnostics', () => {
-  it('shows retirement diagnostics even when retained plugin components validate', async () => {
+describe('current plugin component diagnostics', () => {
+  it('shows current source diagnostics even when healthy plugin components validate', async () => {
     render(<PluginPanel />);
     fireEvent.click(await screen.findByTitle('Plugin developer tools'));
     fireEvent.change(screen.getByPlaceholderText('Plugin directory'), {
       target: { value: '/isolated/mixed' },
     });
     fireEvent.click(screen.getByRole('button', { name: 'Validate' }));
-    expect(await screen.findByText(/LSP component has been retired from EKO/)).toBeTruthy();
+    expect(await screen.findByText(/current component warning from validation/)).toBeTruthy();
     expect(api.validate).toHaveBeenCalled();
   });
 });

@@ -402,6 +402,331 @@ fn render_turn_contract(contract: TurnContract) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn published_unknown_report_resets_original_sink_progress_without_counting_observations()
+    -> anyhow::Result<()> {
+        use crate::chat_driver::{ChatDriverEvent, ChatSink};
+        use echo_agent::agent::{Agent, AgentEvent, AssistantMessageBlock, AssistantPhase};
+        use echo_agent::guard::{Guard, GuardDirection, GuardResult};
+        use echo_agent::llm::types::DeltaMessage;
+        use echo_agent::testing::{MockLlmClient, MockTool, StreamChunk};
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct ObservedProgress {
+            aged: Option<Instant>,
+            registration: Option<uuid::Uuid>,
+            actual_turn: Option<String>,
+            pending: Option<String>,
+            effects: Vec<(String, bool)>,
+            blocks: Vec<AssistantMessageBlock>,
+            order: Vec<String>,
+            tool_results: usize,
+            error: Option<String>,
+        }
+        struct RealProgressSink {
+            registry: Arc<TurnPromptContextRegistry>,
+            observed: Arc<Mutex<ObservedProgress>>,
+        }
+        impl ChatSink for RealProgressSink {
+            fn on_event(&self, event: ChatDriverEvent) -> bool {
+                let ChatDriverEvent::Agent(envelope) = event else {
+                    return true;
+                };
+                let result = (|| -> anyhow::Result<()> {
+                    let mut observed = self.observed.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut entries = self
+                        .registry
+                        .registrations
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let actual_turn = envelope.turn_id.as_str();
+                    let registration = entries
+                        .get_mut(actual_turn)
+                        .ok_or_else(|| anyhow::anyhow!("original turn registration missing"))?;
+                    let aged = match observed.aged {
+                        Some(aged) => aged,
+                        None => {
+                            if !matches!(&envelope.payload, AgentEvent::ExecutionStatus(status)
+                                if status.status == echo_agent::agent::ExecutionStatusKind::Started)
+                            {
+                                anyhow::bail!(
+                                    "original Started must establish the progress observation"
+                                );
+                            }
+                            let aged = Instant::now()
+                                .checked_sub(Duration::from_secs(61))
+                                .ok_or_else(|| anyhow::anyhow!("fixture instant cannot be aged"))?;
+                            observed.aged = Some(aged);
+                            observed.registration = Some(registration.id);
+                            observed.actual_turn = Some(actual_turn.to_string());
+                            aged
+                        }
+                    };
+                    if observed.registration != Some(registration.id) {
+                        anyhow::bail!("progress observer moved to another registration");
+                    }
+                    if observed.actual_turn.as_deref() != Some(actual_turn) {
+                        anyhow::bail!("progress event crossed its original turn");
+                    }
+                    // reported()在真实sink接受事件之后运行；下一回调才观察上一事件的效果。
+                    if let Some(previous) = observed.pending.take() {
+                        observed
+                            .effects
+                            .push((previous, registration.progress.last_report != aged));
+                    }
+                    let label = match &envelope.payload {
+                        AgentEvent::AssistantMessage { block } => {
+                            observed.blocks.push(block.clone());
+                            format!(
+                                "{}:{:?}",
+                                if block.delta.trim().is_empty() {
+                                    "empty_block"
+                                } else {
+                                    "block"
+                                },
+                                block.phase
+                            )
+                        }
+                        AgentEvent::ToolCall { .. } => "tool_call".to_string(),
+                        AgentEvent::ToolResult { result, .. } => {
+                            if result.success && result.output == "real-read-complete" {
+                                observed.tool_results = observed.tool_results.saturating_add(1);
+                            }
+                            "tool_result".to_string()
+                        }
+                        AgentEvent::ExecutionStatus(_) => "status".to_string(),
+                        AgentEvent::FinalAnswer(_) => "confirmed_final".to_string(),
+                        AgentEvent::Error { .. } => "error".to_string(),
+                        _ => "observation".to_string(),
+                    };
+                    observed.order.push(label.clone());
+                    // 仅测试夹具把原有计时设回同一个过去值，逐事件隔离观测；不增加clock或等待。
+                    registration.progress.last_report = aged;
+                    observed.pending = Some(label);
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    self.observed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .error = Some(error.to_string());
+                    return false;
+                }
+                true
+            }
+        }
+        struct RejectOriginalFinal(Arc<AtomicUsize>);
+        impl Guard for RejectOriginalFinal {
+            fn name(&self) -> &str {
+                "progress-whole-output-guard"
+            }
+            fn check<'a>(
+                &'a self,
+                content: &'a str,
+                direction: GuardDirection,
+            ) -> BoxFuture<'a, AgentResult<GuardResult>> {
+                Box::pin(async move {
+                    Ok(
+                        if direction == GuardDirection::Output
+                            && content.contains("SECRET_PROGRESS_FINAL")
+                        {
+                            self.0.fetch_add(1, Ordering::SeqCst);
+                            GuardResult::Block {
+                                reason: "original final withheld".to_string(),
+                            }
+                        } else {
+                            GuardResult::Pass
+                        },
+                    )
+                })
+            }
+        }
+
+        for phase in [
+            AssistantPhase::Unknown,
+            AssistantPhase::Reasoning,
+            AssistantPhase::FinalAnswer,
+        ] {
+            let guarded = phase == AssistantPhase::FinalAnswer;
+            let turn_id = format!("published-progress-{phase:?}");
+            let registry = turn_prompt_context_registry();
+            let observed = Arc::new(Mutex::new(ObservedProgress::default()));
+            let source = AssistantMessageBlock {
+                provider_source: None,
+                block_id: "progress-source-block".to_string(),
+                request_id: "progress-source-request".to_string(),
+                sequence: 0,
+                phase,
+                delta: if guarded {
+                    "SECRET_PROGRESS_FINAL"
+                } else {
+                    "原始可见正文🙂"
+                }
+                .to_string(),
+                complete: true,
+                provider: Some("progress-fixture".to_string()),
+                reasoning: None,
+            };
+            let calls = if guarded {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!([{"index":0,"id":"progress-call","type":"function","function":{"name":"read_file","arguments":"{}"}}])
+            };
+            let delta: DeltaMessage = serde_json::from_value(serde_json::json!({
+                "role":"assistant", "content":if phase == AssistantPhase::Reasoning { "" } else { source.delta.as_str() },
+                "assistant_blocks":[source.clone()], "tool_calls":calls
+            }))?;
+            let model = Arc::new(
+                MockLlmClient::new()
+                    .with_stream_script(vec![
+                        StreamChunk::Delta(delta),
+                        StreamChunk::Terminal {
+                            finish_reason: Some(
+                                if guarded { "stop" } else { "tool_calls" }.to_string(),
+                            ),
+                            usage: None,
+                        },
+                    ])
+                    .with_response("safe completion"),
+            );
+            let guard_calls = Arc::new(AtomicUsize::new(0));
+            let mut builder = echo_agent::agent::ReactAgentBuilder::new()
+                .model("progress-fixture")
+                .llm_client(model.clone())
+                .tool(Box::new(
+                    MockTool::new("read_file").with_response("real-read-complete"),
+                ));
+            if guarded {
+                builder = builder.guard(Arc::new(RejectOriginalFinal(guard_calls.clone())));
+            }
+            let agent = crate::agent_handle::AgentHandle::new(builder.build()?);
+            let sink: Arc<dyn ChatSink> = Arc::new(RealProgressSink {
+                registry: registry.clone(),
+                observed: observed.clone(),
+            });
+            let resources = Arc::new(crate::chat_resources::ChatResources {
+                execution_scope: crate::workspace::WorkspaceExecutionScope::workspace(
+                    &crate::workspace::WorkspaceId::from_name("progress-fixture"),
+                    ".",
+                ),
+                workspace_io_receipt: None,
+                pool: None,
+                store: None,
+                sink,
+                webhook_emitter: None,
+                conv_id: Some(turn_id.clone()),
+                root_message_id: turn_id.clone(),
+                attachments: Vec::new(),
+                cancel: echo_agent::agent::CancellationToken::new(),
+                review_integration: None,
+                memory_generation: None,
+                human_loop_provider: None,
+            });
+            let turn = crate::prepared_turn::PreparedUserTurn {
+                instruction: "verify original published progress".to_string(),
+                resources: Vec::new(),
+                authorship: InstructionAuthorship::User,
+                agent_input: None,
+            };
+            let outcome = crate::chat_driver::drive_chat(&agent, &turn, resources).await?;
+            agent.inner().read().await.close().await?;
+            assert!(
+                !registry.contains(&turn_id),
+                "original registration must naturally retire"
+            );
+            let observed = observed.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(observed.error.is_none(), "{:?}", observed.error);
+            assert!(
+                observed
+                    .actual_turn
+                    .as_deref()
+                    .is_some_and(|id| !registry.contains(id))
+            );
+            if guarded {
+                assert!(matches!(
+                    outcome,
+                    echo_agent::runtime::TurnOutcome::Failed(_)
+                ));
+                assert_eq!(guard_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    model.call_count(),
+                    1,
+                    "the guard rejection must not start another model loop"
+                );
+                assert!(
+                    !observed
+                        .blocks
+                        .iter()
+                        .any(|block| block.delta.contains("SECRET_PROGRESS_FINAL"))
+                );
+                assert!(
+                    !observed.effects.iter().any(|(_, changed)| *changed),
+                    "withheld final and observations are not reports"
+                );
+            } else {
+                assert_eq!(outcome, echo_agent::runtime::TurnOutcome::Completed);
+                assert_eq!(
+                    model.call_count(),
+                    2,
+                    "only the original tool and final requests may run"
+                );
+                assert_eq!(
+                    observed.tool_results, 1,
+                    "the original tool must actually execute"
+                );
+                assert!(
+                    observed
+                        .blocks
+                        .iter()
+                        .any(|block| block.block_id == source.block_id
+                            && block.request_id == source.request_id
+                            && block.phase == phase
+                            && block.delta == source.delta)
+                );
+                let first_block = observed
+                    .order
+                    .iter()
+                    .position(|label| label == &format!("block:{phase:?}"));
+                let first_tool = observed.order.iter().position(|label| label == "tool_call");
+                assert!(
+                    matches!((first_block, first_tool), (Some(block), Some(tool)) if block < tool)
+                );
+                let effects = observed
+                    .effects
+                    .iter()
+                    .filter(|(label, _)| label == &format!("block:{phase:?}"))
+                    .collect::<Vec<_>>();
+                assert!(
+                    !effects.is_empty(),
+                    "original block was not followed through the sink"
+                );
+                for (_, changed) in effects {
+                    assert_eq!(
+                        *changed,
+                        phase == AssistantPhase::Unknown,
+                        "approved public Unknown must reset the original report clock; Reasoning must not"
+                    );
+                }
+                assert!(
+                    observed.effects.iter().any(|(label, _)| label == "status"),
+                    "the original execution status must be observed through the sink"
+                );
+                assert!(
+                    observed
+                        .effects
+                        .iter()
+                        .filter(|(label, _)| label.starts_with("empty_block:")
+                            || matches!(label.as_str(), "tool_call" | "tool_result" | "status"))
+                        .all(|(_, changed)| !changed),
+                    "tool/status observations cannot reset progress"
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn progress_reminder_waits_for_safe_point_and_only_rearms_after_report() {
         let start = Instant::now();

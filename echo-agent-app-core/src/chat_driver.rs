@@ -2018,20 +2018,20 @@ async fn project_eko_turn_event(
     let suppress_internal_transcript = !state.expose_internal_synthesis
         && matches!(
             &event.payload,
-            AgentEvent::AssistantMessage { .. }
-                | AgentEvent::Token(_)
-                | AgentEvent::ThinkStart
-                | AgentEvent::ThinkEnd { .. }
-                | AgentEvent::FinalAnswer(_)
+            AgentEvent::AssistantMessage { .. } | AgentEvent::FinalAnswer(_)
         );
     if suppress_internal_transcript {
         return Ok(SinkControl::Continue);
     }
     let visible_report = match &event.payload {
         AgentEvent::AssistantMessage { block } => {
-            block.phase != echo_agent::agent::AssistantPhase::Reasoning
-                && block.phase != echo_agent::agent::AssistantPhase::FinalAnswer
-                && !block.delta.trim().is_empty()
+            // 公开资格由Framework发布路径保证；合法Unknown正文保持原phase，也应计作报告。
+            matches!(
+                block.phase,
+                echo_agent::agent::AssistantPhase::Commentary
+                    | echo_agent::agent::AssistantPhase::PartialAnswer
+                    | echo_agent::agent::AssistantPhase::Unknown
+            ) && !block.delta.trim().is_empty()
         }
         AgentEvent::FinalAnswer(text) => !text.trim().is_empty(),
         _ => false,
@@ -2612,6 +2612,24 @@ mod tests {
             &crate::workspace::WorkspaceId::from_name("test"),
             ".",
         )
+    }
+
+    // Controlled native input keeps the original transport assertions independent
+    // of provider phase inference and runtime terminal confirmation.
+    fn native_progress_fixture(text: impl Into<String>, sequence: u64) -> AgentEvent {
+        AgentEvent::AssistantMessage {
+            block: echo_agent::agent::AssistantMessageBlock {
+                provider_source: None,
+                block_id: format!("eko-native-fixture-{sequence}"),
+                request_id: "eko-native-fixture-request".to_string(),
+                sequence,
+                phase: echo_agent::agent::AssistantPhase::Commentary,
+                delta: text.into(),
+                complete: false,
+                provider: Some("eko-native-test-fixture".to_string()),
+                reasoning: None,
+            },
+        }
     }
 
     /// Build a minimal [`PreparedUserTurn`] for tests that do not exercise
@@ -3615,7 +3633,25 @@ mod tests {
             let events = self.events.lock().unwrap_or_else(|e| e.into_inner());
             let terminal_count = events
                 .iter()
-                .filter(|event| event.payload.is_terminal())
+                .filter(|event| event.payload.is_execution_terminal())
+                .count();
+            let source_execution = events.first().and_then(|event| match &event.payload {
+                AgentEvent::ExecutionStatus(status)
+                    if status.status == echo_agent::agent::ExecutionStatusKind::Started =>
+                {
+                    Some(status.execution_id.as_str())
+                }
+                _ => None,
+            });
+            let settled = events.last().is_some_and(|event| {
+                matches!(&event.payload,
+                AgentEvent::ExecutionStatus(status)
+                    if status.status == echo_agent::agent::ExecutionStatusKind::Settled
+                        && Some(status.execution_id.as_str()) == source_execution)
+            });
+            let confirmations = events
+                .iter()
+                .filter(|event| matches!(event.payload, AgentEvent::FinalAnswer(_)))
                 .count();
             events.iter().enumerate().all(|(index, event)| {
                 event.schema_version == echo_agent::agent::AGENT_EVENT_SCHEMA_VERSION
@@ -3628,6 +3664,9 @@ mod tests {
                         .is_some_and(|id| id.as_str() == expected_run_id)
                     && !event.event_id.as_str().is_empty()
             }) && terminal_count == 1
+                && confirmations == 1
+                && source_execution.is_some()
+                && settled
         }
     }
 
@@ -3780,7 +3819,7 @@ mod tests {
             &identity,
             1,
             None,
-            AgentEvent::Token("undelivered".to_string()),
+            native_progress_fixture("undelivered", 1),
         )
         .map_err(|error| error.to_string())?;
         let error = match adapter.on_event(envelope).await {
@@ -3841,7 +3880,7 @@ mod tests {
                 &identity,
                 sequence,
                 None,
-                AgentEvent::Token(format!("token-{sequence}")),
+                native_progress_fixture(format!("token-{sequence}"), sequence),
             )
             .map_err(|error| error.to_string())?;
             deliveries.push(adapter.on_event(envelope));
@@ -3879,7 +3918,7 @@ mod tests {
             &identity,
             1,
             None,
-            AgentEvent::Token("undelivered".to_string()),
+            native_progress_fixture("undelivered", 1),
         )
         .map_err(|error| error.to_string())?;
         let error = match adapter.on_event(envelope).await {
@@ -4581,7 +4620,7 @@ mod tests {
     }
 
     struct TaskExecuteReceiptBarrierSink {
-        reached: std::sync::mpsc::SyncSender<()>,
+        reached: std::sync::mpsc::SyncSender<Box<EventEnvelope>>,
         release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
         parked: std::sync::atomic::AtomicBool,
     }
@@ -4594,18 +4633,15 @@ mod tests {
 
     impl ChatSink for TaskExecuteReceiptBarrierSink {
         fn on_event(&self, event: ChatDriverEvent) -> bool {
-            let should_park = matches!(
-                event,
-                ChatDriverEvent::Agent(ref envelope)
-                    if matches!(
-                        &envelope.payload,
-                        AgentEvent::ToolResult { name, .. } if name == "task_execute"
-                    )
-            ) && !self.parked.swap(true, std::sync::atomic::Ordering::SeqCst);
-            if !should_park {
+            let ChatDriverEvent::Agent(envelope) = event else {
+                return true;
+            };
+            if !matches!(&envelope.payload, AgentEvent::ToolResult { name, .. } if name == "task_execute")
+                || self.parked.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
                 return true;
             }
-            if self.reached.send(()).is_err() {
+            if self.reached.send(envelope).is_err() {
                 return false;
             }
             self.release
@@ -5110,6 +5146,8 @@ mod tests {
         let llm = Arc::new(
             echo_agent::testing::MockLlmClient::new()
                 .with_model_name("task-pool-path")
+                // 原pool先由同一transport分类；不让分类消费主ReAct的task_create脚本。
+                .with_response(r#"{"intent":"FALLBACK","skill":null,"confidence":1.0}"#)
                 .then_tool_call(
                     "create-plan",
                     "task_create",
@@ -5125,7 +5163,8 @@ mod tests {
                     .to_string(),
                 )
                 .then_tool_call("execute-plan", "task_execute", r#"{"revision":1}"#)
-                .with_response("pooled task graph finished"),
+                .with_response("pooled task graph finished")
+                .with_response(r#"{"score":9.0,"passed":true,"feedback":"Exact pooled evidence inspected","suggestions":[]}"#),
         );
         let mut react_agent = echo_agent::agent::ReactAgentBuilder::new()
             .model("task-pool-path")
@@ -5152,6 +5191,8 @@ mod tests {
             crate::agent_pool::AgentPool::new_for_test(primary_agent.clone(), None, None, 3, false)
                 .await,
         );
+        // 复用原测试transport接缝，同步替换EKO-owned Critic；保留真实verifier与custom Critic边界。
+        pool.set_llm_client_override_for_test(llm.clone()).await;
         crate::tasks::task_runtime::bind_task_execute_to_pool(&primary_agent, store.clone(), &pool)
             .await;
         let foreground_execution = pool
@@ -5217,7 +5258,7 @@ mod tests {
         })
         .await
         .map_err(|error| error.to_string())?;
-        if let Err(error) = barrier_result {
+        if let Err(error) = &barrier_result {
             let early_outcome = tokio::time::timeout(TASK_EXECUTE_RECEIPT_TEST_TIMEOUT, drive)
                 .await
                 .map_err(|_| {
@@ -5229,10 +5270,43 @@ mod tests {
                 llm.call_count()
             ));
         }
+        let original_event = barrier_result?;
+        let AgentEvent::ToolResult { result, .. } = &original_event.payload else {
+            return Err("pool receipt barrier did not preserve the original ToolResult".into());
+        };
+        assert!(
+            result.success,
+            "task_execute must succeed before observing its receipt: {result:?}"
+        );
+        let requests = llm.all_calls();
+        let classifier_request = requests
+            .first()
+            .ok_or("missing original classification request")?;
+        assert_eq!(classifier_request.len(), 1);
+        assert!(
+            classifier_request
+                .first()
+                .and_then(|message| message.content.as_text())
+                .is_some_and(|text| text.starts_with("You are an intent classifier"))
+        );
+        let tool_counts = llm.all_tool_counts();
+        assert_eq!(tool_counts.first().copied(), Some(0));
+        assert!(tool_counts.get(1).is_some_and(|count| *count > 0));
+        assert!(
+            store
+                .get_plan(
+                    &crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(
+                        "pool-task-turn"
+                    )
+                )
+                .map_err(|error| error.to_string())?
+                .is_some(),
+            "task_create must persist the original plan"
+        );
         assert_eq!(
             store.active_run_driver_receipt_count()?,
             1,
-            "the framework-spawned task_execute pool receipt must belong to the outer driver"
+            "the framework-spawned task_execute pool receipt must belong to the outer driver; original ToolResult: {result:?}"
         );
         release_tx
             .send(())
@@ -5243,6 +5317,12 @@ mod tests {
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())?;
         assert_eq!(outcome, TurnOutcome::Completed);
+        assert_eq!(
+            llm.call_count(),
+            5,
+            "original classifier, three ReAct requests and Critic must all run"
+        );
+        assert_eq!(llm.remaining(), 0);
         assert_eq!(store.active_run_driver_receipt_count()?, 0);
         store
             .shutdown_run_drivers()
@@ -5614,15 +5694,31 @@ mod tests {
         let partial_output = events
             .iter()
             .filter_map(|event| match &event.payload {
-                AgentEvent::Token(token) => Some(token.as_str()),
+                AgentEvent::AssistantMessage { block } => Some(block.delta.as_str()),
                 _ => None,
             })
             .collect::<String>();
         assert_eq!(partial_output, "partial answer");
-        assert!(matches!(
-            events.last().map(|event| &event.payload),
-            Some(AgentEvent::Error { .. })
-        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.payload, AgentEvent::Error { .. }))
+                .count(),
+            1
+        );
+        let source_execution = events.first().and_then(|event| match &event.payload {
+            AgentEvent::ExecutionStatus(status)
+                if status.status == echo_agent::agent::ExecutionStatusKind::Started =>
+            {
+                Some(status.execution_id.as_str())
+            }
+            _ => None,
+        });
+        assert!(source_execution.is_some());
+        assert!(matches!(events.last().map(|event| &event.payload),
+            Some(AgentEvent::ExecutionStatus(status))
+                if status.status == echo_agent::agent::ExecutionStatusKind::Failed
+                    && Some(status.execution_id.as_str()) == source_execution));
         Ok(())
     }
 
@@ -6110,14 +6206,14 @@ mod tests {
         // on_event forwards each event to the channel and keeps going.
         assert!(
             sink.on_event(ChatDriverEvent::Agent(Box::new(
-                EventEnvelope::new(&identity, 1, None, AgentEvent::Token("hel".to_string()),)
+                EventEnvelope::new(&identity, 1, None, native_progress_fixture("hel", 1),)
                     .map_err(|error| error.to_string())?
             ))),
             "on_event should return true to continue"
         );
         assert!(
             sink.on_event(ChatDriverEvent::Agent(Box::new(
-                EventEnvelope::new(&identity, 2, None, AgentEvent::Token("lo".to_string()),)
+                EventEnvelope::new(&identity, 2, None, native_progress_fixture("lo", 2),)
                     .map_err(|error| error.to_string())?
             ))),
             "second event should also be accepted"
@@ -6134,12 +6230,20 @@ mod tests {
             None => return Err("second event was not forwarded".to_string()),
         };
         match first.payload {
-            AgentEvent::Token(t) => assert_eq!(t, "hel"),
-            other => return Err(format!("first should be Token(hel); got {other:?}")),
+            AgentEvent::AssistantMessage { block } => assert_eq!(block.delta, "hel"),
+            other => {
+                return Err(format!(
+                    "first should be native Commentary(hel); got {other:?}"
+                ));
+            }
         }
         match second.payload {
-            AgentEvent::Token(t) => assert_eq!(t, "lo"),
-            other => return Err(format!("second should be Token(lo); got {other:?}")),
+            AgentEvent::AssistantMessage { block } => assert_eq!(block.delta, "lo"),
+            other => {
+                return Err(format!(
+                    "second should be native Commentary(lo); got {other:?}"
+                ));
+            }
         }
         Ok(())
     }

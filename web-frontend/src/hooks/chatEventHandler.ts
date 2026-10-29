@@ -235,25 +235,6 @@ function handleAgentEvent(
       }
       break;
     }
-    case 'token':
-      handleChatEvent({ type: 'token', data: event.data }, ctx);
-      break;
-    case 'think_start':
-      handleChatEvent({ type: 'run_status', status: 'thinking' }, ctx);
-      if (observation && !useChatStore.getState().activity?.key.startsWith('request:'))
-        useChatStore
-          .getState()
-          .observeActivity(
-            `model:${observation.eventId}`,
-            '模型正在响应',
-            observation.at,
-            observation.scope
-          );
-      handleChatEvent({ type: 'thinking_start' }, ctx);
-      break;
-    case 'think_end':
-      handleChatEvent({ type: 'thinking_end', ...event.data }, ctx);
-      break;
     case 'llm_usage':
       handleChatEvent({ type: 'llm_usage', ...event.data }, ctx);
       break;
@@ -345,31 +326,6 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
   const store = useChatStore.getState();
 
   switch (event.type) {
-    case 'token': {
-      if (ctx.isCancelledRef.current) break;
-      const id = ctx.assistantIdRef.current;
-      if (id && event.data) {
-        if (store.messages.find((message) => message.id === id)?.assistantBlocks?.length) break;
-        // 旧起止事件只有运行观测语义；正文类型由消息块显式表达，不能由前序信号推断。
-        store.appendToken(id, event.data);
-      }
-      break;
-    }
-    case 'thinking_start': {
-      if (ctx.isCancelledRef.current) break;
-      const id = ctx.assistantIdRef.current;
-      if (id) {
-        // 起止仅是运行观测；公开Reasoning正文只消费原assistant_message块。
-        ctx.currentThinkingIdRef.current = id;
-      }
-      break;
-    }
-    case 'thinking_end': {
-      if (ctx.isCancelledRef.current) break;
-      // 仅关闭旧观察窗口，不改变后续正文 Token 的类型。
-      ctx.currentThinkingIdRef.current = null;
-      break;
-    }
     case 'llm_usage': {
       // 更新上下文窗口占用快照（不作为聊天消息渲染，仅驱动 footer 指示器）。
       // 对齐 Claude Code statusline：用真实 prompt_tokens 表示当前上下文长度。

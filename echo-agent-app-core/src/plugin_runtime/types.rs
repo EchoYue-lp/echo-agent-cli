@@ -63,14 +63,9 @@ impl ReloadSummary {
                 .into_iter()
                 .flat_map(PreparedPluginSet::diagnostics)
                 .map(|diagnostic| {
-                    // Preserve the frozen diagnostic and its severity; EKO only adds
-                    // its product decision to the retired component's explanation.
+                    // 只投影同一prepared generation的原诊断和级别，不重读文件或解释退役组件。
                     let severity = diagnostic.severity();
-                    if diagnostic.component() == "lsp" {
-                        format!("{severity:?}: LSP component has been retired from EKO; no language server was loaded; legacy input remains unchanged: {diagnostic}")
-                    } else {
-                        format!("{severity:?}: {diagnostic}")
-                    }
+                    format!("{severity:?}: {diagnostic}")
                 })
                 .collect(),
         }

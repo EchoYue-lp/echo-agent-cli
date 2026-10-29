@@ -159,7 +159,6 @@ fn require_applicable_generation(
     if generation.is_applicable()
         && !generation.diagnostics().iter().any(|diagnostic| {
             diagnostic.severity() == echo_agent::plugin::PluginDiagnosticSeverity::Error
-                && diagnostic.component() != "lsp"
         })
     {
         return Ok(generation);

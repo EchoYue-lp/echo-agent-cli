@@ -7,7 +7,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct ScriptedTurnAgent {
-        script: fn() -> Vec<AgentEvent>,
+        script: fn(&str) -> Vec<AgentEvent>,
+        execution_id: String,
     }
 
     struct PermissionCountingTool {
@@ -108,8 +109,11 @@ mod tests {
     }
 
     impl ScriptedTurnAgent {
-        fn new(script: fn() -> Vec<AgentEvent>) -> Self {
-            Self { script }
+        fn new(script: fn(&str) -> Vec<AgentEvent>, execution_id: &str) -> Self {
+            Self {
+                script,
+                execution_id: execution_id.to_string(),
+            }
         }
     }
 
@@ -126,25 +130,41 @@ mod tests {
             ""
         }
 
-        fn execute<'a>(
+        fn execute_stream_message_with_invocation_context<'a>(
             &'a self,
-            _task: &'a str,
-        ) -> BoxFuture<'a, echo_agent::error::Result<String>> {
-            Box::pin(async { Ok(String::new()) })
-        }
-
-        fn execute_stream<'a>(
-            &'a self,
-            _task: &'a str,
+            _message: echo_agent::llm::types::Message,
+            _cancel: echo_agent::agent::CancellationToken,
+            _invocation: echo_agent::agent::AgentInvocationContext,
         ) -> BoxFuture<
             'a,
             echo_agent::error::Result<BoxStream<'a, echo_agent::error::Result<AgentEvent>>>,
         > {
-            let events = (self.script)();
+            let events = (self.script)(&self.execution_id);
             Box::pin(async move {
                 Ok(Box::pin(stream::iter(events.into_iter().map(Ok))) as BoxStream<'a, _>)
             })
         }
+    }
+
+    // 测试source显式声明自身结算；通用正文确认不替代原生执行终态。
+    fn scripted_execution_status(
+        execution_id: &str,
+        kind: echo_agent::agent::ExecutionStatusKind,
+        sequence: u64,
+    ) -> AgentEvent {
+        AgentEvent::ExecutionStatus(echo_agent::agent::ExecutionStatus {
+            adapter_generated: false,
+            execution_id: execution_id.into(),
+            request_id: None,
+            sequence,
+            phase: if kind == echo_agent::agent::ExecutionStatusKind::Started {
+                echo_agent::agent::AgentPhase::Thinking
+            } else {
+                echo_agent::agent::AgentPhase::Terminal
+            },
+            status: kind,
+            reason: None,
+        })
     }
 
     fn turn_identity(
@@ -164,7 +184,7 @@ mod tests {
         store: Arc<TaskRuntimeStore>,
         run: &TaskRun,
         turn_id: &str,
-        script: fn() -> Vec<AgentEvent>,
+        script: fn(&str) -> Vec<AgentEvent>,
     ) -> Result<TurnReceipt, String> {
         let _resources = store.test_resource_scope();
         let sink = EkoAgentTurnSink::for_run(
@@ -177,7 +197,7 @@ mod tests {
         let request =
             TurnRequest::new(turn_identity(run, turn_id)?, "test").mode(TurnMode::Execute);
         AgentTurnDriver
-            .drive(&ScriptedTurnAgent::new(script), request, &sink)
+            .drive(&ScriptedTurnAgent::new(script, turn_id), request, &sink)
             .await
             .map_err(|error| error.to_string())
     }
@@ -273,8 +293,27 @@ mod tests {
 
     #[tokio::test]
     async fn task_turn_driver_rejects_stream_without_terminal() -> Result<(), String> {
-        fn missing_terminal() -> Vec<AgentEvent> {
-            vec![AgentEvent::Token("partial output".to_string())]
+        fn missing_terminal(execution_id: &str) -> Vec<AgentEvent> {
+            vec![
+                scripted_execution_status(
+                    execution_id,
+                    echo_agent::agent::ExecutionStatusKind::Started,
+                    0,
+                ),
+                AgentEvent::AssistantMessage {
+                    block: echo_agent::agent::AssistantMessageBlock {
+                        provider_source: None,
+                        block_id: "missing-terminal-block".to_string(),
+                        request_id: "missing-terminal-request".to_string(),
+                        sequence: 1,
+                        phase: echo_agent::agent::AssistantPhase::Commentary,
+                        delta: "partial output".to_string(),
+                        complete: true,
+                        provider: Some("eko-native-test-fixture".to_string()),
+                        reasoning: None,
+                    },
+                },
+            ]
         }
 
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
@@ -291,7 +330,13 @@ mod tests {
         )
         .await?;
 
-        assert!(matches!(receipt.outcome, TurnOutcome::Failed(_)));
+        // 原envelope在EOF先报告agent_stream；后续projection诊断不能覆盖这一首因。
+        assert!(
+            matches!(receipt.outcome, TurnOutcome::Failed(ref failure)
+            if failure.code == "agent_stream"
+                && failure.message == "agent stream ended without a terminal event"),
+            "original missing-terminal receipt: {receipt:?}"
+        );
         assert!(receipt.final_answer.is_none());
         assert_eq!(receipt.usage().tokens_used, None);
         Ok(())
@@ -299,8 +344,13 @@ mod tests {
 
     #[tokio::test]
     async fn task_turn_usage_counts_only_provider_reported_events() -> Result<(), String> {
-        fn usage_script() -> Vec<AgentEvent> {
+        fn usage_script(execution_id: &str) -> Vec<AgentEvent> {
             vec![
+                scripted_execution_status(
+                    execution_id,
+                    echo_agent::agent::ExecutionStatusKind::Started,
+                    0,
+                ),
                 AgentEvent::LlmUsage {
                     model: "unknown-usage".to_string(),
                     prompt_tokens: 100,
@@ -320,6 +370,11 @@ mod tests {
                     usage_reported: true,
                 },
                 AgentEvent::FinalAnswer("done".to_string()),
+                scripted_execution_status(
+                    execution_id,
+                    echo_agent::agent::ExecutionStatusKind::Settled,
+                    1,
+                ),
             ]
         }
 
@@ -368,7 +423,11 @@ mod tests {
         )
         .mode(TurnMode::Execute);
         let receipt = AgentTurnDriver
-            .drive(&ScriptedTurnAgent::new(usage_script), request, &sink)
+            .drive(
+                &ScriptedTurnAgent::new(usage_script, &execution_id),
+                request,
+                &sink,
+            )
             .await
             .map_err(|error| error.to_string())?;
 
@@ -388,7 +447,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_turn_driver_preserves_typed_provider_timeout_and_cancel() -> Result<(), String> {
-        fn provider_failure() -> Vec<AgentEvent> {
+        fn provider_failure(execution_id: &str) -> Vec<AgentEvent> {
             let failure = echo_agent::error::AgentFailure {
                 category: echo_agent::error::AgentFailureCategory::Llm,
                 terminal_kind: echo_agent::error::AgentTerminalKind::TimedOut,
@@ -397,15 +456,39 @@ mod tests {
                 http_status: Some(504),
                 message: "provider timed out".to_string(),
             };
-            vec![AgentEvent::Error {
-                source: "llm".to_string(),
-                message: failure.message.clone(),
-                failure,
-            }]
+            vec![
+                scripted_execution_status(
+                    execution_id,
+                    echo_agent::agent::ExecutionStatusKind::Started,
+                    0,
+                ),
+                AgentEvent::Error {
+                    source: "llm".to_string(),
+                    message: failure.message.clone(),
+                    failure,
+                },
+                scripted_execution_status(
+                    execution_id,
+                    echo_agent::agent::ExecutionStatusKind::Failed,
+                    1,
+                ),
+            ]
         }
 
-        fn cancelled() -> Vec<AgentEvent> {
-            vec![AgentEvent::Cancelled]
+        fn cancelled(execution_id: &str) -> Vec<AgentEvent> {
+            vec![
+                scripted_execution_status(
+                    execution_id,
+                    echo_agent::agent::ExecutionStatusKind::Started,
+                    0,
+                ),
+                AgentEvent::Cancelled,
+                scripted_execution_status(
+                    execution_id,
+                    echo_agent::agent::ExecutionStatusKind::Cancelled,
+                    1,
+                ),
+            ]
         }
 
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);

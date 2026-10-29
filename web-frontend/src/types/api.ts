@@ -255,9 +255,6 @@ export type ChatEvent = {
   message_key?: string;
   conversation_id?: string | null;
 } & (
-  | { type: 'token'; data: string }
-  | { type: 'thinking_start' }
-  | { type: 'thinking_end'; prompt_tokens: number; completion_tokens: number }
   | {
       type: 'llm_usage';
       model: string;
@@ -427,12 +424,6 @@ export type AgentEvent =
       };
     }
   | { type: 'assistant_message'; data: { block: AssistantMessageBlock } }
-  | { type: 'token'; data: string }
-  | { type: 'think_start' }
-  | {
-      type: 'think_end';
-      data: { prompt_tokens: number; completion_tokens: number };
-    }
   | {
       type: 'llm_usage';
       data: {

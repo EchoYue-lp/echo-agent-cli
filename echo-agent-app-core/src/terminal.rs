@@ -148,12 +148,17 @@ type TerminalSettlementSlot = Arc<Mutex<Option<JoinHandle<Result<(), String>>>>>
 
 struct TerminalSession {
     info: TerminalSessionInfo,
+    // 只读来源身份，不持有资源、不证明远端状态。原资源锁贯穿 child/reader 结算，
+    // owner 转交不得等待那把锁，也不能把同 id 的普通/mux PTY 当作认证 master。
+    project_master_owner: Option<Weak<ProjectSshConnection>>,
     master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
     writer: Arc<BlockingMutex<Box<dyn Write + Send>>>,
     // These are the original handles, retained across failed/cancelled observers.
     resources: BlockingMutex<TerminalResources>,
     settlement: TerminalSettlementSlot,
     completed: BlockingMutex<Option<ExitStatus>>,
+    // 原 waiter 的只读退出观察；reader/资源仍须完整结算，不能把此位当作 Closed。
+    child_exit_observed: AtomicBool,
     close_requested: AtomicBool,
     exit_published: AtomicBool,
     service: Weak<TerminalService>,
@@ -210,6 +215,12 @@ impl TerminalSession {
             Some(launch) => (launch.command, Some(launch.connection), launch.operation),
             None => (command_for_target(&target, cwd, shell), None, None),
         };
+        let project_master_owner = project_connection
+            .as_ref()
+            .filter(|connection| {
+                project_operation.is_none() && connection.master_terminal_id() == id.as_str()
+            })
+            .map(Arc::downgrade);
         // 前端是 xterm 仿真器；所有交互 PTY（包括原 SSH launch）都应广告其能力，
         // 不能把启动宿主继承的 TERM=dumb 当作终端类型。这里只设置子进程环境，
         // 不改全局环境或 shell 配置；当前没有独立的产品 terminal-type 配置。
@@ -235,6 +246,7 @@ impl TerminalSession {
         Ok((
             Arc::new(Self {
                 info: TerminalSessionInfo { id, pid, target },
+                project_master_owner,
                 master: Mutex::new(pair.master),
                 writer: Arc::new(BlockingMutex::new(writer)),
                 resources: BlockingMutex::new(TerminalResources {
@@ -249,6 +261,7 @@ impl TerminalSession {
                 }),
                 settlement,
                 completed: BlockingMutex::new(None),
+                child_exit_observed: AtomicBool::new(false),
                 close_requested: AtomicBool::new(false),
                 exit_published: AtomicBool::new(false),
                 service: Arc::downgrade(service),
@@ -363,6 +376,8 @@ impl TerminalSession {
                     format!("terminal process observation failed; owner retained: {error}")
                 })? {
                     Some(_) => {
+                        // 已确认原 child 退出时立即阻止后继转交；原 wait/join 与资源保留照旧。
+                        self.child_exit_observed.store(true, Ordering::Release);
                         #[cfg(test)]
                         {
                             self.test.wait_attempts.fetch_add(1, Ordering::Relaxed);

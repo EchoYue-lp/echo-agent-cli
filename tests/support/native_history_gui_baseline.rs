@@ -282,7 +282,19 @@ fn append_default_retention_load(
                 &identity,
                 sequence,
                 None,
-                echo_agent::agent::AgentEvent::Token(payload.clone()),
+                echo_agent::agent::AgentEvent::AssistantMessage {
+                    block: echo_agent::agent::AssistantMessageBlock {
+                        provider_source: None,
+                        block_id: format!("perf-retention-{sequence}"),
+                        request_id: "perf-retention-request".to_string(),
+                        sequence,
+                        phase: echo_agent::agent::AssistantPhase::Commentary,
+                        delta: payload.clone(),
+                        complete: false,
+                        provider: Some("eko-native-test-fixture".to_string()),
+                        reasoning: None,
+                    },
+                },
             )?;
             log.append(
                 workspace,

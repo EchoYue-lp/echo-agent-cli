@@ -304,11 +304,11 @@ mod tests {
     async fn reload_summary_preserves_complete_frozen_diagnostics() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let plugin = write_fixture(temp.path())?;
-        std::fs::write(plugin.join("lsp.yaml"), "languages: {}\n")
-            .map_err(|error| error.to_string())?;
-        std::fs::remove_file(plugin.join("mcp.json")).map_err(|error| error.to_string())?;
-        std::fs::create_dir(plugin.join("mcp.json")).map_err(|error| error.to_string())?;
         let runtime = service(temp.path()).await?;
+        std::fs::write(plugin.join("mcp.json"), "{").map_err(|error| error.to_string())?;
+        let hooks = plugin.join("hooks/hooks.yaml");
+        std::fs::remove_file(&hooks).map_err(|error| error.to_string())?;
+        std::fs::create_dir(&hooks).map_err(|error| error.to_string())?;
         let mut registry = runtime.registry_for(temp.path().to_path_buf());
         runtime
             .scan_registry(&mut registry)
@@ -316,19 +316,16 @@ mod tests {
         let prepared = runtime.integrator.prepare(&mut registry).await;
         assert!(
             prepared.diagnostics().iter().any(|diagnostic| {
-                diagnostic.component() == "lsp"
-                    && diagnostic.severity()
-                        == echo_agent::plugin::PluginDiagnosticSeverity::Warning
+                diagnostic.component() == "mcp"
+                    && diagnostic.severity() == echo_agent::plugin::PluginDiagnosticSeverity::Error
             }),
-            "fixture must include the frozen build-boundary warning"
+            "current MCP source must produce a real frozen Error"
         );
         assert!(
             prepared.diagnostics().iter().any(|diagnostic| {
-                diagnostic.component() != "lsp"
-                    && diagnostic.severity()
-                        == echo_agent::plugin::PluginDiagnosticSeverity::Warning
+                diagnostic.severity() == echo_agent::plugin::PluginDiagnosticSeverity::Warning
             }),
-            "fixture must include a retained generic warning"
+            "current wrong-kind component must retain its generic Warning"
         );
         let components =
             prepare_application_components(&prepared, "diagnostic-contract", &registry)
@@ -336,9 +333,8 @@ mod tests {
         let summary = ReloadSummary::from_components(1, 1, None, Some(&prepared), &components);
         assert_eq!(summary.errors.len(), prepared.diagnostics().len());
         for diagnostic in prepared.diagnostics() {
-            let severity_prefix = format!("{:?}:", diagnostic.severity());
             assert!(summary.errors.iter().any(|message| {
-                message.starts_with(&severity_prefix) && message.contains(&diagnostic.to_string())
+                message == &format!("{:?}: {diagnostic}", diagnostic.severity())
             }));
         }
         runtime
@@ -349,58 +345,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retired_lsp_diagnostics_preserve_mixed_plugin_components_and_files()
+    async fn current_component_error_rejects_reload_and_keeps_original_published_generation()
     -> Result<(), String> {
-        for bytes in [
-            b"languages: {}\n".as_slice(),
-            b"invalid: [\n".as_slice(),
-            &[0xff, 0xfe],
-        ] {
-            let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
-            let plugin = write_fixture(temp.path())?;
-            let legacy = plugin.join("lsp.yaml");
-            std::fs::write(&legacy, bytes).map_err(|error| error.to_string())?;
-            let runtime = service(temp.path()).await?;
-            let summary = runtime.reload().await.map_err(|error| error.to_string())?;
-            assert_eq!(summary.agents_loaded, 1);
-            assert_eq!(summary.monitors_loaded, 1);
-            assert_eq!(summary.themes_loaded, 1);
-            assert!(summary.skills_loaded > 0);
-            assert!(
-                summary
-                    .errors
-                    .iter()
-                    .any(|message| message.contains("LSP component has been retired"))
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let plugin = write_fixture(temp.path())?;
+        let runtime = service(temp.path()).await?;
+        let (revision, identity, domain) = {
+            let state = runtime.state.lock().await;
+            let prepared = state
+                .framework_generation
+                .as_ref()
+                .ok_or("published generation missing")?;
+            (
+                state.generation,
+                prepared.identity().to_string(),
+                state
+                    .prepared
+                    .domains
+                    .plugins
+                    .get("runtime-fixture")
+                    .ok_or("domain provider missing")?
+                    .identity
+                    .clone(),
+            )
+        };
+        std::fs::write(plugin.join("mcp.json"), "{").map_err(|error| error.to_string())?;
+        let error = runtime
+            .reload()
+            .await
+            .err()
+            .ok_or("invalid MCP candidate was published")?;
+        assert!(error.to_string().contains("mcp"));
+        {
+            let state = runtime.state.lock().await;
+            assert_eq!(state.generation, revision);
+            assert_eq!(
+                state
+                    .framework_generation
+                    .as_ref()
+                    .map(|generation| generation.identity()),
+                Some(identity.as_str())
             );
             assert_eq!(
-                std::fs::read(&legacy).map_err(|error| error.to_string())?,
-                bytes
+                state
+                    .prepared
+                    .domains
+                    .plugins
+                    .get("runtime-fixture")
+                    .map(|plugin| &plugin.identity),
+                Some(&domain)
             );
-            let entry = runtime
-                .get("runtime-fixture")
-                .await
-                .ok_or_else(|| "mixed plugin missing".to_string())?;
-            assert!(
-                !plugin_capabilities(&entry)
-                    .iter()
-                    .any(|capability| capability.display_name().contains("LSP"))
-            );
-            runtime
-                .shutdown()
-                .await
-                .map_err(|error| error.to_string())?;
         }
+        agent_has_plugin_generation(&runtime.agent_handle, "runtime-fixture", true).await?;
+        runtime
+            .shutdown()
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
     #[tokio::test]
-    async fn retirement_diagnostics_follow_prepared_generation_not_live_files() -> Result<(), String>
-    {
+    async fn current_diagnostics_follow_same_prepared_generation_not_live_files()
+    -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let plugin = write_fixture(temp.path())?;
-        let legacy = plugin.join("lsp.yaml");
-        std::fs::write(&legacy, "languages: {}\n").map_err(|error| error.to_string())?;
         let runtime = service(temp.path()).await?;
+        let source = plugin.join("mcp.json");
+        std::fs::write(&source, "{").map_err(|error| error.to_string())?;
         let mut registry = runtime.registry_for(temp.path().to_path_buf());
         runtime
             .scan_registry(&mut registry)
@@ -409,91 +420,64 @@ mod tests {
         let diagnostic = prepared
             .diagnostics()
             .iter()
-            .find(|diagnostic| diagnostic.component() == "lsp")
-            .ok_or_else(|| "frozen build diagnostic missing".to_string())?;
-        assert_eq!(diagnostic.path(), Some(legacy.as_path()));
+            .find(|diagnostic| diagnostic.component() == "mcp")
+            .ok_or("frozen current document Error missing")?;
+        assert_eq!(diagnostic.path(), Some(source.as_path()));
         assert_eq!(diagnostic.plugin_id(), Some("runtime-fixture"));
         assert_eq!(
             diagnostic.severity(),
-            echo_agent::plugin::PluginDiagnosticSeverity::Warning
+            echo_agent::plugin::PluginDiagnosticSeverity::Error
         );
-        std::fs::rename(&legacy, plugin.join("legacy.saved")).map_err(|error| error.to_string())?;
+        std::fs::write(&source, serde_json::json!({"$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json", "mcpServers": {}}).to_string())
+            .map_err(|error| error.to_string())?;
         let cached = runtime.integrator.prepare(&mut registry).await;
         assert!(Arc::ptr_eq(&prepared, &cached));
-        assert_eq!(cached.generation(), prepared.generation());
         assert_eq!(cached.identity(), prepared.identity());
         assert_eq!(cached.diagnostics(), prepared.diagnostics());
         let components = prepare_application_components(&prepared, "snapshot-test", &registry)
             .map_err(|errors| errors.join("; "))?;
         let observed = ReloadSummary::from_components(1, 1, None, Some(&prepared), &components);
+        assert_eq!(
+            observed.errors,
+            prepared
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| format!("{:?}: {diagnostic}", diagnostic.severity()))
+                .collect::<Vec<_>>()
+        );
+        let mut fresh_registry = runtime.registry_for(temp.path().to_path_buf());
+        runtime
+            .scan_registry(&mut fresh_registry)
+            .map_err(|error| error.to_string())?;
+        let fresh = runtime.integrator.prepare(&mut fresh_registry).await;
+        assert!(fresh.diagnostics().is_empty());
+        assert!(fresh.generation() > prepared.generation());
+        assert_ne!(fresh.identity(), prepared.identity());
+        std::fs::write(&source, "[").map_err(|error| error.to_string())?;
+        let fresh_components =
+            prepare_application_components(&fresh, "snapshot-test", &fresh_registry)
+                .map_err(|errors| errors.join("; "))?;
+        let observed = ReloadSummary::from_components(1, 1, None, Some(&fresh), &fresh_components);
+        assert!(
+            observed.errors.is_empty(),
+            "summary must not reread a later corrupt file"
+        );
+        let cached_fresh = runtime.integrator.prepare(&mut fresh_registry).await;
+        assert!(Arc::ptr_eq(&fresh, &cached_fresh));
+        runtime.integrator.invalidate(&fresh_registry);
+        let changed = runtime.integrator.prepare(&mut fresh_registry).await;
+        assert!(changed.generation() > fresh.generation());
+        let components = prepare_application_components(&changed, "snapshot-test", &fresh_registry)
+            .map_err(|errors| errors.join("; "))?;
+        let observed = ReloadSummary::from_components(1, 1, None, Some(&changed), &components);
+        assert_eq!(observed.errors.len(), changed.diagnostics().len());
         assert!(
             observed
                 .errors
                 .iter()
-                .any(|message| message.contains("LSP component has been retired"))
+                .any(|message| message.starts_with("Error:"))
         );
-        let mut clean_registry = runtime.registry_for(temp.path().to_path_buf());
-        runtime
-            .scan_registry(&mut clean_registry)
-            .map_err(|error| error.to_string())?;
-        let clean = runtime.integrator.prepare(&mut clean_registry).await;
-        assert!(
-            clean
-                .diagnostics()
-                .iter()
-                .all(|diagnostic| diagnostic.component() != "lsp")
-        );
-        std::fs::write(&legacy, "late legacy file").map_err(|error| error.to_string())?;
-        let clean_components =
-            prepare_application_components(&clean, "snapshot-test", &clean_registry)
-                .map_err(|errors| errors.join("; "))?;
-        let observed = ReloadSummary::from_components(1, 1, None, Some(&clean), &clean_components);
-        assert!(
-            !observed
-                .errors
-                .iter()
-                .any(|message| message.contains("LSP component has been retired"))
-        );
-        let cached_clean = runtime.integrator.prepare(&mut clean_registry).await;
-        assert!(Arc::ptr_eq(&clean, &cached_clean));
-        assert_eq!(cached_clean.diagnostics(), clean.diagnostics());
-        runtime.integrator.invalidate(&clean_registry);
-        let late = runtime.integrator.prepare(&mut clean_registry).await;
-        assert!(late.generation() > clean.generation());
-        assert_ne!(late.identity(), clean.identity());
-        assert_eq!(
-            late.diagnostics()
-                .iter()
-                .filter(|diagnostic| diagnostic.component() == "lsp")
-                .count(),
-            1
-        );
-        std::fs::write(&legacy, [0xff]).map_err(|error| error.to_string())?;
-        let cached_late = runtime.integrator.prepare(&mut clean_registry).await;
-        assert!(Arc::ptr_eq(&late, &cached_late));
-        assert_eq!(cached_late.diagnostics(), late.diagnostics());
-        runtime.integrator.invalidate(&clean_registry);
-        let invalid = runtime.integrator.prepare(&mut clean_registry).await;
-        assert!(invalid.generation() > late.generation());
-        let diagnostic = invalid
-            .diagnostics()
-            .iter()
-            .find(|diagnostic| diagnostic.component() == "lsp")
-            .ok_or_else(|| "invalid text diagnostic missing".to_string())?;
-        assert_eq!(
-            diagnostic.severity(),
-            echo_agent::plugin::PluginDiagnosticSeverity::Error
-        );
-        let components = prepare_application_components(&invalid, "snapshot-test", &clean_registry)
-            .map_err(|errors| errors.join("; "))?;
-        let summary = ReloadSummary::from_components(1, 1, None, Some(&invalid), &components);
-        assert!(
-            summary
-                .errors
-                .iter()
-                .any(|message| message.starts_with("Error:")
-                    && message.contains("LSP component has been retired"))
-        );
+        assert!(require_applicable_generation(changed).is_err());
         runtime
             .shutdown()
             .await
@@ -501,149 +485,68 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn retired_lsp_io_errors_keep_legal_components_and_source_identity() -> Result<(), String>
-    {
-        use std::os::unix::fs::{PermissionsExt, symlink};
-        for kind in [
-            "directory",
-            "broken-link",
-            "metadata-loop",
-            "read-permission",
-            "metadata-permission",
-        ] {
-            let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
-            let plugin = write_fixture(temp.path())?;
-            let runtime = service(temp.path()).await?;
-            let legacy = plugin.join("lsp.yaml");
-            let mut restore_permissions = None;
-            match kind {
-                "directory" => std::fs::create_dir(&legacy).map_err(|error| error.to_string())?,
-                "broken-link" => {
-                    symlink("missing-language-input", &legacy).map_err(|error| error.to_string())?
-                }
-                "metadata-loop" => {
-                    symlink("lsp.yaml", &legacy).map_err(|error| error.to_string())?
-                }
-                "read-permission" => {
-                    std::fs::write(&legacy, "languages: {}\n")
-                        .map_err(|error| error.to_string())?;
-                    let permissions = std::fs::metadata(&legacy)
-                        .map_err(|error| error.to_string())?
-                        .permissions();
-                    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o0))
-                        .map_err(|error| error.to_string())?;
-                    restore_permissions = Some((legacy.clone(), permissions));
-                }
-                "metadata-permission" => {
-                    let locked = plugin.join("locked");
-                    std::fs::create_dir(&locked).map_err(|error| error.to_string())?;
-                    std::fs::write(locked.join("source.yaml"), "languages: {}\n")
-                        .map_err(|error| error.to_string())?;
-                    symlink("locked/source.yaml", &legacy).map_err(|error| error.to_string())?;
-                    let permissions = std::fs::metadata(&locked)
-                        .map_err(|error| error.to_string())?
-                        .permissions();
-                    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o0))
-                        .map_err(|error| error.to_string())?;
-                    restore_permissions = Some((locked, permissions));
-                }
-                _ => return Err(format!("unknown input fixture: {kind}")),
-            }
-            // Privileged test processes may bypass Unix mode bits. The deterministic
-            // directory/link/loop cases still exercise actual I/O errors there.
-            let permission_error_observable = match kind {
-                "read-permission" => std::fs::read(&legacy).is_err(),
-                "metadata-permission" => std::fs::metadata(&legacy).is_err(),
-                _ => true,
-            };
-            if !permission_error_observable {
-                if let Some((path, permissions)) = restore_permissions {
-                    std::fs::set_permissions(path, permissions)
-                        .map_err(|error| error.to_string())?;
-                }
-                runtime
-                    .shutdown()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                eprintln!("Unix permission fixture not applicable with bypass privileges: {kind}");
-                continue;
-            }
-            let result = runtime.reload().await;
-            // Restore access before inspecting any result, including a failed reload.
-            if let Some((path, permissions)) = restore_permissions {
-                std::fs::set_permissions(path, permissions).map_err(|error| error.to_string())?;
-            }
-            let summary = result.map_err(|error| error.to_string())?;
-            let prepared = runtime
-                .state
-                .lock()
-                .await
-                .framework_generation
-                .clone()
-                .ok_or_else(|| "published generation missing".to_string())?;
-            let diagnostic = prepared
-                .diagnostics()
-                .iter()
-                .find(|diagnostic| diagnostic.component() == "lsp")
-                .ok_or_else(|| format!("structured diagnostic missing for {kind}"))?;
-            assert_eq!(diagnostic.path(), Some(legacy.as_path()));
-            assert_eq!(diagnostic.plugin_id(), Some("runtime-fixture"));
-            assert_eq!(
-                diagnostic.severity(),
-                echo_agent::plugin::PluginDiagnosticSeverity::Error
-            );
-            assert!(
-                summary
-                    .errors
-                    .iter()
-                    .any(|message| message.starts_with("Error:")
-                        && message.contains(&diagnostic.to_string())
-                        && message.contains("LSP component has been retired"))
-            );
-            assert_eq!(summary.errors.len(), prepared.diagnostics().len());
-            assert_eq!(summary.agents_loaded, 1);
-            assert_eq!(summary.monitors_loaded, 1);
-            assert_eq!(summary.themes_loaded, 1);
-            assert!(summary.skills_loaded > 0);
-            let metadata = std::fs::symlink_metadata(&legacy).map_err(|error| error.to_string())?;
-            match kind {
-                "directory" => assert!(metadata.is_dir()),
-                "read-permission" => assert_eq!(
-                    std::fs::read_to_string(&legacy).map_err(|error| error.to_string())?,
-                    "languages: {}\n"
-                ),
-                _ => assert!(metadata.file_type().is_symlink()),
-            }
-            eprintln!("Retired input fixture exercised with original Error: {kind}");
-            runtime
-                .shutdown()
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn retired_lsp_only_plugin_reports_no_activated_language_component() -> Result<(), String>
-    {
+    async fn obsolete_plugin_sidecar_does_not_change_current_domain_or_component_identity()
+    -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let plugin = temp.path().join(".echo-agent/plugins/legacy-only");
-        std::fs::create_dir_all(&plugin).map_err(|error| error.to_string())?;
-        std::fs::write(plugin.join("plugin.json"), serde_json::json!({"$schema": AGENT_PLUGIN_SCHEMA_V1, "name":"legacy-only", "version":"1.0.0", "description":"legacy language service"}).to_string()).map_err(|error| error.to_string())?;
-        std::fs::write(plugin.join("lsp.yaml"), "languages: {}\n")
-            .map_err(|error| error.to_string())?;
+        let plugin = write_fixture(temp.path())?;
         let runtime = service(temp.path()).await?;
+        let (framework_identity, diagnostics, domain_identity) = {
+            let state = runtime.state.lock().await;
+            let framework = state
+                .framework_generation
+                .as_ref()
+                .ok_or("published generation missing")?;
+            (
+                framework.identity().to_string(),
+                framework.diagnostics().to_vec(),
+                state
+                    .prepared
+                    .domains
+                    .plugins
+                    .get("runtime-fixture")
+                    .ok_or("domain provider missing")?
+                    .identity
+                    .clone(),
+            )
+        };
+        let obsolete = plugin.join("lsp.yaml");
+        let validation_before = PluginRuntimeService::validate(&plugin);
+        assert!(validation_before.valid);
+        let original_bytes = [0xff, 0xfe];
+        std::fs::write(&obsolete, original_bytes).map_err(|error| error.to_string())?;
+        let validation_after = PluginRuntimeService::validate(&plugin);
+        assert!(validation_after.valid);
+        assert_eq!(validation_after.components, validation_before.components);
+        assert_eq!(validation_after.errors, validation_before.errors);
         let summary = runtime.reload().await.map_err(|error| error.to_string())?;
-        assert_eq!(summary.agents_loaded, 0);
-        assert_eq!(summary.skills_loaded, 0);
-        assert!(
-            summary
-                .errors
-                .iter()
-                .any(|message| message.contains("no language server was loaded"))
+        assert_eq!(summary.agents_loaded, 1);
+        assert_eq!(summary.monitors_loaded, 1);
+        assert_eq!(summary.themes_loaded, 1);
+        assert!(summary.skills_loaded > 0);
+        {
+            let state = runtime.state.lock().await;
+            let framework = state
+                .framework_generation
+                .as_ref()
+                .ok_or("published generation missing")?;
+            assert_eq!(framework.identity(), framework_identity);
+            assert_eq!(framework.diagnostics(), diagnostics);
+            assert_eq!(
+                state
+                    .prepared
+                    .domains
+                    .plugins
+                    .get("runtime-fixture")
+                    .map(|plugin| &plugin.identity),
+                Some(&domain_identity)
+            );
+        }
+        assert_eq!(
+            std::fs::read(&obsolete).map_err(|error| error.to_string())?,
+            original_bytes
         );
+        agent_has_plugin_generation(&runtime.agent_handle, "runtime-fixture", true).await?;
         runtime
             .shutdown()
             .await

@@ -1760,6 +1760,72 @@ mod tests {
             hex::encode(Sha256::digest(std::fs::read(&copied.target_path)?)),
             copied.sha256
         );
+        let partial_path = copied.target_path.clone();
+        let partial_sha = copied.sha256.clone();
+        let partial_bytes = copied.bytes;
+        // 部分成功后的重入不能覆盖已冲突的目标文件，也不能先发布半份 canonical 历史。
+        std::fs::write(&missing.path, original.as_bytes())?;
+        let conflicting = "目标中已有另一份内容🙂";
+        std::fs::write(&partial_path, conflicting.as_bytes())?;
+        let rejected_retry = copy_reply_fork_history_resources_with_receipts(
+            &mut rows,
+            Some(&source_root),
+            Some(&target_root),
+            "target",
+        );
+        assert!(rejected_retry.error.is_some());
+        assert_eq!(rows, before);
+        assert_eq!(std::fs::read(&partial_path)?, conflicting.as_bytes());
+        // 仅测试自己修复已知 fixture，再以原 rows/目标身份重入同一 copier。
+        std::fs::write(&partial_path, original.as_bytes())?;
+        let retried = copy_reply_fork_history_resources_with_receipts(
+            &mut rows,
+            Some(&source_root),
+            Some(&target_root),
+            "target",
+        );
+        assert!(retried.error.is_none(), "{:?}", retried.error);
+        assert_eq!(retried.resources.len(), 1, "相同内容复用原已验证副本");
+        let recovered = retried.resources.first().context("retry receipt missing")?;
+        assert_eq!(recovered.target_path, partial_path);
+        assert_eq!(recovered.sha256, partial_sha);
+        assert_eq!(recovered.bytes, partial_bytes);
+        assert!(recovered.reader_verified);
+        assert_ne!(rows, before);
+        std::fs::remove_file(&resource.path)?;
+        std::fs::remove_file(&missing.path)?;
+        let config = echo_agent::tools::artifact::ToolOutputArtifactConfig::new(
+            &target_root,
+            "conversation_or_30d",
+        );
+        let reference = echo_agent::tools::artifact::ToolOutputArtifactRef {
+            path: partial_path,
+            artifact_bytes: partial_bytes,
+            payload_bytes: partial_bytes,
+            sha256: partial_sha,
+            retention: "conversation_or_30d".into(),
+        };
+        let mut cursor = None;
+        let mut read_back = String::new();
+        loop {
+            let page = echo_agent::tools::files::artifact::read_artifact_page(
+                &config,
+                &reference,
+                cursor.as_deref(),
+                echo_agent::tools::files::artifact::ArtifactPageLimit::Bytes(257),
+            )?;
+            read_back.push_str(&page.content);
+            if page.complete {
+                break;
+            }
+            cursor = Some(page.next_cursor.context("retry reader cursor missing")?);
+        }
+        assert_eq!(read_back.as_bytes(), original.as_bytes());
+        assert_eq!(u64::try_from(read_back.len())?, reference.artifact_bytes);
+        assert_eq!(
+            hex::encode(Sha256::digest(read_back.as_bytes())),
+            reference.sha256
+        );
         Ok(())
     }
 

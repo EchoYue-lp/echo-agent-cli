@@ -153,6 +153,8 @@ impl EkoConfig {
                     max_tokens: model.max_tokens,
                     temperature: model.temperature,
                     context_window: model.context_window,
+                    // 当前EKO配置没有额外来源事实；保留上述直接配置，不伪造provider事实。
+                    facts: Default::default(),
                 }
             }),
             agent: self.agent.clone(),

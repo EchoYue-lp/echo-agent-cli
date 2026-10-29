@@ -2729,6 +2729,7 @@ mod tests {
         let model = Arc::new(MockLlmClient::new().with_stream_script(vec![
             StreamChunk::Delta(DeltaMessage {
                 role: Some("assistant".into()),
+                provider_response: None,
                 content: None,
                 reasoning_content: None,
                 reasoning_blocks: None,

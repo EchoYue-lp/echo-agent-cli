@@ -473,7 +473,25 @@ describe('canonical chat event v4 contract', () => {
       sequence: 3,
       payload: {
         source: 'agent',
-        event: { ...base.payload.event, payload: { type: 'token', data: 'late token' } },
+        event: {
+          ...base.payload.event,
+          schema_version: 5,
+          payload: {
+            type: 'assistant_message',
+            data: {
+              block: {
+                block_id: 'late-block',
+                request_id: 'late-request',
+                sequence: 3,
+                phase: 'commentary',
+                delta: 'late token',
+                complete: false,
+                provider: null,
+                reasoning: null,
+              },
+            },
+          },
+        },
       },
     } as ChatEventEnvelope;
 
@@ -487,6 +505,13 @@ describe('canonical chat event v4 contract', () => {
     expect(useChatStore.getState().runStatus).toBe('completed');
     expect(useChatStore.getState().isStreaming).toBe(false);
     expect(useChatStore.getState().messages.at(-1)?.content).not.toContain('late token');
+    expect(
+      useChatStore
+        .getState()
+        .messages.at(-1)
+        ?.assistantBlocks?.map((block) => block.content)
+        .join('') ?? ''
+    ).not.toContain('late token');
     expect(refs.isCancelledRef.current).toBe(false);
   });
 

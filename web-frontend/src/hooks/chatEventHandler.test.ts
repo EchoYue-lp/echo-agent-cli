@@ -1,4 +1,4 @@
-import type { ChatEventEnvelope, HitlRequestIdentity } from '../types/api';
+import type { AgentEvent, ChatEventEnvelope, HitlRequestIdentity } from '../types/api';
 import fixtureText from '../fixtures/chat-event-envelope-v4.json?raw';
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { TaskRun } from '../generated';
@@ -28,7 +28,7 @@ describe('chat and TaskRuntime lifecycle separation', () => {
     useTaskRuntimeStore.getState().reset();
   });
 
-  it('旧思考起止信号不再把后续正文 Token 改写为 Reasoning', () => {
+  it('原生Reasoning与公开进度独立，块完成不结算当前Turn', () => {
     const id = useChatStore.getState().startAssistantMessage();
     const ctx = {
       assistantIdRef: { current: id },
@@ -37,19 +37,54 @@ describe('chat and TaskRuntime lifecycle separation', () => {
       isCancelledRef: { current: false },
       currentThinkingIdRef: { current: null as string | null },
     };
-    handleChatEvent({ type: 'thinking_start' }, ctx);
-    handleChatEvent({ type: 'token', data: '已检查当前实现，接下来运行验证。' }, ctx);
-    handleChatEvent({ type: 'thinking_end', prompt_tokens: 1, completion_tokens: 1 }, ctx);
-    handleChatEvent({ type: 'token', data: '验证完成。' }, ctx);
-
+    const base = (JSON.parse(fixtureText) as ChatEventEnvelope[]).at(0);
+    if (!base || base.payload.source !== 'agent') throw new Error('missing agent fixture');
+    const agent = base.payload.event;
+    const blocks = [
+      ['reasoning', '原生推理'],
+      ['commentary', '已检查当前实现，接下来运行验证。'],
+      ['commentary', '验证完成。'],
+    ] as const;
+    blocks.forEach(([phase, delta], sequence) => {
+      handleChatEventEnvelope(
+        {
+          ...base,
+          payload: {
+            source: 'agent',
+            event: {
+              ...agent,
+              schema_version: 5,
+              payload: {
+                type: 'assistant_message',
+                data: {
+                  block: {
+                    block_id: `native-block-${sequence}`,
+                    request_id: 'native-request',
+                    sequence,
+                    phase,
+                    delta,
+                    complete: true,
+                    provider: null,
+                    reasoning: null,
+                  },
+                },
+              },
+            },
+          },
+        },
+        ctx
+      );
+    });
     const message = useChatStore.getState().messages.find((entry) => entry.id === id);
-    expect(message?.content).toBe('已检查当前实现，接下来运行验证。验证完成。');
-    expect(message?.executionSteps).toEqual([]);
-    expect(message?.assistantBlocks).toBeUndefined();
+    expect(message?.content).toBe('');
+    expect(message?.assistantBlocks?.map((view) => [view.block.phase, view.content])).toEqual(
+      blocks
+    );
+    expect(message?.finalAnswerConfirmed).not.toBe(true);
     expect(message?.isStreaming).toBe(true);
   });
 
-  it('原生块独立进入正文时间线，兼容 Token 不重复，最终发布也不结算 TaskRun', () => {
+  it('原生块独立进入正文时间线，最终候选不冒确认，发布也不结算TaskRun', () => {
     const id = useChatStore.getState().startAssistantMessage();
     const ctx = {
       assistantIdRef: { current: id },
@@ -89,7 +124,32 @@ describe('chat and TaskRuntime lifecycle separation', () => {
       },
       ctx
     );
-    handleChatEvent({ type: 'token', data: '真实进度' }, ctx);
+    const finalCandidate: AgentEvent = {
+      type: 'assistant_message',
+      data: {
+        block: {
+          block_id: 'candidate',
+          request_id: 'request',
+          sequence: 1,
+          phase: 'final_answer',
+          delta: '未确认候选',
+          complete: true,
+          provider: null,
+          reasoning: null,
+        },
+      },
+    };
+    handleChatEventEnvelope(
+      {
+        ...base,
+        payload: {
+          source: 'agent',
+          event: { ...base.payload.event, schema_version: 5, payload: finalCandidate },
+        },
+      },
+      ctx
+    );
+    expect(useChatStore.getState().messages.at(-1)?.finalAnswerConfirmed).not.toBe(true);
     expect(useChatStore.getState().messages.at(-1)?.assistantBlocks?.at(0)?.content).toBe(
       '真实进度'
     );
@@ -119,7 +179,21 @@ describe('chat and TaskRuntime lifecycle separation', () => {
       timestamp: new Date(1000).toISOString(),
       payload: {
         source: 'agent',
-        event: { ...base.payload.event, payload: { type: 'think_start' } },
+        event: {
+          ...base.payload.event,
+          schema_version: 5,
+          payload: {
+            type: 'execution_status',
+            data: {
+              execution_id: base.payload.event.execution_id ?? 'execution',
+              request_id: 'model-one',
+              sequence: 1,
+              phase: 'Thinking',
+              status: 'started',
+              reason: null,
+            },
+          },
+        },
       },
     };
     handleChatEventEnvelope(started, ctx);
@@ -134,7 +208,29 @@ describe('chat and TaskRuntime lifecycle separation', () => {
     handleChatEventEnvelope(lifecycle, ctx);
     expect(useChatStore.getState().activity?.lastEventAt).toBe(1000);
     handleChatEventEnvelope(
-      { ...started, event_id: 'model-two', timestamp: new Date(5000).toISOString() },
+      {
+        ...started,
+        event_id: 'model-two',
+        timestamp: new Date(5000).toISOString(),
+        payload: {
+          source: 'agent',
+          event: {
+            ...base.payload.event,
+            schema_version: 5,
+            payload: {
+              type: 'execution_status',
+              data: {
+                execution_id: base.payload.event.execution_id ?? 'execution',
+                request_id: 'model-two',
+                sequence: 2,
+                phase: 'Thinking',
+                status: 'started',
+                reason: null,
+              },
+            },
+          },
+        },
+      },
       ctx
     );
     expect(useChatStore.getState().activity?.startedAt).toBe(5000);

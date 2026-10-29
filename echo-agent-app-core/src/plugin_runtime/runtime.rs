@@ -1994,7 +1994,7 @@ impl PluginRuntimeService {
                     project_dir,
                 )
                 .with_json_user_config(&defaults);
-                let mut errors = validate_application_component_files(
+                let errors = validate_application_component_files(
                     &manifest.name,
                     directory,
                     &resolved,
@@ -2002,9 +2002,6 @@ impl PluginRuntimeService {
                 );
                 let components = component_names(directory, &resolved);
                 let valid = errors.is_empty();
-                if std::fs::symlink_metadata(directory.join("lsp.yaml")).is_ok() {
-                    errors.push("LSP component has been retired from EKO; no language server will be loaded; retained components were validated independently".to_string());
-                }
                 PluginValidationReport {
                     valid,
                     name: Some(manifest.name),

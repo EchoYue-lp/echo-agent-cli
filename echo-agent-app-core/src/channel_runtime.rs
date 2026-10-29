@@ -117,7 +117,6 @@ async fn render_agent_command_result(
 
 #[cfg(feature = "channels")]
 enum ChannelRenderEvent {
-    Token(String),
     Driver(crate::chat_driver::ChatDriverEvent),
     // Keep the full owned journal envelope without inflating every bounded queue slot.
     Journaled(Box<crate::chat_event_log::ChatEventEnvelope>),
@@ -213,9 +212,8 @@ use tool_render::{
 
 #[cfg(all(feature = "channels", test))]
 use outbound::{
-    CHANNEL_OUTBOUND_TOTAL_MESSAGES, CHANNEL_TOKEN_COALESCE_BYTES, ChannelBufferOutcome,
-    ChannelStreamingSanitizer, channel_outbound_transport_unpaced, channel_rate_deadline,
-    channel_rate_policy,
+    CHANNEL_OUTBOUND_TOTAL_MESSAGES, ChannelBufferOutcome, ChannelStreamingSanitizer,
+    channel_outbound_transport_unpaced, channel_rate_deadline, channel_rate_policy,
 };
 
 #[cfg(all(feature = "channels", test))]
@@ -1519,19 +1517,32 @@ fn channel_render_event_stream(
                 },
                 terminal = &mut terminal_rx, if terminal_open => {
                     terminal_open = false;
-                    match terminal {
+                    let terminal_error = match terminal {
                         Ok(Ok(outcome)) => {
                             #[cfg(test)]
                             if std::env::var_os("EKO_WEIXIN_A2_PHASE").is_some() {
                                 eprintln!("A2_OWNER_BOUNDARY:renderer.physical-terminal senders={} queued={}", driver_rx.sender_strong_count(), driver_rx.len());
                             }
                             terminal_outcome = Some(outcome);
+                            None
                         },
-                        Ok(Err(error)) => { yield Err(error.into_react_error()); break; }
-                        Err(_) => {
-                            yield Err(echo_agent::error::ReactError::Other("channel foreground owner ended without a physical terminal receipt".to_string()));
-                            break;
+                        Ok(Err(error)) => Some(error.into_react_error()),
+                        Err(_) => Some(echo_agent::error::ReactError::Other(
+                            "channel foreground owner ended without a physical terminal receipt".to_string(),
+                        )),
+                    };
+                    if let Some(error) = terminal_error {
+                        // 原sink已接受的有限前缀先按序呈现；未结算观察不能等仍存活owner的EOF。
+                        // 固定len避免活sender持续补入把错误传播变成无界drain，不新增队列或预算。
+                        let accepted_events = driver_rx.len();
+                        for _ in 0..accepted_events {
+                            match driver_rx.try_recv() {
+                                Ok(event) => yield Ok(event),
+                                Err(_) => break,
+                            }
                         }
+                        yield Err(error);
+                        break;
                     }
                 }
             }
@@ -3390,9 +3401,9 @@ impl AppChannelMessageHandler {
                 );
                 let _ = reply
                     .render_tx
-                    .send(ChannelRenderEvent::Token(format!(
+                    .send(ChannelRenderEvent::Prompt(format!(
                         "Channel input {} failed before delivery: {error}",
-                        submitted.identity.input_id
+                        submitted.identity.input_id,
                     )))
                     .await;
                 let _ = reply.terminal_tx.send(Ok(failure));
@@ -3613,10 +3624,10 @@ impl AppChannelMessageHandler {
                     .map_err(|_| "channel live input phase is unavailable".to_string())? =
                     Some(observed.phase);
                 let _ = observer_render_tx
-                    .send(ChannelRenderEvent::Token(format!(
+                    .send(ChannelRenderEvent::Prompt(format!(
                         "Channel input {} is {}.",
                         dispatched_input_id,
-                        channel_input_phase_label(observed.phase)
+                        channel_input_phase_label(observed.phase),
                     )))
                     .await;
                 let _ = drain_tx.send(observed);
@@ -8362,19 +8373,11 @@ async fn prepare_channel_turn(
 #[cfg(feature = "channels")]
 const FLUSH_THRESHOLD: usize = 80;
 
-/// 句末标点(中英文)触发 flush。
-#[cfg(feature = "channels")]
-fn is_sentence_end(c: char) -> bool {
-    // 中文句末:。 ． ！ ？ … ;英文句末:. ! ?
-    matches!(c, '。' | '．' | '！' | '？' | '…' | '.' | '!' | '?')
-}
-
 /// 把共享 `ChatDriverEvent` 流投影为有界的内部文本 drafts。
 ///
-/// flush 条件(满足任一):
-/// 1. buf 含换行 → flush 到最后一个换行(含),保留换行后的剩余。
-/// 2. buf 以句末标点结尾 → flush 全 buf。
-/// 3. buf.chars().count() >= FLUSH_THRESHOLD → flush 全 buf。
+/// Native assistant blocks retain their envelope and identity through the
+/// channel projection. Legacy Token/Think arms are intentionally absent here;
+/// generic FinalAnswer/ExecutionStatus and Terminal paths remain authoritative.
 ///
 /// These sentence/newline boundaries do not directly release transport
 /// messages. Dynamic continuation drafts are buffered up to the 252 KiB
@@ -8420,8 +8423,6 @@ async fn aggregate_by_sentence_with_repository<'a>(
         let mut tool_state = ChannelToolRenderState::default();
         let mut tool_capacity_reported = false;
         let mut tool_identity_conflict_reported = false;
-        let mut native_messages = false;
-        let mut legacy_tokens_seen = false;
         let mut native_events = HashSet::new();
         let mut unknown_blocks: HashMap<_, String> = HashMap::new();
         let mut unknown_bytes = 0_usize;
@@ -8479,21 +8480,6 @@ async fn aggregate_by_sentence_with_repository<'a>(
                     flush_all!();
                     yield ChannelOutboundDraft::ordinary(prompt);
                 }
-                ChannelRenderEvent::Token(t) => {
-                    if native_messages { continue; }
-                    legacy_tokens_seen = true;
-                    buf.push_str(&t);
-                    if let Some(trailing_chars) = buf.chars().rev().position(|ch| ch == '\n') {
-                        let cut = buf.chars().count().saturating_sub(trailing_chars);
-                        let chunk: String = buf.chars().take(cut).collect();
-                        buf = buf.chars().skip(cut).collect();
-                        yield ChannelOutboundDraft::stream(chunk);
-                    } else if buf.chars().last().map(is_sentence_end).unwrap_or(false)
-                        || buf.chars().count() >= FLUSH_THRESHOLD
-                    {
-                        flush_all!();
-                    }
-                }
                 ChannelRenderEvent::Driver(ChatDriverEvent::Agent(envelope)) => {
                 let fallback_message_id = envelope
                     .message_id
@@ -8504,7 +8490,6 @@ async fn aggregate_by_sentence_with_repository<'a>(
                 let chat_owner = ChannelToolOwner::Chat(fallback_message_id.clone());
                 match envelope.payload {
                 AgentEvent::AssistantMessage { block } => {
-                    native_messages = true;
                     // 仅去重原event身份的重复呈现，不生成消息或完成事实。
                     let observation = (
                         envelope.stream_id.clone(), envelope.turn_id.clone(),
@@ -8564,25 +8549,6 @@ async fn aggregate_by_sentence_with_repository<'a>(
                     };
                     let reason = status.reason.as_deref().map(|reason| format!(": {}", channel_safe_text(reason, 320))).unwrap_or_default();
                     yield ChannelOutboundDraft::ordinary(format!("[execution:{}] {label}{reason}", channel_safe_text(&status.execution_id, 80)));
-                }
-                AgentEvent::Token(t) => {
-                    if native_messages { continue; }
-                    legacy_tokens_seen = true;
-                    buf.push_str(&t);
-                    // 1. 换行 flush(到最后一个 \n 含)。反向字符偏移表示换行后
-                    //    还有多少字符,因此 `cut` 是包含换行的字符数。
-                    if let Some(trailing_chars) = buf.chars().rev().position(|ch| ch == '\n') {
-                        let cut = buf.chars().count().saturating_sub(trailing_chars);
-                        let chunk: String = buf.chars().take(cut).collect();
-                        buf = buf.chars().skip(cut).collect();
-                        yield ChannelOutboundDraft::stream(chunk);
-                    }
-                    // 2/3. 句末标点 或 阈值(chars().count() 非字节)→ flush 全 buf
-                    else if buf.chars().last().map(is_sentence_end).unwrap_or(false)
-                        || buf.chars().count() >= FLUSH_THRESHOLD
-                    {
-                        flush_all!();
-                    }
                 }
                 AgentEvent::ToolCall { call_id, invocation } => {
                     flush_all!();
@@ -8696,8 +8662,8 @@ async fn aggregate_by_sentence_with_repository<'a>(
                         continue;
                     }
                     discard_unknown_execution!(&envelope.stream_id, &envelope.turn_id, &envelope.execution_id);
-                    if native_messages || !legacy_tokens_seen {
-                        // FinalAnswer来自原Framework校验/持久化/执行结算路径。
+                    {
+                        // FinalAnswer是原Framework校验/持久化后的正文发布，不证明后继物理结算成功。
                         // 按原事件顺序呈现；Terminal仍独占foreground关闭，
                         // 不由此把Agent执行结束提升成TaskRun完成。
                         let execution = (
@@ -9006,6 +8972,45 @@ mod tests {
     use std::sync::Arc;
     #[cfg(feature = "channels")]
     struct SessionIdentityProbe;
+
+    #[cfg(feature = "channels")]
+    fn native_commentary_block(
+        text: impl Into<String>,
+        sequence: u64,
+    ) -> echo_agent::agent::AgentEvent {
+        echo_agent::agent::AgentEvent::AssistantMessage {
+            block: echo_agent::agent::AssistantMessageBlock {
+                provider_source: None,
+                block_id: format!("native-consumer-block-{sequence}"),
+                request_id: "native-consumer-request".to_string(),
+                sequence,
+                phase: echo_agent::agent::AssistantPhase::Commentary,
+                delta: text.into(),
+                complete: true,
+                provider: Some("native-consumer-fixture".to_string()),
+                reasoning: None,
+            },
+        }
+    }
+
+    #[cfg(feature = "channels")]
+    fn native_commentary_event(
+        sequence: u64,
+        text: impl Into<String>,
+    ) -> echo_agent::error::Result<crate::chat_driver::ChatDriverEvent> {
+        let identity = echo_agent::agent::EventIdentity::new(
+            "native-consumer-stream",
+            "native-consumer-turn",
+        )?;
+        Ok(crate::chat_driver::ChatDriverEvent::Agent(Box::new(
+            echo_agent::agent::EventEnvelope::new(
+                &identity,
+                sequence,
+                None,
+                native_commentary_block(text, sequence),
+            )?,
+        )))
+    }
 
     #[cfg(feature = "channels")]
     #[tokio::test]
@@ -13450,32 +13455,37 @@ mod tests {
 
     #[cfg(feature = "channels")]
     #[test]
-    fn large_token_is_utf8_chunked_and_cancels_at_bounded_queue() -> Result<(), String> {
+    fn native_surface_sink_keeps_large_utf8_block_and_rejects_oversized_event() -> Result<(), String>
+    {
         use crate::chat_driver::{ChatDriverEvent, ChatSink};
-        use echo_agent::agent::{AgentEvent, EventEnvelope, EventIdentity};
-
         let (tx, mut rx) = tokio::sync::mpsc::channel(super::CHANNEL_EVENT_QUEUE_CAPACITY);
         let cancellation = echo_agent::agent::CancellationToken::new();
         let sink = super::ChannelSurfaceSink::new(tx, cancellation.clone());
-        let identity = EventIdentity::new("channel-large-token", "turn-1")
+        let original = native_commentary_event(1, "中文🙂".repeat(25_000))
             .map_err(|error| error.to_string())?;
-        let envelope = EventEnvelope::new(
-            &identity,
-            1,
-            None,
-            AgentEvent::Token("中文🙂".repeat(25_000)),
-        )
-        .map_err(|error| error.to_string())?;
-        assert!(!sink.on_event(ChatDriverEvent::Agent(Box::new(envelope))));
+        assert!(sink.on_event(original.clone()));
+        let super::ChannelRenderEvent::Driver(delivered) =
+            rx.try_recv().map_err(|error| error.to_string())?
+        else {
+            return Err("native block lost its original envelope".to_string());
+        };
+        assert_eq!(
+            serde_json::to_value(delivered).map_err(|error| error.to_string())?,
+            serde_json::to_value(original).map_err(|error| error.to_string())?
+        );
+        assert!(!cancellation.is_cancelled());
+        assert!(rx.try_recv().is_err());
+        let oversized =
+            native_commentary_event(2, "中".repeat(super::outbound::CHANNEL_TURN_EVENT_BYTES))
+                .map_err(|error| error.to_string())?;
+        assert!(matches!(&oversized, ChatDriverEvent::Agent(envelope)
+            if matches!(&envelope.payload, echo_agent::agent::AgentEvent::AssistantMessage { .. })));
+        assert!(!sink.on_event(oversized));
         assert!(cancellation.is_cancelled());
-        assert_eq!(rx.len(), super::CHANNEL_EVENT_QUEUE_CAPACITY);
-        while let Ok(event) = rx.try_recv() {
-            let super::ChannelRenderEvent::Token(token) = event else {
-                return Err("large token queued a non-token event".to_string());
-            };
-            assert!(token.len() <= super::CHANNEL_TOKEN_COALESCE_BYTES);
-            assert!(token.is_char_boundary(token.len()));
-        }
+        assert!(
+            rx.try_recv().is_err(),
+            "拒绝超限原事件，不能匿名截断或造新envelope"
+        );
         Ok(())
     }
 
@@ -13664,6 +13674,85 @@ mod tests {
             return Err("channel stream continued after terminal receipt".to_string());
         }
         assert!(cancellation.is_cancelled());
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn observation_drains_accepted_body_before_error_without_waiting_for_owner_eof()
+    -> Result<(), String> {
+        use crate::chat_driver::{ChatDriverEvent, ChatTurnError};
+        use echo_agent::agent::{AgentEvent, EventEnvelope, EventIdentity};
+        use futures::StreamExt;
+
+        // 原owner仍持有sender：非终态观察不能等待其EOF，也不能丢弃sink已接受的正文。
+        for terminal_error in [
+            Some(ChatTurnError::Observation {
+                run_id: "original-run".into(),
+                execution_id: Some("original-execution".into()),
+            }),
+            Some(ChatTurnError::Error("original renderer failure".into())),
+            None,
+        ] {
+            for _ in 0..32 {
+                let (driver_tx, driver_rx) = tokio::sync::mpsc::channel(1);
+                let identity = EventIdentity::new("observation-stream", "observation-turn")
+                    .map_err(|error| error.to_string())?;
+                let body = EventEnvelope::new(
+                    &identity,
+                    1,
+                    None,
+                    AgentEvent::FinalAnswer("accepted body".to_string()),
+                )
+                .map_err(|error| error.to_string())?;
+                driver_tx
+                    .try_send(super::ChannelRenderEvent::Driver(ChatDriverEvent::Agent(
+                        Box::new(body),
+                    )))
+                    .map_err(|_| "observation driver receiver closed".to_string())?;
+                let (prompt_tx, prompt_rx) = tokio::sync::broadcast::channel::<String>(1);
+                drop(prompt_tx);
+                let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+                match terminal_error.clone() {
+                    Some(error) => terminal_tx
+                        .send(Err(error))
+                        .map_err(|_| "observation receipt receiver closed".to_string())?,
+                    None => drop(terminal_tx),
+                }
+                let mut stream = super::channel_render_event_stream(
+                    driver_rx,
+                    prompt_rx,
+                    terminal_rx,
+                    super::ChannelStreamDropGuard(echo_agent::agent::CancellationToken::new()),
+                );
+                let first = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+                    .await
+                    .map_err(|_| "observation waited for live producer EOF".to_string())?
+                    .ok_or_else(|| "missing accepted body".to_string())?
+                    .map_err(|error| format!("observation overtook accepted body: {error}"))?;
+                assert!(matches!(first,
+                super::ChannelRenderEvent::Driver(ChatDriverEvent::Agent(envelope))
+                    if matches!(envelope.payload, AgentEvent::FinalAnswer(ref text) if text == "accepted body")));
+                let second = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+                    .await
+                    .map_err(|_| "observation waited for live producer EOF".to_string())?
+                    .ok_or_else(|| "missing original observation".to_string())?;
+                match &terminal_error {
+                    Some(ChatTurnError::Observation { .. }) => assert!(matches!(second,
+                    Err(echo_agent::error::ReactError::ExecutionNotSettled { run_id, execution_id })
+                        if run_id == "original-run" && execution_id.as_deref() == Some("original-execution"))),
+                    Some(_) => assert!(matches!(second,
+                    Err(echo_agent::error::ReactError::Other(message))
+                        if message == "original renderer failure")),
+                    None => assert!(matches!(second,
+                    Err(echo_agent::error::ReactError::Other(message))
+                        if message == "channel foreground owner ended without a physical terminal receipt")),
+                }
+                assert!(stream.next().await.is_none());
+                // sender在两个投影之后才释放，证明没有以物理收尾替代原观察。
+                drop(driver_tx);
+            }
+        }
         Ok(())
     }
 
@@ -14495,12 +14584,12 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn flush_on_newline() {
-            // Token("a") Token("b\n") Token("c") FinalAnswer("") → "ab\n", "c"
+        async fn native_blocks_keep_newlines_and_order() {
+            // 原生块保留换行与顺序；不再依赖匿名token的切句边界。
             let evs = events_to_stream(vec![
-                Ok(AgentEvent::Token("a".into())),
-                Ok(AgentEvent::Token("b\n".into())),
-                Ok(AgentEvent::Token("c".into())),
+                Ok(super::native_commentary_block("a", 1)),
+                Ok(super::native_commentary_block("b\n", 2)),
+                Ok(super::native_commentary_block("c", 3)),
                 Ok(AgentEvent::FinalAnswer(String::new())),
             ]);
             let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
@@ -14509,11 +14598,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn flush_on_sentence_end() {
-            // 中文句末标点 。 触发 flush
+        async fn native_block_completion_keeps_cjk_sentence_text() {
+            // complete原生块保留中文句末标点。
             let evs = events_to_stream(vec![
-                Ok(AgentEvent::Token("你好。".into())),
-                Ok(AgentEvent::Token("再见".into())),
+                Ok(super::native_commentary_block("你好。", 1)),
+                Ok(super::native_commentary_block("再见", 2)),
                 Ok(AgentEvent::FinalAnswer(String::new())),
             ]);
             let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
@@ -14522,12 +14611,12 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn flush_on_threshold() {
-            // 超过 FLUSH_THRESHOLD 字符阈值 flush(单 Token 阈值+10)
+        async fn native_long_block_keeps_complete_body() {
+            // 完整原生块超过旧字符阈值时仍原样投影。
             let n = FLUSH_THRESHOLD + 10;
             let long: String = "x".repeat(n);
             let evs = events_to_stream(vec![
-                Ok(AgentEvent::Token(long.clone())),
+                Ok(super::native_commentary_block(long.clone(), 1)),
                 Ok(AgentEvent::FinalAnswer(String::new())),
             ]);
             let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
@@ -14537,10 +14626,14 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn finalanswer_flushes_remaining() {
-            // 无标点的短串 + FinalAnswer flush 剩余
+        async fn runtime_final_notification_flushes_incomplete_native_block() {
+            // 真实FinalAnswer通知仍可冲刷尚未complete的原生公开块。
+            let mut pending = super::native_commentary_block("hi", 1);
+            if let AgentEvent::AssistantMessage { block } = &mut pending {
+                block.complete = false;
+            }
             let evs = events_to_stream(vec![
-                Ok(AgentEvent::Token("hi".into())),
+                Ok(pending),
                 Ok(AgentEvent::FinalAnswer(String::new())),
             ]);
             let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
@@ -14550,17 +14643,20 @@ mod tests {
 
         #[tokio::test]
         async fn empty_buf_finalanswer_no_yield() {
-            // FinalAnswer 前无 Token → 不 yield 空
+            // 无原生正文的空FinalAnswer不生成消息。
             let evs = events_to_stream(vec![Ok(AgentEvent::FinalAnswer(String::new()))]);
             let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
             let texts = collect_texts(out).await;
-            assert!(texts.is_empty(), "no token before FinalAnswer → no yield");
+            assert!(
+                texts.is_empty(),
+                "empty runtime final without native text yields nothing"
+            );
         }
 
         #[tokio::test]
         async fn cancelled_terminal_is_user_visible() {
             let driver = events_to_stream(vec![
-                Ok(AgentEvent::Token("partial".into())),
+                Ok(super::native_commentary_block("partial", 1)),
                 Ok(AgentEvent::Cancelled),
             ]);
             let terminal = futures::stream::once(async {
@@ -14583,7 +14679,7 @@ mod tests {
         #[tokio::test]
         async fn failed_terminal_is_typed_and_user_visible() -> std::result::Result<(), String> {
             let driver = events_to_stream(vec![
-                Ok(AgentEvent::Token("partial".into())),
+                Ok(super::native_commentary_block("partial", 1)),
                 Ok(AgentEvent::error_message("llm", "boom")),
             ]);
             let terminal = futures::stream::once(async {
@@ -15154,10 +15250,13 @@ mod tests {
             let sensitive = format!("Bearer {secret}");
             let mut events = vec![
                 Ok(ChannelRenderEvent::Prompt(format!("prompt {sensitive}"))),
-                Ok(ChannelRenderEvent::Token(format!(
-                    "huge token {sensitive} {}",
-                    "中文🙂".repeat(5_000)
-                ))),
+                Ok(ChannelRenderEvent::Driver(
+                    super::native_commentary_event(
+                        4,
+                        format!("huge native block {sensitive} {}", "中文🙂".repeat(5_000)),
+                    )
+                    .map_err(|error| error.to_string())?,
+                )),
                 agent_render_event(
                     1,
                     AgentEvent::BudgetDecision {
@@ -15826,9 +15925,9 @@ mod tests {
 
         #[tokio::test]
         async fn multibyte_no_panic() {
-            // 中文 + emoji 不 panic,按 FinalAnswer flush
+            // 原生中文与emoji保留，空final不制造第二份正文。
             let evs = events_to_stream(vec![
-                Ok(AgentEvent::Token("你好🦀世界".into())),
+                Ok(super::native_commentary_block("你好🦀世界", 1)),
                 Ok(AgentEvent::FinalAnswer(String::new())),
             ]);
             let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
@@ -15837,11 +15936,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn fullwidth_punctuation_flushes() {
-            // 全角 ！ ？ 。 触发 flush(验证 is_sentence_end 全角分支)
+        async fn native_fullwidth_text_preserves_unicode() {
+            // Native blocks preserve fullwidth punctuation and Unicode text.
             let evs = events_to_stream(vec![
-                Ok(AgentEvent::Token("第一句！".into())),
-                Ok(AgentEvent::Token("第二句？".into())),
+                Ok(super::native_commentary_block("第一句！", 1)),
+                Ok(super::native_commentary_block("第二句？", 2)),
                 Ok(AgentEvent::FinalAnswer(String::new())),
             ]);
             let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;

@@ -3314,7 +3314,19 @@ mod resource_chain_acceptance {
                     &identity,
                     sequence,
                     None,
-                    echo_agent::agent::AgentEvent::Token(load.clone()),
+                    echo_agent::agent::AgentEvent::AssistantMessage {
+                        block: echo_agent::agent::AssistantMessageBlock {
+                            provider_source: None,
+                            block_id: format!("retention-load-{sequence}"),
+                            request_id: "retention-load-request".to_string(),
+                            sequence,
+                            phase: echo_agent::agent::AssistantPhase::Commentary,
+                            delta: load.clone(),
+                            complete: false,
+                            provider: Some("eko-native-test-fixture".to_string()),
+                            reasoning: None,
+                        },
+                    },
                 )?;
                 log.append(
                     fixture.workspace.id.as_str(),
