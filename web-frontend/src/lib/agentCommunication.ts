@@ -40,7 +40,6 @@ export function agentInputMessages(
   for (const record of records) {
     if (
       record.payload.origin !== 'agent' ||
-      !record.payload.from ||
       !record.message_id ||
       record.message_id !== record.payload.message_id ||
       record.route.workspace_id !== workspaceId ||
@@ -123,12 +122,12 @@ export function receiptConversation(receipt: AgentControlReceipt): ConversationT
   return receipt.target.type === 'conversation' ? receipt.target : null;
 }
 
-/** A canonical ResourceLink snapshot survives inbox retention and copies without becoming a new delivery. */
+/** Canonical来源在复制后仍保留；接收会话的时间由原SavedMessage提供，不从payload重建。 */
 export function restoredAgentInput(
   payload: AgentCommunicationInput['payload'],
   workspaceId: string,
   conversationId: string
-): Pick<ChatMessage, 'id' | 'content' | 'internalAgent' | 'agentInput' | 'timestamp'> {
+): Pick<ChatMessage, 'id' | 'content' | 'internalAgent' | 'agentInput'> {
   const record: AgentCommunicationInput = {
     message_id: payload.message_id,
     route: payload.to,
@@ -149,6 +148,5 @@ export function restoredAgentInput(
     content: payload.payload.text,
     internalAgent: true,
     agentInput: record,
-    timestamp: Date.parse(payload.created_at),
   };
 }

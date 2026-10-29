@@ -47,3 +47,13 @@ tauri::commands::conversations::native_history_tests::resource_chain_acceptance:
 App-core私有I/O诊断需要单独精确的test-utils lib构建；它与GUI lib及default app-core的实际features、binary和回执分开绑定。原report只精确认可具名GUI lib构建，不放宽source/lock/feature/binary守卫。每个Cargo批次先保日志、自然出口及必要制品，核真实reader为空，再清准确自有target。无窗口不编译、不生成合法dataset或计时。
 
 这些入口本身属于可执行示例/测试链；没有新增产品API示例或官网性能宣传。底层持久化、barrier、retention策略、4096有界批和预算均沿原实现，不因测试便利调整。单run报告继续保守输出incomplete；整份性能目标、真实WKWebView/paint及发行验收分别完成，不能靠改报告状态核销。
+
+## 原生聊天时间线的JS测量接缝
+
+`web-frontend/src/testing/nativeChatTimeline.tsx`仅供private性能构建入口导入，shipping index不引用。它沿原`handleChatEventEnvelope`消费AssistantMessage、ToolCall/ToolResult、ExecutionStatus和最终通知；工具摘要复用原`ingest/recordToolStart`，publication DTO只薄接原`applyFinalAnswerSource`。真实`MessageBubble/NativeMessageTimeline/ToolExecutionGroup`在同一个生产模块图内呈现，没有复制组件、建立产品控制台或增加第二性能runner。
+
+场景使用`gui/NativeMessageTimeline/`前缀，保原probe四操作ABI：mount观察消息块，single-row观察工具摘要与raw result ingress，batch观察执行状态，run-state观察最终通知及publication身份。原trace顺序和已验证DTO必须保留，不为阶段分组制造terminal。只测消息层DOM，不把工具执行/详情读取、模型/网络、TaskRun/TurnStatus结算或整页导航计入该结果。真实输入中的普通最终通知先于Settled时也保原顺序，不能用Settled自行发布正文。
+
+JS分别记录dispatch、真实React layout-effect提交及DOM-ready；原native Mach计时仍止于下一次WebKit transaction回调入口。typed边界放在原样本`correctness`内部；不同clock不混算，transaction/rAF或截图都不等于屏幕paint。prepare/execute/cleanup失败和在途取消均拒绝成功见证并恢复专用空现场；现有聊天/会话/工具/TaskRun不能被夹具接管。文字/工具摘要离线负载在挂载前拒绝自动媒体及分段delta拼接出的媒体语法，不改变产品对图片/附件的正常支持。
+
+`nativeChatTimeline.test.tsx`是已有Vitest链上的合成JS回归，不是实际native样本。完整数据仍需准确最终source、真实capture步骤/原stdout marker、retained binary、原envelope/get DTO和tool-summary trace。旧unknown-only capture缺少完整工具轨迹，不能按缺失填零或换来源标签取得资格。正式App、capability、quiet、原Node统计与report均复用原测量链，未取得时对应项继续未完成。新增接缝不增加产品API/普通examples或官网性能数字。

@@ -1822,6 +1822,97 @@ it('places a newly persisted Agent input after real cold human/assistant history
   expect(useChatStore.getState().messages).toHaveLength(2);
 });
 
+it.each(['original', 'fork-copy'] as const)(
+  'keeps canonical target chronology and original Agent identity through %s cold/live merging',
+  async (mode) => {
+    const { agentInputMessages, withAgentInputs } = await import('../lib/agentCommunication');
+    const conversationId = mode === 'original' ? 'original-target' : 'fork-target';
+    const canonicalAt = '2026-10-28T00:00:30Z';
+    const source = {
+      message_id: 'accepted-agent',
+      from: { workspace_id: 'sender-workspace', conversation_id: 'sender-chat' },
+      to:
+        mode === 'original'
+          ? { workspace_id: 'global', conversation_id: conversationId }
+          : { workspace_id: 'source-workspace', conversation_id: 'source-chat' },
+      origin: 'agent' as const,
+      payload: { kind: 'text' as const, text: '原始 Agent 正文 🧪' },
+      created_at: '2026-10-28T00:00:01Z',
+    };
+    mocks.getConversation.mockResolvedValueOnce({
+      messages: [
+        {
+          message_id: 'human',
+          role: 'user',
+          content: 'human before acceptance',
+          created_at: '2026-10-28T00:00:10Z',
+        },
+        {
+          message_id: 'canonical-agent',
+          role: 'user',
+          content: 'runtime guidance',
+          created_at: canonicalAt,
+          agent_input: source,
+          attachments: [
+            {
+              name: 'context.txt',
+              mime_type: 'text/plain',
+              url: 'data:text/plain;base64,Y29udGV4dA==',
+              size: 7,
+            },
+          ],
+        },
+        {
+          message_id: 'answer',
+          role: 'assistant',
+          content: 'assistant after acceptance',
+          created_at: '2026-10-28T00:00:40Z',
+        },
+      ],
+    });
+    await useConversationStore.getState().loadConversation(conversationId);
+    const cold = useChatStore.getState().messages;
+    const accepted = cold.find((message) => message.agentInput);
+    expect(accepted?.timestamp).toBe(Date.parse(canonicalAt));
+    expect(accepted?.agentInput?.payload).toEqual(source);
+    expect(accepted?.internalAgent).toBe(true);
+    expect(accepted?.attachments?.[0]?.name).toBe('context.txt');
+    const pending = {
+      message_id: 'pending-agent',
+      route: { workspace_id: 'global', conversation_id: conversationId },
+      payload: {
+        ...source,
+        message_id: 'pending-agent',
+        to: { workspace_id: 'global', conversation_id: conversationId },
+        payload: { kind: 'text' as const, text: 'pending between canonical rows' },
+      },
+      persisted_at: '2026-10-28T00:00:20Z',
+      phase: 'persisted',
+      outcome: null,
+      drained: false,
+      reason: null,
+      turn_id: null,
+      attempt: 0,
+    };
+    const timeline = withAgentInputs(cold, agentInputMessages([pending], 'global', conversationId));
+    expect(timeline.map((message) => message.content)).toEqual([
+      'human before acceptance',
+      'pending between canonical rows',
+      source.payload.text,
+      'assistant after acceptance',
+    ]);
+    expect(useChatStore.getState().messages).toBe(cold);
+    if (!accepted) throw new Error('canonical Agent input fixture was not restored');
+    render(
+      createElement(MessageBubble, { message: accepted, onEditAndResend: vi.fn(), onFork: vi.fn() })
+    );
+    expect(screen.getByText('来自 Agent · sender-workspace/sender-chat')).toBeDefined();
+    expect(screen.queryByRole('button', { name: '编辑' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '分叉会话' })).toBeNull();
+    expect(mocks.createSideConversation).not.toHaveBeenCalled();
+  }
+);
+
 it('does not create or rename a conversation from an Agent observation alone', async () => {
   const { restoredAgentInput } = await import('../lib/agentCommunication');
   const payload = {
@@ -1836,6 +1927,7 @@ it('does not create or rename a conversation from an Agent observation alone', a
   const record: ChatMessage = {
     role: 'user',
     ...restoredAgentInput(payload, 'global', 'existing'),
+    timestamp: Date.parse('2026-10-28T00:00:10Z'),
   };
   expect(await useConversationStore.getState().saveCurrent([record])).toEqual({
     workspace_id: 'global',

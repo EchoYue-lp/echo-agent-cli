@@ -887,40 +887,49 @@ describe('canonical branch prefix', () => {
   });
 });
 
-it('shows a typed inbox-only Agent input in the real empty ChatPanel instead of the welcome branch', () => {
-  mocks.renderRealBubble = true;
-  useTaskRuntimeStore.setState({ activeRun: null });
-  const record = {
-    message_id: 'inbox-only',
-    route: { workspace_id: workspace.id, conversation_id: run.conversation_id },
-    payload: {
+it.each([
+  {
+    from: { workspace_id: 'source', conversation_id: 'sender' },
+    label: '来自 Agent · source/sender',
+  },
+  { from: null, label: '来自 Agent · 来源未提供' },
+])(
+  'shows a typed inbox-only Agent input in the real empty ChatPanel with $label',
+  ({ from, label }) => {
+    mocks.renderRealBubble = true;
+    useTaskRuntimeStore.setState({ activeRun: null });
+    const record = {
       message_id: 'inbox-only',
-      from: { workspace_id: 'source', conversation_id: 'sender' },
-      to: { workspace_id: workspace.id, conversation_id: run.conversation_id },
-      origin: 'agent' as const,
-      payload: { kind: 'text' as const, text: '只有真实收件，没有本地用户或助手消息' },
-      created_at: '2026-10-28T07:00:00Z',
-    },
-    persisted_at: '2026-10-28T07:00:00Z',
-    phase: 'persisted',
-    outcome: null,
-    drained: false,
-    reason: null,
-    turn_id: null,
-    attempt: 0,
-  };
-  useChatStore.setState({
-    agentInputs: [record],
-    agentInputsBinding: JSON.stringify([
-      workspace.id,
-      workspace.product_data_generation,
-      run.conversation_id,
-      1,
-    ]),
-  });
-  render(<ChatPanel />);
-  expect(screen.getByText('来自 Agent · source/sender')).toBeDefined();
-  expect(screen.getByText('只有真实收件，没有本地用户或助手消息')).toBeDefined();
-  expect(screen.queryByRole('button', { name: '编辑' })).toBeNull();
-  expect(useChatStore.getState().messages).toEqual([]);
-});
+      route: { workspace_id: workspace.id, conversation_id: run.conversation_id },
+      payload: {
+        message_id: 'inbox-only',
+        from,
+        to: { workspace_id: workspace.id, conversation_id: run.conversation_id },
+        origin: 'agent' as const,
+        payload: { kind: 'text' as const, text: '只有真实收件，没有本地用户或助手消息' },
+        created_at: '2026-10-28T07:00:00Z',
+      },
+      persisted_at: '2026-10-28T07:00:00Z',
+      phase: 'persisted',
+      outcome: null,
+      drained: false,
+      reason: null,
+      turn_id: null,
+      attempt: 0,
+    };
+    useChatStore.setState({
+      agentInputs: [record],
+      agentInputsBinding: JSON.stringify([
+        workspace.id,
+        workspace.product_data_generation,
+        run.conversation_id,
+        1,
+      ]),
+    });
+    render(<ChatPanel />);
+    expect(screen.getByText(label)).toBeDefined();
+    expect(screen.getByText('只有真实收件，没有本地用户或助手消息')).toBeDefined();
+    expect(screen.queryByRole('button', { name: '编辑' })).toBeNull();
+    expect(useChatStore.getState().messages).toEqual([]);
+  }
+);

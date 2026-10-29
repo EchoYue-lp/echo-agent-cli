@@ -108,3 +108,7 @@ ADR 0001 §4.9 逆向了 Codex 的全方向通信矩阵,但 ADR 0016 实现时�
 - 特征测试:`tests/f10_agent_communication_matrix.rs`(生产路径接线 + 组
   CRUD + 无 app_ops fail-closed)。
 - 提交前按 AGENTS.md 执行 echo-agent-cli 全套门禁。
+
+## 当前 typed Agent 输入的缺失地址
+
+现有 spawn 首条消息、resume follow-up 与 handoff follow-up 可通过原 AgentMessage::agent_text(None, ...) 产生合法的 Agent 输入。GUI 依据原 typed origin 保留消息，地址为空时显示“来自 Agent · 来源未提供”，不隐藏消息，不补造来源工作空间或会话。相同规则用于 live 观察和当前版本 canonical cold/Fork 显示；原 message_id、正文、实际阶段和重复投递语义不变。来源地址缺失不改变 Runtime authorship，也不增加用户 Goal 编辑、HITL 批准或编辑/重发权限。本修复不增加协作控制台或旧 wrapper 解析。

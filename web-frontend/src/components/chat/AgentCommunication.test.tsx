@@ -208,15 +208,23 @@ describe('typed outbound receipt', () => {
 
 it('cold canonical input and live receipt share one identity while a Fork copy remains a distinct source', () => {
   const record = input();
-  const cold: ChatMessage = { role: 'user', ...restoredAgentInput(record.payload, 'w', 'c') };
+  const canonicalTimestamp = Date.parse('2026-10-28T07:00:10Z');
+  const cold: ChatMessage = {
+    role: 'user',
+    ...restoredAgentInput(record.payload, 'w', 'c'),
+    timestamp: canonicalTimestamp,
+  };
   const same = withAgentInputs([cold], agentInputMessages([record], 'w', 'c'));
   expect(same).toHaveLength(1);
   expect(same[0]?.agentInput?.phase).toBe('persisted');
+  expect(same[0]?.timestamp).toBe(canonicalTimestamp);
   const imported: ChatMessage = {
     role: 'user',
     ...restoredAgentInput(record.payload, 'w', 'fork'),
+    timestamp: canonicalTimestamp,
   };
   const newDelivery = input({
+    persisted_at: '2026-10-28T07:00:20Z',
     route: { workspace_id: 'w', conversation_id: 'fork' },
     payload: { ...record.payload, to: { workspace_id: 'w', conversation_id: 'fork' } },
   });

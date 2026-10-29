@@ -77,7 +77,11 @@ Side Conversation 不增加本地权限门控。模型选择和内部消息不�
 
 ## 用户侧投影
 
-GUI 左侧树和完整对话表面呈现 Side Conversation；TUI、CLI/JSONL 与 channel 保持既有普通 conversation/Subagent 语义。内部消息默认不插入主 GUI transcript。
+GUI 左侧树和完整对话表面呈现 Side Conversation。依据用户提供的 Codex 参考，普通对话时间线只读呈现 typed Agent 来信与原工具发送事实：用户输入和 Agent 来信均右对齐，来信保留来源且可展开全文，发送行点击只导航到原目标会话。来源未知时明确显示未提供，不能猜成人类；canonical 接收时间与来源创建时间分别保留。GUI 不新增人工消息编排或投递收据管理台，Agent 来信不能批准 HITL、更新用户 Goal 或取得本人编辑权限。
+
+### 开发测试中的原生时间线接缝
+
+`web-frontend/src/testing/nativeChatTimeline.tsx` 只供性能测试入口导入，复用原事件 handler、ChatStore 和 MessageBubble／原生消息／工具组件，不进入 shipping index，也不拥有投递、持久化或完成权威。`web-frontend/src/testing/nativeChatTimeline.test.tsx` 在现有 Vitest 链验证该适配边界；其导出是开发测试 ABI，不是新增产品 API。输入、提交与见证的精确边界见 `docs/zh/architecture/performance-baseline.md`：JS 回归、DOM-ready、React layout-effect 和 WebKit transaction 都不能授予实际屏幕 paint 或完整原生性能资格；真实 capture、工具轨迹、冻结二进制及独占测量仍须分别取证。
 
 ## 场景处置清单
 

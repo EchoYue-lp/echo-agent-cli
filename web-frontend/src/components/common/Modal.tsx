@@ -10,11 +10,13 @@ import { createPortal } from 'react-dom';
 
 const FOCUSABLE_SELECTOR = [
   'a[href]',
-  'button:not([disabled])',
-  'input:not([disabled])',
-  'select:not([disabled])',
-  'textarea:not([disabled])',
-  '[tabindex]:not([tabindex="-1"])',
+  // :disabled包含父fieldset的禁用状态，避免HITL提交中把焦点送到不可操作的选项。
+  'button:not(:disabled)',
+  'input:not(:disabled)',
+  'select:not(:disabled)',
+  'textarea:not(:disabled)',
+  'summary',
+  '[tabindex]:not([tabindex="-1"]):not(:disabled)',
 ].join(',');
 
 interface ModalStackEntry {

@@ -99,6 +99,22 @@ const inputProjection = (
 
 let queuedFrontier: ConversationInputFrontier = { queue_revision: 0, items: [] };
 
+const nativeCommentary = (text: string, sequence = 1): AgentEvent => ({
+  type: 'assistant_message',
+  data: {
+    block: {
+      block_id: 'native-body',
+      request_id: 'native-request',
+      sequence,
+      phase: 'commentary',
+      delta: text,
+      complete: false,
+      provider: null,
+      reasoning: null,
+    },
+  },
+});
+
 const agentEnvelope = (
   turnId: string,
   sequence: number,
@@ -120,7 +136,7 @@ const agentEnvelope = (
   payload: {
     source: 'agent',
     event: {
-      schema_version: 4,
+      schema_version: 5,
       event_id: `agent-event-${sequence}`,
       content_hash: `agent-hash-${sequence}`,
       sequence,
@@ -2422,7 +2438,7 @@ describe('useTauriChat foreground turn recovery', () => {
         payload: agentEnvelope(
           snapshot.active_turn_id,
           4,
-          { type: 'token', data: 'ordered token' },
+          nativeCommentary('ordered token', 4),
           conversationId,
           snapshot.root_turn_id
         ),
@@ -2440,8 +2456,11 @@ describe('useTauriChat foreground turn recovery', () => {
 
     await waitFor(() => expect(useChatStore.getState().runStatus).toBe('completed'));
     expect(
-      useChatStore.getState().messages.find((message) => message.id === snapshot.root_turn_id)
-        ?.content
+      useChatStore
+        .getState()
+        .messages.find((message) => message.id === snapshot.root_turn_id)
+        ?.assistantBlocks?.map((block) => block.content)
+        .join('')
     ).toContain('ordered token');
     hook.unmount();
   });
@@ -2510,7 +2529,7 @@ describe('useTauriChat foreground turn recovery', () => {
           },
         }),
       });
-      listener?.({ payload: agent(3, { type: 'token', data: '本机原回复' }) });
+      listener?.({ payload: agent(3, nativeCommentary('本机原回复', 3)) });
       listener?.({ payload: agent(4, { type: 'final_answer', data: '本机原回复' }) });
       completed = true;
       listener?.({
@@ -2554,14 +2573,14 @@ describe('useTauriChat foreground turn recovery', () => {
     const first = agentEnvelope(
       snapshot.active_turn_id,
       1,
-      { type: 'token', data: 'first ' },
+      nativeCommentary('first ', 1),
       conversationId,
       snapshot.root_turn_id
     );
     const second = agentEnvelope(
       snapshot.active_turn_id,
       2,
-      { type: 'token', data: 'second' },
+      nativeCommentary('second', 2),
       conversationId,
       snapshot.root_turn_id
     );
@@ -2591,8 +2610,11 @@ describe('useTauriChat foreground turn recovery', () => {
 
     await waitFor(() => {
       expect(
-        useChatStore.getState().messages.find((message) => message.id === snapshot.root_turn_id)
-          ?.content
+        useChatStore
+          .getState()
+          .messages.find((message) => message.id === snapshot.root_turn_id)
+          ?.assistantBlocks?.map((block) => block.content)
+          .join('')
       ).toContain('first second');
     });
     expect(mocks.apiInvoke).toHaveBeenCalledWith('replay_chat_events', {
@@ -2717,7 +2739,7 @@ describe('useTauriChat foreground turn recovery', () => {
         agentEnvelope(
           activeTurnId,
           1,
-          { type: 'token', data: 'continued' },
+          nativeCommentary('continued', 1),
           conversationId,
           rootTurnId
         ),
@@ -2736,7 +2758,11 @@ describe('useTauriChat foreground turn recovery', () => {
     const hook = renderHook(() => useTauriChat());
     await waitFor(() => {
       expect(
-        useChatStore.getState().messages.find((message) => message.id === rootTurnId)?.content
+        useChatStore
+          .getState()
+          .messages.find((message) => message.id === rootTurnId)
+          ?.assistantBlocks?.map((block) => block.content)
+          .join('')
       ).toBe('continued');
     });
     await act(async () => {
@@ -2758,13 +2784,7 @@ describe('useTauriChat foreground turn recovery', () => {
     useChatStore.getState().startAssistantMessage(rootTurnId);
     const replay: ChatEventReplay = {
       events: [
-        agentEnvelope(
-          rootTurnId,
-          1,
-          { type: 'token', data: 'partial' },
-          conversationId,
-          rootTurnId
-        ),
+        agentEnvelope(rootTurnId, 1, nativeCommentary('partial', 1), conversationId, rootTurnId),
         agentEnvelope(
           rootTurnId,
           2,
@@ -2869,7 +2889,7 @@ describe('useTauriChat foreground turn recovery', () => {
         agentEnvelope(
           rootTurnId,
           1,
-          { type: 'token', data: 'durable partial output' },
+          nativeCommentary('durable partial output', 1),
           conversationId,
           rootTurnId
         ),
@@ -2888,7 +2908,13 @@ describe('useTauriChat foreground turn recovery', () => {
     const hook = renderHook(() => useTauriChat());
     await waitFor(() => expect(useChatStore.getState().runStatus).toBe('idle'));
     expect(useChatStore.getState().isStreaming).toBe(false);
-    expect(useChatStore.getState().messages.at(-1)?.content).toBe('durable partial output');
+    expect(
+      useChatStore
+        .getState()
+        .messages.at(-1)
+        ?.assistantBlocks?.map((block) => block.content)
+        .join('')
+    ).toBe('durable partial output');
     expect(mocks.apiInvoke).not.toHaveBeenCalledWith('cancel_chat', expect.anything());
     hook.unmount();
   });
@@ -3413,5 +3439,135 @@ describe('useTauriChat foreground turn recovery', () => {
     expect(useChatStore.getState().pendingHitlRequests).toEqual([]);
     expect(useChatStore.getState().runStatus).toBe('running');
     hook.unmount();
+  });
+
+  describe('HITL reply feedback stays with its original presentation', () => {
+    async function pendingReply(kind: 'input' | 'selection') {
+      const identity: HitlRequestIdentity = {
+        ...hitlIdentity('reused-reply'),
+        kind,
+        scope: {
+          workspace_id: activeSnapshot.workspace_id,
+          host_generation: 'original-host',
+          conversation_id: activeSnapshot.conversation_id,
+          root_turn_id: activeSnapshot.root_turn_id,
+          turn_id: activeSnapshot.active_turn_id,
+        },
+      };
+      const reply = deferred<{ submitted: boolean; response_target: string }>();
+      const previous = mocks.apiInvoke.getMockImplementation();
+      mocks.apiInvoke.mockImplementation((command, args) => {
+        if (command === `send_${kind}_response`) return reply.promise;
+        if (command === 'get_conversation') return Promise.resolve({ messages: [] });
+        if (command === 'list_tool_executions') return Promise.resolve([]);
+        if (command === 'restore_conversation') return Promise.resolve({ success: true });
+        return previous?.(command, args);
+      });
+      useConversationStore.setState({
+        workspaceId: 'global',
+        activeId: activeSnapshot.conversation_id,
+      });
+      const hook = renderHook(() => useTauriChat());
+      await waitFor(() =>
+        expect(
+          useChatStore
+            .getState()
+            .messages.some((message) => message.id === activeSnapshot.root_turn_id)
+        ).toBe(true)
+      );
+      const enqueue = (next = identity) => {
+        if (kind === 'input')
+          useChatStore
+            .getState()
+            .enqueueHitlRequest({ kind, identity: next, requestId: next.request_id });
+        else
+          useChatStore.getState().enqueueHitlRequest({
+            kind,
+            identity: next,
+            requestId: next.request_id,
+            prompt: 'choose',
+            options: ['Continue'],
+          });
+      };
+      act(() => enqueue());
+      let operation: Promise<boolean> | undefined;
+      await act(async () => {
+        operation =
+          kind === 'input'
+            ? hook.result.current.sendInput(identity, 'original reply')
+            : hook.result.current.sendSelection(identity, 'Continue');
+      });
+      expect(mocks.apiInvoke).toHaveBeenCalledWith(
+        `send_${kind}_response`,
+        expect.objectContaining({
+          requestId: identity.request_id,
+          responseTarget: identity.response_target,
+          workspaceId: identity.scope.workspace_id,
+          conversationId: identity.scope.conversation_id,
+          requestScope: identity.scope,
+          requestKind: kind,
+        })
+      );
+      return { hook, identity, reply, operation, enqueue };
+    }
+
+    for (const kind of ['input', 'selection'] as const) {
+      it.each(['conversation', 'successor', 'released', 'revisit'] as const)(
+        `keeps a late ${kind} failure out of the current view after %s`,
+        async (transition) => {
+          const { hook, identity, reply, operation, enqueue } = await pendingReply(kind);
+          if (transition === 'conversation' || transition === 'revisit') {
+            await act(async () =>
+              useConversationStore.getState().loadConversation('other-conversation')
+            );
+            if (transition === 'revisit') {
+              await act(async () =>
+                useConversationStore.getState().loadConversation(activeSnapshot.conversation_id)
+              );
+              act(() => enqueue());
+            }
+          } else {
+            act(() => {
+              useChatStore.getState().removeHitlRequest(identity);
+              if (transition === 'successor')
+                enqueue({ ...identity, response_target: 'successor-response-target' });
+            });
+          }
+          const currentPending = useChatStore.getState().pendingHitlRequests;
+          const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+          try {
+            await act(async () => {
+              reply.reject(new Error('original response target expired'));
+              expect(await operation).toBe(false);
+            });
+            expect(useToastStore.getState().toasts).toEqual([]);
+            expect(useChatStore.getState().pendingHitlRequests).toBe(currentPending);
+          } finally {
+            consoleError.mockRestore();
+            hook.unmount();
+          }
+        }
+      );
+
+      it(`keeps a current ${kind} rejection visible and the exact request retryable`, async () => {
+        const { hook, identity, reply, operation } = await pendingReply(kind);
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+        try {
+          await act(async () => {
+            reply.reject(new Error('current answer rejected'));
+            expect(await operation).toBe(false);
+          });
+          expect(useToastStore.getState().toasts).toEqual([
+            expect.objectContaining({ message: '回复提交失败：Error: current answer rejected' }),
+          ]);
+          expect(useChatStore.getState().pendingHitlRequests).toEqual([
+            expect.objectContaining({ identity }),
+          ]);
+        } finally {
+          consoleError.mockRestore();
+          hook.unmount();
+        }
+      });
+    }
   });
 });

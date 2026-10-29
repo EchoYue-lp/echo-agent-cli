@@ -64,6 +64,30 @@ function callbacks() {
 }
 
 describe('HitlDialog', () => {
+  it('keeps reverse Tab on enabled details while a selection reply disables its fieldset', async () => {
+    const props = callbacks();
+    let finish: ((accepted: boolean) => void) | undefined;
+    props.onSelection.mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          finish = resolve;
+        })
+    );
+    render(<HitlDialog requests={[selection]} {...props} />);
+    fireEvent.click(screen.getByRole('radio', { name: /保留现有改动/ }));
+    fireEvent.click(screen.getByRole('button', { name: '提交回答' }));
+    await waitFor(() => expect(props.onSelection).toHaveBeenCalledOnce());
+    const close = screen
+      .getAllByRole('button', { name: '稍后处理' })
+      .find((button) => !(button as HTMLButtonElement).disabled);
+    const details = screen.getByText('请求详情').closest('summary');
+    if (!close || !details) throw new Error('HITL modal controls missing');
+    close.focus();
+    fireEvent.keyDown(document, { key: 'Tab', shiftKey: true });
+    expect(document.activeElement).toBe(details);
+    await act(async () => finish?.(true));
+  });
+
   it('unifies the FIFO queue and hides without approving, cancelling or losing discovery', () => {
     const props = callbacks();
     render(

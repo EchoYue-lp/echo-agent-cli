@@ -38,4 +38,6 @@ Side Conversation 创建/导航及 GUI 普通 Fork 继续由用户显式操作�
 
 点击目标复用正常workspace switch及conversation load，并核对代际和导航epoch；只导航，不发信、不建会话、不启动Agent。产物侧完整Rust、新版本FileStore cold与实际Tauri原生验收单独取得，JS夹具不冒充该资格。
 
+冷恢复的时间顺序沿原 SavedMessage.created_at。AgentMessage 的 created_at 保留在原 typed payload 中，表示来源消息的创建时间，不能覆盖接收会话的 canonical 时间；Fork 复制也保留两者的原值。来源显示 helper 只补身份与正文，live 观察仍使用原投递记录的 persisted_at，不新增时钟或重发历史消息。
+
 本实现不消费Framework examples、SDK或官网组件，不更改其公共协议；正式采用由EKO唯一writer在安全切点三方合并共享DTO、store及MessageBubble增量。

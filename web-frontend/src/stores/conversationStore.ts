@@ -664,6 +664,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
               ? m.execution_status?.execution_id
               : undefined,
             isStreaming: false,
+            // 会话时间只读原canonical行，来源payload的创建时间不覆盖接收顺序。
             timestamp: canonicalMessageTimestamp(m),
             ...(m.agent_input ? restoredAgentInput(m.agent_input, workspaceId, id) : {}),
           };

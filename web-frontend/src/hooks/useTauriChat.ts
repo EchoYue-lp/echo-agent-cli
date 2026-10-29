@@ -12,6 +12,7 @@ import { productDataScope, sameProductDataScope } from '../lib/productDataScope'
 import { handleChatEventEnvelope } from './chatEventHandler';
 import { ChatEventSequencer } from './chatEventSequencer';
 import { reorderById } from './queuedChat';
+import { sameHitlIdentity } from '../types/api';
 import type { ForegroundTurnSnapshot } from '../generated';
 import type {
   Attachment,
@@ -1164,36 +1165,48 @@ export function useTauriChat() {
     []
   );
 
-  const sendInput = useCallback(async (identity: HitlRequestIdentity, text: string) => {
-    try {
-      const receipt = await apiInvoke<{ submitted: boolean; response_target: string }>(
-        'send_input_response',
-        {
-          workspaceId: identity.scope.workspace_id,
-          conversationId: identity.scope.conversation_id,
-          expectedRootTurnId: identity.scope.root_turn_id,
-          expectedActiveTurnId: identity.scope.turn_id,
-          requestId: identity.request_id,
-          responseTarget: identity.response_target,
-          requestScope: identity.scope,
-          requestKind: identity.kind,
-          text,
+  const sendInput = useCallback(
+    async (identity: HitlRequestIdentity, text: string) => {
+      const ownsPresentation = captureInputProjection();
+      try {
+        const receipt = await apiInvoke<{ submitted: boolean; response_target: string }>(
+          'send_input_response',
+          {
+            workspaceId: identity.scope.workspace_id,
+            conversationId: identity.scope.conversation_id,
+            expectedRootTurnId: identity.scope.root_turn_id,
+            expectedActiveTurnId: identity.scope.turn_id,
+            requestId: identity.request_id,
+            responseTarget: identity.response_target,
+            requestScope: identity.scope,
+            requestKind: identity.kind,
+            text,
+          }
+        );
+        if (receipt?.submitted !== true || receipt.response_target !== identity.response_target) {
+          throw new Error('HITL response submission was not acknowledged');
         }
-      );
-      if (receipt?.submitted !== true || receipt.response_target !== identity.response_target) {
-        throw new Error('HITL response submission was not acknowledged');
+        useChatStore.getState().removeHitlRequest(identity);
+        return true;
+      } catch (e) {
+        console.error('[TauriChat] Failed to send input:', e);
+        // 原调用仍返回真实拒绝；迟到失败不污染换代后的视图或已由其它入口释放的请求。
+        if (
+          ownsPresentation() &&
+          useChatStore
+            .getState()
+            .pendingHitlRequests.some((request) => sameHitlIdentity(request.identity, identity))
+        )
+          useToastStore.getState().addToast('error', `回复提交失败：${errorMessage(e)}`);
+        return false;
       }
-      useChatStore.getState().removeHitlRequest(identity);
-      return true;
-    } catch (e) {
-      console.error('[TauriChat] Failed to send input:', e);
-      useToastStore.getState().addToast('error', `回复提交失败：${errorMessage(e)}`);
-      return false;
-    }
-  }, []);
+    },
+    [captureInputProjection]
+  );
 
   const sendSelection = useCallback(
     async (identity: HitlRequestIdentity, selection: string, instructions?: string) => {
+      const ownsPresentation = captureInputProjection();
       try {
         const receipt = await apiInvoke<{ submitted: boolean; response_target: string }>(
           'send_selection_response',
@@ -1217,11 +1230,17 @@ export function useTauriChat() {
         return true;
       } catch (e) {
         console.error('[TauriChat] Failed to send selection:', e);
-        useToastStore.getState().addToast('error', `回复提交失败：${errorMessage(e)}`);
+        if (
+          ownsPresentation() &&
+          useChatStore
+            .getState()
+            .pendingHitlRequests.some((request) => sameHitlIdentity(request.identity, identity))
+        )
+          useToastStore.getState().addToast('error', `回复提交失败：${errorMessage(e)}`);
         return false;
       }
     },
-    []
+    [captureInputProjection]
   );
 
   const cancel = useCallback(async () => {
