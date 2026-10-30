@@ -2951,6 +2951,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_source_projection_keeps_plugin_owner_with_same_name_direct_connection()
+    -> anyhow::Result<()> {
+        use echo_agent::agent::{AgentConfig, ReactAgent};
+        use echo_agent::mcp::{McpServerId, McpToolAdapter};
+
+        let fixture = HttpMcpFixture::start("fixture_tool").await?;
+        let mut agent = ReactAgent::new(AgentConfig::minimal("test-model", "helper"));
+        let plugin_id = McpServerId::plugin("plugin-a", "shared");
+        let direct_id = McpServerId::direct("shared");
+        let plugin_name = McpToolAdapter::exposed_name_for_identity(&plugin_id, "fixture_tool");
+        let direct_name = McpToolAdapter::exposed_name_for_identity(&direct_id, "fixture_tool");
+        agent
+            .connect_mcp_owned(
+                plugin_id.clone(),
+                fixture.entry().to_server_config("shared")?,
+            )
+            .await?;
+        let plugin_source = crate::types::ToolSource::Mcp {
+            server: "shared".to_string(),
+            tool: "fixture_tool".to_string(),
+            plugin_id: Some("plugin-a".to_string()),
+        };
+        assert_eq!(
+            crate::tool_control::mcp_tool_sources(&agent).get(&plugin_name),
+            Some(&plugin_source)
+        );
+        agent
+            .connect_mcp_from_config(fixture.entry().to_server_config("shared")?)
+            .await?;
+        let sources = crate::tool_control::mcp_tool_sources(&agent);
+        assert_eq!(sources.get(&plugin_name), Some(&plugin_source));
+        assert_eq!(
+            sources.get(&direct_name),
+            Some(&crate::types::ToolSource::Mcp {
+                server: "shared".to_string(),
+                tool: "fixture_tool".to_string(),
+                plugin_id: None,
+            })
+        );
+        assert!(!sources.contains_key("ordinary_tool_without_source"));
+        assert!(agent.disconnect_mcp("shared").await?);
+        let sources = crate::tool_control::mcp_tool_sources(&agent);
+        assert_eq!(sources.get(&plugin_name), Some(&plugin_source));
+        assert!(!sources.contains_key(&direct_name));
+        assert!(agent.disconnect_mcp_owned(&plugin_id).await?);
+        assert!(crate::tool_control::mcp_tool_sources(&agent).is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn disabling_a_server_disconnects_it_and_revokes_its_tools() -> anyhow::Result<()> {
         let fixture = HttpMcpFixture::start("fixture_tool").await?;
         let harness = ReconcileHarness::new(ReconcileDeadlines::default())?;

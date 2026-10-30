@@ -57,3 +57,7 @@ App-core私有I/O诊断需要单独精确的test-utils lib构建；它与GUI lib
 JS分别记录dispatch、真实React layout-effect提交及DOM-ready；原native Mach计时仍止于下一次WebKit transaction回调入口。typed边界放在原样本`correctness`内部；不同clock不混算，transaction/rAF或截图都不等于屏幕paint。prepare/execute/cleanup失败和在途取消均拒绝成功见证并恢复专用空现场；现有聊天/会话/工具/TaskRun不能被夹具接管。文字/工具摘要离线负载在挂载前拒绝自动媒体及分段delta拼接出的媒体语法，不改变产品对图片/附件的正常支持。
 
 `nativeChatTimeline.test.tsx`是已有Vitest链上的合成JS回归，不是实际native样本。完整数据仍需准确最终source、真实capture步骤/原stdout marker、retained binary、原envelope/get DTO和tool-summary trace。旧unknown-only capture缺少完整工具轨迹，不能按缺失填零或换来源标签取得资格。正式App、capability、quiet、原Node统计与report均复用原测量链，未取得时对应项继续未完成。新增接缝不增加产品API/普通examples或官网性能数字。
+
+完整工具捕获继续复用原`native_unknown_actual_backend_replay_capture`单个显式ignored入口，在原unknown/Guard案例之外增加`tool-progress-signed`。同一资源链producer保持Untouched原rows；可选测试renderer接到真实`bind_surface_chat_sink(Gui)`，ToolExecutionProjector先提交原仓库摘要，再经原callback交付并记录started/finished与envelope的实际顺序。捕获写出完整source rows、canonical、冷journal envelopes、tool-events、delivery-trace、实际Settled及已确认get publication，不手造summary/result或把Candidate改成Settled。
+
+新模块仍属原测试链，无产品入口/模型服务/App/poller。所有输出沿既有FILE/INDEX stdout marker和create-new文件语义，必须由准确最终源的真实warm/同源批运行，再逐bytes/SHA、retained binary及compiled source核对；source-only候选、rustfmt或更早来源的捕获都不获得最终native计时资格。阶段分组只能筛选原回调，不能把实际summary-before-envelope改排成想象顺序；private reader同时核原索引、stdout与全delivery trace。缺finished或错owner负控只变异内存副本，原件保持。

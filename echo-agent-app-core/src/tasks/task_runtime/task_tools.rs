@@ -502,7 +502,8 @@ mod task_create_tests {
     fn plan_task_schema_keeps_generated_briefs_in_user_language() -> std::result::Result<(), String>
     {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
-        let schema = FrameworkTaskCreateTool::new(task_service(store)).parameters();
+        let tool = FrameworkTaskCreateTool::new(task_service(store));
+        let schema = tool.parameters();
         let task_prefix = if schema.pointer("/properties/tasks/items").is_some() {
             "/properties/tasks/items"
         } else {
@@ -516,8 +517,11 @@ mod task_create_tests {
             .pointer(&format!("{task_prefix}/properties/description/description"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        assert!(title.contains("user's current language"));
-        assert!(description.contains("user's current language"));
+        assert!(!title.is_empty());
+        assert!(!description.is_empty());
+        let policy = tool.description();
+        assert!(policy.contains("Titles/briefs: user's language"));
+        assert!(policy.contains("code/paths/commands/technical IDs unchanged"));
         Ok(())
     }
 

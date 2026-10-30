@@ -361,12 +361,25 @@ async fn await_channel_rate(
     remaining_burst: &mut usize,
     next_sustained: &mut tokio::time::Instant,
     policy: ChannelRatePolicy,
+    service_cancel: Option<&echo_agent::agent::CancellationToken>,
 ) {
+    // 服务停止后原 deferred sender 不再发送；继续 drain 原投影，但不为丢弃的输出等待发送节流。
+    if service_cancel.is_some_and(echo_agent::agent::CancellationToken::is_cancelled) {
+        return;
+    }
     let now = tokio::time::Instant::now();
     if let Some(deadline) = channel_rate_deadline(remaining_burst, next_sustained, now, policy)
         && now < deadline
     {
-        tokio::time::sleep_until(deadline).await;
+        if let Some(cancel) = service_cancel {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {},
+                _ = tokio::time::sleep_until(deadline) => {},
+            }
+        } else {
+            tokio::time::sleep_until(deadline).await;
+        }
     }
 }
 
@@ -390,10 +403,18 @@ pub(super) fn channel_outbound_transport<'a>(
     channel_id: String,
     to: String,
     chat_type: echo_agent::channels::ChatType,
+    service_cancel: Option<echo_agent::agent::CancellationToken>,
 ) -> futures::stream::BoxStream<'a, echo_agent::error::Result<echo_agent::channels::OutboundMessage>>
 {
     let rate_policy = channel_rate_policy(&channel_id);
-    channel_outbound_transport_with_rate(drafts, channel_id, to, chat_type, rate_policy)
+    channel_outbound_transport_with_rate(
+        drafts,
+        channel_id,
+        to,
+        chat_type,
+        rate_policy,
+        service_cancel,
+    )
 }
 
 #[cfg(test)]
@@ -413,6 +434,7 @@ pub(super) fn channel_outbound_transport_unpaced<'a>(
             burst: usize::MAX,
             sustained_interval: std::time::Duration::from_secs(1),
         },
+        None,
     )
 }
 
@@ -422,6 +444,7 @@ fn channel_outbound_transport_with_rate<'a>(
     to: String,
     chat_type: echo_agent::channels::ChatType,
     rate_policy: ChannelRatePolicy,
+    service_cancel: Option<echo_agent::agent::CancellationToken>,
 ) -> futures::stream::BoxStream<'a, echo_agent::error::Result<echo_agent::channels::OutboundMessage>>
 {
     use echo_agent::channels::OutboundMessage;
@@ -482,7 +505,7 @@ fn channel_outbound_transport_with_rate<'a>(
                                     await_channel_rate(
                                         &mut remaining_burst,
                                         &mut next_sustained,
-                                        rate_policy,
+                                        rate_policy, service_cancel.as_ref(),
                                     )
                                     .await;
                                     yield OutboundMessage::new(
@@ -500,7 +523,7 @@ fn channel_outbound_transport_with_rate<'a>(
                         await_channel_rate(
                             &mut remaining_burst,
                             &mut next_sustained,
-                            rate_policy,
+                            rate_policy, service_cancel.as_ref(),
                         )
                         .await;
                     }
@@ -525,7 +548,7 @@ fn channel_outbound_transport_with_rate<'a>(
                         if chunk.is_empty() { continue; }
                         ordinary_messages = ordinary_messages.saturating_add(1);
                         ordinary_bytes = ordinary_bytes.saturating_add(chunk.len());
-                        await_channel_rate(&mut remaining_burst, &mut next_sustained, rate_policy).await;
+                        await_channel_rate(&mut remaining_burst, &mut next_sustained, rate_policy, service_cancel.as_ref(),).await;
                         yield OutboundMessage::new(&channel_id, &to, chat_type, chunk);
                     }
                 } else {
@@ -540,7 +563,7 @@ fn channel_outbound_transport_with_rate<'a>(
                         Err(echo_agent::error::ReactError::Other("channel confirmed-answer preview exceeds its reserve".to_string()))?;
                     }
                     final_messages = final_messages.saturating_add(1);
-                    await_channel_rate(&mut remaining_burst, &mut next_sustained, rate_policy).await;
+                    await_channel_rate(&mut remaining_burst, &mut next_sustained, rate_policy, service_cancel.as_ref(),).await;
                     yield OutboundMessage::new(&channel_id, &to, chat_type, preview);
                 }
                 continue;
@@ -728,5 +751,103 @@ pub(super) fn channel_terminal_stream(
         }
     }
     .boxed();
-    channel_outbound_transport(drafts, channel_id, reply_target, chat_type)
+    channel_outbound_transport(drafts, channel_id, reply_target, chat_type, None)
+}
+
+#[cfg(test)]
+mod service_stop_rate_tests {
+    use super::*;
+    use futures::StreamExt;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    fn original_drafts(
+        done: Arc<AtomicBool>,
+    ) -> futures::stream::BoxStream<'static, echo_agent::error::Result<ChannelOutboundDraft>> {
+        async_stream::stream! {
+            for ordinal in 0..12 {
+                yield Ok(ChannelOutboundDraft::ordinary(format!("原始投影🧭{ordinal}")));
+            }
+            done.store(true, Ordering::Release);
+        }
+        .boxed()
+    }
+
+    #[tokio::test]
+    async fn stopped_service_drains_original_source_without_rate_wait()
+    -> echo_agent::error::Result<()> {
+        let stop = echo_agent::agent::CancellationToken::new();
+        stop.cancel();
+        let done = Arc::new(AtomicBool::new(false));
+        let stream = channel_outbound_transport_with_rate(
+            original_drafts(done.clone()),
+            "weixin".into(),
+            "peer".into(),
+            echo_agent::channels::ChatType::Direct,
+            ChannelRatePolicy {
+                burst: 0,
+                sustained_interval: std::time::Duration::from_secs(60),
+            },
+            Some(stop),
+        );
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.collect::<Vec<_>>(),
+        )
+        .await
+        .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
+        assert_eq!(output.len(), 12);
+        assert!(output.iter().all(Result::is_ok));
+        assert!(
+            done.load(Ordering::Acquire),
+            "only real source EOF proves the finite projection drained"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_service_keeps_rate_wait_until_same_service_is_stopped()
+    -> echo_agent::error::Result<()> {
+        let stop = echo_agent::agent::CancellationToken::new();
+        let done = Arc::new(AtomicBool::new(false));
+        let mut stream = channel_outbound_transport_with_rate(
+            original_drafts(done.clone()),
+            "weixin".into(),
+            "peer".into(),
+            echo_agent::channels::ChatType::Direct,
+            ChannelRatePolicy {
+                burst: 0,
+                sustained_interval: std::time::Duration::from_secs(60),
+            },
+            Some(stop.clone()),
+        );
+        {
+            let first = stream.next();
+            tokio::pin!(first);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), &mut first)
+                    .await
+                    .is_err(),
+                "live delivery must retain its original pacing"
+            );
+            assert!(!done.load(Ordering::Acquire));
+            stop.cancel();
+            let output = tokio::time::timeout(std::time::Duration::from_secs(5), &mut first)
+                .await
+                .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
+            assert!(matches!(output, Some(Ok(_))));
+        }
+        let remaining = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.collect::<Vec<_>>(),
+        )
+        .await
+        .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
+        assert_eq!(remaining.len(), 11);
+        assert!(remaining.iter().all(Result::is_ok));
+        assert!(done.load(Ordering::Acquire));
+        Ok(())
+    }
 }

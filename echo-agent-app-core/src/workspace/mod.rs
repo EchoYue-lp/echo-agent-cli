@@ -583,10 +583,19 @@ mod tests {
             port: Some(2222),
             path: "/srv/project".to_string(),
         };
-        let mut workspace: Workspace = serde_json::from_value(serde_json::json!({
-            "id": "remote", "name": "Remote", "root": "/local/data", "kind": {"type": "code"},
-            "created_at": "2026-08-24T00:00:00Z", "last_active": "2026-08-24T00:00:00Z"
-        }))?;
+        let timestamp =
+            chrono::DateTime::parse_from_rfc3339("2026-08-24T00:00:00Z")?.with_timezone(&Utc);
+        let mut workspace = Workspace {
+            id: WorkspaceId::from_raw("remote".to_string()),
+            name: "Remote".to_string(),
+            root: PathBuf::from("/local/data"),
+            project_root: None,
+            kind: WorkspaceKind::Code { repo_url: None },
+            metadata: WorkspaceMetadata::new(raw.clone()),
+            product_data_generation: String::new(),
+            created_at: timestamp,
+            last_active: timestamp,
+        };
         workspace.metadata.project_location = raw.clone();
         workspace.metadata.project_execution_location = Some(actual.clone());
         let parsed: Workspace = serde_json::from_slice(&serde_json::to_vec(&workspace)?)?;

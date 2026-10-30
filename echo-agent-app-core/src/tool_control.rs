@@ -59,7 +59,7 @@ pub(crate) fn tool_category(name: &str) -> Option<crate::types::ToolCategory> {
         "tool_search" | "task_create" | "task_update" | "task_list" | "task_execute"
         | "agent_tool" | "agent_spawn" | "agent_list" | "agent_inspect" | "agent_wait"
         | "agent_followup" | "agent_message" | "agent_interrupt" | "agent_resume"
-        | "agent_handoff" | "agent_group" | "ask_user" => Some(TaskCollaboration),
+        | "agent_handoff" | "agent_group" | "human_in_loop" => Some(TaskCollaboration),
         "read_file" | "read_artifact" | "apply_patch" | "grep" | "glob" | "list_dir"
         | "code_search" | "repo_map" | "diff" | "git_status" | "git_diff" | "git_log"
         | "git_blame" | "git_branch" | "git_commit" | "enter_worktree" | "exit_worktree"
@@ -112,15 +112,10 @@ pub(crate) fn tool_category(name: &str) -> Option<crate::types::ToolCategory> {
 pub(crate) fn mcp_tool_sources(
     agent: &echo_agent::agent::ReactAgent,
 ) -> std::collections::HashMap<String, crate::types::ToolSource> {
-    use echo_agent::mcp::{McpServerId, McpServerOwner, McpToolAdapter};
+    use echo_agent::mcp::{McpServerOwner, McpToolAdapter};
     let mut sources = std::collections::HashMap::new();
-    for selector in agent.list_mcp_servers() {
-        let Some(id) = McpServerId::parse_selector(&selector) else {
-            continue;
-        };
-        let Some(client) = agent.mcp_client(&selector) else {
-            continue;
-        };
+    // 原manager快照保留owner；local_name不能重建插件连接身份。
+    for (id, client) in agent.mcp_clients_by_id() {
         let plugin_id = match &id.owner {
             McpServerOwner::Direct => None,
             McpServerOwner::Plugin(plugin) => Some(plugin.clone()),
@@ -315,6 +310,20 @@ mod product_policy_tests {
         assert!(tool_category("mcp__random__shell").is_none());
         assert!(tool_category("new_dynamic_capability").is_none());
         Ok(())
+    }
+
+    #[test]
+    fn registered_human_input_tool_is_optional_task_collaboration() {
+        use echo_agent::tools::Tool;
+
+        let provider = std::sync::Arc::new(echo_agent::human_loop::HumanLoopManager::default());
+        let tool = echo_agent::tools::builtin::human_in_loop::HumanInLoop::new(provider);
+        assert_eq!(
+            tool_category(tool.name()),
+            Some(crate::types::ToolCategory::TaskCollaboration)
+        );
+        assert!(required_tool_reason(tool.name()).is_none());
+        assert!(tool_category("ask_user").is_none());
     }
 
     #[test]

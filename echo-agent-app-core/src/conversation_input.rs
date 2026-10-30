@@ -252,16 +252,15 @@ impl ChannelInputBinding {
                 "invalid persisted channel binding identity".to_string(),
             ));
         }
-        if let FrozenChannelContext::Reference(context) = &self.context {
-            if context.account_id != self.account_id
+        if let FrozenChannelContext::Reference(context) = &self.context
+            && (context.account_id != self.account_id
                 || context.generation != self.credential_generation
                 || context.peer != self.peer_id
-                || context.reference.trim().is_empty()
-            {
-                return Err(ConversationInputError::Validation(
-                    "persisted context reference belongs to another channel identity".to_string(),
-                ));
-            }
+                || context.reference.trim().is_empty())
+        {
+            return Err(ConversationInputError::Validation(
+                "persisted context reference belongs to another channel identity".to_string(),
+            ));
         }
         Ok(())
     }
@@ -469,7 +468,8 @@ pub struct ConversationInputFrontier {
 pub enum ConversationInputFact {
     Persisted {
         identity: ConversationInputIdentity,
-        payload: ConversationInputPayload,
+        // 仅缩小Rust枚举内存布局；serde与TS投影仍保同一payload结构和原事实语义。
+        payload: Box<ConversationInputPayload>,
     },
     AttemptStarted {
         attempt: ConversationInputAttempt,
@@ -693,7 +693,7 @@ impl ConversationInputService {
             .append_conversation_input_fact_expected_queue_revision(
                 ConversationInputFact::Persisted {
                     identity: next_identity,
-                    payload,
+                    payload: Box::new(payload),
                 },
                 expected_queue_revision,
             )

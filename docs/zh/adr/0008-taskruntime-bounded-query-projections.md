@@ -131,3 +131,7 @@ cursor 只记录已经从 journal 完整投影到所有相关 segment 的 source
 ### 持久化排队 Steer 替换
 
 排队 Steer 编辑属于应用层对现有 ConversationInput journal 的消费。替换复用既有 `Persisted` fact，保持 input id，使用下一个 identity revision 和新的 payload hash，并继续校验原队列 revision。投影保留原队列位置和 first sequence。只有没有 active attempt 且仍可派发的输入允许替换；过期或正在执行的 identity 返回类型化校验错误。不新增第二个队列存储或 CRUD 权威。
+
+## 当前只读查询与可选修复（2026-10-30）
+
+completion report 已从原 RunAuthority 取得 journal 校验后的同一 projection，项目绑定校验直接使用同一 projection 携带的原 journal binding；不得为相同校验再次打开带派生写副作用的 run-state reader。当前 checkpoint 与合法 journal 在只读目录中仍可查询，可选派生修复失败继续保留 degraded 诊断；损坏或不连续 journal、异项目 binding、authority closed 与真实耐久性欠账仍按原边界拒绝。此调整不增加旧业务 schema reader、第二 store 或 validator，也不把缺失 checkpoint 当事实权威。测试分别保留当前 schema 冷读、坏 cache 重建、损坏 journal 拒绝和连续查询不重复全量 replay；实际运行资格按精确源码与日志记录。内部查询适配不涉及 examples 或官网公开 API，故无需新增示例或产品宣称。

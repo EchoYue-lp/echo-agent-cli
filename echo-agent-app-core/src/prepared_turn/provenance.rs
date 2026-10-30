@@ -182,7 +182,7 @@ fn input_resource_parts_inner(turn: &PreparedUserTurn) -> anyhow::Result<Vec<Con
         let binding = InputResourceBinding {
             version: 1,
             reference: reference.clone(),
-            source: resource.source.clone(),
+            source: resource.source,
             text_reference,
         };
         let mut meta = serde_json::Map::new();

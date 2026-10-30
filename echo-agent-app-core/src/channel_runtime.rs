@@ -1566,6 +1566,7 @@ fn channel_render_event_stream(
 async fn channel_input_response_stream(
     receiver: input_pump::ChannelInputReplyReceiver,
     tool_executions: Arc<crate::tool_execution::ToolExecutionRepository>,
+    service_cancel: Option<echo_agent::agent::CancellationToken>,
 ) -> futures::stream::BoxStream<
     'static,
     echo_agent::error::Result<echo_agent::channels::OutboundMessage>,
@@ -1583,6 +1584,7 @@ async fn channel_input_response_stream(
         correlation.to,
         correlation.chat_type,
         tool_executions,
+        service_cancel,
     )
     .await
 }
@@ -1604,7 +1606,12 @@ async fn drive_deferred_weixin_reply(
         template,
         client_id_prefix,
     } = deferred;
-    let mut stream = channel_input_response_stream(receiver, tool_executions).await;
+    let mut stream = channel_input_response_stream(
+        receiver,
+        tool_executions,
+        Some(scope.service_cancel.clone()),
+    )
+    .await;
     let mut ordinal = 0_u64;
     let mut sending = true;
     while let Some(item) = stream.next().await {
@@ -2035,7 +2042,7 @@ fn hand_weixin_steer_to_original_owner<T>(
 enum ChannelLiveInputRoute {
     Routed,
     WeixinAcceptedPending,
-    PumpPending(input_pump::ChannelInputReplyRoute),
+    PumpPending(Box<input_pump::ChannelInputReplyRoute>),
 }
 
 #[cfg(feature = "channels")]
@@ -2605,7 +2612,7 @@ impl input_pump::ChannelInputPumpAdapter for ChannelInputPumpAdapter {
                 );
                 match admission {
                     Ok(crate::chat_event_log::WeixinControlAdmission::Execute(lease)) => {
-                        let (observer, receiver) = ControlEffectObserver::new(lease);
+                        let (observer, receiver) = ControlEffectObserver::new(*lease);
                         drop(receiver);
                         Some(observer)
                     }
@@ -3351,11 +3358,11 @@ impl AppChannelMessageHandler {
             .resolve_active_turn(active_surface_id, conv, agent_conv)
             .await?
         else {
-            return Ok(ChannelLiveInputRoute::PumpPending(reply));
+            return Ok(ChannelLiveInputRoute::PumpPending(Box::new(reply)));
         };
         let workspace_id = active.runtime.execution_scope().workspace_id().to_string();
         if submitted.identity.address.workspace_id != workspace_id {
-            return Ok(ChannelLiveInputRoute::PumpPending(reply));
+            return Ok(ChannelLiveInputRoute::PumpPending(Box::new(reply)));
         }
         let snapshots = self
             .foreground_turns
@@ -3363,11 +3370,11 @@ impl AppChannelMessageHandler {
             .map_err(|error| error.to_string())?;
         let Some(snapshot) = channel_snapshot_for_conversation(snapshots, conv)? else {
             Self::clear_active_turn(&self.active_turns, active_surface_id, &active.turn_id);
-            return Ok(ChannelLiveInputRoute::PumpPending(reply));
+            return Ok(ChannelLiveInputRoute::PumpPending(Box::new(reply)));
         };
         if !channel_snapshot_matches_root(&snapshot, &active.turn_id) {
             Self::clear_active_turn(&self.active_turns, active_surface_id, &active.turn_id);
-            return Ok(ChannelLiveInputRoute::PumpPending(reply));
+            return Ok(ChannelLiveInputRoute::PumpPending(Box::new(reply)));
         }
         let active_agent_turn_id = channel_steer_target(&snapshot).to_string();
         let service = self.app_state.conversation_inputs();
@@ -3380,7 +3387,7 @@ impl AppChannelMessageHandler {
             .first()
             .is_none_or(|item| item.receipt.identity != submitted.identity)
         {
-            return Ok(ChannelLiveInputRoute::PumpPending(reply));
+            return Ok(ChannelLiveInputRoute::PumpPending(Box::new(reply)));
         }
         let projection = match service
             .dispatch_selected(
@@ -3391,7 +3398,7 @@ impl AppChannelMessageHandler {
             .await
         {
             Ok(projection) => projection,
-            Err(_) => return Ok(ChannelLiveInputRoute::PumpPending(reply)),
+            Err(_) => return Ok(ChannelLiveInputRoute::PumpPending(Box::new(reply))),
         };
         let attempt = match channel_input_attempt(&projection) {
             Ok(attempt) => attempt,
@@ -3425,7 +3432,7 @@ impl AppChannelMessageHandler {
                     .deferred(attempt, error.to_string())
                     .await
                     .map_err(|settle| settle.to_string())?;
-                return Ok(ChannelLiveInputRoute::PumpPending(reply));
+                return Ok(ChannelLiveInputRoute::PumpPending(Box::new(reply)));
             }
         };
         let flow = match self
@@ -3440,7 +3447,7 @@ impl AppChannelMessageHandler {
                     .deferred(attempt, error.to_string())
                     .await
                     .map_err(|settle| settle.to_string())?;
-                return Ok(ChannelLiveInputRoute::PumpPending(reply));
+                return Ok(ChannelLiveInputRoute::PumpPending(Box::new(reply)));
             }
         };
         let turn = match prepare_channel_turn(
@@ -3467,7 +3474,7 @@ impl AppChannelMessageHandler {
                     .deferred(attempt, error.clone())
                     .await
                     .map_err(|settle| settle.to_string())?;
-                return Ok(ChannelLiveInputRoute::PumpPending(reply));
+                return Ok(ChannelLiveInputRoute::PumpPending(Box::new(reply)));
             }
         };
         let Some(pool) = active.runtime.pool() else {
@@ -3475,7 +3482,7 @@ impl AppChannelMessageHandler {
                 .deferred(attempt, "active workspace has no AgentPool".to_string())
                 .await
                 .map_err(|error| error.to_string())?;
-            return Ok(ChannelLiveInputRoute::PumpPending(reply));
+            return Ok(ChannelLiveInputRoute::PumpPending(Box::new(reply)));
         };
         let execution = match pool.lease_existing(&active.agent_conversation_id).await {
             Ok(Some(execution)) => execution,
@@ -3484,14 +3491,14 @@ impl AppChannelMessageHandler {
                     .deferred(attempt, "active channel Agent is unavailable".to_string())
                     .await
                     .map_err(|error| error.to_string())?;
-                return Ok(ChannelLiveInputRoute::PumpPending(reply));
+                return Ok(ChannelLiveInputRoute::PumpPending(Box::new(reply)));
             }
             Err(error) => {
                 service
                     .deferred(attempt, error.to_string())
                     .await
                     .map_err(|settle| settle.to_string())?;
-                return Ok(ChannelLiveInputRoute::PumpPending(reply));
+                return Ok(ChannelLiveInputRoute::PumpPending(Box::new(reply)));
             }
         };
         let agent = execution.agent();
@@ -3503,7 +3510,7 @@ impl AppChannelMessageHandler {
                     .deferred(attempt, error.to_string())
                     .await
                     .map_err(|settle| settle.to_string())?;
-                return Ok(ChannelLiveInputRoute::PumpPending(reply));
+                return Ok(ChannelLiveInputRoute::PumpPending(Box::new(reply)));
             }
         };
         let (steer_tx, steer_rx) = tokio::sync::oneshot::channel();
@@ -3639,7 +3646,7 @@ impl AppChannelMessageHandler {
                 .deferred(attempt, error.to_string())
                 .await
                 .map_err(|settle| settle.to_string())?;
-            return Ok(ChannelLiveInputRoute::PumpPending(reply));
+            return Ok(ChannelLiveInputRoute::PumpPending(Box::new(reply)));
         }
         if release_weixin_after_handoff {
             match self
@@ -3712,7 +3719,9 @@ impl AppChannelMessageHandler {
                 )?;
                 Ok(ChannelLiveInputRoute::Routed)
             }
-            ConversationInputPhase::Deferred => Ok(ChannelLiveInputRoute::PumpPending(reply)),
+            ConversationInputPhase::Deferred => {
+                Ok(ChannelLiveInputRoute::PumpPending(Box::new(reply)))
+            }
             ConversationInputPhase::RecoveryRequired => {
                 let failure = crate::chat_driver::TurnOutcome::Failed(
                     echo_agent::error::AgentFailure::message(
@@ -5995,6 +6004,7 @@ impl<'a> ChannelHandlerResponse<'a> {
                 correlation.channel_id,
                 correlation.to,
                 correlation.chat_type,
+                None,
             ),
         }
     }
@@ -6529,11 +6539,10 @@ impl AppChannelMessageHandler {
                 settlement.as_ref().is_ok_and(|outcome| matches!(outcome, crate::chat_driver::TurnOutcome::Completed)),
                 "The original extension did not produce both a Settled receipt and completed foreground settlement",
             )).await;
-                let message = match settlement {
+                match settlement {
                     Ok(_) => message,
                     Err(error) => format!("{message}; foreground settlement failed: {error}"),
-                };
-                message
+                }
             };
             if let Some(observer) = control
                 .as_ref()
@@ -6570,7 +6579,7 @@ impl AppChannelMessageHandler {
                 }
             }
             let message = operation(lease).await;
-            return Ok(channel_immediate_response(&msg, message));
+            Ok(channel_immediate_response(&msg, message))
         })
     }
 
@@ -6676,7 +6685,7 @@ impl AppChannelMessageHandler {
             } else {
                 operation.await
             };
-            return Ok(channel_immediate_response(&msg, message));
+            Ok(channel_immediate_response(&msg, message))
         })
     }
 
@@ -6799,12 +6808,12 @@ impl AppChannelMessageHandler {
                         },
                     )
                     .await;
-                    return Ok(channel_immediate_response(
+                    Ok(channel_immediate_response(
                         &msg,
                         value.unwrap_or_else(|error| {
                             format!("Structured extraction serialization failed: {error}")
                         }),
-                    ));
+                    ))
                 }
                 PreparedStructuredExtractionCommand::Validate(schema) => {
                     let value = serde_json::to_value(
@@ -6827,12 +6836,12 @@ impl AppChannelMessageHandler {
                         },
                     )
                     .await;
-                    return Ok(channel_immediate_response(
+                    Ok(channel_immediate_response(
                         &msg,
                         value.unwrap_or_else(|error| {
                             format!("Structured extraction serialization failed: {error}")
                         }),
-                    ));
+                    ))
                 }
                 PreparedStructuredExtractionCommand::Extract(request) => {
                     let runtime = match self.control_runtime().await {
@@ -7043,7 +7052,7 @@ impl AppChannelMessageHandler {
                     let message = result_rx.await.unwrap_or_else(|_| {
                         "Original extraction owner ended without a terminal result.".to_string()
                     });
-                    return Ok(channel_immediate_response(&msg, message));
+                    Ok(channel_immediate_response(&msg, message))
                 }
             }
         })
@@ -7340,7 +7349,7 @@ impl AppChannelMessageHandler {
             let message = result_rx.await.unwrap_or_else(|_| {
                 "Original management owner ended without a terminal result.".to_string()
             });
-            return Ok(channel_immediate_response(&msg, message));
+            Ok(channel_immediate_response(&msg, message))
         })
     }
 
@@ -7496,6 +7505,7 @@ impl AppChannelMessageHandler {
                                 channel_input_response_stream(
                                     reply_receiver,
                                     self.app_state.storage.tool_executions.clone(),
+                                    None,
                                 )
                                 .await,
                             ));
@@ -7503,7 +7513,7 @@ impl AppChannelMessageHandler {
                         Ok(ChannelLiveInputRoute::PumpPending(reply_route)) => {
                             if let Err(error) = self
                                 .input_pump
-                                .register_reply(submitted.identity.clone(), reply_route)
+                                .register_reply(submitted.identity.clone(), *reply_route)
                             {
                                 return Ok(channel_immediate_response(
                                     &msg,
@@ -7531,6 +7541,7 @@ impl AppChannelMessageHandler {
                                 channel_input_response_stream(
                                     reply_receiver,
                                     self.app_state.storage.tool_executions.clone(),
+                                    None,
                                 )
                                 .await,
                             ));
@@ -7571,6 +7582,7 @@ impl AppChannelMessageHandler {
                         channel_input_response_stream(
                             reply_receiver,
                             self.app_state.storage.tool_executions.clone(),
+                            None,
                         )
                         .await,
                     ));
@@ -8067,6 +8079,7 @@ impl AppChannelMessageHandler {
                     to,
                     chat_type,
                     self.app_state.storage.tool_executions.clone(),
+                    None,
                 )
                 .await,
             ))
@@ -8402,7 +8415,7 @@ async fn aggregate_by_sentence<'a>(
             std::env::temp_dir().join(format!("eko-channel-render-test-{}", uuid::Uuid::new_v4())),
         ),
     );
-    aggregate_by_sentence_with_repository(events, channel_id, to, chat_type, repository).await
+    aggregate_by_sentence_with_repository(events, channel_id, to, chat_type, repository, None).await
 }
 
 #[cfg(feature = "channels")]
@@ -8412,6 +8425,7 @@ async fn aggregate_by_sentence_with_repository<'a>(
     to: String,
     chat_type: echo_agent::channels::ChatType,
     tool_executions: Arc<crate::tool_execution::ToolExecutionRepository>,
+    service_cancel: Option<echo_agent::agent::CancellationToken>,
 ) -> futures::stream::BoxStream<'a, echo_agent::error::Result<echo_agent::channels::OutboundMessage>>
 {
     use crate::chat_driver::ChatDriverEvent;
@@ -8958,7 +8972,7 @@ async fn aggregate_by_sentence_with_repository<'a>(
             }
         }
     };
-    channel_outbound_transport(s.boxed(), channel_id, to, chat_type)
+    channel_outbound_transport(s.boxed(), channel_id, to, chat_type, service_cancel)
 }
 
 #[cfg(test)]
@@ -9329,8 +9343,11 @@ mod tests {
                     publisher,
                 )
                 .await?;
-            let bootstrap =
-                tokio::time::timeout(std::time::Duration::from_secs(2), receipt).await??;
+            let bootstrap = tokio::time::timeout(std::time::Duration::from_secs(2), receipt)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("durable fixture original bootstrap receipt deadline: {error}")
+                })??;
             if bootstrap != echo_agent::channels::ChannelIngressDisposition::TerminalRejected {
                 sessions.close().await?;
                 return Err(anyhow::anyhow!("空初始化消息没有按真实入口拒绝"));
@@ -9396,10 +9413,23 @@ mod tests {
             if let Err(error) =
                 tokio::time::timeout(std::time::Duration::from_secs(3), llm.wait_started()).await
             {
+                let source_started = llm.started.load(std::sync::atomic::Ordering::Acquire);
+                let model_calls = llm.calls.load(std::sync::atomic::Ordering::Acquire);
+                let driver_finished = root.is_finished();
+                let foreground_present = foreground
+                    .snapshot_scoped(
+                        runtime.execution_scope().workspace_id(),
+                        surface,
+                        &conversation,
+                    )
+                    .is_some();
+                let run_active = store.is_run_active(&run_id);
                 cancel.cancel();
-                let _ = root.await;
-                let _ = sessions.close().await;
-                return Err(anyhow::anyhow!(error));
+                let original_outcome = root.await;
+                let original_close = sessions.close().await;
+                return Err(anyhow::anyhow!(
+                    "durable fixture original model-start deadline: {error}; started={source_started}; calls={model_calls}; driver_finished={driver_finished}; foreground_present={foreground_present}; run_active={run_active}; root={original_outcome:?}; close={original_close:?}"
+                ));
             }
             if surface == crate::foreground_turn::ForegroundTurnSurface::Channel {
                 let surface_id =
@@ -10113,9 +10143,22 @@ mod tests {
                 )
                 .is_some()
         );
-        lease
-            .settle_after_observers(crate::chat_driver::TurnOutcome::Cancelled)
-            .await?;
+        assert!(matches!(
+            lease
+                .settle_after_observers(crate::chat_driver::TurnOutcome::Cancelled)
+                .await,
+            Err(crate::foreground_turn::ForegroundTurnError::DriverSettlement(_))
+        ));
+        assert!(
+            fixture
+                .foreground
+                .snapshot_scoped(
+                    fixture.runtime.execution_scope().workspace_id(),
+                    crate::foreground_turn::ForegroundTurnSurface::Channel,
+                    &fixture.conversation,
+                )
+                .is_some()
+        );
         let reopened = fixture.reopen().await?;
         assert_eq!(
             reopened
@@ -10591,6 +10634,31 @@ mod tests {
                 )),
                 crate::product_data_io::ProductDataIoService::new(),
             )?;
+            let resource_scope =
+                crate::runtime::ApplicationLifecycleRetention::resource_scope_for_test();
+            state.tasks.runtime = Some(Arc::new(
+                crate::tasks::task_runtime::TaskRuntimeStore::open_for_workspace(
+                    temporary.path().join("tasks"),
+                    "global",
+                )?,
+            ));
+            state.workspace.global_execution_root = temporary.path().join("product-data");
+            std::fs::create_dir_all(&state.workspace.global_execution_root)?;
+            state
+                .tasks
+                .runtime
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("fixture store missing"))?
+                .bind_lifecycle_retention(&resource_scope);
+            pool.bind_lifecycle_retention(&resource_scope);
+            state
+                .workspace
+                .runtimes
+                .bind_lifecycle_retention(&resource_scope);
+            state
+                .session
+                .foreground_turns
+                .bind_lifecycle_retention(&resource_scope);
             state.set_pool(pool);
             state.storage.chat_events = Arc::new(crate::chat_event_log::ChatEventLog::open(
                 temporary.path().join("events"),
@@ -10615,6 +10683,7 @@ mod tests {
                 .delivery_handle()
                 .ok_or_else(|| anyhow::anyhow!("original sender unavailable"))?;
             let coordinator = Arc::new(super::ChannelSessionCoordinator::new());
+            coordinator.bind_lifecycle_retention(Arc::downgrade(&resource_scope));
             let factory_coordinator = coordinator.clone();
             let factory_state = state.clone();
             let sessions = SessionHandler::new(
@@ -10706,7 +10775,7 @@ mod tests {
         };
         use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
         let temporary = tempfile::tempdir()?;
-        let llm = Arc::new(ChannelCancellationBarrierLlmClient::new());
+        let llm = Arc::new(ChannelCancellationBarrierLlmClient::after_intent_router());
         let primary = echo_agent::agent::AgentHandle::new(
             echo_agent::agent::ReactAgentBuilder::new()
                 .model("channel-cancellation-barrier")
@@ -10730,6 +10799,31 @@ mod tests {
             )),
             crate::product_data_io::ProductDataIoService::new(),
         )?;
+        let resource_scope =
+            crate::runtime::ApplicationLifecycleRetention::resource_scope_for_test();
+        state.tasks.runtime = Some(Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::open_for_workspace(
+                temporary.path().join("tasks"),
+                "global",
+            )?,
+        ));
+        state.workspace.global_execution_root = temporary.path().join("product-data");
+        std::fs::create_dir_all(&state.workspace.global_execution_root)?;
+        state
+            .tasks
+            .runtime
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("fixture store missing"))?
+            .bind_lifecycle_retention(&resource_scope);
+        pool.bind_lifecycle_retention(&resource_scope);
+        state
+            .workspace
+            .runtimes
+            .bind_lifecycle_retention(&resource_scope);
+        state
+            .session
+            .foreground_turns
+            .bind_lifecycle_retention(&resource_scope);
         state.set_pool(pool);
         state.storage.chat_events = Arc::new(crate::chat_event_log::ChatEventLog::open(
             temporary.path().join("chat-events"),
@@ -10753,7 +10847,9 @@ mod tests {
             .delivery_handle()
             .ok_or_else(|| anyhow::anyhow!("original delivery handle missing"))?;
         let foreground = crate::foreground_turn::ForegroundTurnControl::default();
+        foreground.bind_lifecycle_retention(&resource_scope);
         let coordinator = Arc::new(super::ChannelSessionCoordinator::new());
+        coordinator.bind_lifecycle_retention(Arc::downgrade(&resource_scope));
         let captured = Arc::new(std::sync::Mutex::new(None));
         let factory_captured = captured.clone();
         let factory_state = state.clone();
@@ -10802,7 +10898,20 @@ mod tests {
         assert_eq!(receipt.await?, ChannelIngressDisposition::DurableInput);
         // The real original pump drives a real pooled AgentHandle. The only
         // substituted boundary is LLM output, held until its actual cancel token.
-        tokio::time::timeout(std::time::Duration::from_secs(5), llm.wait_started()).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), llm.wait_started())
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "24-steer main-stream start deadline: {error}; routing={}, main={}",
+                    llm.routing_calls.load(std::sync::atomic::Ordering::Acquire),
+                    llm.calls.load(std::sync::atomic::Ordering::Acquire)
+                )
+            })?;
+        eprintln!(
+            "CHANNEL24_PHASE:original-main-stream-started routing={} main={}",
+            llm.routing_calls.load(std::sync::atomic::Ordering::Acquire),
+            llm.calls.load(std::sync::atomic::Ordering::Acquire)
+        );
         let handler = captured
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -10821,8 +10930,10 @@ mod tests {
                 ))
                 .await
         });
-        let prompt =
-            tokio::time::timeout(std::time::Duration::from_secs(2), prompts.recv()).await??;
+        let prompt = tokio::time::timeout(std::time::Duration::from_secs(2), prompts.recv())
+            .await
+            .map_err(|error| anyhow::anyhow!("24-steer HITL prompt deadline: {error}"))??;
+        eprintln!("CHANNEL24_PHASE:original-hitl-prompt");
         let response_target = prompt
             .split("Use /reply ")
             .nth(1)
@@ -10889,7 +11000,9 @@ mod tests {
                     tokio::task::yield_now().await;
                 }
             })
-            .await??;
+            .await.map_err(|error| anyhow::anyhow!("24-steer original mailbox acceptance deadline: {error}; routing={}, main={}",
+                llm.routing_calls.load(std::sync::atomic::Ordering::Acquire), llm.calls.load(std::sync::atomic::Ordering::Acquire)))??;
+        eprintln!("CHANNEL24_PHASE:all-24-durable-original-mailbox-accepted");
         seed_absent_weixin_context(
             protocol_store.as_ref(),
             "generation",
@@ -10935,13 +11048,19 @@ mod tests {
             )?
             .wait()
             .await?;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            coordinator.join_input_pumps(),
-        )
-        .await?
-        .map_err(anyhow::Error::msg)?;
-        sessions.close().await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            // The original SessionHandler owns durable service cancellation and stream retirement.
+            // Close that admission before observing the coordinator's original pump EOF.
+            sessions.close().await?;
+            coordinator
+                .join_input_pumps()
+                .await
+                .map_err(anyhow::Error::msg)
+        })
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("24-steer original session close/pump join deadline: {error}")
+        })??;
         let after = state.conversation_inputs().list(&address).await?;
         let original_tracked = after
             .items
@@ -11318,6 +11437,8 @@ mod tests {
     #[cfg(feature = "channels")]
     struct ChannelCancellationBarrierLlmClient {
         calls: std::sync::atomic::AtomicUsize,
+        routing_calls: std::sync::atomic::AtomicUsize,
+        complete_intent_classification: bool,
         started: std::sync::atomic::AtomicBool,
         started_notify: tokio::sync::Notify,
     }
@@ -11327,16 +11448,34 @@ mod tests {
         fn new() -> Self {
             Self {
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                routing_calls: std::sync::atomic::AtomicUsize::new(0),
+                complete_intent_classification: false,
                 started: std::sync::atomic::AtomicBool::new(false),
                 started_notify: tokio::sync::Notify::new(),
             }
         }
 
-        async fn wait_started(&self) {
-            if self.started.load(std::sync::atomic::Ordering::Acquire) {
-                return;
+        fn after_intent_router() -> Self {
+            Self {
+                complete_intent_classification: true,
+                ..Self::new()
             }
-            self.started_notify.notified().await;
+        }
+
+        async fn wait_started(&self) {
+            if self.complete_intent_classification {
+                let notified = self.started_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if !self.started.load(std::sync::atomic::Ordering::Acquire) {
+                    notified.await;
+                }
+            } else {
+                if self.started.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                self.started_notify.notified().await;
+            }
         }
 
         async fn wait_for_cancel(
@@ -11369,9 +11508,33 @@ mod tests {
         ) -> futures::future::BoxFuture<'_, echo_agent::error::Result<echo_agent::llm::ChatResponse>>
         {
             Box::pin(async move {
-                self.wait_for_cancel(&request).await?;
+                if !self.complete_intent_classification {
+                    self.wait_for_cancel(&request).await?;
+                    return Err(echo_agent::error::ReactError::Other(
+                        "channel cancellation barrier returned unexpectedly".to_string(),
+                    ));
+                }
+                // Only the 24-steer fixture completes intent before parking its original ReAct stream.
+                let classifier = request.messages.len() == 1
+                    && request.messages.first().is_some_and(|message| {
+                        message.role == echo_agent::llm::types::Role::User
+                            && message.text_content().is_some_and(|text| {
+                                text.starts_with(
+                                    "You are an intent classifier for an AI agent system.",
+                                )
+                            })
+                    });
+                if classifier {
+                    self.routing_calls
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    return echo_agent::testing::MockLlmClient::new()
+                        .with_response(r#"{"intent":"FALLBACK","skill":null,"confidence":1.0}"#)
+                        .chat(request)
+                        .await;
+                }
                 Err(echo_agent::error::ReactError::Other(
-                    "channel cancellation barrier returned unexpectedly".to_string(),
+                    "unexpected non-classifier chat request before the held original stream closes"
+                        .to_string(),
                 ))
             })
         }
@@ -11505,7 +11668,8 @@ mod tests {
             (other_product_id, other_runtime_id),
         ] {
             let mut checkpoint = AgentCheckpoint::new(runtime_id);
-            checkpoint.messages_json = "[]".to_string();
+            checkpoint.messages_json = AgentCheckpoint::serialize_payload(Vec::new(), None)
+                .map_err(|error| error.to_string())?;
             runtime_state
                 .save_checkpoint_for_scope(scope_id, &checkpoint)
                 .await
@@ -15069,6 +15233,7 @@ mod tests {
                 "u1".to_string(),
                 ChatType::Direct,
                 repository,
+                None,
             )
             .await;
             let joined = collect_texts(output).await.join("\n");
@@ -15401,6 +15566,7 @@ mod tests {
                 "qq".to_string(),
                 "u1".to_string(),
                 ChatType::Direct,
+                None,
             ))
             .await;
             let joined = texts.join("\n");

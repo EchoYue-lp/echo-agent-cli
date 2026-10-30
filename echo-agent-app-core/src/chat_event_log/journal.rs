@@ -1117,7 +1117,7 @@ impl ChatEventLog {
                     &input_id,
                     ChatDriverEvent::InputLifecycle(Box::new(ConversationInputFact::Persisted {
                         identity,
-                        payload,
+                        payload: Box::new(payload),
                     })),
                 )?;
                 authority
@@ -1899,8 +1899,7 @@ impl ChatEventLog {
             identity: next,
             payload,
         } = fact
-        {
-            if next.input_id == current.receipt.identity.input_id
+            && next.input_id == current.receipt.identity.input_id
                 && next.address == current.receipt.identity.address
                 && next.revision == current.receipt.identity.revision.saturating_add(1)
                 && next.payload_sha256 == payload.payload_sha256
@@ -1911,9 +1910,8 @@ impl ChatEventLog {
                 && payload.channel_binding.is_none()
                 && current.receipt.is_dispatchable()
                 && current.active_attempt.is_none()
-            {
-                return Ok(());
-            }
+        {
+            return Ok(());
         }
         if current.receipt.identity != *identity {
             return Err(ConversationInputError::StaleRevision {
@@ -2679,7 +2677,7 @@ impl EventJournal<WeixinControlEvent> for WeixinControlJournal<'_> {
 
 #[cfg(any(test, feature = "channels"))]
 pub(crate) enum WeixinControlAdmission {
-    Execute(WeixinControlLease),
+    Execute(Box<WeixinControlLease>),
     Handled,
     TerminalRejected,
     RecoveryRequired,
@@ -2918,14 +2916,16 @@ impl ChatEventLog {
             Ok(claim) => {
                 authority.weixin_control_active = true;
                 drop(guard);
-                Ok(WeixinControlAdmission::Execute(WeixinControlLease {
-                    cached,
-                    workspace: workspace.to_string(),
-                    conversation: conversation.to_string(),
-                    root: root.to_string(),
-                    stream,
-                    claim,
-                }))
+                Ok(WeixinControlAdmission::Execute(Box::new(
+                    WeixinControlLease {
+                        cached,
+                        workspace: workspace.to_string(),
+                        conversation: conversation.to_string(),
+                        root: root.to_string(),
+                        stream,
+                        claim,
+                    },
+                )))
             }
         }
     }

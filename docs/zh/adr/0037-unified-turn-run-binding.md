@@ -115,6 +115,14 @@ ZCode 普通 Bot callback
    普通Steer由主模型结合历史理解，不为旧Plan14建立独立语义Applied或持续要求状态机。
    完整原文恢复沿下文的同journal来源族与Plan15验收，不自动改Goal、计划或验收。
 
+本轮 Clippy 布局修复将 Rust 的 `ConversationInputFact::Persisted.payload` 改为
+`Box<ConversationInputPayload>`，并间接存放原微信 control lease 与待回填 channel route；
+只改变枚举的内存布局和对应 Rust 构造签名。Serde／TS／journal 继续使用原字段、phase、
+身份和完整 payload 值，不新增恢复状态、queue owner 或序列化 wrapper；lease／route 在原
+消费边界解包，仍由同一物理 owner 完成或 Drop。新 Rust 签名的编译资格与原值的 journal
+往返、隔离 TS 导出及完整消费者测试分别核验，不能沿旧输入绿色结果自动授予。本产品
+内部载荷没有 examples 构造或官网 API 承诺，不新增平行示例或对外能力说明。
+
 ## 取舍
 
 - **代价**:每轮对话产生一个 run 目录(events.jsonl 等),事件量与文件数增长;

@@ -327,7 +327,7 @@ export const MessageBubble = memo(function MessageBubble({
         {isUser && message.content && (
           <div className="group/msg relative w-full">
             {!editing && (
-              <div className="absolute -top-3 right-0 z-10 flex gap-0.5 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] px-1 py-0.5 opacity-0 shadow-[var(--shadow-md)] transition-all duration-200 group-hover/msg:opacity-100 group-hover/msg:-translate-y-0.5">
+              <div className="absolute -top-3 right-0 z-10 flex gap-0.5 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] px-1 py-0.5 opacity-0 shadow-[var(--shadow-md)] transition-all duration-200 group-hover/msg:opacity-100 group-focus-within/msg:opacity-100 group-hover/msg:-translate-y-0.5">
                 <ActionButton
                   icon={<Copy size={13} />}
                   label="复制"

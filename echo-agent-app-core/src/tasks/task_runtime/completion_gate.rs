@@ -99,7 +99,9 @@ impl TaskRuntimeStore {
             .completion_gate_projection(run_id)?
             .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
         let run = projection.run.clone();
-        self.validate_run_project_binding(run_id)?;
+        // This run already belongs to the journal-validated authority projection.
+        // Reopening a derived snapshot here would make optional repair a read prerequisite.
+        self.validate_project_binding(projection.project_binding.as_ref())?;
         let Some(plan) = projection.plan.clone() else {
             return Ok(CompletionGateReport {
                 run_id: run_id.to_string(),

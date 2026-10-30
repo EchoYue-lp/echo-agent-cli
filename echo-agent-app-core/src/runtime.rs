@@ -2634,6 +2634,11 @@ mod tests {
             WorkspaceKind::General,
             temp.path().join("workspace"),
         )?;
+        std::fs::create_dir(workspace.root.join(".git"))?;
+        assert_eq!(
+            crate::utils::find_project_root(&workspace.root).as_ref(),
+            Some(&workspace.root)
+        );
         let state_dir = WorkspaceLayout::state_dir(&workspace.root);
         let receipts = ReviewReceiptStore::open(&state_dir).map_err(anyhow::Error::msg)?;
         receipts
@@ -2677,8 +2682,9 @@ mod tests {
             Some(ReviewTerminal::Interrupted { .. })
         ));
 
-        let global_cwd = temp.path().join("outside-project");
-        std::fs::create_dir_all(&global_cwd)?;
+        // Only cwd is an existing project-free volume root. All writable fixtures remain owned here.
+        let global_cwd = std::path::PathBuf::from("/");
+        assert!(crate::utils::find_project_root(&global_cwd).is_none());
         let global_root = temp.path().join("global-data");
         let receipts = ReviewReceiptStore::open(&global_root).map_err(anyhow::Error::msg)?;
         receipts
@@ -2726,6 +2732,23 @@ mod tests {
         let Some(fixture_dir) = std::env::var_os("EKO_BOOTSTRAP_WORKSPACE_FIXTURE") else {
             return Ok(());
         };
+        let cwd = std::env::current_dir()?;
+        let resolved = crate::infra::resolve_memory_store_paths(None);
+        if crate::utils::find_project_root(&cwd).is_none() {
+            assert_eq!(resolved, crate::infra::global_memory_paths());
+            assert_eq!(
+                resolved.1,
+                PathBuf::from(
+                    std::env::var_os("EKO_DATA_DIR")
+                        .ok_or_else(|| anyhow::anyhow!("owned global fixture root missing"))?
+                )
+            );
+        } else {
+            assert_eq!(
+                resolved.1,
+                crate::workspace::layout::WorkspaceLayout::state_dir(&cwd)
+            );
+        }
         let runtime = bootstrap_review_fixture(None, &PathBuf::from(fixture_dir)).await?;
         runtime
             .lifecycle_owner(tokio_util::sync::CancellationToken::new())?

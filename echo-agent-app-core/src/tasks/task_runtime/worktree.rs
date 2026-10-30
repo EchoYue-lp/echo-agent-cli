@@ -2812,15 +2812,51 @@ mod tests {
     }
 
     #[test]
-    fn eko_worktree_factory_create_fails_outside_git_repo() {
-        // Sprint 8: EkoWorktreeFactory implements the framework trait; on a
-        // non-git directory, create() must surface an error (RunWorktree::create_fork
-        // → git rev-parse fails). This guards the trait wiring without needing
-        // a real git repo (which CI/sandbox may not have).
-        let tmp = std::env::temp_dir();
-        let factory = EkoWorktreeFactory::new(tmp.clone());
-        let res = factory.isolate("writer-run1");
-        assert!(res.is_err(), "expected error outside a git repo");
+    fn eko_worktree_factory_create_fails_outside_git_repo() -> Result<(), String> {
+        const NAME: &str = "tasks::task_runtime::worktree::tests::eko_worktree_factory_create_fails_outside_git_repo";
+        let Some(nonrepo) = std::env::var_os("EKO_WORKTREE_NONREPO_FIXTURE") else {
+            let fixture = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let nonrepo = fixture.path().join("nonrepo");
+            std::fs::create_dir(&nonrepo).map_err(|error| error.to_string())?;
+            let output = std::process::Command::new(
+                std::env::current_exe().map_err(|error| error.to_string())?,
+            )
+            .args(["--exact", NAME, "--nocapture"])
+            .env("EKO_WORKTREE_NONREPO_FIXTURE", &nonrepo)
+            .env("GIT_CEILING_DIRECTORIES", fixture.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .map_err(|error| error.to_string())?;
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        };
+        let nonrepo = std::path::PathBuf::from(nonrepo);
+        let git = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&nonrepo)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .map_err(|error| error.to_string())?;
+        assert!(!git.status.success());
+        assert!(String::from_utf8_lossy(&git.stderr).contains("not a git repository"));
+        let factory = EkoWorktreeFactory::new(nonrepo.clone());
+        assert!(
+            factory.isolate("writer-run1").is_err(),
+            "expected error outside a git repo"
+        );
+        assert!(
+            std::fs::read_dir(&nonrepo)
+                .map_err(|error| error.to_string())?
+                .next()
+                .is_none()
+        );
+        Ok(())
     }
 
     #[test]

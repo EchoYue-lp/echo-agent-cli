@@ -515,6 +515,8 @@ mod tests {
         let root = temp.path();
         let eko = root.join(".eko");
         std::fs::create_dir_all(&eko)?;
+        std::fs::create_dir(root.join(".git"))?;
+        assert_eq!(crate::utils::find_project_root(root).as_deref(), Some(root));
         std::fs::write(eko.join(LEARNED_RULES_FILE), "RULE_BODY")?;
 
         let provider = InstructionProvider::load_for(Some(root));

@@ -140,8 +140,8 @@ fn current_tool_profiles_reject_legacy_extra_missing_and_reordered_fixtures()
 
 fn payload(bytes: usize) -> String {
     let unit = "中文🧪\n";
-    let mut text = unit.repeat(bytes / unit.as_bytes().len());
-    text.push_str(&"a".repeat(bytes % unit.as_bytes().len()));
+    let mut text = unit.repeat(bytes / unit.len());
+    text.push_str(&"a".repeat(bytes % unit.len()));
     text
 }
 fn shell_quote(path: &Path) -> String {
@@ -212,7 +212,7 @@ async fn seed_tools(root: &Path) -> harness::HarnessResult {
         ("over", config.threshold_bytes.saturating_mul(2)),
     ] {
         let text = payload(bytes);
-        assert_eq!(text.as_bytes().len(), bytes);
+        assert_eq!(text.len(), bytes);
         std::fs::write(
             root.join("input").join(format!("{group}.txt")),
             text.as_bytes(),
@@ -366,7 +366,7 @@ async fn raw_samples(root: &Path, facts: &Value) -> harness::HarnessResult {
                 index,
                 elapsed,
                 if complete { "success" } else { "preview_only" },
-                json!({"ok":true,"raw_success":result.success,"raw_preview_bytes":result.output.as_bytes().len(),"truncated":result.truncated,
+                json!({"ok":true,"raw_success":result.success,"raw_preview_bytes":result.output.len(),"truncated":result.truncated,
                     "artifact":result.artifact,"scope":"raw registered ToolManager + original shell producer; final policy measured separately"}),
             )?;
         }

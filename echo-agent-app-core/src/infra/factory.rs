@@ -237,6 +237,10 @@ struct SubagentPromptPublication {
     compiler: Arc<dyn SubagentPromptCompiler>,
 }
 
+#[cfg(test)]
+type ForkMemoryStoreObservations =
+    Arc<tokio::sync::Mutex<Vec<(String, std::sync::Weak<dyn echo_agent::memory::Store>)>>>;
+
 /// EKO-owned model consumers attached to one parent agent generation.
 ///
 /// Only subagent definitions with omitted `model` frontmatter are included.
@@ -250,6 +254,9 @@ pub struct AgentModelConsumers {
     prompt_publications: Arc<Vec<SubagentPromptPublication>>,
     prompt_compiler: Arc<dyn SubagentPromptCompiler>,
     disabled_tools_projection: Arc<tokio::sync::RwLock<Option<std::collections::HashSet<String>>>>,
+    // 只弱观察实际 Fork 构建结果，不延长 Agent/Store owner 生命周期。
+    #[cfg(test)]
+    fork_memory_stores: ForkMemoryStoreObservations,
 }
 
 impl AgentModelConsumers {
@@ -406,6 +413,20 @@ impl AgentModelConsumers {
                 }
             });
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn fork_memory_store_for_test(
+        &self,
+        name: &str,
+    ) -> Option<Arc<dyn echo_agent::memory::Store>> {
+        self.fork_memory_stores
+            .lock()
+            .await
+            .iter()
+            .rev()
+            .find(|(role, _)| role == name)
+            .and_then(|(_, store)| store.upgrade())
     }
 
     #[cfg(test)]
@@ -585,6 +606,7 @@ pub async fn create_agent_with_diagnostics(
         params,
         app_config,
         echo_agent::subagent::SubagentEventBus::new(),
+        None,
     )
     .await
 }
@@ -599,6 +621,7 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
     params: &AgentCreateParams,
     app_config: &EkoConfig,
     subagent_event_bus: echo_agent::subagent::SubagentEventBus,
+    memory_store: Option<Arc<dyn echo_agent::memory::Store>>,
 ) -> std::result::Result<CreatedAgent, String> {
     // EKO can boot before the user configures a provider. An explicit selector
     // must still resolve, while an absent selector leaves the Agent detached
@@ -904,22 +927,29 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
         .workspace_data_root
         .as_deref()
         .or(params.working_dir.as_deref());
-    #[cfg(not(test))]
-    let (memory_store_path, _) = resolve_memory_store_paths(memory_workspace_root);
-    #[cfg(not(test))]
-    let subagent_memory_store = create_memory_store_at(&memory_store_path);
-    // Tests without an explicit workspace need no durable side effect. Tests
-    // that exercise workspace persistence pass a TempDir-backed working_dir
-    // and continue to use the real FileStore path inside that owned scope.
-    #[cfg(test)]
-    let subagent_memory_store: Option<Arc<dyn echo_agent::memory::Store>> =
-        match memory_workspace_root {
-            Some(root) => {
-                let (memory_store_path, _) = resolve_memory_store_paths(Some(root));
+    // 池已选定的 generation Store 必须在注册工具、继承实例和 Fork 闭包前进入
+    // 原 builder；不能先捕获临时 Store，再在池里替换父 Agent 的注入通道。
+    let subagent_memory_store = match memory_store {
+        Some(store) => Some(store),
+        None => {
+            #[cfg(not(test))]
+            {
+                let (memory_store_path, _) = resolve_memory_store_paths(memory_workspace_root);
                 create_memory_store_at(&memory_store_path)
             }
-            None => Some(Arc::new(echo_agent::memory::InMemoryStore::new())),
-        };
+            #[cfg(test)]
+            {
+                match memory_workspace_root {
+                    Some(root) => {
+                        let (memory_store_path, _) = resolve_memory_store_paths(Some(root));
+                        create_memory_store_at(&memory_store_path)
+                    }
+                    None => Some(Arc::new(echo_agent::memory::InMemoryStore::new())
+                        as Arc<dyn echo_agent::memory::Store>),
+                }
+            }
+        }
+    };
     if let Some(store) = subagent_memory_store.clone() {
         builder = builder.store(store);
     }
@@ -1356,6 +1386,8 @@ async fn register_default_subagents(
     local_state_dir: Option<std::path::PathBuf>,
     default_cwd: Option<std::path::PathBuf>,
 ) -> AgentModelConsumers {
+    #[cfg(test)]
+    let fork_memory_stores = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let tool_output_artifacts = agent.tool_output_artifacts();
     let local_skill_source = agent.default_skill_source();
     tracing::info!(
@@ -1572,6 +1604,8 @@ async fn register_default_subagents(
                 let factory_tool_output_artifacts = tool_output_artifacts.clone();
                 let factory_prompt_compiler = prompt_compiler.clone();
                 let factory_subagent_registry = subagent_registry.clone();
+                #[cfg(test)]
+                let factory_fork_memory_stores = fork_memory_stores.clone();
                 let factory_memory_store = memory_store.clone();
                 let factory_file_system = file_system.clone();
                 let factory_local_skill_source = local_skill_source.clone();
@@ -1591,6 +1625,8 @@ async fn register_default_subagents(
                         let tool_output_artifacts = factory_tool_output_artifacts.clone();
                         let prompt_compiler = factory_prompt_compiler.clone();
                         let subagent_registry = factory_subagent_registry.clone();
+                        #[cfg(test)]
+                        let fork_memory_stores = factory_fork_memory_stores.clone();
                         let memory_store = factory_memory_store.clone();
                         let file_system = factory_file_system.clone();
                         let local_skill_source = factory_local_skill_source.clone();
@@ -1698,6 +1734,13 @@ async fn register_default_subagents(
                                 &subagent,
                             )
                             .await;
+                            #[cfg(test)]
+                            if let Some(store) = subagent.store() {
+                                fork_memory_stores
+                                    .lock()
+                                    .await
+                                    .push((subagent_def.name.clone(), Arc::downgrade(store)));
+                            }
                             Ok(crate::project::agent_adapter::boxed_project_agent(
                                 crate::agent_handle::AgentHandle::new(subagent),
                                 file_system,
@@ -1794,6 +1837,8 @@ async fn register_default_subagents(
         prompt_publications: Arc::new(prompt_publications),
         prompt_compiler,
         disabled_tools_projection,
+        #[cfg(test)]
+        fork_memory_stores,
     }
 }
 

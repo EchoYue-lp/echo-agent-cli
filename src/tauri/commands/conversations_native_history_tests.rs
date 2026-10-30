@@ -114,7 +114,7 @@ async fn produce_and_reopen_with_unknown_blocks(
         "role":"assistant", "content":"SECRET-DRAFT", "assistant_blocks":raw.clone(),
     }))?;
     let llm = Arc::new(MockLlmClient::new().with_stream_script(vec![
-        StreamChunk::Delta(delta),
+        StreamChunk::Delta(Box::new(delta)),
         StreamChunk::Terminal {
             finish_reason: Some("stop".to_string()),
             usage: None,
@@ -455,6 +455,12 @@ mod resource_chain_acceptance {
             "/tests/support/native_history_gui_baseline.rs"
         ));
     }
+
+    // 同一资源producer的离线GUI回调捕获；不增加产品入口或执行器。
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/tauri/commands/native_timeline_tool_backend_capture.rs"
+    ));
 
     const TOOL: &str = "resource_chain_output";
     const FINAL: &str = "真实执行已完成，原文、上传附件与工具结果保留供后续引用。";
@@ -806,6 +812,7 @@ mod resource_chain_acceptance {
         workspace: String,
         conversation: String,
         root: String,
+        surface: Option<Arc<dyn core::chat_driver::ChatSink>>,
     }
     #[async_trait::async_trait]
     impl EventSink for PublicationSink {
@@ -813,6 +820,14 @@ mod resource_chain_acceptance {
             &self,
             event: echo_agent::agent::EventEnvelope,
         ) -> echo_agent::error::Result<SinkControl> {
+            if let Some(surface) = self.surface.as_ref() {
+                if !surface.on_event(ChatDriverEvent::Agent(Box::new(event))) {
+                    return Err(echo_agent::error::ReactError::Other(
+                        "原GUI journal/tool projection或捕获consumer拒绝事件".into(),
+                    ));
+                }
+                return Ok(SinkControl::Continue);
+            }
             self.log
                 .append_async(
                     self.workspace.clone(),
@@ -1474,6 +1489,27 @@ mod resource_chain_acceptance {
         source_rows: SourceRows,
         model_streaming: bool,
     ) -> anyhow::Result<Seed> {
+        seed_and_close_with_surface_capture(
+            workspace,
+            log_path,
+            conversation,
+            mode,
+            source_rows,
+            model_streaming,
+            None,
+        )
+        .await
+    }
+
+    async fn seed_and_close_with_surface_capture(
+        workspace: &core::workspace::Workspace,
+        log_path: &Path,
+        conversation: &str,
+        mode: NativeFixtureMode,
+        source_rows: SourceRows,
+        model_streaming: bool,
+        capture_renderer: Option<Arc<dyn core::chat_driver::ChatSink>>,
+    ) -> anyhow::Result<Seed> {
         use core::workspace::layout::WorkspaceLayout;
         let artifacts = WorkspaceLayout::artifacts(&workspace.root);
         let raw = format!("{}\n原文完整尾部🙂", "原始用户中文🙂\n".repeat(6000));
@@ -1543,11 +1579,32 @@ mod resource_chain_acceptance {
             builder = builder.guard(Arc::new(TransformOriginalUnknown(guard_calls.clone())));
         }
         let agent = builder.build()?;
+        let surface = if let Some(renderer) = capture_renderer {
+            let tools = Arc::new(core::tool_execution::ToolExecutionRepository::open(
+                workspace.root.join("capture-tool-detail"),
+            )?);
+            tools.register_artifact_config(ToolOutputArtifactConfig::new(
+                &artifacts,
+                "conversation_or_30d",
+            ));
+            Some(core::chat_event_log::bind_surface_chat_sink(
+                core::chat_event_log::ChatSurface::Gui,
+                renderer,
+                log.clone(),
+                tools,
+                workspace.id.to_string(),
+                Some(conversation.into()),
+                turn_id.clone(),
+            ))
+        } else {
+            None
+        };
         let sink = PublicationSink {
             log: log.clone(),
             workspace: workspace.id.to_string(),
             conversation: conversation.into(),
             root: turn_id.clone(),
+            surface,
         };
         let identity =
             EventIdentity::for_chat(Some(conversation.into()), &turn_id, &turn_id, None)?

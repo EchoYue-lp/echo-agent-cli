@@ -111,3 +111,7 @@ SandboxExecutor.execute 继续表示原物理执行的结算 future。command de
 v4 回归定义在同一生产 launch/wait/resource 路径注入自有本机 fixture 进程，覆盖255、缺 status、观察者丢失、真实已知完成与 deadline/cancel 观察。本切片仅定义源码，未执行；它们和旧本机 CAS fixture 都不代表 Rust 编译、集成 ProductDataIO/TaskRun/Cell 路由、真实 SFTP/服务器或自动重连恢复合格。examples 与官网仍由合格项目集成交付同步。
 
 SFTP 错误薄适配把当前请求是否丢失写响应，与整次操作此前已完成的副作用分开。递归删除、逐级建目录保留本次局部的 completed-mutation 标志，原子写在父目录创建后的 metadata 查询也带回此事实。后续只读失败在已有 mutation 时仍为 PartialSideEffect/Possible/VerifyThenRetry，同时不制造未完成写请求的停止义务；没有 mutation 的只读失败保留普通无副作用分类。两份受控本机 fixture 对照仍只是未编译测试定义，不代表真实 SFTP/服务器验收。
+
+## GUI Git 的原目标执行环境（2026-10-30）
+
+用户直接触发的 GUI Git 仅在 Local 位置且原 FileSystem 明确声明 paths_are_native 时使用原生进程捷径。绑定的 Local 映射 namespace 与 SSH 都继续使用同一原 filesystem/executor，避免把目标路径误解释为宿主同名仓库；既有 worktree 算法、物理 owner、部分创建收据、重试与晚到文件保护保持原边界，不新增 Agent 自动权限门控。原 namespace 故障控制覆盖 repo 与其同一夹具内的 sibling target，真实 non-Git 控制仅给自己的 self-reexec child 限定 Git ancestor 发现；不修改全局 Git、进程环境或生产 VCS 优先级。此私有适配不改变终端与 SSH 的公开示例或官网能力说明，不以本地夹具代替真实 SSH 验收。

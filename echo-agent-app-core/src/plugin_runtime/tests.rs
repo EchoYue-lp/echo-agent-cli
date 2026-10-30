@@ -1644,6 +1644,14 @@ mod tests {
         )?;
         let task_root = WorkspaceLayout::tasks(&workspace.root);
         let store = TaskRuntimeStore::open_for_workspace(&task_root, workspace.id.to_string())?;
+        // Capture the same current binding at original admission, never invent it during cold resume.
+        store.bind_project_environment(
+            workspace.id.as_str(),
+            workspace.execution_location(),
+            workspace.metadata.project_root_revision,
+            Arc::new(echo_agent::tools::files::LocalFileSystem),
+            Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox()),
+        )?;
         store.create_run_with_profile(
             "cold-original",
             &workspace.id.to_string(),

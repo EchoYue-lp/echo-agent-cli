@@ -807,7 +807,7 @@ async fn gui_local_git_uses_native_process_but_automatic_git_keeps_project_execu
                 path: fixture.visible_root.clone(),
             },
             1,
-            fixture.files.clone(),
+            Arc::new(LocalFileSystem),
             fixture.executor.clone(),
         )
         .map_err(|error| error.to_string())?;
@@ -837,7 +837,7 @@ async fn gui_local_git_uses_native_process_but_automatic_git_keeps_project_execu
             .lock()
             .map_err(|error| error.to_string())?
             .as_slice(),
-        &[fixture.visible_root.clone()]
+        std::slice::from_ref(&fixture.visible_root)
     );
     Ok(())
 }
@@ -857,7 +857,56 @@ async fn gui_ssh_git_keeps_original_project_executor_without_local_fallback()
             .lock()
             .map_err(|error| error.to_string())?
             .as_slice(),
-        &[fixture.visible_root.clone()]
+        std::slice::from_ref(&fixture.visible_root)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn gui_mapped_local_git_keeps_the_original_project_executor()
+-> std::result::Result<(), String> {
+    let fixture = EnvironmentFixture::new()?;
+    let store = TaskRuntimeStore::open_for_workspace(&fixture.data_root, "workspace")
+        .map_err(|error| error.to_string())?;
+    store
+        .bind_project_environment(
+            "workspace",
+            crate::workspace::ProjectLocation::Local {
+                path: fixture.visible_root.clone(),
+            },
+            1,
+            fixture.files.clone(),
+            fixture.executor.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+    for args in [
+        vec!["init"],
+        vec!["config", "--local", "eko.route-fixture", "target-only"],
+    ] {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&fixture.target_root)
+            .args(args)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+    }
+    let value = store
+        .project_run_git(
+            &fixture.visible_root,
+            &["config", "--local", "--get", "eko.route-fixture"],
+        )
+        .map_err(|error| error.to_string())?;
+    assert_eq!(value.trim(), "target-only");
+    assert_eq!(
+        fixture
+            .calls
+            .lock()
+            .map_err(|error| error.to_string())?
+            .as_slice(),
+        std::slice::from_ref(&fixture.visible_root)
     );
     Ok(())
 }

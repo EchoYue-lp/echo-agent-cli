@@ -2646,26 +2646,27 @@ mod tests {
         );
         assert_eq!(model.call_count(), 2);
         assert_eq!(sender.freeze_calls.load(Ordering::SeqCst), 2);
-        let sends = sender
-            .sends
-            .lock()
-            .map_err(|_| anyhow::anyhow!("send fixture poisoned"))?;
-        assert_eq!(sends.len(), 2);
-        assert_eq!(sends.first().map(|record| &record.0), Some(&original_route));
-        assert!(
-            sends
-                .first()
-                .is_some_and(|record| record.2.contains("original pre-edit answer"))
-        );
-        let newer = sends
-            .get(1)
-            .ok_or_else(|| anyhow::anyhow!("new definition notification absent"))?;
-        assert_eq!(newer.0.definition_id, restored.definition_id);
-        assert_eq!(newer.0.account_id, "new-account");
-        assert_eq!(newer.0.credential_generation, "new-generation");
-        assert_eq!(newer.0.peer_id, "new-peer");
-        assert!(newer.2.contains("original post-edit answer"));
-        drop(sends);
+        {
+            let sends = sender
+                .sends
+                .lock()
+                .map_err(|_| anyhow::anyhow!("send fixture poisoned"))?;
+            assert_eq!(sends.len(), 2);
+            assert_eq!(sends.first().map(|record| &record.0), Some(&original_route));
+            assert!(
+                sends
+                    .first()
+                    .is_some_and(|record| record.2.contains("original pre-edit answer"))
+            );
+            let newer = sends
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("new definition notification absent"))?;
+            assert_eq!(newer.0.definition_id, restored.definition_id);
+            assert_eq!(newer.0.account_id, "new-account");
+            assert_eq!(newer.0.credential_generation, "new-generation");
+            assert_eq!(newer.0.peer_id, "new-peer");
+            assert!(newer.2.contains("original post-edit answer"));
+        }
         reopened.shutdown_run_drivers().await?;
         Ok(())
     }
@@ -2727,7 +2728,7 @@ mod tests {
             reasoning: None,
         };
         let model = Arc::new(MockLlmClient::new().with_stream_script(vec![
-            StreamChunk::Delta(DeltaMessage {
+            StreamChunk::Delta(Box::new(DeltaMessage {
                 role: Some("assistant".into()),
                 provider_response: None,
                 content: None,
@@ -2742,7 +2743,7 @@ mod tests {
                     native(AssistantPhase::FinalAnswer, answer.clone(), 2),
                 ]),
                 tool_calls: None,
-            }),
+            })),
             StreamChunk::Terminal {
                 finish_reason: Some("stop".into()),
                 usage: None,
@@ -2824,32 +2825,33 @@ mod tests {
         fire(invocation).await?;
         assert_eq!(model.call_count(), 1);
         assert_eq!(sender.recorded.freeze_calls.load(Ordering::SeqCst), 1);
-        let sends = sender
-            .recorded
-            .sends
-            .lock()
-            .map_err(|_| anyhow::anyhow!("send observer poisoned"))?;
-        assert_eq!(sends.len(), 1);
-        let (_, sent) = sends
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("original send missing"))?;
-        assert!(sent.contains(&answer));
-        assert!(!sent.contains("private-native-reasoning"));
-        assert_eq!(
-            store
-                .get_run(&identity.run_id())?
-                .ok_or_else(|| anyhow::anyhow!("original TaskRun missing"))?
-                .status,
-            TaskRunStatus::Completed
-        );
-        assert_eq!(
-            store
-                .weixin_notification_status(&identity.run_id())?
-                .ok_or_else(|| anyhow::anyhow!("original notification receipt missing"))?
-                .outcome,
-            Some(echo_agent::delivery::DeliveryOutcome::Completed)
-        );
-        drop(sends);
+        {
+            let sends = sender
+                .recorded
+                .sends
+                .lock()
+                .map_err(|_| anyhow::anyhow!("send observer poisoned"))?;
+            assert_eq!(sends.len(), 1);
+            let (_, sent) = sends
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("original send missing"))?;
+            assert!(sent.contains(&answer));
+            assert!(!sent.contains("private-native-reasoning"));
+            assert_eq!(
+                store
+                    .get_run(&identity.run_id())?
+                    .ok_or_else(|| anyhow::anyhow!("original TaskRun missing"))?
+                    .status,
+                TaskRunStatus::Completed
+            );
+            assert_eq!(
+                store
+                    .weixin_notification_status(&identity.run_id())?
+                    .ok_or_else(|| anyhow::anyhow!("original notification receipt missing"))?
+                    .outcome,
+                Some(echo_agent::delivery::DeliveryOutcome::Completed)
+            );
+        }
         store.shutdown_run_drivers().await?;
         assert_eq!(
             store

@@ -2412,7 +2412,10 @@ mod tests {
             second.workspace().await.metadata.description,
             updated.metadata.description
         );
-        updated.project_root = Some(temp.path().join("project"));
+        let project = temp.path().join("project");
+        updated.project_root = Some(project.clone());
+        updated.metadata.project_location =
+            crate::workspace::ProjectLocation::Local { path: project };
         assert!(registry.get_or_open(updated).await.is_err());
         assert_eq!(
             second.execution_root,

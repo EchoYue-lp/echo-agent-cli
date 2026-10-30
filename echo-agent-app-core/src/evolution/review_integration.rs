@@ -2716,6 +2716,7 @@ mod tests {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let root = temp.path().join("shared-rule-projection");
         std::fs::create_dir_all(root.join(".eko")).map_err(|error| error.to_string())?;
+        std::fs::create_dir(root.join(".git")).map_err(|error| error.to_string())?;
         let root = root.canonicalize().map_err(|error| error.to_string())?;
         let workspace = Workspace {
             id: WorkspaceId::from_name("shared-rule-projection"),
@@ -2817,6 +2818,7 @@ mod tests {
         // rejected before rule files or the source Memory acquire new effects.
         let broken_project = temp.path().join("broken-explicit-project");
         std::fs::create_dir_all(broken_project.join(".eko")).map_err(|error| error.to_string())?;
+        std::fs::create_dir(broken_project.join(".git")).map_err(|error| error.to_string())?;
         std::fs::write(broken_project.join(".eko/project.md"), [0xff])
             .map_err(|error| error.to_string())?;
         let broken_primary = projection_test_agent()?;

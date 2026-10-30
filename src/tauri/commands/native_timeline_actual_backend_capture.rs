@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 const FILE_MARKER: &str = "EKO_NATIVE_TIMELINE_CAPTURE_FILE:";
 const INDEX_MARKER: &str = "EKO_NATIVE_TIMELINE_CAPTURE_INDEX:";
 
-fn write_original<T: serde::Serialize>(
+pub(super) fn write_original<T: serde::Serialize>(
     directory: &Path,
     name: &str,
     value: &T,
@@ -224,6 +224,7 @@ async fn native_unknown_actual_backend_replay_capture() -> anyhow::Result<()> {
             cases.push(capture_case(&directory, count, transform).await?);
         }
     }
+    cases.push(super::resource_chain_acceptance::capture_tool_case(&directory).await?);
     let index = serde_json::json!({
         "schema_version": 1,
         "producer_test": "native_unknown_actual_backend_replay_capture",
@@ -231,6 +232,7 @@ async fn native_unknown_actual_backend_replay_capture() -> anyhow::Result<()> {
         "compiled_source_sha256": {
             "helper": hex::encode(Sha256::digest(include_bytes!("conversations_native_history_tests.rs"))),
             "capture_module": hex::encode(Sha256::digest(include_bytes!("native_timeline_actual_backend_capture.rs"))),
+            "tool_capture": hex::encode(Sha256::digest(include_bytes!("native_timeline_tool_backend_capture.rs"))),
             "get_projection": hex::encode(Sha256::digest(include_bytes!("conversations.rs"))),
             "native_publication_projection": hex::encode(Sha256::digest(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/echo-agent-app-core/src/conversation_projection.rs")))),
         },

@@ -375,3 +375,31 @@ checker采用已审固定five和完整warning集合校验，少项/加项/重复
 原 actual/canonical `.audit.json`、`.audit.stderr`、`.gate.json`、`.caller-run.json`，以及 DB 三个状态快照和实核汇总，均保存在 CLI 仓内 `.echo-semantic/local/eko-appcore-fixture-resume-20261029/fresh-exact5-gates-20261029/`。Root 的独立 raw／gate／输入复核保存在顶层 `.echo-semantic/local/controlled-goal-resume-20261029/root-cli-fresh5-gates-readback.json`。官方自然 1 与精确 gate 0 分列，不用旧 raw 或合同控制测试替代本次 fresh 执行。
 
 本后继事实只覆盖当前精确 consumer／lock／完整五身份和设置。任何后继源码、锁、consumer、身份、advisory、漏洞或 settings 变化仍先拒绝并复核，不给未来来源永久签票，也不向 Framework／SDK 继承；Rust、文档、原生、全矩阵、SDK 来源、main CI、发布与完整 Goal 仍分别验收。此次只追加非 consumer 采用／扫描事实，不重复 Rust／GUI／前端验证。
+
+
+### 2026-10-30 Store owner 修复后精确274输入的绑定维护准备（采用前历史）
+
+原人类本轮裁决“继续保留原六个依赖，完成本次修复和验证（推荐）”及旧六项、退役后五身份严格子集、d027 实际扫描和原失败均保留。Root 在完整当前差异 source-only 复核后，仅批准这个冻结 consumer 的验证绑定维护方向；这不是新的风险接受或未来来源续期。
+
+当前原 collector 对全部274输入两读均为 `78e10e9372eb354e861f6c0ee8944daa8d9f5264360c15035c1883f634596360`。原基准 `a71a7542d1e6b84b78300fa50ca985860b07190f` 的273个 Git blob 可逐项恢复并准确复现 `d027ea4999a8bcbdc8d6262d4cfdd64f4669565135547e2b0e540e0baa01af9e`。完整差异为新增1、修改58、移除0，其中27路径含生产语义，32路径仅测试；Root独立报告逐项复核完整变化集，Critical／Important／Minor 均为0，没有发现新增原GTK/glib、宏或通知D-Bus调用、依赖、feature暴露的具体反例。源码审查不宣称这些上游风险已修复。
+
+实际构建锁仍为 `399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f`／768包。CLI manifest、feature、build和配置未变；原五项name/version/source/checksum/advisory/kind保持，Framework／SDK风险例外不继承。本候选policy仅替换consumer_inputs_sha256，schema、decision路径、lock与accepted五身份以及settings／ignore均不改；本准备阶段的正式policy当时仍绑定旧d027。
+
+本段仅记录候选准备与精确维护边界。原8道Rust门全部实际通过、代码稳定且原collector重新两读仍为上述78e10后，Root再给具体正常预检采用与原工具控制／fresh actual-lock／canonical-origin窗口。此刻未正式采用新policy，未运行或预签fresh scanner／gate。官方scanner自然出口与独立精确gate出口继续分列；新warning、漏洞、yanked、身份、锁、settings或source漂移仍阻断，不增加ignore、不关闭fetch或改官方来源。
+
+证据分别为CLI本批 `risk-current-two-reads-and-exposure.json`（原collector两读、完整旧源恢复、1新增58修改diff与五身份），以及Root `eko-store-factory-dependency-exposure-review-r01.md`（SHA-256 `292f3e4f65afcea54dd28d4aaba5bad30188ce624d450492c256e923e2712114`）。正在执行的工程门与已通过focused12只属于各自精确源码；风险metadata后继即使不改变consumer，也必须有新显式guard和正常门禁，不热写已经冻结的cli-after。任何工程修复改变代码时，先交真实delta复核，不沿当前source票签新hash。完整Rust／前端／原生／mainCI和整体Goal继续分别验收。
+
+
+### 2026-10-30 精确78e10绑定的真实采用与fresh门禁结果
+
+上节“绑定维护准备”明确保留为采用前历史。本节记录后续真实结果，不改原人类“继续保留原六个依赖，完成本次修复和验证（推荐）”、旧d027扫描、原失败或当时source-only审查的验证范围。Root在原8道Rust、3道前端与postSource全部自然退出0、原collector终态后两读仍为78e10／274后，明确授权唯一EKO writer正常预检采用这一个冻结consumer的绑定维护。正式policy的consumer_inputs_sha256现为 `78e10e9372eb354e861f6c0ee8944daa8d9f5264360c15035c1883f634596360`，policy SHA-256为 `703b5bc5e9fd85e637de32ab40d662856bac352eb3470fc7f656d083a893f5e0`；schema、decision路径、lock与accepted五身份、settings和ignore均未改变。
+
+原六方法与缺warning／settings两项负控共8个工具测试实际全部通过。原actual-lock caller于2026-10-30 16:21:10＋08:00启动，原canonical-origin caller于2026-10-30 16:22:29＋08:00启动，两次均采用默认fresh fetch、原官方HTTPS URL及原checker。两次official scanner自然出口均为1，原完整JSON与stderr保留；两个independent exact gate及caller均实际退出0。两报告均零漏洞、4项unmaintained与1项unsound，完整五身份和原settings精确相同。这是当前已接受风险合同的验证资格，不是零warning审计、上游风险修复、新人类风险接受或未来源码续期。
+
+前／间／后source guard核验保持当前274输入两读78e10、实际构建锁 `399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f`／768包及原checker／canonical helper字节。原helper生成独立canonical审计锁SHA-256 `f6f52503a2de104add23c857ebd776eb060ddc18dca49d9ff19fc0f34e9e6b6d`，未覆盖构建锁。DB实际从 `40f5be6fb12ed93fc591bf4ab23b7d793b3f2239`更新到 `ee1a49a2769a24a596afc1c20cb33748d2769586`，报告1386条advisory；tracked文件1400→1405且前／间／后物理blob与mode逐核一致。两次FETCH_HEAD时间均实际推进，原6份未跟踪草稿的字节与mode保持，不清DB、不改来源、不禁fetch、不加ignore或filter。
+
+原8Rust／3frontend资格仍绑定未热改的d826工程快照，正式风险policy与本决定的metadata变化另有显式guard；source-only风险暴露审查没有被改写为当时执行过scanner。当前正常Source与final结果仅为本Task，globalClosure仍not_checked，不授capture、Tauri/App、真实auth／SSH／IM／cron、quiet/native、mainCI或发布资格。源码、consumer、锁、身份、漏洞、warning或settings再变化时原工具仍阻断，必须先交真实delta复核。
+
+此前正常Source于2026-10-30 16:19:30＋08:00退出0、正常final于16:25:40＋08:00退出0，仅覆盖旧决定字节 `2b61a3bd8bda177ca6bad2a9637985de668dda0468f5837f8840ab0451b2595e`；16:27:45＋08:00后准备的时态候选 `5c835ae55353cf2a024bcb3945294403c167a3745c04254e60dd067583b3ddfd` 及本后继新字节不继承这两票，正式采用后须另建metadata-only guard并重新取得Source／final实际结果。
+
+完整原raw／stderr／caller-run／gate、before／between／after DB和source快照、两metadata采用guard及正常Source／final实际收据保存在本仓 `.echo-semantic/local/eko-resume-20261029/store-owner-49d-consumer-epoch-20261030-r03/risk-fresh-78e10-execution-r01/`。本节只追加真实采用与门禁时态，不重跑未受影响的Rust／前端，不以文稿或旧raw替代本次fresh结果。

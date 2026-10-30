@@ -228,11 +228,12 @@ impl Boot {
         hold_before_claim: bool,
         local_channel: LocalChannel,
     ) -> anyhow::Result<Self> {
-        // 原 factory 先调用真实 IntentRouter，再执行回答。两条响应分别供给原
-        // 分类请求和回答请求，避免分类提前耗尽唯一回答而触发无意义的恢复重试。
+        // 原 factory 依次执行真实 IntentRouter、回答与默认 Critic；三类请求
+        // 分别供给合法响应，业务回答与验证请求独立计数，保留仅发送一次的断言。
         let llm = Arc::new(echo_agent::testing::MockLlmClient::new().with_responses([
             r#"{"intent":"FALLBACK","skill":null,"confidence":1.0}"#,
             BUSINESS_REPLY,
+            r#"{"score":9.0,"passed":true,"feedback":"Original durable reply verified","suggestions":[]}"#,
         ]));
         let primary = echo_agent::agent::AgentHandle::new(
             echo_agent::agent::ReactAgentBuilder::new()
@@ -590,15 +591,15 @@ async fn child_entry(local_channel: LocalChannel) -> anyhow::Result<()> {
         }
     })
     .await;
-    if pending.is_err() {
-        if let Ok((inputs, complete)) = boot
+    if pending.is_err()
+        && let Ok((inputs, complete)) = boot
             .state
             .storage
             .chat_events
             .channel_input_bindings()
             .await
-        {
-            let runs = boot.state.tasks.runtime.as_ref().map(|store| {
+    {
+        let runs = boot.state.tasks.runtime.as_ref().map(|store| {
                 inputs.iter().filter_map(|input| input.receipt.turn_id.as_deref()).map(|turn_id| {
                     let run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(turn_id);
                     serde_json::json!({
@@ -609,47 +610,81 @@ async fn child_entry(local_channel: LocalChannel) -> anyhow::Result<()> {
                     })
                 }).collect::<Vec<_>>()
             });
-            eprintln!(
-                "A2_PENDING_DIAGNOSTIC:{}",
-                serde_json::json!({
-                    "inventory_complete": complete,
-                    "inputs": inputs.iter().map(|input| &input.receipt).collect::<Vec<_>>(),
-                    "runs": runs,
-                    "model_calls": boot.llm.call_count(),
-                })
-            );
-        }
+        eprintln!(
+            "A2_PENDING_DIAGNOSTIC:{}",
+            serde_json::json!({
+                "inventory_complete": complete,
+                "inputs": inputs.iter().map(|input| &input.receipt).collect::<Vec<_>>(),
+                "runs": runs,
+                "model_calls": boot.llm.call_count(),
+            })
+        );
     }
     pending??;
     let calls = boot.llm.call_count();
     let requests = boot.llm.all_calls();
     let tool_counts = boot.llm.all_tool_counts();
+    let formats = boot.llm.all_response_formats();
     anyhow::ensure!(
-        requests.len() == calls && tool_counts.len() == calls,
+        requests.len() == calls && tool_counts.len() == calls && formats.len() == calls,
         "模型请求及工具计数记录不完整"
     );
-    let routing_calls = requests
-        .iter()
-        .zip(&tool_counts)
-        .filter(|(messages, tools)| {
-            **tools == 0
-                && messages.len() == 1
-                && messages.first().is_some_and(|message| {
-                    message.role == echo_agent::llm::types::Role::User
-                        && message.content.as_text().is_some_and(|text| {
-                            text.starts_with("You are an intent classifier for an AI agent system.")
-                        })
-                })
-        })
-        .count();
-    let answer_calls = calls.saturating_sub(routing_calls);
+    let mut routing_calls = 0_usize;
+    let mut answer_calls = 0_usize;
+    let mut critique_calls = 0_usize;
+    let mut unknown_calls = 0_usize;
+    let mut request_classes = Vec::new();
+    for ((messages, tools), format) in requests.iter().zip(&tool_counts).zip(&formats) {
+        let routing = *tools == 0
+            && format.is_none()
+            && messages.len() == 1
+            && messages.first().is_some_and(|message| {
+                message.role == echo_agent::llm::types::Role::User
+                    && message.text_content().is_some_and(|text| {
+                        text.starts_with("You are an intent classifier for an AI agent system.")
+                    })
+            });
+        let answer = *tools > 0
+            && format.is_none()
+            && messages.iter().any(|message| {
+                message.role == echo_agent::llm::types::Role::User
+                    && message.text_content().as_deref() == Some("original durable input")
+            });
+        let critique = *tools == 0
+            && matches!(format,
+            Some(echo_agent::llm::ResponseFormat::JsonSchema { json_schema }) if json_schema.name == "critique_output");
+        let class = match (routing, answer, critique) {
+            (true, false, false) => {
+                routing_calls = routing_calls.saturating_add(1);
+                "routing"
+            }
+            (false, true, false) => {
+                answer_calls = answer_calls.saturating_add(1);
+                "answer"
+            }
+            (false, false, true) => {
+                critique_calls = critique_calls.saturating_add(1);
+                "critique"
+            }
+            _ => {
+                unknown_calls = unknown_calls.saturating_add(1);
+                "unknown"
+            }
+        };
+        request_classes.push(class);
+    }
+    let exact_pipeline = routing_calls == expected
+        && answer_calls == expected
+        && critique_calls == expected
+        && unknown_calls == 0
+        && calls == expected.saturating_mul(3);
     let (inputs, complete) = boot
         .state
         .storage
         .chat_events
         .channel_input_bindings()
         .await?;
-    if routing_calls != expected || answer_calls != expected {
+    if !exact_pipeline {
         // 仅记录本 fixture 的身份、类型化结果和少量调用特征；不采集系统提示词、
         // provider 凭据或 context token，以区分路由、压缩与实际回答调用。
         eprintln!(
@@ -659,6 +694,9 @@ async fn child_entry(local_channel: LocalChannel) -> anyhow::Result<()> {
                 "model_calls": calls,
                 "routing_calls": routing_calls,
                 "answer_calls": answer_calls,
+                "critique_calls": critique_calls,
+                "unknown_calls": unknown_calls,
+                "request_classes": request_classes,
                 "inventory_complete": complete,
                 "inputs": inputs.iter().map(|input| &input.receipt).collect::<Vec<_>>(),
                 "request_tool_counts": boot.llm.all_tool_counts(),
@@ -674,8 +712,8 @@ async fn child_entry(local_channel: LocalChannel) -> anyhow::Result<()> {
         );
     }
     anyhow::ensure!(
-        routing_calls == expected && answer_calls == expected,
-        "冷恢复总模型调用 {calls}，分类 {routing_calls}，回答 {answer_calls}；分类及回答各应为 {expected}"
+        exact_pipeline,
+        "冷恢复总模型调用 {calls}，分类 {routing_calls}，回答 {answer_calls}，验证 {critique_calls}，未知 {unknown_calls}；三类各应为 {expected}且无未知请求"
     );
     let current = inputs
         .iter()
@@ -746,7 +784,7 @@ async fn child_entry(local_channel: LocalChannel) -> anyhow::Result<()> {
         );
     }
     emit(
-        serde_json::json!({"phase":phase,"model_calls":calls,"routing_calls":routing_calls,"answer_calls":answer_calls,"inventory_complete":complete,"original_group_failures":failures}),
+        serde_json::json!({"phase":phase,"model_calls":calls,"routing_calls":routing_calls,"answer_calls":answer_calls,"critique_calls":critique_calls,"unknown_calls":unknown_calls,"request_classes":request_classes,"inventory_complete":complete,"original_group_failures":failures}),
     )?;
     Ok(())
 }
@@ -778,6 +816,7 @@ async fn child(
             "--nocapture",
             "--test-threads=1",
         ])
+        .env("EKO_DATA_DIR", root.join("child-user-data"))
         .env("EKO_WEIXIN_A2_ROOT", root)
         .env("EKO_WEIXIN_A2_PHASE", phase)
         .env("EKO_WEIXIN_A2_ACCOUNT", name)

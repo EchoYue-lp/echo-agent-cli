@@ -581,7 +581,7 @@ mod tests {
             let model = Arc::new(
                 MockLlmClient::new()
                     .with_stream_script(vec![
-                        StreamChunk::Delta(delta),
+                        StreamChunk::Delta(Box::new(delta)),
                         StreamChunk::Terminal {
                             finish_reason: Some(
                                 if guarded { "stop" } else { "tool_calls" }.to_string(),

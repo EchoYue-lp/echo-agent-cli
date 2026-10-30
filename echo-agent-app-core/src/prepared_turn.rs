@@ -1831,7 +1831,7 @@ mod tests {
 
     #[test]
     fn reply_fork_resources_remain_readable_after_source_cleanup() -> anyhow::Result<()> {
-        use echo_agent::memory::{StoredMessage, project_message};
+        use echo_agent::memory::project_message;
         let temporary = tempfile::tempdir()?;
         let source_root = temporary.path().join("source/.eko/artifacts");
         let target_root = temporary.path().join("target/.eko/artifacts");
@@ -1896,16 +1896,10 @@ mod tests {
             .context("tool identity missing")?;
         let mut rows = vec![
             user,
-            StoredMessage {
-                id: None,
-                conversation_id: "branch".into(),
-                role: "assistant".into(),
-                content: None,
-                attachments_json: None,
-                tool_calls_json: Some(calls.clone()),
-                tool_result_json: None,
-                created_at: "fixture".into(),
-            },
+            project_message(
+                "branch",
+                &Message::assistant_with_tools(serde_json::from_str(&calls)?),
+            )?,
             tool_row,
         ];
         let receipts =
@@ -2143,18 +2137,21 @@ mod tests {
                 expected_tombstone_epoch: None,
             })
             .await?;
-        let runtime = FileRuntimeStateStore::new(temporary.path().join("runtime"))?;
+        let runtime = Arc::new(FileRuntimeStateStore::new(
+            temporary.path().join("runtime"),
+        )?);
         let agent = crate::agent_handle::AgentHandle::new(
             ReactAgentBuilder::new()
                 .llm_client(Arc::new(echo_agent::testing::MockLlmClient::new()))
                 .system_prompt("current system")
                 .conversation_id("branch")
                 .conversation_store(store.clone())
+                .state_store(runtime.clone())
                 .build()?,
         );
         crate::managed_conversation::replace_and_resume(
             store.as_ref(),
-            &runtime,
+            runtime.as_ref(),
             &agent,
             "branch",
             &rows,
@@ -2365,19 +2362,18 @@ mod agent_communication_source_tests {
         let mut message = turn.to_message()?;
         if let echo_agent::llm::types::MessageContent::Parts(parts) = &mut message.content {
             for part in parts {
-                if let ContentPart::ResourceLink { resource } = part {
-                    if let Some(value) = resource
+                if let ContentPart::ResourceLink { resource } = part
+                    && let Some(value) = resource
                         .meta
                         .as_mut()
                         .and_then(|meta| meta.get_mut("eko_agent_communication"))
-                    {
-                        let text = value
-                            .get_mut("message")
-                            .and_then(|message| message.get_mut("payload"))
-                            .and_then(|payload| payload.get_mut("text"))
-                            .ok_or_else(|| anyhow::anyhow!("typed source text missing"))?;
-                        *text = serde_json::json!("tampered body");
-                    }
+                {
+                    let text = value
+                        .get_mut("message")
+                        .and_then(|message| message.get_mut("payload"))
+                        .and_then(|payload| payload.get_mut("text"))
+                        .ok_or_else(|| anyhow::anyhow!("typed source text missing"))?;
+                    *text = serde_json::json!("tampered body");
                 }
             }
         }

@@ -263,6 +263,25 @@ summary。详见 [ADR 0040](../adr/0040-app-core-subagent-event-projection.md)�
   Gate 使用 checkpoint-backed projection，Artifact/Review 历史使用增量 segment。10k/100k
   release 规模验证仍属于 Final Integration Gate，不能仅凭实现存在宣称已通过。
 
+## AgentPool 与默认 Subagent 的记忆装配
+
+同一应用 generation 已选定的 `Store` 是父 Agent、默认继承实例和默认 Fork 工厂的共同
+记忆 owner。全局池从已启动的主 Agent 提取原 Store；工作区先选定匹配的 Review generation，
+再将该 generation 的 `memory_store()` 交给原池。工作区地址、generation 和原运行收据仍由
+各自 owner 管理，相同 FileStore 文件路径不构成相同 Arc 身份。
+
+池在调用原 `create_agent_with_diagnostics_and_event_bus` 时传入所选 Store，使它先进入
+原 builder，再注册默认 Subagent 和捕获 Fork 闭包。之后从已构建父 Agent 提取的 Store
+同时用于继承实例与每次真实 Fork。不能在工厂返回后只替换父 Agent 的 Store 注入通道，
+因为已经构建的子实例和闭包仍持有原 Store。独立 factory 调用没有传入共享 Store 时，
+继续沿原路径创建本身的 Store，并使用原 fallback；不额外打开第二个共享 Store。
+
+同一个 Store 不代表共享可变对话上下文或执行实例，也不要求为每个默认 Subagent 安装
+同一个完整 layer manager。只读工具范围、TaskRuntime 的 Run／depth／lineage、工作区与
+Fork 隔离继续沿用原限制；本修复不重新注册工具来绕过 Store owner 检查。装配验证需同时
+检查最终父 Agent、继承实例和实际 Fork 工厂的 Store Arc，以及 sentinel 在所选 Store 中的
+读取／写回和跨工作区不串写；创建级检查不替代原 TaskRuntime/Fork 执行和退出结算验证。
+
 ## Background Review 生命周期
 
 GUI与IM把框架惰性 handle 交给 app-core 的 generation-bound owner。owner 在首次 poll 前
@@ -487,3 +506,7 @@ join／settle.wait_final返回后才离开Tokio。GUI terminal／SSH、Agent she
 
 旧src/cli路径对照及tui/cli来源枚举只说明历史。当前没有独立REPL/JSONL产品或新Task CRUD；
 原运行时结算不等于Goal完成，UI、文档或旧focused结果不补造删后构建/锁/native/正式pin资格。
+
+### IM 服务停止后的原投影排空
+
+普通 turn 取消只结束原 turn，继续保留 IM service；真正关闭 service 才取消其原 durable token。已取消的 deferred sender 继续消费原 renderer 与有限事件队列以取得真实 EOF，停止实际发送后不再为这些被抑制的输出等待发送节流。活跃 service 仍按原 burst/interval、脱敏、UTF-8 分块和消息/字节预算发送。该 token 仅沿既有 EKO IM 投影适配传递，不新增执行 owner、队列、通用取消状态机或伪造完成；错误、原 driver 与 JoinSet 仍须实际结算。此内部关闭修复不改变 examples／官网公开 API，不代替真实手机或原生 GUI 验收。

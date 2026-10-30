@@ -298,12 +298,11 @@ impl PreModelContextProjector for TaskRuntimeContextProjector {
                     move |store| {
                         let mut required = Vec::new();
                         let mut visible = visible;
-                        if let Some(goal) = store.canonical_goal_reference(&run_id)? {
-                            if let Some(text) =
+                        if let Some(goal) = store.canonical_goal_reference(&run_id)?
+                            && let Some(text) =
                                 verified_artifact_text(&goal.artifact, &observed_reads)
-                            {
-                                visible.push(text);
-                            }
+                        {
+                            visible.push(text);
                         }
                         for reference in &advertised {
                             if store
@@ -550,18 +549,17 @@ fn observed_artifact_reads(request: &echo_agent::llm::ChatRequest) -> Vec<Observ
         {
             for call in tool_calls {
                 calls.remove(&call.id);
-                if call.function.name == "read_artifact" {
-                    if let Ok(parameters) =
+                if call.function.name == "read_artifact"
+                    && let Ok(parameters) =
                         serde_json::from_str::<serde_json::Value>(&call.function.arguments)
-                    {
-                        calls.insert(
-                            call.id.clone(),
-                            parameters
-                                .get("expected_sha256")
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_string),
-                        );
-                    }
+                {
+                    calls.insert(
+                        call.id.clone(),
+                        parameters
+                            .get("expected_sha256")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                    );
                 }
             }
         }
@@ -585,8 +583,9 @@ fn observed_artifact_reads(request: &echo_agent::llm::ChatRequest) -> Vec<Observ
 fn utf8_segment(text: &str, start: u64, end: u64) -> Option<String> {
     let start = usize::try_from(start).ok()?;
     let end = usize::try_from(end).ok()?;
+    // 原artifact范围是字节坐标；保字节长度和双侧字符边界，实际取文仍沿字符迭代器。
     if start > end
-        || end > text.as_bytes().len()
+        || end > text.len()
         || !text.is_char_boundary(start)
         || !text.is_char_boundary(end)
     {
@@ -644,7 +643,7 @@ fn verified_artifact_text(
         };
         if total != artifact.bytes
             || end > total
-            || end.checked_sub(start) != u64::try_from(body.as_bytes().len()).ok()
+            || end.checked_sub(start) != u64::try_from(body.len()).ok()
         {
             continue;
         }
@@ -3590,9 +3589,9 @@ mod tests {
                     .insert("cursor".to_string(), serde_json::json!(cursor));
             }
             script = script.then_tool_call(
-                &format!("source-page-{ordinal}"),
+                format!("source-page-{ordinal}"),
                 "read_artifact",
-                &parameters.to_string(),
+                parameters.to_string(),
             );
             let page = read_artifact_page(
                 &config,

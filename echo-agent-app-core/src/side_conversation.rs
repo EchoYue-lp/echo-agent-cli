@@ -912,17 +912,21 @@ mod tests {
 
     use crate::agent_router::AgentRouter;
 
-    fn stored(conversation_id: &str, role: &str, content: &str, id: i64) -> StoredMessage {
-        StoredMessage {
-            id: Some(id),
-            conversation_id: conversation_id.to_string(),
-            role: role.to_string(),
-            content: Some(content.to_string()),
-            attachments_json: None,
-            tool_calls_json: None,
-            tool_result_json: None,
-            created_at: echo_agent::utils::time::now_local().to_rfc3339(),
-        }
+    fn stored(
+        conversation_id: &str,
+        role: &str,
+        content: &str,
+        id: i64,
+    ) -> Result<StoredMessage, String> {
+        let message = if role == "user" {
+            echo_agent::llm::types::Message::user(content.to_string())
+        } else {
+            echo_agent::llm::types::Message::assistant(content.to_string())
+        };
+        let mut row = echo_agent::memory::project_message(conversation_id, &message)
+            .map_err(|error| error.to_string())?;
+        row.id = Some(id);
+        Ok(row)
     }
 
     #[tokio::test]
@@ -945,9 +949,9 @@ mod tests {
             .save_messages(
                 "main-conversation",
                 &[
-                    stored("main-conversation", "user", "先分析现状", 1),
-                    stored("main-conversation", "assistant", "现状已分析", 2),
-                    stored("main-conversation", "assistant", "内部协调消息", 3),
+                    stored("main-conversation", "user", "先分析现状", 1)?,
+                    stored("main-conversation", "assistant", "现状已分析", 2)?,
+                    stored("main-conversation", "assistant", "内部协调消息", 3)?,
                 ],
             )
             .await
@@ -1131,19 +1135,19 @@ mod tests {
             "user",
             "内部协调请求",
             3,
-        ));
+        )?);
         messages.push(stored(
             &created.entry.conversation_id,
             "assistant",
             "内部协调结果",
             4,
-        ));
+        )?);
         messages.push(stored(
             &created.entry.conversation_id,
             "user",
             "后续用户消息",
             5,
-        ));
+        )?);
         let authority = store
             .get_projection_authority(&created.entry.conversation_id)
             .await

@@ -12118,6 +12118,95 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn readonly_current_checkpoint_does_not_block_journal_derived_queries() -> Result<(), String> {
+        use echo_agent::state::journal::{CheckpointStore, FileCheckpointStore};
+        use std::os::unix::fs::PermissionsExt;
+
+        let (temp, store, run_id) = seed_public_query_fixture(1_000)?;
+        let run_directory = temp.path().join("tasks").join(&run_id);
+        let checkpoint_path = run_directory.join("checkpoint.json");
+        drop(store);
+        let checkpoints = FileCheckpointStore::<super::super::event_rebuild::EventFoldState>::open(
+            &checkpoint_path,
+        );
+        let current = checkpoints
+            .load()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "query checkpoint is missing".to_string())?;
+        assert!(current.state.has_current_query_projection_schema());
+        // A current checkpoint does not make optional cold projection writes a read prerequisite.
+        let original_permissions = std::fs::metadata(&run_directory)
+            .map_err(|error| error.to_string())?
+            .permissions();
+        let mut readonly = original_permissions.clone();
+        readonly.set_mode(0o555);
+        std::fs::set_permissions(&run_directory, readonly).map_err(|error| error.to_string())?;
+        let query = (|| {
+            let reopened =
+                TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))
+                    .map_err(|error| error.to_string())?;
+            time_public_queries(&reopened, &run_id)?;
+            let first_replays = reopened
+                .shadow
+                .history_fallback_replay_count_for_test(&run_id)
+                .map_err(|error| error.to_string())?;
+            time_public_queries(&reopened, &run_id)?;
+            let second_replays = reopened
+                .shadow
+                .history_fallback_replay_count_for_test(&run_id)
+                .map_err(|error| error.to_string())?;
+            if first_replays != second_replays {
+                return Err("readonly history fallback was replayed on every query".to_string());
+            }
+            Ok(())
+        })();
+        std::fs::set_permissions(&run_directory, original_permissions)
+            .map_err(|error| error.to_string())?;
+        query?;
+        // A current projection must still reject a foreign host's project binding.
+        let foreign = TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))
+            .map_err(|error| error.to_string())?;
+        foreign
+            .bind_project_environment(
+                &foreign.active_workspace_id(),
+                crate::workspace::ProjectLocation::Local {
+                    path: temp
+                        .path()
+                        .canonicalize()
+                        .map_err(|error| error.to_string())?,
+                },
+                1,
+                std::sync::Arc::new(echo_agent::tools::files::LocalFileSystem),
+                std::sync::Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox()),
+            )
+            .map_err(|error| error.to_string())?;
+        let binding_error = foreign
+            .completion_gate_report(&run_id)
+            .err()
+            .ok_or_else(|| {
+                "foreign project binding was accepted by the current completion query".to_string()
+            })?;
+        assert!(
+            binding_error
+                .to_string()
+                .contains("TaskRun project location or revision differs")
+        );
+        drop(foreign);
+        // A read-only cache must never turn a complete corrupt journal record into valid state.
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_directory.join("events.jsonl"))
+            .and_then(|mut file| file.write_all(b"{invalid-current-journal}\n"))
+            .map_err(|error| error.to_string())?;
+        let corrupt = TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))
+            .map_err(|error| error.to_string())?;
+        assert!(corrupt.completion_gate_report(&run_id).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn readonly_legacy_checkpoint_does_not_block_journal_derived_queries() -> Result<(), String> {
         use echo_agent::state::journal::{CheckpointStore, FileCheckpointStore};
         use std::os::unix::fs::PermissionsExt;

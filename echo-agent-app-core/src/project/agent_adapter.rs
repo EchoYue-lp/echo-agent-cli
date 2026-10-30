@@ -314,6 +314,20 @@ mod tests {
                 Ok(futures::stream::empty().boxed())
             })
         }
+        fn execute_stream_message_with_invocation_context<'a>(
+            &'a self,
+            message: Message,
+            cancel: CancellationToken,
+            invocation: AgentInvocationContext,
+        ) -> BoxFuture<'a, Result<BoxStream<'a, Result<AgentEvent>>>> {
+            Box::pin(async move {
+                assert_eq!(message.text_content().as_deref(), Some("read"));
+                assert!(invocation.working_dir.is_some());
+                assert!(!cancel.is_cancelled());
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(futures::stream::empty().boxed())
+            })
+        }
     }
 
     fn fixture(
@@ -350,6 +364,17 @@ mod tests {
         for root in [&host, &checkout] {
             std::fs::create_dir(root)?;
             std::fs::write(root.join("Cargo.toml"), "marker")?;
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .arg("init")
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(crate::utils::find_project_root(root).as_ref(), Some(root));
         }
         std::fs::write(host.join("AGENTS.md"), "LOCAL_HOST_SENTINEL")?;
         std::fs::write(checkout.join("AGENTS.md"), "TARGET_CHECKOUT_SENTINEL")?;

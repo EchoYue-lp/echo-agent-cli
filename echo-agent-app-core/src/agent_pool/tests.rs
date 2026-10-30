@@ -892,7 +892,7 @@ mod tests {
             kind: WorkspaceKind::General,
             metadata: crate::workspace::WorkspaceMetadata::new(
                 crate::workspace::ProjectLocation::Local {
-                    path: workspace_root.clone(),
+                    path: project_root.clone(),
                 },
             ),
             product_data_generation: String::new(),
@@ -1351,6 +1351,257 @@ mod tests {
             future.agent().read(|agent| agent.working_dir()).await,
             Some(root)
         );
+        Ok(())
+    }
+
+    async fn assert_default_subagents_use_selected_pool_store(
+        pool: &AgentPool,
+        conversation: &str,
+        selected: &Arc<dyn echo_agent::memory::Store>,
+        other_scope: &Arc<dyn echo_agent::memory::Store>,
+    ) -> TestResult {
+        let namespace = ["eko-store-owner-contract"];
+        let sentinel = format!("{conversation}-selected");
+        selected
+            .put(&namespace, &sentinel, serde_json::json!(conversation))
+            .await
+            .map_err(|error| error.to_string())?;
+        let lease = pool
+            .acquire(conversation)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (parent_store, registry, manager) = lease
+            .agent()
+            .read(|agent| {
+                (
+                    agent.store().cloned(),
+                    agent.subagent_registry().clone(),
+                    agent.memory_layer_manager().cloned(),
+                )
+            })
+            .await;
+        let parent_store = parent_store.ok_or_else(|| "池父 Agent 没有 Store".to_string())?;
+        assert!(Arc::ptr_eq(&parent_store, selected));
+        let expected_manager = pool
+            .shared
+            .review_integration
+            .as_ref()
+            .ok_or_else(|| "原 Review owner 缺失".to_string())?
+            .lease_generation()
+            .map_err(|error| error.to_string())?
+            .layer_manager()
+            .map_err(|error| error.to_string())?;
+        assert!(
+            manager
+                .as_ref()
+                .is_some_and(|manager| Arc::ptr_eq(manager, &expected_manager))
+        );
+        let consumers = pool
+            .agents
+            .read()
+            .await
+            .get(conversation)
+            .map(|agent| agent.model_consumers.clone())
+            .ok_or_else(|| "实际池 Agent 未发布".to_string())?;
+        for role in ["reviewer", "implementer"] {
+            let inherited = consumers
+                .inherited_handle_for_test(role)
+                .ok_or_else(|| format!("原继承实例缺失: {role}"))?;
+            let inherited_store = inherited
+                .read(|agent| agent.store().cloned())
+                .await
+                .ok_or_else(|| format!("继承实例 Store 缺失: {role}"))?;
+            // 真实 registry→默认 FnAgentFactory；不替换 factory 或注册测试替身。
+            let fork = registry
+                .create_fresh_agent(role)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("原 Fork 工厂缺失: {role}"))?;
+            let fork_store = consumers
+                .fork_memory_store_for_test(role)
+                .await
+                .ok_or_else(|| format!("真实 Fork 没有 Store 观察: {role}"))?;
+            if role == "reviewer" {
+                for write_tool in ["remember", "forget"] {
+                    assert!(!fork.tool_names().iter().any(|name| name == write_tool));
+                    assert!(
+                        !inherited
+                            .read(|agent| agent.tool_names().iter().any(|name| name == write_tool))
+                            .await
+                    );
+                }
+            }
+            for (kind, child_store) in [("inherited", inherited_store), ("fork", fork_store)] {
+                assert!(
+                    Arc::ptr_eq(&child_store, selected),
+                    "{conversation}/{role}/{kind} 未使用所选 generation 的 Store"
+                );
+                let item = child_store
+                    .get(&namespace, &sentinel)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| {
+                        format!("{conversation}/{role}/{kind} 未读到所选 Store sentinel")
+                    })?;
+                assert_eq!(item.value, serde_json::json!(conversation));
+                let key = format!("{conversation}-{role}-{kind}");
+                child_store
+                    .put(&namespace, &key, serde_json::json!(kind))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                assert_eq!(
+                    selected
+                        .get(&namespace, &key)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .map(|item| item.value),
+                    Some(serde_json::json!(kind))
+                );
+                assert!(
+                    other_scope
+                        .get(&namespace, &key)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .is_none()
+                );
+            }
+            drop(fork);
+        }
+        assert!(
+            other_scope
+                .get(&namespace, &sentinel)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
+        drop(lease);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn global_pool_default_inherited_and_real_fork_keep_selected_store_owner() -> TestResult {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(temp.path().join(".git")).map_err(|error| error.to_string())?;
+        let selected = Arc::new(echo_agent::memory::InMemoryStore::new())
+            as Arc<dyn echo_agent::memory::Store>;
+        let other = Arc::new(echo_agent::memory::InMemoryStore::new())
+            as Arc<dyn echo_agent::memory::Store>;
+        let integration = Arc::new(crate::evolution::ReviewIntegration::new_scoped(
+            echo_agent::evolution::ReviewConfig::default(),
+            temp.path().join(".eko"),
+            selected.clone(),
+            "global".to_string(),
+            "global".to_string(),
+        ));
+        let manager = integration
+            .lease_generation()
+            .map_err(|error| error.to_string())?
+            .layer_manager()
+            .map_err(|error| error.to_string())?;
+        let primary = create_test_agent_handle()?;
+        primary
+            .write(|agent| agent.install_memory_layer_manager(manager))
+            .await
+            .map_err(|error| error.to_string())?;
+        let pool =
+            AgentPool::new_for_test(primary, Some(integration), Some(selected.clone()), 3, false)
+                .await;
+        pool.apply_working_dir(Some(temp.path().to_path_buf()))
+            .await;
+        let result = assert_default_subagents_use_selected_pool_store(
+            &pool,
+            "global-memory-owner",
+            &selected,
+            &other,
+        )
+        .await;
+        pool.shutdown().await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn workspace_pool_default_inherited_and_real_forks_keep_scope_store_owner() -> TestResult
+    {
+        let seed = Arc::new(create_test_pool(3, false).await?);
+        seed.update_mcp_config_snapshot(Default::default()).await;
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let registry = crate::workspace::runtime::WorkspaceRuntimeRegistry::new();
+        let mut runtimes = Vec::new();
+        for name in ["memory-owner-workspace-a", "memory-owner-workspace-b"] {
+            let root = temp.path().join(name);
+            std::fs::create_dir_all(root.join(".git")).map_err(|error| error.to_string())?;
+            let now = chrono::Utc::now();
+            let workspace = crate::workspace::Workspace {
+                id: crate::workspace::WorkspaceId::from_name(name),
+                name: name.to_string(),
+                root: root.clone(),
+                project_root: None,
+                kind: WorkspaceKind::General,
+                metadata: crate::workspace::WorkspaceMetadata::new(
+                    crate::workspace::ProjectLocation::Local { path: root },
+                ),
+                product_data_generation: String::new(),
+                created_at: now,
+                last_active: now,
+            };
+            let host = registry
+                .get_or_open(workspace)
+                .await
+                .map_err(|error| error.to_string())?;
+            runtimes.push(
+                host.get_or_open_execution(&seed)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        let first = runtimes
+            .first()
+            .ok_or_else(|| "工作区 A 缺失".to_string())?;
+        let second = runtimes.get(1).ok_or_else(|| "工作区 B 缺失".to_string())?;
+        let first_generation = first
+            .review_integration()
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+        let second_generation = second
+            .review_integration()
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+        let first_store = first_generation.memory_store();
+        let second_store = second_generation.memory_store();
+        assert!(!Arc::ptr_eq(&first_store, &second_store));
+        assert!(!Arc::ptr_eq(
+            &first_generation
+                .layer_manager()
+                .map_err(|error| error.to_string())?,
+            &second_generation
+                .layer_manager()
+                .map_err(|error| error.to_string())?
+        ));
+        for (runtime, selected, other, conversation) in [
+            (
+                first,
+                &first_store,
+                &second_store,
+                "workspace-a-memory-owner",
+            ),
+            (
+                second,
+                &second_store,
+                &first_store,
+                "workspace-b-memory-owner",
+            ),
+        ] {
+            let result = assert_default_subagents_use_selected_pool_store(
+                &runtime.pool(),
+                conversation,
+                selected,
+                other,
+            )
+            .await;
+            runtime.pool().shutdown().await?;
+            result?;
+        }
+        seed.shutdown().await?;
         Ok(())
     }
 

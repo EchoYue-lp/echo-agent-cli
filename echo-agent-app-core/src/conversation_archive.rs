@@ -743,17 +743,19 @@ mod tests {
             (3, "user", instruction, "2026-01-01T00:02:00Z"),
         ]
         .into_iter()
-        .map(|(id, role, content, created_at)| StoredMessage {
-            id: Some(id),
-            conversation_id: "primary".to_string(),
-            role: role.to_string(),
-            content: Some(content.to_string()),
-            attachments_json: None,
-            tool_calls_json: None,
-            tool_result_json: None,
-            created_at: created_at.to_string(),
+        .map(|(id, role, content, created_at)| {
+            let message = if role == "user" {
+                echo_agent::llm::types::Message::user(content.to_string())
+            } else {
+                echo_agent::llm::types::Message::assistant(content.to_string())
+            };
+            let mut row = echo_agent::memory::project_message("primary", &message)
+                .map_err(|error| error.to_string())?;
+            row.id = Some(id);
+            row.created_at = created_at.to_string();
+            Ok(row)
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, String>>()?;
         let cutoff = DateTime::parse_from_rfc3339("2026-01-01T00:01:00Z")
             .map_err(|error| error.to_string())?
             .with_timezone(&Utc);

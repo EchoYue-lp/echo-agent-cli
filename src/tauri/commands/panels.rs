@@ -2125,7 +2125,7 @@ fn remove_worktree_in_control(
     }
     let canonical_repo = control
         .files
-        .canonicalize(&repo_root)
+        .canonicalize(repo_root)
         .map_err(|error| IpcError::Validation(error.to_string()))?;
     let canonical_target = control
         .files
@@ -2138,10 +2138,10 @@ fn remove_worktree_in_control(
     }
     let output = run_git(
         control.store.as_deref(),
-        &repo_root,
+        repo_root,
         &["worktree", "list", "--porcelain", "-z"],
     )?;
-    let known = parse_worktree_list(&output, &repo_root)
+    let known = parse_worktree_list(&output, repo_root)
         .into_iter()
         .find(|worktree| {
             control
@@ -2172,7 +2172,7 @@ fn remove_worktree_in_control(
         }
         run_git(
             control.store.as_deref(),
-            &repo_root,
+            repo_root,
             &["worktree", "unlock", &target_str],
         )?;
     }
@@ -2731,8 +2731,26 @@ mod scoped_control_tests {
 
     #[test]
     fn reply_fork_rejects_unborn_and_non_git_without_creating_a_directory() -> anyhow::Result<()> {
-        let temporary = tempfile::tempdir()?;
-        let repo = temporary.path().join("source");
+        const NAME: &str = "tauri::commands::panels::scoped_control_tests::reply_fork_rejects_unborn_and_non_git_without_creating_a_directory";
+        let Some(directory) = std::env::var_os("EKO_REPLY_FORK_NONREPO_FIXTURE") else {
+            let temporary = tempfile::tempdir()?;
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", NAME, "--nocapture"])
+                .env("EKO_REPLY_FORK_NONREPO_FIXTURE", temporary.path())
+                .env("GIT_CEILING_DIRECTORIES", temporary.path())
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        };
+        let directory = std::path::PathBuf::from(directory);
+        let repo = directory.join("source");
         std::fs::create_dir(&repo)?;
         let control = ScopedWorktreeControl {
             _global: None,
@@ -2743,7 +2761,7 @@ mod scoped_control_tests {
         };
         assert!(git_repo_root(&control).is_err());
         run_git(None, &repo, &["init"])?;
-        let target = temporary.path().join("branch");
+        let target = directory.join("branch");
         assert!(
             create_worktree_in_control(
                 &control,
@@ -2853,7 +2871,9 @@ mod scoped_control_tests {
         )?;
         let repo = repo.canonicalize()?;
         let head = run_git(None, &repo, &["rev-parse", "HEAD"])?;
-        let files = Arc::new(namespaced_files(&repo, &repo));
+        // Both the repo and its sibling target belong to this one original fixture namespace.
+        let namespace = temporary.path().canonicalize()?;
+        let files = Arc::new(namespaced_files(&namespace, &namespace));
         let executor = Arc::new(ReplyForkFaultExecutor {
             inner: ProjectGitExecutor {
                 files: files.clone(),

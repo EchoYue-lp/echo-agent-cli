@@ -1988,7 +1988,7 @@ mod workspace_transition_tests {
     use super::*;
     use echo_agent::agent::ReactAgentBuilder;
     use echo_agent::llm::{ChatChunk, ChatRequest, ChatResponse, LlmClient};
-    use echo_agent::memory::{ConversationStore, FileConversationStore, StoredMessage};
+    use echo_agent::memory::{ConversationStore, FileConversationStore};
     use echo_agent::testing::MockLlmClient;
 
     /// Keep the real streaming turn open until the live delivery owns a mailbox receipt.
@@ -2758,10 +2758,12 @@ mod workspace_transition_tests {
             .map_err(|error| error.to_string())?;
         let primary = ReactAgentBuilder::new()
             .llm_client(Arc::new(MockLlmClient::new().with_responses([
-                "target model preflight",
+                r#"{"intent":"FALLBACK","skill":null,"confidence":1.0}"#,
                 "target answer",
-                "source model preflight",
+                r#"{"score":9.0,"passed":true,"feedback":"Original reply verified","suggestions":[]}"#,
+                r#"{"intent":"FALLBACK","skill":null,"confidence":1.0}"#,
                 "source incorporated reply",
+                r#"{"score":9.0,"passed":true,"feedback":"Original reply verified","suggestions":[]}"#,
             ])))
             .system_prompt("Agent delivery integration test")
             .build()
@@ -2772,10 +2774,12 @@ mod workspace_transition_tests {
         );
         seed_pool
             .set_llm_client_override_for_test(Arc::new(MockLlmClient::new().with_responses([
-                "target model preflight",
+                r#"{"intent":"FALLBACK","skill":null,"confidence":1.0}"#,
                 "target answer",
-                "source model preflight",
+                r#"{"score":9.0,"passed":true,"feedback":"Original reply verified","suggestions":[]}"#,
+                r#"{"intent":"FALLBACK","skill":null,"confidence":1.0}"#,
                 "source incorporated reply",
+                r#"{"score":9.0,"passed":true,"feedback":"Original reply verified","suggestions":[]}"#,
             ])))
             .await;
         let mcp = Arc::new(crate::mcp_config_runtime::McpConfigRuntime::new(
@@ -2972,26 +2976,22 @@ mod workspace_transition_tests {
             .map_err(|error| error.to_string())?;
         let crash_instruction = render_agent_delivery_instruction(&crash_message);
         let created_at = Utc::now().to_rfc3339();
-        transcript.push(StoredMessage {
-            id: None,
-            conversation_id: target.conversation_id.clone(),
-            role: "user".to_string(),
-            content: Some(crash_instruction),
-            attachments_json: None,
-            tool_calls_json: None,
-            tool_result_json: None,
-            created_at: created_at.clone(),
-        });
-        transcript.push(StoredMessage {
-            id: None,
-            conversation_id: target.conversation_id.clone(),
-            role: "assistant".to_string(),
-            content: Some("unowned adjacent assistant text".to_string()),
-            attachments_json: None,
-            tool_calls_json: None,
-            tool_result_json: None,
-            created_at,
-        });
+        let mut crash_input = echo_agent::memory::project_message(
+            &target.conversation_id,
+            &echo_agent::llm::types::Message::user(crash_instruction),
+        )
+        .map_err(|error| error.to_string())?;
+        crash_input.created_at = created_at.clone();
+        let mut adjacent = echo_agent::memory::project_message(
+            &target.conversation_id,
+            &echo_agent::llm::types::Message::assistant(
+                "unowned adjacent assistant text".to_string(),
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        adjacent.created_at = created_at;
+        transcript.push(crash_input);
+        transcript.push(adjacent);
         let additions = transcript.split_off(transcript.len().saturating_sub(2));
         let authority = target_store
             .get_projection_authority(&target.conversation_id)
@@ -3078,13 +3078,30 @@ mod workspace_transition_tests {
         let active_agent = execution.agent();
         let active_model = Arc::new(ParkedReplyClient {
             inner: MockLlmClient::new()
-                .with_responses(["active turn draft", "active turn after steer"]),
+                .with_responses([
+                    r#"{"intent":"FALLBACK","skill":null,"confidence":1.0}"#,
+                    "active turn draft", "active turn after steer",
+                    r#"{"score":9.0,"passed":true,"feedback":"Original live reply verified","suggestions":[]}"#,
+                ]),
             entered: tokio::sync::Notify::new(),
             release: CancellationToken::new(),
         });
         active_agent
             .write(|agent| {
+                assert_eq!(
+                    agent.critic_owner(),
+                    Some(crate::infra::EKO_MODEL_CRITIC_OWNER)
+                );
                 agent.set_llm_client(active_model.clone());
+                // This fixture replaces the original transport while retaining the actual owned verifier.
+                agent.set_owned_critic(
+                    crate::infra::EKO_MODEL_CRITIC_OWNER,
+                    Arc::new(
+                        echo_agent::agent::critic::LlmCritic::new(active_model.clone())
+                            .with_pass_threshold(7.0),
+                    ),
+                );
+                crate::runtime::configure_intent_router(agent);
             })
             .await;
         let spill_dir = crate::prepared_turn::resolve_user_input_spill_dir(Some(
@@ -3198,18 +3215,61 @@ mod workspace_transition_tests {
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())?;
         assert_eq!(active_outcome, crate::chat_driver::TurnOutcome::Completed);
+        let active_calls = active_model.inner.all_calls();
+        println!(
+            "AGENT_DELIVERY_ORIGINAL_LIVE_REQUESTS:{}",
+            serde_json::json!({"calls":active_calls.len(),"formats":active_model.inner.all_response_formats(),"tool_counts":active_model.inner.all_tool_counts(),"remaining":active_model.inner.remaining()})
+        );
+        assert_eq!(active_calls.len(), 4);
+        assert_eq!(active_model.inner.remaining(), 0);
+        assert!(
+            active_calls
+                .first()
+                .is_some_and(|messages| messages.len() == 1
+                    && messages.first().is_some_and(|message| {
+                        message.text_content().is_some_and(|text| {
+                            text.starts_with("You are an intent classifier for an AI agent system.")
+                        })
+                    }))
+        );
+        assert!(
+            active_calls
+                .get(2)
+                .is_some_and(|messages| messages.iter().any(|message| {
+                    message
+                        .text_content()
+                        .is_some_and(|text| text.contains("Steer the active target turn"))
+                })),
+            "the next original model request must consume the live mailbox payload"
+        );
+        assert!(matches!(active_model.inner.all_response_formats().last(),
+            Some(Some(echo_agent::llm::ResponseFormat::JsonSchema { json_schema })) if json_schema.name == "critique_output"));
 
         let busy_execution = runtime
             .agent_for(&target.conversation_id)
             .await
             .map_err(|error| error.to_string())?;
+        let busy_model = Arc::new(MockLlmClient::new().with_responses([
+            r#"{"intent":"FALLBACK","skill":null,"confidence":1.0}"#,
+            "processed after busy turn",
+            r#"{"score":9.0,"passed":true,"feedback":"Original FIFO reply verified","suggestions":[]}"#,
+        ]));
         busy_execution
             .agent()
             .write(|agent| {
-                agent.set_llm_client(Arc::new(
-                    MockLlmClient::new()
-                        .with_responses(["busy turn preflight", "processed after busy turn"]),
-                ));
+                assert_eq!(
+                    agent.critic_owner(),
+                    Some(crate::infra::EKO_MODEL_CRITIC_OWNER)
+                );
+                agent.set_llm_client(busy_model.clone());
+                agent.set_owned_critic(
+                    crate::infra::EKO_MODEL_CRITIC_OWNER,
+                    Arc::new(
+                        echo_agent::agent::critic::LlmCritic::new(busy_model.clone())
+                            .with_pass_threshold(7.0),
+                    ),
+                );
+                crate::runtime::configure_intent_router(agent);
             })
             .await;
         drop(busy_execution);
@@ -3288,6 +3348,15 @@ mod workspace_transition_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         };
         assert!(resumed_record.attempt >= 2);
+        println!(
+            "AGENT_DELIVERY_ORIGINAL_FIFO_REQUESTS:{}",
+            serde_json::json!({"calls":busy_model.call_count(),"formats":busy_model.all_response_formats(),"tool_counts":busy_model.all_tool_counts(),"remaining":busy_model.remaining()})
+        );
+        assert_eq!(busy_model.call_count(), 3);
+        assert_eq!(busy_model.remaining(), 0);
+        assert!(matches!(busy_model.all_response_formats().last(),
+            Some(Some(echo_agent::llm::ResponseFormat::JsonSchema { json_schema })) if json_schema.name == "critique_output"));
+
         state
             .shutdown_agent_deliveries()
             .await
@@ -4278,17 +4347,16 @@ mod workspace_transition_tests {
             ("assistant", "internal result"),
         ]
         .into_iter()
-        .map(|(role, content)| echo_agent::memory::StoredMessage {
-            id: None,
-            conversation_id: "move-hidden".to_string(),
-            role: role.to_string(),
-            content: Some(content.to_string()),
-            attachments_json: None,
-            tool_calls_json: None,
-            tool_result_json: None,
-            created_at: Utc::now().to_rfc3339(),
+        .map(|(role, content)| {
+            let message = if role == "user" {
+                echo_agent::llm::types::Message::user(content.to_string())
+            } else {
+                echo_agent::llm::types::Message::assistant(content.to_string())
+            };
+            echo_agent::memory::project_message("move-hidden", &message)
+                .map_err(|error| error.to_string())
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, String>>()?;
         source_store
             .save_messages("move-hidden", &rows)
             .await
@@ -4337,7 +4405,7 @@ mod workspace_transition_tests {
             .deletions
             .install_before_lineage_barrier(entered_tx, release_rx);
         let handoff_state = Arc::clone(&state);
-        let handoff = tokio::spawn(async move {
+        let mut handoff = tokio::spawn(async move {
             let operation = AppStateAgentControlOps::new(&handoff_state);
             crate::agent_control::AgentControlAppOps::handoff_conversation(
                 &operation,
@@ -4350,10 +4418,18 @@ mod workspace_transition_tests {
             )
             .await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(10), entered_rx)
-            .await
-            .map_err(|_| "source retirement did not reach its lineage barrier".to_string())?
-            .map_err(|error| error.to_string())?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                entered = entered_rx => entered.map_err(|error| error.to_string()),
+                result = &mut handoff => Err(match result {
+                    Ok(Err(error)) => format!("handoff failed before the source lineage barrier: {error}"),
+                    Ok(Ok(_)) => "handoff completed without the source lineage barrier".to_string(),
+                    Err(error) => format!("handoff task failed before the source lineage barrier: {error}"),
+                }),
+            }
+        })
+        .await
+        .map_err(|_| "source retirement did not reach its lineage barrier".to_string())??;
         assert!(
             state
                 .session
@@ -4965,6 +5041,16 @@ mod workspace_transition_tests {
             0,
             &instruction,
         )?;
+        let mut prepared =
+            crate::prepared_turn::PreparedUserTurn::runtime_instruction(instruction.clone());
+        prepared
+            .bind_agent_input(
+                &delivery,
+                &temp.path().join("typed-recovery"),
+                "primary",
+                "turn-recovery",
+            )
+            .map_err(|error| error.to_string())?;
         store
             .apply_transcript_projection(
                 echo_agent::memory::TranscriptProjectionBatch::prepare(
@@ -4973,26 +5059,16 @@ mod workspace_transition_tests {
                     "primary",
                     0,
                     vec![
-                        echo_agent::memory::StoredMessage {
-                            id: None,
-                            conversation_id: "primary".to_string(),
-                            role: "user".to_string(),
-                            content: Some(instruction),
-                            attachments_json: None,
-                            tool_calls_json: None,
-                            tool_result_json: None,
-                            created_at: Utc::now().to_rfc3339(),
-                        },
-                        echo_agent::memory::StoredMessage {
-                            id: None,
-                            conversation_id: "primary".to_string(),
-                            role: "assistant".to_string(),
-                            content: Some("acknowledged".to_string()),
-                            attachments_json: None,
-                            tool_calls_json: None,
-                            tool_result_json: None,
-                            created_at: Utc::now().to_rfc3339(),
-                        },
+                        echo_agent::memory::project_message(
+                            "primary",
+                            &prepared.to_message().map_err(|error| error.to_string())?,
+                        )
+                        .map_err(|error| error.to_string())?,
+                        echo_agent::memory::project_message(
+                            "primary",
+                            &echo_agent::llm::types::Message::assistant("acknowledged".to_string()),
+                        )
+                        .map_err(|error| error.to_string())?,
                     ],
                 )
                 .map_err(|error| error.to_string())?,
@@ -5881,6 +5957,7 @@ mod workspace_transition_tests {
         );
         let linked_project = temp.path().join("workspace-b-project");
         std::fs::create_dir_all(&linked_project).map_err(|error| error.to_string())?;
+        std::fs::create_dir(linked_project.join(".git")).map_err(|error| error.to_string())?;
         std::fs::write(linked_project.join("same.txt"), "same bytes")
             .map_err(|error| error.to_string())?;
         let linked_skill = linked_project.join(".eko/skills/linked-review");
@@ -5923,7 +6000,7 @@ mod workspace_transition_tests {
             .map_err(|error| error.to_string())?;
         assert_eq!(
             execution_b.agent().read(|agent| agent.working_dir()).await,
-            Some(canonical_b.clone())
+            Some(canonical_linked_project.clone())
         );
         assert!(
             execution_b

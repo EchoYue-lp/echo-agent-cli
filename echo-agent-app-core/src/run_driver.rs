@@ -374,15 +374,16 @@ mod tests {
         );
         let run_id = "background-auto-ingest";
         store
-            .create_run(
+            .create_run_with_profile(
                 run_id,
                 "global",
                 "background-conversation",
                 "background-root",
-                DomainProfile::AcademicResearch,
+                DomainProfile::General,
                 "persist research evidence",
                 "agent_autonomous",
                 AttendedMode::Attended,
+                TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
             )
             .map_err(|error| error.to_string())?;
         store
@@ -394,13 +395,18 @@ mod tests {
         let llm = Arc::new(
             MockLlmClient::new()
                 .with_model_name("background-auto-ingest")
+                .then_tool_call(
+                    "research-discovery",
+                    "tool_search",
+                    r#"{"query":"semantic_scholar_search","limit":1}"#,
+                )
                 .then_tool_call("research-call", "semantic_scholar_search", "{}")
                 .with_response("Research evidence persisted."),
         );
         let agent = crate::agent_handle::AgentHandle::new(
             echo_agent::agent::ReactAgentBuilder::new()
                 .model("background-auto-ingest")
-                .llm_client(llm)
+                .llm_client(llm.clone())
                 .build()
                 .map_err(|error| error.to_string())?,
         );
@@ -444,6 +450,26 @@ mod tests {
                 ));
             }
         }
+        let requests = llm.all_calls();
+        assert!(
+            requests
+                .iter()
+                .any(|messages| messages.iter().any(|message| {
+                    message.tool_call_id.as_deref() == Some("research-discovery")
+                        && message.name.as_deref() == Some("tool_search")
+                        && message.text_content().is_some_and(|text| {
+                            text.starts_with("Activated tool schemas for the next turn:")
+                                && text
+                                    .lines()
+                                    .any(|line| line.starts_with("- semantic_scholar_search:"))
+                        })
+                })),
+            "the original model must observe real tool discovery before research execution"
+        );
+        println!(
+            "AUTOINGEST_ORIGINAL_REQUESTS:{}",
+            serde_json::json!({"calls":requests.len(),"tool_counts":llm.all_tool_counts(),"research_activation_observed":true})
+        );
         driver.abort();
         let _ = driver.await;
         release_tx

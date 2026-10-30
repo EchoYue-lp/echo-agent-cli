@@ -340,6 +340,10 @@ mod tests {
         let second = temp.path().join("second");
         std::fs::create_dir_all(first.join(".eko"))?;
         std::fs::create_dir_all(second.join(".eko"))?;
+        for root in [&first, &second] {
+            std::fs::create_dir(root.join(".git"))?;
+            assert_eq!(crate::utils::find_project_root(root).as_ref(), Some(root));
+        }
         std::fs::write(first.join(".eko/project.md"), "FIRST_WORKSPACE_RULE")?;
         std::fs::write(second.join(".eko/project.md"), "SECOND_WORKSPACE_RULE")?;
 

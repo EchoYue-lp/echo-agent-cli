@@ -1202,8 +1202,13 @@ mod tests {
     #[tokio::test]
     async fn actual_auth_credential_change_rejects_late_confirmation() -> anyhow::Result<()> {
         let fixture = AuthHttpFixture::new(QrFixtureCase::HeldConfirmation).await?;
+        let elapsed = std::time::Instant::now();
         let challenge = fixture.begin(Duration::from_secs(2)).await?;
         tokio::time::timeout(Duration::from_secs(1), fixture.provider.entered.notified()).await?;
+        eprintln!(
+            "AUTH_CREDENTIAL_PHASE:held-confirmation elapsed_ms={}",
+            elapsed.elapsed().as_millis()
+        );
         let revision = fixture.state.config.configuration_snapshot().await.1;
         let mut replacement = account();
         replacement.generation = "replacement-generation".to_string();
@@ -1215,8 +1220,19 @@ mod tests {
             })
             .await
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        eprintln!(
+            "AUTH_CREDENTIAL_PHASE:replacement-owned-persist-return elapsed_ms={}",
+            elapsed.elapsed().as_millis()
+        );
         fixture.provider.release.notify_one();
-        assert_eq!(fixture.settle(&challenge).await?.phase, "cancelled");
+        let observed = fixture.settle(&challenge).await;
+        if let Ok(settled) = &observed {
+            eprintln!(
+                "AUTH_CREDENTIAL_PHASE:original-settle phase={} elapsed_ms={}",
+                settled.phase,
+                elapsed.elapsed().as_millis()
+            );
+        }
         let generation = fixture
             .state
             .config
@@ -1227,8 +1243,11 @@ mod tests {
             .weixin
             .account
             .map(|account| account.generation);
+        let closed = fixture.close().await;
+        let settled = observed?;
+        assert_eq!(settled.phase, "cancelled");
         assert_eq!(generation.as_deref(), Some("replacement-generation"));
-        fixture.close().await
+        closed
     }
 
     #[tokio::test]

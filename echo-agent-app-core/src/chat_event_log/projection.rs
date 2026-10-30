@@ -212,8 +212,7 @@ fn preserve_native_publication_key(
             .map(echo_agent::utils::canonical_json::canonical_json_bytes)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?
-            .iter()
-            .any(|record| *record == encoded)
+            .contains(&encoded)
     };
     if identical
         && loaded
@@ -753,7 +752,7 @@ impl RetentionPins {
                     FoldedConversationInput {
                         projection: ConversationInputProjection {
                             receipt,
-                            payload: payload.clone(),
+                            payload: payload.as_ref().clone(),
                             task_target: self
                                 .conversation_inputs
                                 .get(&identity.input_id)

@@ -2060,6 +2060,78 @@ mod tests {
             self.execute_stream_with_cancel("", cancel)
         }
 
+        fn execute_stream_message_with_invocation_context<'a>(
+            &'a self,
+            message: echo_agent::prelude::Message,
+            cancel: echo_agent::agent::CancellationToken,
+            invocation: echo_agent::agent::AgentInvocationContext,
+        ) -> futures::future::BoxFuture<
+            'a,
+            echo_agent::error::Result<
+                futures::stream::BoxStream<
+                    'a,
+                    echo_agent::error::Result<echo_agent::agent::AgentEvent>,
+                >,
+            >,
+        > {
+            Box::pin(async move {
+                use echo_agent::agent::{
+                    AgentEvent, AgentPhase, ExecutionStatus, ExecutionStatusKind,
+                };
+                let execution = invocation
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.execution_id.clone())
+                    .ok_or_else(|| {
+                        echo_agent::error::ReactError::Other(
+                            "slow fixture needs its admitted execution identity".to_string(),
+                        )
+                    })?;
+                // This is the original test source: retain the whole typed invocation through physical EOF.
+                let source = futures::stream::unfold(
+                    (0_u8, message, invocation, cancel, execution),
+                    |(step, message, invocation, cancel, execution)| async move {
+                        let event = match step {
+                            0 => AgentEvent::ExecutionStatus(ExecutionStatus {
+                                adapter_generated: false,
+                                execution_id: execution.clone(),
+                                request_id: None,
+                                sequence: 0,
+                                phase: AgentPhase::Thinking,
+                                status: ExecutionStatusKind::Started,
+                                reason: None,
+                            }),
+                            1 => {
+                                cancel.cancelled().await;
+                                AgentEvent::ExecutionStatus(ExecutionStatus {
+                                    adapter_generated: false,
+                                    execution_id: execution.clone(),
+                                    request_id: None,
+                                    sequence: 1,
+                                    phase: AgentPhase::Terminal,
+                                    status: ExecutionStatusKind::Cancelled,
+                                    reason: None,
+                                })
+                            }
+                            2 => AgentEvent::Cancelled,
+                            _ => return None,
+                        };
+                        Some((
+                            Ok(event),
+                            (
+                                step.saturating_add(1),
+                                message,
+                                invocation,
+                                cancel,
+                                execution,
+                            ),
+                        ))
+                    },
+                );
+                Ok(Box::pin(source) as futures::stream::BoxStream<'a, _>)
+            })
+        }
+
         fn steer_input(
             &self,
             expected_turn_id: Option<&str>,

@@ -565,31 +565,30 @@ impl AppChannelMessageHandler {
                 receipt.publish(ChannelIngressDisposition::DurableInput);
                 return Ok(());
             }
-            if saved.is_some() {
-                if let Err(error) = self
+            if saved.is_some()
+                && let Err(error) = self
                     .app_state
                     .storage
                     .chat_events
                     .prove_unclaimed_channel_input(submitted.identity.clone())
                     .await
-                {
-                    // Preserve attempted/effect/send uncertainty. Never convert it
-                    // into cancellation or a fresh chat to make recovery look green.
-                    if submitted.blocks_replay() || submitted.is_dispatchable() {
-                        self.app_state
-                            .storage
-                            .chat_events
-                            .mark_channel_input_uncertain_checked(
-                                submitted.identity.clone(),
-                                Some(submitted.queue_revision),
-                                error.to_string(),
-                            )
-                            .await
-                            .map_err(|error| fail(error.to_string()))?;
-                    }
-                    receipt.publish(ChannelIngressDisposition::DurableInput);
-                    return Ok(());
+            {
+                // Preserve attempted/effect/send uncertainty. Never convert it
+                // into cancellation or a fresh chat to make recovery look green.
+                if submitted.blocks_replay() || submitted.is_dispatchable() {
+                    self.app_state
+                        .storage
+                        .chat_events
+                        .mark_channel_input_uncertain_checked(
+                            submitted.identity.clone(),
+                            Some(submitted.queue_revision),
+                            error.to_string(),
+                        )
+                        .await
+                        .map_err(|error| fail(error.to_string()))?;
                 }
+                receipt.publish(ChannelIngressDisposition::DurableInput);
+                return Ok(());
             }
             let incarnation = self.session_instance.incarnation_id();
             let agent_conv = Self::agent_conversation_id(&conv, &incarnation);
@@ -636,7 +635,7 @@ impl AppChannelMessageHandler {
                         receipt.publish(ChannelIngressDisposition::DurableInput);
                         return Ok(());
                     }
-                    ChannelLiveInputRoute::PumpPending(route) => route,
+                    ChannelLiveInputRoute::PumpPending(route) => *route,
                     ChannelLiveInputRoute::Routed => {
                         return Err(fail(
                             "Weixin steer lost its original data owner".to_string(),
@@ -840,7 +839,7 @@ impl AppChannelMessageHandler {
             WeixinControlAdmission::InFlight => return Ok(()),
             WeixinControlAdmission::Execute(lease) => lease,
         };
-        let (effect, result) = ControlEffectObserver::new(lease);
+        let (effect, result) = ControlEffectObserver::new(*lease);
         let effect = effect.with_ingress(receipt).with_reply(reply);
         // Result publication belongs to that same original effect owner, not
         // to EOF, rendering or this short admission call's lifetime.
@@ -910,7 +909,7 @@ mod tests {
         else {
             return Err("original control was not admitted".into());
         };
-        let (effect, result) = ControlEffectObserver::new(lease);
+        let (effect, result) = ControlEffectObserver::new(*lease);
         let (published, mut observed) = echo_agent::channels::channel_ingress_receipt();
         let effect = effect.with_ingress(published);
         effect.defer_response();
@@ -955,7 +954,7 @@ mod tests {
         else {
             return Err("original control was not admitted".into());
         };
-        let (effect, result) = ControlEffectObserver::new(lease);
+        let (effect, result) = ControlEffectObserver::new(*lease);
         let (published, mut observed) = echo_agent::channels::channel_ingress_receipt();
         let effect = effect.with_ingress(published);
         effect.defer_response();
@@ -988,7 +987,7 @@ mod tests {
         else {
             return Err("original effect owner was not admitted".into());
         };
-        let (render_observer, rendered_result) = ControlEffectObserver::new(lease);
+        let (render_observer, rendered_result) = ControlEffectObserver::new(*lease);
         let original_effect_owner = render_observer.clone();
         drop(rendered_result);
         drop(render_observer);

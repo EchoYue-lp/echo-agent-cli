@@ -210,6 +210,7 @@ pub(crate) struct TodoQueryProjection {
 #[derive(Debug, Clone)]
 pub(crate) struct CompletionGateProjection {
     pub(crate) run: TaskRun,
+    pub(crate) project_binding: Option<ProjectExecutionBinding>,
     pub(crate) plan: Option<TaskPlan>,
     pub(crate) completion: CompletionQueryProjection,
     pub(crate) active_subagents: Vec<ActiveSubagentBoundary>,
@@ -1580,6 +1581,7 @@ impl EventFoldState {
             .collect::<std::collections::HashSet<_>>();
         Ok(CompletionGateProjection {
             run: rebuilt.run,
+            project_binding: rebuilt.project_binding,
             plan,
             completion: self.completion.for_tasks(&task_ids),
             active_subagents: self.active_subagents.values().cloned().collect(),

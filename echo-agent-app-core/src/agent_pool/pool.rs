@@ -2097,6 +2097,7 @@ impl AgentPool {
             &params,
             &app_config,
             self.shared.subagent_event_bus.clone(),
+            self.shared.store.clone(),
         )
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -2158,9 +2159,6 @@ impl AgentPool {
             .or_else(|| self.shared.conversation_store.clone());
         if let Some(ref cs) = conversation_store {
             agent.set_conversation_store(cs.clone());
-        }
-        if let Some(ref st) = self.shared.store {
-            agent.install_store(st.clone()).await;
         }
         if let Some(ref review_integration) = self.shared.review_integration {
             let memory_generation = review_integration

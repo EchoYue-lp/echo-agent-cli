@@ -170,9 +170,7 @@ async fn native_sink_preserves_envelope_order_and_reopens_original_journal_witho
         .map_err(|_| anyhow::anyhow!("observer poisoned"))?
         .clone();
     assert_eq!(
-        live.iter()
-            .map(|event| event.event.clone())
-            .collect::<Vec<_>>(),
+        live.iter().map(|event| event.event).collect::<Vec<_>>(),
         vec![
             RuntimeEventKind::Note,
             RuntimeEventKind::Note,

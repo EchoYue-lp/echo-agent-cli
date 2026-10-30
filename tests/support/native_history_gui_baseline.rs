@@ -104,7 +104,7 @@ fn source_stream_directory(log_root: &Path) -> anyhow::Result<PathBuf> {
         streams.len() == 1,
         "本单conversation夹具必须只有一个原stream目录"
     );
-    Ok(streams.into_iter().next().context("原stream目录缺失")?)
+    streams.into_iter().next().context("原stream目录缺失")
 }
 
 fn coverage_point(stream: &Path) -> anyhow::Result<(String, u64)> {

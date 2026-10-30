@@ -745,6 +745,31 @@ fn project_conversation_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn canonical_fixture(
+        id: Option<i64>,
+        conversation_id: &str,
+        message: Message,
+        created_at: &str,
+    ) -> anyhow::Result<StoredMessage> {
+        let mut stored = echo_agent::memory::project_message(conversation_id, &message)?;
+        stored.id = id;
+        stored.created_at = created_at.to_string();
+        Ok(stored)
+    }
+
+    fn fixture_tool_call(name: &str) -> echo_agent::llm::types::ToolCall {
+        echo_agent::llm::types::ToolCall {
+            provider_source: None,
+            id: "call-1".to_string(),
+            call_type: "function".to_string(),
+            function: echo_agent::llm::types::FunctionCall {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
     use echo_agent::llm::types::{ContentPart, Message, MessageContent};
 
     fn saved_message(id: &str, role: &str, content: &str) -> SavedMessage {
@@ -878,16 +903,12 @@ mod tests {
                 arguments: "{\"path\":\"中文🧭.txt\"}".to_string(),
             },
         }];
-        let stored = StoredMessage {
-            id: Some(1),
-            conversation_id: "history".to_string(),
-            role: "assistant".to_string(),
-            content: None,
-            attachments_json: None,
-            tool_calls_json: Some(serde_json::to_string(&calls)?),
-            tool_result_json: None,
-            created_at: "2026-10-27T00:00:00Z".to_string(),
-        };
+        let stored = canonical_fixture(
+            Some(1),
+            "history",
+            Message::assistant_with_tools(calls.clone()),
+            "2026-10-27T00:00:00Z",
+        )?;
         let projected = project_stored_message(stored)?;
         let value = serde_json::to_value(projected)?;
         assert_eq!(value.get("tool_calls"), Some(&serde_json::to_value(calls)?));
@@ -895,47 +916,64 @@ mod tests {
     }
 
     #[test]
-    fn malformed_tool_history_is_an_explicit_error_and_is_not_rewritten() {
-        let stored = StoredMessage {
-            id: Some(1),
-            conversation_id: "history".to_string(),
-            role: "assistant".to_string(),
-            content: None,
-            attachments_json: None,
-            tool_calls_json: Some("[{invalid-json]".to_string()),
-            tool_result_json: None,
-            created_at: "2026-10-27T00:00:00Z".to_string(),
-        };
+    fn malformed_tool_history_is_an_explicit_error_and_is_not_rewritten() -> anyhow::Result<()> {
+        let mut stored = canonical_fixture(
+            Some(1),
+            "history",
+            Message::assistant_with_tools(vec![fixture_tool_call("lookup")]),
+            "2026-10-27T00:00:00Z",
+        )?;
+        stored.tool_calls_json = Some("[{invalid-json]".to_string());
         let original = stored.clone();
-        let projected = project_stored_message(stored.clone());
-        assert!(projected.is_err());
+        assert!(project_stored_message(stored.clone()).is_err());
         assert_eq!(stored, original);
+        Ok(())
     }
 
     #[test]
     fn stored_internal_agent_marker_projects_to_the_gui_contract() -> anyhow::Result<()> {
-        let stored = StoredMessage {
-            id: Some(1),
-            conversation_id: "side-1".to_string(),
-            role: "user".to_string(),
-            content: Some("internal instruction".to_string()),
-            attachments_json: Some(
-                serde_json::json!({"eko_visibility": "internal_agent"}).to_string(),
-            ),
-            tool_calls_json: None,
-            tool_result_json: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
+        use echo_agent_app_core::api::{
+            agent_router::{AgentAddress, AgentMessage},
+            prepared_turn::PreparedUserTurn,
+            workspace::WorkspaceId,
         };
-
-        let projected = project_stored_message(stored)?;
+        let root = tempfile::tempdir()?;
+        let input = AgentMessage::agent_text(
+            Some(AgentAddress::new(
+                WorkspaceId::from_raw("workspace".into()),
+                "source",
+            )),
+            AgentAddress::new(WorkspaceId::from_raw("workspace".into()), "side-1"),
+            "internal instruction",
+        );
+        let mut turn = PreparedUserTurn::runtime_instruction("internal instruction");
+        turn.bind_agent_input(&input, root.path(), "side-1", "turn")?;
+        let stored = canonical_fixture(
+            Some(1),
+            "side-1",
+            turn.to_message()?,
+            "2026-01-01T00:00:00Z",
+        )?;
+        let projected = project_stored_message(stored.clone())?;
         assert!(projected.internal_agent);
         assert_eq!(projected.content.as_deref(), Some("internal instruction"));
+        assert_eq!(
+            serde_json::to_value(&projected.agent_input)?,
+            serde_json::to_value(Some(&input))?
+        );
         assert_eq!(
             serde_json::to_value(projected)?
                 .get("internal_agent")
                 .and_then(serde_json::Value::as_bool),
             Some(true)
         );
+        // The retired display marker alone cannot produce canonical Agent identity.
+        let mut bare_marker = stored;
+        bare_marker.attachments_json =
+            Some(serde_json::json!({"eko_visibility":"internal_agent"}).to_string());
+        let original = bare_marker.clone();
+        assert!(project_stored_message(bare_marker.clone()).is_err());
+        assert_eq!(bare_marker, original);
         Ok(())
     }
 
@@ -949,19 +987,19 @@ mod tests {
         ]
         .into_iter()
         .enumerate()
-        .map(|(index, (role, content))| StoredMessage {
-            id: i64::try_from(index)
-                .ok()
-                .and_then(|index| index.checked_add(1)),
-            conversation_id: "side-1".to_string(),
-            role: role.to_string(),
-            content: Some(content.to_string()),
-            attachments_json: None,
-            tool_calls_json: None,
-            tool_result_json: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
+        .map(|(index, (role, content))| {
+            canonical_fixture(
+                i64::try_from(index).ok().and_then(|id| id.checked_add(1)),
+                "side-1",
+                if role == "user" {
+                    Message::user(content.to_string())
+                } else {
+                    Message::assistant(content.to_string())
+                },
+                "2026-01-01T00:00:00Z",
+            )
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
         let ids = std::collections::HashSet::from([1_i64, 2_i64]);
         let projected = project_conversation_messages(messages, None, &ids, None)?;
         assert_eq!(
@@ -977,36 +1015,24 @@ mod tests {
     #[test]
     fn completed_side_first_prompt_recovers_its_stable_gui_identity() -> anyhow::Result<()> {
         let stored = vec![
-            StoredMessage {
-                id: Some(1),
-                conversation_id: "side-1".to_string(),
-                role: "user".to_string(),
-                content: Some("inherited context".to_string()),
-                attachments_json: None,
-                tool_calls_json: None,
-                tool_result_json: None,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-            },
-            StoredMessage {
-                id: Some(2),
-                conversation_id: "side-1".to_string(),
-                role: "user".to_string(),
-                content: Some("initial side prompt".to_string()),
-                attachments_json: None,
-                tool_calls_json: None,
-                tool_result_json: None,
-                created_at: "2026-01-01T00:01:00Z".to_string(),
-            },
-            StoredMessage {
-                id: Some(3),
-                conversation_id: "side-1".to_string(),
-                role: "assistant".to_string(),
-                content: Some("finished".to_string()),
-                attachments_json: None,
-                tool_calls_json: None,
-                tool_result_json: None,
-                created_at: "2026-01-01T00:02:00Z".to_string(),
-            },
+            canonical_fixture(
+                Some(1),
+                "side-1",
+                Message::user("inherited context".to_string()),
+                "2026-01-01T00:00:00Z",
+            )?,
+            canonical_fixture(
+                Some(2),
+                "side-1",
+                Message::user("initial side prompt".to_string()),
+                "2026-01-01T00:01:00Z",
+            )?,
+            canonical_fixture(
+                Some(3),
+                "side-1",
+                Message::assistant("finished".to_string()),
+                "2026-01-01T00:02:00Z",
+            )?,
         ];
 
         let projected = project_conversation_messages(
@@ -1170,30 +1196,49 @@ mod tests {
 
     #[test]
     fn branch_prefix_keeps_canonical_tool_history_and_rekeys_messages() -> anyhow::Result<()> {
+        let mut tool_call = Message::assistant("tool call".to_string());
+        tool_call.tool_calls = Some(vec![fixture_tool_call("lookup")]);
         let stored = [
-            ("user", "first"),
-            ("assistant", "tool call"),
-            ("tool", "result"),
-            ("assistant", "answer"),
-            ("user", "second"),
+            Message::user("first".to_string()),
+            tool_call,
+            Message::tool_result(
+                "call-1".to_string(),
+                "lookup".to_string(),
+                "result".to_string(),
+            ),
+            Message::assistant("answer".to_string()),
+            Message::user("second".to_string()),
         ]
         .into_iter()
         .enumerate()
-        .map(|(index, (role, content))| StoredMessage {
-            id: i64::try_from(index).ok(),
-            conversation_id: "source".to_string(),
-            role: role.to_string(),
-            content: Some(content.to_string()),
-            attachments_json: None,
-            tool_calls_json: (index == 1).then(|| "[]".to_string()),
-            tool_result_json: (role == "tool").then(|| "{}".to_string()),
-            created_at: "2026-01-01T00:00:00Z".to_string(),
+        .map(|(index, message)| {
+            canonical_fixture(
+                i64::try_from(index).ok(),
+                "source",
+                message,
+                "2026-01-01T00:00:00Z",
+            )
         })
-        .collect::<Vec<_>>();
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
         let prefix = branch_prefix(&stored, 1, "branch", false)?;
         assert_eq!(prefix.len(), 4);
         assert!(prefix.iter().any(|message| message.role == "tool"));
+        let restored = echo_agent::memory::restore_messages(&prefix)?;
+        assert_eq!(
+            serde_json::to_value(
+                restored
+                    .get(1)
+                    .and_then(|message| message.tool_calls.as_ref())
+            )?,
+            serde_json::to_value(Some(vec![fixture_tool_call("lookup")]))?
+        );
+        assert_eq!(
+            restored
+                .get(2)
+                .and_then(|message| message.tool_call_id.as_deref()),
+            Some("call-1")
+        );
         assert!(
             prefix
                 .iter()
@@ -1224,17 +1269,19 @@ mod tests {
         ]
         .into_iter()
         .enumerate()
-        .map(|(index, (role, content))| StoredMessage {
-            id: i64::try_from(index).ok(),
-            conversation_id: "source".to_string(),
-            role: role.to_string(),
-            content: Some(content.to_string()),
-            attachments_json: None,
-            tool_calls_json: None,
-            tool_result_json: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
+        .map(|(index, (role, content))| {
+            canonical_fixture(
+                i64::try_from(index).ok(),
+                "source",
+                if role == "user" {
+                    Message::user(content.to_string())
+                } else {
+                    Message::assistant(content.to_string())
+                },
+                "2026-01-01T00:00:00Z",
+            )
         })
-        .collect::<Vec<_>>();
+        .collect::<anyhow::Result<Vec<_>>>()?;
         retain_public_messages(&mut stored, &std::collections::HashSet::from([2, 3]))?;
         let fork = branch_prefix(&stored, 1, "fork", true)?;
         assert_eq!(fork.len(), 4);
@@ -1311,38 +1358,28 @@ mod tests {
                 text: "artifact path: /tmp/user-input/paste.txt".to_string(),
             }]),
         )?;
-        let tool_call_assistant = StoredMessage {
-            id: Some(2),
-            conversation_id: "conv".to_string(),
-            role: "assistant".to_string(),
-            content: None,
-            attachments_json: None,
-            tool_calls_json: Some("[]".to_string()),
-            tool_result_json: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-        };
-        let tool_result = StoredMessage {
-            id: Some(3),
-            conversation_id: "conv".to_string(),
-            role: "tool".to_string(),
-            content: Some("matched lines".to_string()),
-            attachments_json: None,
-            tool_calls_json: None,
-            tool_result_json: Some(
-                serde_json::json!({"tool_call_id": "call-1", "name": "grep"}).to_string(),
+        let tool_call_assistant = canonical_fixture(
+            Some(2),
+            "conv",
+            Message::assistant_with_tools(vec![fixture_tool_call("grep")]),
+            "2026-01-01T00:00:00Z",
+        )?;
+        let tool_result = canonical_fixture(
+            Some(3),
+            "conv",
+            Message::tool_result(
+                "call-1".to_string(),
+                "grep".to_string(),
+                "matched lines".to_string(),
             ),
-            created_at: "2026-01-01T00:00:01Z".to_string(),
-        };
-        let final_assistant = StoredMessage {
-            id: Some(4),
-            conversation_id: "conv".to_string(),
-            role: "assistant".to_string(),
-            content: Some("root cause".to_string()),
-            attachments_json: None,
-            tool_calls_json: None,
-            tool_result_json: None,
-            created_at: "2026-01-01T00:00:02Z".to_string(),
-        };
+            "2026-01-01T00:00:01Z",
+        )?;
+        let final_assistant = canonical_fixture(
+            Some(4),
+            "conv",
+            Message::assistant("root cause".to_string()),
+            "2026-01-01T00:00:02Z",
+        )?;
         let existing = vec![
             canonical_user,
             tool_call_assistant,
@@ -2588,13 +2625,13 @@ async fn run_reply_fork_owned(
         )
         .await;
         // 这里只在真实原操作返回后执行；IPC观察丢失不提前关闭仍在用的draft。
-        if let Some((owner_id, connection)) = cleanup {
-            if let Err(cleanup_error) = app_state
+        if let Some((owner_id, connection)) = cleanup
+            && let Err(cleanup_error) = app_state
                 .terminal
                 .close_project_ssh_checked(&owner_id, &connection)
                 .await
-            {
-                result = match result {
+        {
+            result = match result {
                     Err(primary) => Err(IpcError::Internal(format!(
                         "{primary}; 独立SSH draft结算未确认: {cleanup_error}"
                     ))),
@@ -2610,8 +2647,7 @@ async fn run_reply_fork_owned(
                             Err(IpcError::Internal(format!("{primary}; 分叉资源回执不是对象; 独立SSH draft结算未确认: {cleanup_error}")))
                         }
                     }
-                };
-            }
+            };
         }
         result
     })
@@ -2948,8 +2984,9 @@ async fn execute_reply_fork(
                             "目标工作空间已属于其它项目；保留已有资源".into(),
                         ));
                     }
-                    if let Some(draft_id) = ssh_draft.as_ref() {
-                        if app_state.terminal.project_ssh(draft_id).is_ok() {
+                    if let Some(draft_id) = ssh_draft.as_ref()
+                        && app_state.terminal.project_ssh(draft_id).is_ok()
+                    {
                             app_state
                                 .reconnect_workspace_project_owned(
                                     target_id.clone(),
@@ -2958,7 +2995,6 @@ async fn execute_reply_fork(
                                 )
                                 .await
                                 .map_err(IpcError::from)?;
-                        }
                     }
                     workspace
                 }

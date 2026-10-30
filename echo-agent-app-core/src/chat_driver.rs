@@ -5645,11 +5645,11 @@ mod tests {
             echo_agent::testing::MockLlmClient::new()
                 .with_model_name("t")
                 .with_stream_script(vec![
-                    StreamChunk::Delta(DeltaMessage {
+                    StreamChunk::Delta(Box::new(DeltaMessage {
                         role: Some("assistant".to_string()),
                         content: Some("partial answer".to_string()),
                         ..DeltaMessage::default()
-                    }),
+                    })),
                     StreamChunk::Err(echo_agent::error::ReactError::Other(
                         "provider disconnected".to_string(),
                     )),
