@@ -652,11 +652,13 @@ mod tests {
 
     #[tokio::test]
     async fn cron_stream_failure_is_persisted_and_returned_as_error() -> Result<(), String> {
-        let llm = MockLlmClient::new().with_error(echo_agent::error::ReactError::Other(
-            "provider unavailable".to_string(),
-        ));
+        let llm = Arc::new(
+            MockLlmClient::new().with_error(echo_agent::error::ReactError::Other(
+                "provider unavailable".to_string(),
+            )),
+        );
         let agent = ReactAgentBuilder::new()
-            .llm_client(Arc::new(llm))
+            .llm_client(llm.clone())
             .system_prompt("test")
             .build()
             .map_err(|error| error.to_string())?;
@@ -666,12 +668,64 @@ mod tests {
         let fire_fn = build_occurrence_fire_fn(handle, Some(store.clone()), None, None, None);
 
         let task = CronTask::new("failing", "*/5 * * * *", "run this");
-        let result = fire_fn(invocation("cron-scheduled:failing", task)).await;
+        let scheduled_at = chrono::Utc::now();
+        let first = SchedulerInvocation::new(
+            "cron-scheduled:failing",
+            task.clone(),
+            scheduled_at,
+            echo_agent::scheduler::SchedulerTrigger::Scheduled,
+        );
+        let identity =
+            OccurrenceIdentity::from_scheduler_invocation(store.active_workspace_id(), &first);
+        let result = fire_fn(first.clone()).await;
         assert!(result.is_err(), "failed cron run must not report success");
         let failed = store
             .list_runs_in(&[TaskRunStatus::Failed])
             .map_err(|error| error.to_string())?;
         assert_eq!(failed.len(), 1);
+        let run = failed
+            .first()
+            .ok_or_else(|| "failed cron history is missing".to_string())?;
+        assert_eq!(run.run_id, identity.run_id());
+        assert_eq!(
+            run.conversation_id,
+            crate::scheduler::cron_conversation_id(&task.id, &identity.occurrence_id)
+        );
+        let before = store
+            .get_run_state(&run.run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "failed cron state is missing".to_string())?;
+        assert!(llm.call_count() > 0);
+        let calls = llm.call_count();
+        let retry = SchedulerInvocation::new(
+            "cron-scheduled:failing",
+            task,
+            scheduled_at,
+            echo_agent::scheduler::SchedulerTrigger::Manual,
+        );
+        assert_ne!(retry.attempt_id, first.attempt_id);
+        assert!(
+            fire_fn(retry).await.is_err(),
+            "同失败slot不能变成成功或重放"
+        );
+        let after = store
+            .get_run_state(&run.run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "failed cron history disappeared".to_string())?;
+        assert_eq!(after.run.status, TaskRunStatus::Failed, "失败不得代成取消");
+        assert_eq!(after.run.conversation_id, run.conversation_id);
+        assert_eq!(
+            after.journal_sequence, before.journal_sequence,
+            "重复失败slot不得新增执行事实"
+        );
+        assert_eq!(llm.call_count(), calls, "重复失败slot不得再次调用模型");
+        assert_eq!(
+            store
+                .list_runs_in(&[TaskRunStatus::Failed])
+                .map_err(|error| error.to_string())?
+                .len(),
+            1
+        );
         Ok(())
     }
 

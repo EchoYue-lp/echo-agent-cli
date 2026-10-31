@@ -451,7 +451,11 @@ primary、计划 Subagent、Verification 与 review 消费持久规则。原 poo
 
 ## GUI 正式任务历史读取
 
-任务上下文面板发现所选 Workspace 内的原正式 TaskRun。库存与精确选择扩展既有 taskRuntimeStore；普通新建/最近任务会话仍由 ConversationStore 拥有。list_task_runs 将产品数据 generation 和状态筛选绑定到有界实时页，按创建时间/run_id 排序并明确 continuation；读取或修复失败保留已显示内容并反馈错误。库存与原 latest-task 共用 provenance 可见性判定，打开历史不会创建计划或把普通 turn 升级成任务。
+任务上下文面板发现所选 Workspace 内的原 TaskRun。库存与精确选择扩展既有 taskRuntimeStore；普通 GUI 会话仍由 ConversationStore 拥有。渠道入口的 `channel:` 会话与调度 occurrence 的 `cron:` 会话，无论成功、失败、取消或是否生成计划，都进入同一个历史可见性判断。普通 GUI 轻量回合仍沿原 provenance 规则，打开历史不会创建计划或把普通回合升级成任务。
+
+侧栏最近任务复用 `list_task_runs`，按 `(workspace_id, product_data_generation, run_id)` 去重，同一 IM 会话的不同运行分别保留；已有运行行时不再重复显示对应会话行。来源来自应用入口拥有的会话命名空间，状态直接读取原 Run，不用来源、日志文字或 `attended_mode` 猜测失败/取消。`list_task_runs` 将 generation 和筛选条件绑定到每页最多 20 条的实时页，首屏每个 scope 读取 8 条，更多页只在用户要求后续读。读取失败保留已显示内容并反馈错误。
+
+页面可见时每五秒刷新已请求范围内的有限 Run 页，至多两个 scope 顺序读取；隐藏时停止后继轮询，回到前台立即刷新。周期刷新不扫描完整会话列表，初次显示、工作空间/GUI 会话变化和回前台才沿既有会话元数据入口更新。关闭页面会注销监听并取消后继刷新；迟到响应必须仍匹配原 scope/generation。失败早于 transcript 保存时仍可直接打开原 Run 详情，不补造会话、计划或第二套历史 store。
 
 选择旧 run 后，详情、轮询和控制使用其精确 run_id，而非会话 latest。运行页/事件页不建立第二个任务或事件 store。事件读取返回有限片段、无精度损失的后续 sequence 和未读尾部标记，Subagent 历史未读完仍明确提示。原类型化控制回执区分 no-op、已接受请求、排期/恢复重试与物理或语义完成。同 ID 工作区换 generation 以及迟到请求由原 scope 和 GUI 选择世代隔离。
 
@@ -460,6 +464,10 @@ primary、计划 Subagent、Verification 与 review 消费持久规则。原 poo
 历史检查在同一个 Zustand store 中至多额外保留一份呈现快照，不替换当前聊天的 activeRun、任务数量、失败提示或消息归属。任务面板操作携带实际显示的 run_id；冲突提示的 Continue 使用原准入 Workspace/run 与类型化回执，不读取选中历史的状态来判断目标。迟到结果不能清除后继提示或覆盖另一个呈现快照。
 
 ## 会话事件投影与终态
+
+同一任务的续接保持原 `root_message_id`，当前有限回合仍使用自己的 `turn_id`。原生事件的 message 身份必须指向原根消息，不能把续接 turn 当成新 journal 根；原 journal 的身份校验继续严格执行。IM 的 execution/input 生命周期事实完整保留在原 journal，手机不逐条接收这些内部 ID 和调试状态。真实失败与取消只由原 typed Terminal 生成用户可读提示，不把断流、保存回执或模型片段冒充最终结果，也不重写已保存的旧终态。
+
+前台等待续接后，首个有限回合的 receipt、原生执行状态和 `RunTurnFinished` 保持原值。只有原受控 completion 明确为 `Stopped + Completed`，并且原 generation 下读回的同一 Run、工作空间、会话、TaskRun 根消息均匹配且 Run 已 `Completed`，才把已结束前台的聚合呈现为完成。该只读观察沿原 foreground slot 携回，不持久化、不参与准入或执行，也不替代 TaskRun 权威。`Deferred`、`Paused`、取消、身份漂移、未观察到物理释放或下游投递债务不获得这项成功呈现；迟到观察不能写入后继 slot。
 
 前端接纳框架 AgentEvent schema5 的 `transcript_projection_settlement`，完整保留保存结果分类、操作与会话/世代身份、尝试次数及错误信息。它是会话保存检查点，不是 TaskRun 或聊天回合完成；成功保存不改变运行状态，未确认、阻塞与冲突显示明确提示，真正的回合结束仍以原 `turn_status` 为准。
 

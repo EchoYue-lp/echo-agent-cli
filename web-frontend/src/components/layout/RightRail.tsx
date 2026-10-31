@@ -7,6 +7,7 @@ import { productDataScope } from '../../lib/productDataScope';
 import { TaskRuntimePanel } from '../task/TaskRuntimePanel';
 import { taskTimestamp } from '../task/TaskRuntimeList';
 import type { TaskRun } from '../../generated';
+import { taskRunSourceLabel } from '../../lib/taskRunPresentation';
 
 const STATUS: Record<TaskRun['status'], string> = {
   pending: '待执行',
@@ -92,7 +93,7 @@ export function RightRail() {
         )}
         {loadingRuns && <p role="status">正在读取运行列表…</p>}
         {!loadingRuns && !runPage.length && !runListError && (
-          <p>尚无正式任务运行。普通会话不会自动加入此列表。</p>
+          <p>尚无任务运行。IM、定时任务和对话的运行记录都会显示在这里。</p>
         )}
         <div className="eko-task-history-rows">
           {runPage.map((run) => (
@@ -105,9 +106,7 @@ export function RightRail() {
             >
               <strong>{run.goal}</strong>
               <span>
-                {STATUS[run.status]} ·{' '}
-                {run.attended_mode === 'unattended' ? '后台触发' : '交互任务'} ·{' '}
-                {taskTimestamp(run.updated_at)}
+                {STATUS[run.status]} · {taskRunSourceLabel(run)} · {taskTimestamp(run.updated_at)}
               </span>
             </button>
           ))}

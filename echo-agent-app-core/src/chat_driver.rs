@@ -1226,7 +1226,7 @@ async fn drive_prepared_chat(
     } else {
         None
     };
-    let mut result = if let Some(registration) = prepared.task_driver_registration.take() {
+    let result = if let Some(registration) = prepared.task_driver_registration.take() {
         let store = prepared
             .store
             .as_ref()
@@ -1339,12 +1339,30 @@ async fn drive_prepared_chat(
                     disposition = ?request.disposition,
                     "finite RunTurn requested continuation"
                 );
-                if prepared.foreground_progress.is_some() {
+                if let Some(progress) = prepared.foreground_progress.as_ref() {
                     let completion = request.completion.wait().await?;
-                    if completion.terminal != TurnOutcome::Completed
-                        && let Ok(outcome) = result.as_mut()
+                    // completion已等待原driver物理idle。成功还须读同generation的
+                    // 原Run；Completed的Deferred/Paused回执不能冒成Goal完成。
+                    let terminal = if completion.terminal != TurnOutcome::Completed {
+                        Some(completion.terminal.clone())
+                    } else if completion.reason == crate::tasks::task_runtime::continuation::ContinuationCompletionReason::Stopped {
+                        let run_id = prepared.formal_run_id.clone();
+                        let state = crate::tasks::task_runtime::TaskRuntimeOperation::new(store.clone())
+                            .run_store("read original foreground continuation completion", move |store| store.get_run_state(&run_id))
+                            .await.map_err(|error| error.to_string())?
+                            .ok_or_else(|| "foreground continuation original run disappeared".to_string())?;
+                        foreground_continuation_projection(
+                            &completion, &state.run, &prepared.formal_run_id,
+                            &prepared.binding, &prepared.resources,
+                        )?
+                    } else {
+                        None
+                    };
+                    if result.is_ok()
+                        && let Some(terminal) = terminal
                     {
-                        outcome.outcome = completion.terminal;
+                        // 只回传原前台surface投影，首finite receipt与已存journal保持原值。
+                        progress.record_continuation_outcome(&prepared.formal_run_id, terminal)?;
                     }
                     tracing::debug!(
                         run_id = %prepared.formal_run_id,
@@ -1398,6 +1416,33 @@ async fn drive_prepared_chat(
         "chat execution path observed"
     );
     result
+}
+
+/// 从原completion与Run事实派生前台呈现；不重新判定执行/验收成功，不写原事实。
+fn foreground_continuation_projection(
+    completion: &crate::tasks::task_runtime::continuation::ContinuationCompletion,
+    run: &crate::tasks::task_runtime::types::TaskRun,
+    run_id: &str,
+    binding: &RunTurnBinding,
+    resources: &crate::chat_resources::ChatResources,
+) -> Result<Option<TurnOutcome>, String> {
+    use crate::tasks::task_runtime::{TaskRunStatus, continuation::ContinuationCompletionReason};
+    if completion.reason != ContinuationCompletionReason::Stopped
+        || completion.terminal != TurnOutcome::Completed
+    {
+        return Ok(None);
+    }
+    if run.run_id != run_id
+        || run.workspace_id != resources.execution_scope.workspace_id()
+        || resources.conv_id.as_deref() != Some(run.conversation_id.as_str())
+        || run.root_message_id != binding.root_message_id
+    {
+        return Err(
+            "foreground continuation original run identity changed; success not published"
+                .to_string(),
+        );
+    }
+    Ok((run.status == TaskRunStatus::Completed).then_some(TurnOutcome::Completed))
 }
 
 struct RegisteredTurnDriver {
@@ -2232,10 +2277,11 @@ async fn drive_chat_inner(
                 },
             ));
         }
+        // 当前有限turn与本surface已经选定的journal根分别携带；恢复不能改写根身份。
         let event_identity = EventIdentity::for_chat(
             conversation_id.clone(),
             turn_id.clone(),
-            turn_id.clone(),
+            res.root_message_id.clone(),
             active_run_id.clone(),
         )
         .map_err(|error| error.to_string())?;
@@ -2371,6 +2417,136 @@ impl ChatSink for ChannelChatSink {
 mod tests {
     use super::*;
     use crate::tasks::task_runtime::TaskRunStatus;
+
+    #[test]
+    fn foreground_projection_keeps_deferred_paused_cancelled_and_foreign_runs_non_successful()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tasks::task_runtime::continuation::{
+            ContinuationCompletion, ContinuationCompletionReason,
+        };
+        use crate::tasks::task_runtime::{
+            AttendedMode, DomainProfile, TaskRunExecutionProfile, TaskRuntimeStore,
+        };
+        use std::sync::Arc;
+        let store = TaskRuntimeStore::new_in_memory()?;
+        let workspace = store.active_workspace_id();
+        let mut run = store.create_run_with_profile(
+            "projection-run",
+            &workspace,
+            "projection-conversation",
+            "formal-root",
+            DomainProfile::General,
+            "原Goal",
+            "agent_task_plan",
+            AttendedMode::Attended,
+            TaskRunExecutionProfile::conversation_turn(),
+        )?;
+        // 此处只测原Run读模型的呈现；真正Completed提交及物理释放由r06真实入口验证。
+        run.status = TaskRunStatus::Completed;
+        let binding = RunTurnBinding {
+            domain_plugin: None,
+            run_id: Some(run.run_id.clone()),
+            turn_id: "current-finite-turn".into(),
+            root_message_id: "formal-root".into(),
+            origin: RunTurnOrigin::Continuation,
+            transcript_visibility: TurnVisibility::Internal,
+            expected_resume: None,
+        };
+        let resources = crate::chat_resources::ChatResources {
+            execution_scope: crate::workspace::WorkspaceExecutionScope::workspace(
+                &crate::workspace::WorkspaceId::from_name(&workspace),
+                ".",
+            ),
+            workspace_io_receipt: None,
+            pool: None,
+            store: None,
+            sink: Arc::new(MockChatSink::default()),
+            webhook_emitter: None,
+            conv_id: Some(run.conversation_id.clone()),
+            root_message_id: "surface-resume-message".into(),
+            attachments: Vec::new(),
+            cancel: echo_agent::agent::CancellationToken::new(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        };
+        let completion = ContinuationCompletion {
+            terminal: TurnOutcome::Completed,
+            reason: ContinuationCompletionReason::Stopped,
+        };
+        assert_eq!(
+            foreground_continuation_projection(
+                &completion,
+                &run,
+                &run.run_id,
+                &binding,
+                &resources
+            )?,
+            Some(TurnOutcome::Completed)
+        );
+        for status in [
+            TaskRunStatus::Pending,
+            TaskRunStatus::Running,
+            TaskRunStatus::Paused,
+            TaskRunStatus::Failed,
+            TaskRunStatus::Cancelled,
+        ] {
+            let mut observed = run.clone();
+            observed.status = status;
+            assert!(
+                foreground_continuation_projection(
+                    &completion,
+                    &observed,
+                    &run.run_id,
+                    &binding,
+                    &resources
+                )?
+                .is_none()
+            );
+        }
+        let deferred = ContinuationCompletion {
+            terminal: TurnOutcome::Completed,
+            reason: ContinuationCompletionReason::Deferred,
+        };
+        assert!(
+            foreground_continuation_projection(&deferred, &run, &run.run_id, &binding, &resources)?
+                .is_none()
+        );
+        let cancelled = ContinuationCompletion {
+            terminal: TurnOutcome::Cancelled,
+            reason: ContinuationCompletionReason::Stopped,
+        };
+        assert!(
+            foreground_continuation_projection(
+                &cancelled,
+                &run,
+                &run.run_id,
+                &binding,
+                &resources
+            )?
+            .is_none()
+        );
+        for field in ["run", "workspace", "conversation", "root"] {
+            let mut observed = run.clone();
+            match field {
+                "run" => observed.run_id = "foreign-run".into(),
+                "workspace" => observed.workspace_id = "foreign-workspace".into(),
+                "conversation" => observed.conversation_id = "foreign-conversation".into(),
+                _ => observed.root_message_id = "foreign-root".into(),
+            }
+            assert!(
+                foreground_continuation_projection(
+                    &completion,
+                    &observed,
+                    &run.run_id,
+                    &binding,
+                    &resources
+                )
+                .is_err()
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn existing_run_continuation_preserves_identity_and_rejects_foreign_bindings()
@@ -3453,6 +3629,136 @@ mod tests {
             finalize_run_turn(&store, "setup-retry", &outcome, None).await?,
             RunTurnDecision::Continue
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn continuation_journal_keeps_original_root_across_two_finite_turns() -> Result<(), String>
+    {
+        use crate::chat_event_log::{
+            ChatEventLog, ChatEventRetention, ChatSurface, bind_surface_chat_sink,
+        };
+        use std::sync::Arc;
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let log = Arc::new(
+            ChatEventLog::open(
+                directory.path().join("chat-events"),
+                ChatEventRetention::default(),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        let renderer = Arc::new(MockChatSink::default());
+        let sink = bind_surface_chat_sink(
+            ChatSurface::Channel,
+            renderer.clone(),
+            log.clone(),
+            Arc::new(
+                crate::tool_execution::ToolExecutionRepository::open(
+                    directory.path().join("tools"),
+                )
+                .map_err(|error| error.to_string())?,
+            ),
+            "history-workspace",
+            Some("history-conversation".to_string()),
+            "original-root",
+        );
+        let model = Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .with_network_error("retryable local transport failure")
+                .with_response("恢复后的回答"),
+        );
+        let mut raw = echo_agent::agent::ReactAgent::new(
+            echo_agent::agent::AgentConfig::minimal("root-history", "root-history")
+                .llm_max_retries(0),
+        );
+        raw.set_llm_client(model.clone());
+        let agent = AgentHandle::new(raw);
+        let cancel = echo_agent::agent::CancellationToken::new();
+        let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
+            pool: None,
+            store: None,
+            sink,
+            webhook_emitter: None,
+            conv_id: Some("history-conversation".to_string()),
+            root_message_id: "original-root".to_string(),
+            attachments: Vec::new(),
+            cancel: cancel.clone(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        for (turn_id, origin) in [
+            ("original-root", RunTurnOrigin::User),
+            ("continuation-turn", RunTurnOrigin::Continuation),
+        ] {
+            let receipt = drive_chat_inner(
+                &agent,
+                &make_turn("继续同一任务"),
+                resources.clone(),
+                ChatTurnModelScope {
+                    turn_id: turn_id.to_string(),
+                    bound_run_id: None,
+                    driver_execution_context: Some(format!("execution-{turn_id}")),
+                    origin,
+                    transcript_visibility: TurnVisibility::Internal,
+                    invocation_resources: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            if turn_id == "original-root" {
+                let TurnOutcome::Failed(failure) = receipt.outcome else {
+                    return Err("首回合未保留原网络失败".to_string());
+                };
+                assert_eq!(failure.code, "llm_network");
+                assert!(failure.retryable);
+            } else {
+                assert_eq!(
+                    receipt.outcome,
+                    TurnOutcome::Completed,
+                    "续接不能因原journal根身份错误变成断流/取消"
+                );
+            }
+        }
+        let replay = log
+            .replay(
+                "history-workspace",
+                Some("history-conversation"),
+                "original-root",
+                0,
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(
+            replay
+                .events
+                .iter()
+                .any(|event| event.turn_id == "original-root")
+        );
+        assert!(
+            replay
+                .events
+                .iter()
+                .any(|event| event.turn_id == "continuation-turn")
+        );
+        for event in &replay.events {
+            assert_eq!(event.root_turn_id, "original-root");
+            assert_eq!(event.message_id, "original-root");
+            if let ChatDriverEvent::Agent(inner) = &event.payload {
+                assert_eq!(
+                    inner.message_id.as_ref().map(|id| id.as_str()),
+                    Some("original-root")
+                );
+                assert!(
+                    !matches!(&inner.payload, AgentEvent::ExecutionStatus(status)
+                    if status.status == echo_agent::agent::ExecutionStatusKind::Cancelled)
+                );
+            }
+        }
+        assert_eq!(model.call_count(), 2);
+        assert!(!cancel.is_cancelled());
         Ok(())
     }
 

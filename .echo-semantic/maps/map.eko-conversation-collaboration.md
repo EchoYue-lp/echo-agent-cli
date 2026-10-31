@@ -8,7 +8,7 @@ observed_at: 40fd80447cdf3d7627399af0b2069a8b4da5327a
 boundary_refs: [boundary.eko-conversation-collaboration]
 behavior_refs: [behavior.side-conversation-lifecycle, behavior.gui-conversation-fork, behavior.automatic-agent-collaboration-ui-boundary]
 rule_refs: [rule.conversation-collaboration-authorities]
-evidence_refs: [evidence.side-conversation-preflight, evidence.gui-conversation-fork, evidence.automatic-agent-collaboration-ui-retirement]
+evidence_refs: [evidence.side-conversation-preflight, evidence.gui-conversation-fork, evidence.automatic-agent-collaboration-ui-retirement, evidence.eko-im-cron-history-foreground-outcome]
 finding_refs: [finding.manual-agent-collaboration-ui-retirement]
 audit_refs: [audit.automatic-agent-collaboration-ui-retirement]
 related_map_refs: []

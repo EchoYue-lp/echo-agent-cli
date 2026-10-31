@@ -1664,6 +1664,109 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn task_history_external_runs_survive_reopen_without_plans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        let workspace = store.active_workspace_id();
+        for (id, conversation, status) in [
+            ("im-first", "channel:sha256:history", TaskRunStatus::Failed),
+            (
+                "im-second",
+                "channel:sha256:history",
+                TaskRunStatus::Cancelled,
+            ),
+            (
+                "cron-failed",
+                "cron:daily:occurrence",
+                TaskRunStatus::Failed,
+            ),
+            ("gui-hidden", "ordinary-gui", TaskRunStatus::Cancelled),
+        ] {
+            store.create_run_with_profile(
+                id,
+                &workspace,
+                conversation,
+                &format!("root-{id}"),
+                DomainProfile::General,
+                "原触发输入",
+                "agent_task_plan",
+                AttendedMode::Attended,
+                TaskRunExecutionProfile::conversation_turn(),
+            )?;
+            store.transition_run(id, TaskRunStatus::Running)?;
+            store.finalize_run(id, status, None)?;
+            assert!(store.get_plan(id)?.is_none());
+        }
+        drop(store);
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        let first = reopened.query_task_runs_page("generation-a", &[], 1, None)?;
+        assert_eq!(
+            first.items.len(),
+            1,
+            "后台触发无plan的原Run仍须进入同一历史查询"
+        );
+        let cursor = first
+            .next_continuation
+            .as_deref()
+            .ok_or("后台多Run分页缺失")?;
+        assert!(
+            reopened
+                .query_task_runs_page("generation-b", &[], 1, Some(cursor))
+                .is_err()
+        );
+        let mut ids = first
+            .items
+            .iter()
+            .map(|run| run.run_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut next = first.next_continuation;
+        for _ in 0..3 {
+            let Some(cursor) = next.take() else {
+                break;
+            };
+            let page = reopened.query_task_runs_page("generation-a", &[], 1, Some(&cursor))?;
+            assert!(page.items.len() <= 1);
+            for run in page.items {
+                assert!(ids.insert(run.run_id), "同一scope/generation/run不能重复");
+            }
+            next = page.next_continuation;
+        }
+        assert!(next.is_none());
+        assert_eq!(
+            ids,
+            ["im-first", "im-second", "cron-failed"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<std::collections::HashSet<_>>()
+        );
+        assert!(
+            reopened
+                .latest_task_ui_run_for_conversation("channel:sha256:history")?
+                .is_some()
+        );
+        assert!(
+            reopened
+                .latest_task_ui_run_for_conversation("cron:daily:occurrence")?
+                .is_some()
+        );
+        assert!(
+            reopened
+                .latest_task_ui_run_for_conversation("ordinary-gui")?
+                .is_none()
+        );
+        assert_eq!(
+            reopened.get_run("im-first")?.ok_or("失败Run缺失")?.status,
+            TaskRunStatus::Failed
+        );
+        assert_eq!(
+            reopened.get_run("im-second")?.ok_or("取消Run缺失")?.status,
+            TaskRunStatus::Cancelled
+        );
+        Ok(())
+    }
+
     fn seed_task_query_run(
         store: &TaskRuntimeStore,
         id: &str,

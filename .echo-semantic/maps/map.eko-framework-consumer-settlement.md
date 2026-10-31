@@ -15,6 +15,7 @@ behavior_refs:
 rule_refs:
 - rule.eko-framework-consumer-authorities
 evidence_refs:
+- evidence.eko-im-cron-history-foreground-outcome
 - evidence.latest-framework-consumer-integration
 - evidence.background-review-entry-repair
 - evidence.background-review-entry-verification

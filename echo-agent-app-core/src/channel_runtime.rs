@@ -336,35 +336,6 @@ fn channel_input_phase_label(
 }
 
 #[cfg(feature = "channels")]
-fn channel_input_fact_phase(
-    fact: &crate::conversation_input::ConversationInputFact,
-) -> Option<crate::conversation_input::ConversationInputPhase> {
-    use crate::conversation_input::{ConversationInputFact, ConversationInputPhase};
-
-    match fact {
-        ConversationInputFact::Persisted { .. } => Some(ConversationInputPhase::Persisted),
-        ConversationInputFact::TaskRunTargetBound { .. } => None,
-        ConversationInputFact::AttemptStarted { .. } => {
-            Some(ConversationInputPhase::AttemptStarted)
-        }
-        ConversationInputFact::MailboxAccepted { .. } => {
-            Some(ConversationInputPhase::MailboxAccepted)
-        }
-        ConversationInputFact::Drained { .. } | ConversationInputFact::DriverAccepted { .. } => {
-            Some(ConversationInputPhase::Drained)
-        }
-        ConversationInputFact::TurnSettled { .. } => Some(ConversationInputPhase::TurnSettled),
-        ConversationInputFact::Deferred { .. } => Some(ConversationInputPhase::Deferred),
-        ConversationInputFact::Reordered { .. } => None,
-        ConversationInputFact::RecoveryRequired { .. }
-        | ConversationInputFact::RecoveryUncertain { .. } => {
-            Some(ConversationInputPhase::RecoveryRequired)
-        }
-        ConversationInputFact::Cancelled { .. } => Some(ConversationInputPhase::Cancelled),
-    }
-}
-
-#[cfg(feature = "channels")]
 async fn settle_channel_turn_after_input_observers(
     lease: crate::foreground_turn::ForegroundTurnLease,
     outcome: crate::chat_driver::TurnOutcome,
@@ -7461,11 +7432,7 @@ impl AppChannelMessageHandler {
                 if !submitted.is_dispatchable() {
                     return Ok(channel_immediate_response(
                         &msg,
-                        format!(
-                            "Channel input {} is already {}.",
-                            submitted.identity.input_id,
-                            channel_input_phase_label(submitted.phase)
-                        ),
+                        "这条消息已接收，无需重复发送。",
                     ));
                 }
                 if let Err(error) = self
@@ -8545,25 +8512,9 @@ async fn aggregate_by_sentence_with_repository<'a>(
                         | echo_agent::agent::AssistantPhase::FinalAnswer => {}
                     }
                 }
-                AgentEvent::ExecutionStatus(status) => {
-                    let observation = (
-                        envelope.stream_id, envelope.turn_id,
-                        envelope.execution_id, envelope.event_id,
-                    );
-                    if !native_events.insert(observation) { continue; }
-                    flush_all!();
-                    let label = match status.status {
-                        echo_agent::agent::ExecutionStatusKind::Started => "started",
-                        echo_agent::agent::ExecutionStatusKind::Waiting => "waiting",
-                        echo_agent::agent::ExecutionStatusKind::ToolPending => "tool_pending",
-                        echo_agent::agent::ExecutionStatusKind::Candidate => "candidate",
-                        echo_agent::agent::ExecutionStatusKind::Settled => "agent_execution_settled",
-                        echo_agent::agent::ExecutionStatusKind::Cancelled => "agent_execution_cancelled",
-                        echo_agent::agent::ExecutionStatusKind::Failed => "agent_execution_failed",
-                    };
-                    let reason = status.reason.as_deref().map(|reason| format!(": {}", channel_safe_text(reason, 320))).unwrap_or_default();
-                    yield ChannelOutboundDraft::ordinary(format!("[execution:{}] {label}{reason}", channel_safe_text(&status.execution_id, 80)));
-                }
+                // 原生状态已由原sink/journal记录；它们不包含用户回答，也不是
+                // 手机进度文案。只由真实Terminal发布失败/取消，不在此发送内部ID。
+                AgentEvent::ExecutionStatus(_) => {}
                 AgentEvent::ToolCall { call_id, invocation } => {
                     flush_all!();
                     let address = tool_state.chat_address(&call_id, &fallback_message_id);
@@ -8865,26 +8816,9 @@ async fn aggregate_by_sentence_with_repository<'a>(
                     flush_all!();
                     yield ChannelOutboundDraft::ordinary(format!("[paused:{run_id}] {goal}; new instruction: {new_message}"));
                 }
-                // 绑定只固定原输入的任务去向，不是重排或用户可见的投递阶段。
-                ChannelRenderEvent::Driver(ChatDriverEvent::InputLifecycle(fact))
-                    if matches!(
-                        fact.as_ref(),
-                        crate::conversation_input::ConversationInputFact::TaskRunTargetBound { .. }
-                    ) => {}
-                ChannelRenderEvent::Driver(ChatDriverEvent::InputLifecycle(fact)) => {
-                    flush_all!();
-                    let phase = channel_input_fact_phase(&fact)
-                        .map(channel_input_phase_label)
-                        .unwrap_or("reordered");
-                    yield ChannelOutboundDraft::ordinary(format!(
-                        "[input:{}] {}",
-                        channel_safe_text(
-                            &fact.identity().input_id,
-                            CHANNEL_TOOL_PROGRESS_CHARS,
-                        ),
-                        phase,
-                    ));
-                }
+                // 输入持久化/排队/ACK事实继续留在原journal；不主动向用户
+                // 投递input ID或逐阶段调试标签。公开提示与HITL仍走原分支。
+                ChannelRenderEvent::Driver(ChatDriverEvent::InputLifecycle(_)) => {}
                 ChannelRenderEvent::Driver(ChatDriverEvent::CommandCellStarted { cell }) => {
                     flush_all!();
                     yield ChannelOutboundDraft::ordinary(format!("[cell:{}] started: {}", cell.cell_id, cell.name));
@@ -8958,14 +8892,14 @@ async fn aggregate_by_sentence_with_repository<'a>(
                     crate::chat_driver::TurnOutcome::Cancelled,
                 ) => {
                     flush_all!();
-                    yield ChannelOutboundDraft::terminal("[cancelled] The channel turn was cancelled.");
+                    yield ChannelOutboundDraft::terminal("本次处理已取消。");
                     break;
                 }
                 ChannelRenderEvent::Terminal(
                     crate::chat_driver::TurnOutcome::Failed(failure),
                 ) => {
                     flush_all!();
-                    yield ChannelOutboundDraft::terminal(format!("[failed:{}] {}", failure.code, failure.message));
+                    yield ChannelOutboundDraft::terminal(format!("本次处理失败：{}", failure.message));
                     break;
                 }
                 ChannelRenderEvent::Journaled(_) => {}
@@ -14743,7 +14677,10 @@ mod tests {
             while let Some(message) = output.next().await {
                 texts.push(message?.text);
             }
-            assert_eq!(texts, vec!["[input:queue-control] reordered".to_string()]);
+            assert!(
+                texts.is_empty(),
+                "内部输入绑定和排队事实保留在journal，不主动发送到IM"
+            );
             Ok(())
         }
 
@@ -14833,10 +14770,7 @@ mod tests {
             let texts = collect_texts(out).await;
             assert_eq!(
                 texts,
-                vec![
-                    "partial".to_string(),
-                    "[cancelled] The channel turn was cancelled.".to_string()
-                ]
+                vec!["partial".to_string(), "本次处理已取消。".to_string()]
             );
         }
 
@@ -14867,7 +14801,7 @@ mod tests {
                 .await
                 .ok_or_else(|| "missing typed terminal output".to_string())?
                 .map_err(|error| error.to_string())?;
-            assert_eq!(second.text, "[failed:llm_network] boom");
+            assert_eq!(second.text, "本次处理失败：boom");
             Ok(())
         }
 
@@ -15121,7 +15055,7 @@ mod tests {
                 .ok_or_else(|| "result event is missing".to_string())?;
             let terminal = texts
                 .iter()
-                .position(|text| text.starts_with("[cancelled]"))
+                .position(|text| text == "本次处理已取消。")
                 .ok_or_else(|| "terminal event is missing".to_string())?;
             assert!(started < progress);
             assert!(progress < result);
@@ -15521,7 +15455,7 @@ mod tests {
             let terminal = texts
                 .last()
                 .ok_or_else(|| "terminal output is missing".to_string())?;
-            assert!(terminal.starts_with("[failed:terminal_failure]"));
+            assert!(terminal.starts_with("本次处理失败："));
             assert!(terminal.contains("[REDACTED]"));
             Ok(())
         }

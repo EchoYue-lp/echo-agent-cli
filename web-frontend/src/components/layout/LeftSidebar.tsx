@@ -25,9 +25,13 @@ import { BrandIcon } from '../common/BrandIcon';
 import { useUiStore } from '../../stores/uiStore';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { useConversationStore } from '../../stores/conversationStore';
-import { conversationApi } from '../../api/endpoints';
+import { conversationApi, taskRuntimeApi } from '../../api/endpoints';
 import type { Workspace } from '../../api/endpoints';
 import type { ConversationListItem } from '../../types/api';
+import type { TaskRun } from '../../generated';
+import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
+import { useContextPaneStore } from '../../stores/contextPaneStore';
+import { taskRunSourceLabel } from '../../lib/taskRunPresentation';
 import { fileSystem } from '../../lib/tauri-bridge';
 import { workspaceIdForView, GLOBAL_WORKSPACE_ID } from '../../lib/viewAddress';
 import { workspaceLocationLabel, workspaceIsRemote } from '../../lib/workspacePresentation';
@@ -42,7 +46,17 @@ interface RecentTask {
   workspaceGeneration: string;
   workspaceName: string;
   conversation: ConversationListItem;
+  run?: TaskRun;
+  hasConversation?: boolean;
 }
+const RUN_STATUS_LABEL: Record<TaskRun['status'], string> = {
+  pending: '待执行',
+  running: '运行中',
+  paused: '已暂停',
+  completed: '已完成',
+  failed: '失败',
+  cancelled: '已取消',
+};
 const SIDE_STATUS_LABEL = {
   idle: '空闲',
   queued: '排队',
@@ -97,6 +111,8 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   const [recentVisibleCount, setRecentVisibleCount] = useState(4);
   const [recentLoading, setRecentLoading] = useState(false);
   const [recentError, setRecentError] = useState('');
+  const [recentRunPages, setRecentRunPages] = useState(1);
+  const [recentHasMoreRuns, setRecentHasMoreRuns] = useState(false);
   const recentScopes = useMemo(
     () => [
       {
@@ -124,33 +140,104 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   );
   useEffect(() => {
     let cancelled = false;
-    const scopes = recentScopes.slice(0, recentWorkspaceCount);
-    const rows: RecentTask[] = [];
-    let next = 0;
-    let failed = 0;
-    setRecentLoading(true);
-    setRecentError('');
-    // Read only the explicitly requested finite batch, with two metadata reads at a time.
-    const readNext = async () => {
-      while (!cancelled && next < scopes.length) {
-        const scope = scopes[next++];
-        if (!scope) return;
-        try {
-          const items = await conversationApi.list(scope.id);
+    let inFlight = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const conversationMetadata = new Map<string, ConversationListItem[]>();
+    const scopeIsCurrent = (scope: (typeof recentScopes)[number]) =>
+      scope.id === GLOBAL_WORKSPACE_ID ||
+      useWorkspaceStore.getState().workspaces.find((item) => item.id === scope.id)
+        ?.product_data_generation === scope.generation;
+    const refresh = async (readConversations = false) => {
+      if (cancelled || inFlight || document.hidden) return;
+      inFlight = true;
+      if (timer) clearTimeout(timer);
+      const scopes = recentScopes.slice(0, recentWorkspaceCount);
+      const rows: RecentTask[] = [];
+      let next = 0;
+      const failed = new Set<string>();
+      let hasMoreRuns = false;
+      setRecentLoading(true);
+      setRecentError('');
+      // Read only the explicitly requested finite batch, with two metadata reads at a time.
+      const readNext = async () => {
+        while (!cancelled && next < scopes.length) {
+          const scope = scopes[next++];
+          if (!scope) return;
+          const key = JSON.stringify([scope.id, scope.generation]);
+          let items = conversationMetadata.get(key) ?? [];
+          const runs = new Map<string, TaskRun>();
+          // 周期刷新只走有界 Run 索引；不周期扫描全部会话 manifest。
+          if (readConversations) {
+            try {
+              items = await conversationApi.list(scope.id);
+              conversationMetadata.set(key, items);
+            } catch {
+              failed.add(scope.id);
+            }
+          }
+          try {
+            let continuation: string | null = null;
+            for (let page = 0; page < recentRunPages; page += 1) {
+              if (cancelled || !scopeIsCurrent(scope)) return;
+              const result = await taskRuntimeApi.listRuns(
+                { workspaceId: scope.id, workspaceGeneration: scope.generation },
+                [],
+                continuation,
+                RECENT_PER_WORKSPACE
+              );
+              if (
+                result.items.some((run) => run.workspace_id !== scope.id) ||
+                (result.next_continuation !== null && result.next_continuation === continuation)
+              )
+                throw new Error('运行历史返回了错误的工作空间或分页位置');
+              for (const run of result.items) runs.set(run.run_id, run);
+              continuation = result.next_continuation;
+              if (!continuation) break;
+            }
+            if (continuation) hasMoreRuns = true;
+          } catch {
+            failed.add(scope.id);
+          }
           if (cancelled) return;
-          const actual = useWorkspaceStore
-            .getState()
-            .workspaces.find((item) => item.id === scope.id);
-          if (
-            scope.id !== GLOBAL_WORKSPACE_ID &&
-            actual?.product_data_generation !== scope.generation
-          )
-            continue;
+          if (!scopeIsCurrent(scope)) continue;
+          const metadata = new Map(items.map((item) => [item.conversation_id, item]));
+          const runConversations = new Set<string>();
+          for (const run of runs.values()) {
+            if (
+              !run.conversation_id.startsWith('channel:') &&
+              !run.conversation_id.startsWith('cron:')
+            )
+              continue;
+            const conversation = metadata.get(run.conversation_id);
+            if (conversation?.archived || conversation?.side_conversation) continue;
+            runConversations.add(run.conversation_id);
+            rows.push({
+              workspaceId: scope.id,
+              workspaceGeneration: scope.generation,
+              workspaceName: scope.name,
+              run,
+              hasConversation: !!conversation,
+              // 只读行投影；失败发生于消息落盘前时仍可打开原 Run，绝不补造会话。
+              conversation: {
+                id: -1,
+                conversation_id: run.conversation_id,
+                title: run.goal || conversation?.title || '新任务',
+                message_count: conversation?.message_count ?? 0,
+                created_at: run.created_at,
+                updated_at: run.updated_at,
+              },
+            });
+          }
           rows.push(
             ...items
-              .filter((item) => !item.archived && !item.side_conversation)
+              .filter(
+                (item) =>
+                  !item.archived &&
+                  !item.side_conversation &&
+                  !runConversations.has(item.conversation_id)
+              )
               .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
-              .slice(0, RECENT_PER_WORKSPACE)
+              .slice(0, RECENT_PER_WORKSPACE * recentRunPages)
               .map((conversation) => ({
                 workspaceId: scope.id,
                 workspaceGeneration: scope.generation,
@@ -158,23 +245,79 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                 conversation,
               }))
           );
-        } catch {
-          failed += 1;
         }
-      }
-    };
-    void Promise.all([readNext(), readNext()]).then(() => {
+      };
+      await Promise.all([readNext(), readNext()]);
       if (cancelled) return;
-      setRecentTasks(
-        rows.sort((a, b) => b.conversation.updated_at.localeCompare(a.conversation.updated_at))
-      );
-      setRecentError(failed ? `${failed} 个工作空间的最近任务暂时无法读取` : '');
+      setRecentTasks((previous) => {
+        const retained = previous.filter(
+          (row) =>
+            failed.has(row.workspaceId) &&
+            scopes.some(
+              (scope) =>
+                scope.id === row.workspaceId &&
+                scope.generation === row.workspaceGeneration &&
+                scopeIsCurrent(scope)
+            )
+        );
+        const unique = new Map(
+          [...retained, ...rows].map((row) => [
+            JSON.stringify([
+              row.workspaceId,
+              row.workspaceGeneration,
+              row.run?.run_id ?? row.conversation.conversation_id,
+            ]),
+            row,
+          ])
+        );
+        const merged = [...unique.values()];
+        const backgroundConversations = new Set(
+          merged
+            .filter((row) => row.run)
+            .map((row) =>
+              JSON.stringify([
+                row.workspaceId,
+                row.workspaceGeneration,
+                row.conversation.conversation_id,
+              ])
+            )
+        );
+        return merged
+          .filter(
+            (row) =>
+              row.run ||
+              !backgroundConversations.has(
+                JSON.stringify([
+                  row.workspaceId,
+                  row.workspaceGeneration,
+                  row.conversation.conversation_id,
+                ])
+              )
+          )
+          .sort((a, b) => b.conversation.updated_at.localeCompare(a.conversation.updated_at));
+      });
+      setRecentHasMoreRuns(hasMoreRuns);
+      setRecentError(failed.size ? `${failed.size} 个工作空间的最近任务暂时无法读取` : '');
       setRecentLoading(false);
-    });
+      inFlight = false;
+      timer = setTimeout(() => void refresh(), 5000);
+    };
+    const onFocus = () => void refresh(true);
+    const onVisible = () => {
+      if (document.hidden) {
+        if (timer) clearTimeout(timer);
+      } else void refresh(true);
+    };
+    void refresh(true);
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisible);
     return () => {
       cancelled = true;
+      if (timer) clearTimeout(timer);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisible);
     };
-  }, [recentScopes, recentWorkspaceCount, conversations]);
+  }, [recentScopes, recentWorkspaceCount, recentRunPages, conversations]);
 
   const openRecentTask = async (task: RecentTask) => {
     const epoch = useUiStore.getState().beginNavigation();
@@ -210,9 +353,26 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
         useConversationStore.getState().workspaceId !== task.workspaceId
       )
         return;
-      await loadConversation(task.conversation.conversation_id);
-      if (useUiStore.getState().navigationEpoch === epoch)
+      if (task.hasConversation !== false) await loadConversation(task.conversation.conversation_id);
+      if (
+        useUiStore.getState().navigationEpoch !== epoch ||
+        useConversationStore.getState().newConversationEpoch !== draftEpoch
+      )
+        return;
+      if (task.run)
+        await useTaskRuntimeStore
+          .getState()
+          .loadByRun(
+            { workspaceId: task.workspaceId, workspaceGeneration: task.workspaceGeneration },
+            task.run.run_id
+          );
+      if (
+        useUiStore.getState().navigationEpoch === epoch &&
+        useConversationStore.getState().newConversationEpoch === draftEpoch
+      ) {
         useWorkspaceViewStore.getState().openChat();
+        if (task.run) useContextPaneStore.getState().openTasks();
+      }
     } catch (error) {
       if (useUiStore.getState().navigationEpoch === epoch)
         useToastStore
@@ -597,15 +757,20 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
             {recentTasks.slice(0, recentVisibleCount).map((task) => (
               <button
                 type="button"
-                key={`${task.workspaceId}:${task.workspaceGeneration}:${task.conversation.conversation_id}`}
+                key={`${task.workspaceId}:${task.workspaceGeneration}:${task.run?.run_id ?? task.conversation.conversation_id}`}
                 onClick={() => void openRecentTask(task)}
                 aria-label={`打开任务 ${task.conversation.title || '新任务'}，${task.workspaceName}`}
                 title={`${task.conversation.title || '新任务'} · ${task.workspaceName}`}
                 className={`group flex min-h-8 w-full items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-[13px] transition-colors hover:bg-[var(--bg-sidebar-hover)] ${activeConvId === task.conversation.conversation_id && (current?.id ?? GLOBAL_WORKSPACE_ID) === task.workspaceId ? 'bg-[var(--bg-sidebar-active)] text-[var(--text-primary)]' : ''}`}
               >
                 <MessageSquare size={13} className="shrink-0 text-[var(--text-tertiary)]" />
-                <span className="min-w-0 flex-1 truncate">
-                  {task.conversation.title || '新任务'}
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate">{task.conversation.title || '新任务'}</span>
+                  {task.run && (
+                    <span className="block text-[10px] text-[var(--text-tertiary)]">
+                      {taskRunSourceLabel(task.run)} · {RUN_STATUS_LABEL[task.run.status]}
+                    </span>
+                  )}
                 </span>
                 <span className="max-w-[56px] shrink-0 truncate text-[10px] text-[var(--text-tertiary)]">
                   {task.workspaceName}
@@ -620,7 +785,8 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                 {recentError}
               </p>
             )}
-            {(recentTasks.length > recentVisibleCount ||
+            {(recentHasMoreRuns ||
+              recentTasks.length > recentVisibleCount ||
               recentWorkspaceCount < recentScopes.length) && (
               <button
                 type="button"
@@ -628,6 +794,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                 onClick={() => {
                   setRecentVisibleCount((count) => count + 8);
                   setRecentWorkspaceCount((count) => count + WORKSPACE_BATCH);
+                  setRecentRunPages((count) => count + 1);
                 }}
                 className="px-3 py-2 text-xs text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
               >

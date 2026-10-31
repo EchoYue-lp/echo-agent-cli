@@ -451,7 +451,7 @@ async fn native_confirmed_execution_a_stays_before_execution_b_progress_and_canc
     assert!(
         output
             .last()
-            .is_some_and(|value| value.starts_with("[cancelled]"))
+            .is_some_and(|value| value == "本次处理已取消。")
     );
     assert!(!output.concat().contains("candidate"));
     Ok(())
@@ -497,10 +497,7 @@ async fn native_confirmed_answer_and_cancellation_both_survive_exhausted_ordinar
             .count(),
         1
     );
-    assert_eq!(
-        output.last().map(String::as_str),
-        Some("[cancelled] The channel turn was cancelled.")
-    );
+    assert_eq!(output.last().map(String::as_str), Some("本次处理已取消。"));
     assert!(!output.concat().contains("unconfirmed-candidate"));
     Ok(())
 }
@@ -725,7 +722,7 @@ async fn native_second_reserved_answer_is_an_explicit_projection_failure() -> an
 }
 
 #[tokio::test]
-async fn native_execution_status_is_visible_but_never_confirms_an_answer_or_closes_foreground()
+async fn native_execution_status_is_trace_only_and_never_confirms_an_answer_or_closes_foreground()
 -> anyhow::Result<()> {
     let status = agent_event(
         1,
@@ -760,13 +757,14 @@ async fn native_execution_status_is_visible_but_never_confirms_an_answer_or_clos
     .await?;
     assert_eq!(
         output.first().map(String::as_str),
-        Some("[execution:original-execution] agent_execution_settled")
+        Some("TaskRun continues")
     );
-    assert_eq!(output.get(1).map(String::as_str), Some("TaskRun continues"));
+    assert_eq!(output.len(), 2);
+    assert!(!output.concat().contains("original-execution"));
     assert!(
         output
             .last()
-            .is_some_and(|message| message.starts_with("[cancelled]"))
+            .is_some_and(|message| message == "本次处理已取消。")
     );
     assert!(!output.concat().contains("unconfirmed-candidate"));
     Ok(())
@@ -1040,17 +1038,7 @@ async fn native_clean_execution_tail_publishes_one_confirmed_answer_through_orig
         echo_agent::agent::ExecutionStatusKind::Settled
     );
     assert_eq!(started.execution_id, settled.execution_id);
-    assert_eq!(
-        delivered,
-        vec![
-            format!("[execution:{}] started", started.execution_id),
-            "original-tail-answer".to_string(),
-            format!(
-                "[execution:{}] agent_execution_settled",
-                settled.execution_id
-            ),
-        ]
-    );
+    assert_eq!(delivered, vec!["original-tail-answer".to_string()]);
     assert!(!delivered.concat().contains("unconfirmed-tail-candidate"));
     Ok(())
 }
@@ -1144,11 +1132,10 @@ async fn native_hitl_response_target_and_settled_status_keep_original_foreground
                 }),
             )?))
             .map_err(|_| anyhow::anyhow!("original renderer receiver closed"))?;
-        let settled = tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
-            .await?
-            .transpose()?
-            .ok_or_else(|| anyhow::anyhow!("settled status missing"))?;
-        assert!(settled.text.contains("[execution:physical-execution]"));
+        assert!(
+            output.next().now_or_never().is_none(),
+            "原生Settled只保留在事件中，不能发送内部ID或结束foreground"
+        );
         assert!(!cancel.is_cancelled());
 
         let mut request = HumanLoopRequest::input("确认原生任务继续🙂");
@@ -1372,13 +1359,9 @@ async fn native_hitl_timeout_and_reused_request_id_keep_original_foreground_owne
                 }),
             )?))
             .map_err(|_| anyhow::anyhow!("original status observer closed"))?;
-        let observation = tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
-            .await?
-            .transpose()?
-            .ok_or_else(|| anyhow::anyhow!("original execution observation missing"))?;
-        assert_eq!(
-            observation.text,
-            "[execution:original-execution] agent_execution_cancelled"
+        assert!(
+            output.next().now_or_never().is_none(),
+            "原生Cancelled观察不能主动发送调试状态或代替物理Terminal"
         );
         assert!(
             foreground
@@ -1405,7 +1388,7 @@ async fn native_hitl_timeout_and_reused_request_id_keep_original_foreground_owne
             .await?
             .transpose()?
             .ok_or_else(|| anyhow::anyhow!("original cancellation receipt missing"))?;
-        assert_eq!(terminal.text, "[cancelled] The channel turn was cancelled.");
+        assert_eq!(terminal.text, "本次处理已取消。");
         assert!(
             tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
                 .await?
@@ -1413,5 +1396,213 @@ async fn native_hitl_timeout_and_reused_request_id_keep_original_foreground_owne
         );
         assert!(cancel.is_cancelled());
     }
+    Ok(())
+}
+
+/// 真实输入journal与原生事件都保留；手机只收到公开正文或真实终态。
+#[tokio::test]
+async fn native_im_diagnostics_remain_in_journal_while_failure_is_readable() -> anyhow::Result<()> {
+    use crate::chat_event_log::{ChatEventLog, ChatEventRetention};
+    use crate::conversation_input::{
+        ConversationInputAddress, ConversationInputFact, ConversationInputOutcome,
+        ConversationInputPhase, ConversationInputService,
+    };
+    use std::sync::Arc;
+
+    let temporary = tempfile::tempdir()?;
+    let log = Arc::new(ChatEventLog::open(
+        temporary.path(),
+        ChatEventRetention::default(),
+    )?);
+    let service = ConversationInputService::new(log.clone());
+    let address = ConversationInputAddress {
+        workspace_id: "native-workspace".into(),
+        conversation_id: "native-conversation".into(),
+    };
+    let submitted = service
+        .submit(
+            address.clone(),
+            "private-input-id".into(),
+            "NATIVE_WAIT".into(),
+            Vec::new(),
+        )
+        .await?;
+    let started = service
+        .dispatch_next(&address, "native-im-turn".into())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("原输入未dispatch"))?;
+    let attempt = started
+        .active_attempt
+        .ok_or_else(|| anyhow::anyhow!("原输入没有attempt"))?;
+    service.mailbox_accepted(attempt.clone()).await?;
+    service.drained(attempt.clone()).await?;
+    let failure = echo_agent::error::AgentFailure::message("llm_network", "模型服务不可用。");
+    service
+        .settle_attempt(&attempt, &TurnOutcome::Failed(failure.clone()))
+        .await?;
+    let lifecycle = log.replay(
+        "native-workspace",
+        Some("native-conversation"),
+        &submitted.identity.input_id,
+        0,
+    )?;
+    assert_eq!(lifecycle.events.len(), 5);
+    let expected_input_events = lifecycle.events.clone();
+    let mut expected_execution_events = Vec::new();
+    let mut events = lifecycle
+        .events
+        .into_iter()
+        .map(|envelope| Ok(ChannelRenderEvent::Journaled(Box::new(envelope))))
+        .collect::<Vec<_>>();
+    let identity = EventIdentity::new("native-im-stream", "native-im-turn")?
+        .with_conversation_id("native-conversation")?
+        .with_execution_id("private-execution-id")?;
+    for (sequence, status) in [
+        (1_u64, echo_agent::agent::ExecutionStatusKind::Started),
+        (2_u64, echo_agent::agent::ExecutionStatusKind::Failed),
+    ] {
+        let event = ChatDriverEvent::Agent(Box::new(EventEnvelope::new(
+            &identity,
+            sequence,
+            None,
+            AgentEvent::ExecutionStatus(echo_agent::agent::ExecutionStatus {
+                execution_id: "private-execution-id".into(),
+                request_id: None,
+                sequence: sequence.saturating_sub(1),
+                phase: AgentEvent::Cancelled.phase(),
+                status,
+                reason: Some("内部状态只保留原事件".into()),
+                adapter_generated: false,
+            }),
+        )?));
+        let envelope = log.append(
+            "native-workspace",
+            Some("native-conversation"),
+            "native-im-turn",
+            event,
+        )?;
+        expected_execution_events.push(envelope.clone());
+        events.push(Ok(ChannelRenderEvent::Journaled(Box::new(envelope))));
+    }
+    events.push(Ok(ChannelRenderEvent::Terminal(TurnOutcome::Failed(
+        failure,
+    ))));
+    assert_eq!(texts(events).await?, vec!["本次处理失败：模型服务不可用。"]);
+    let original = log.replay(
+        "native-workspace",
+        Some("native-conversation"),
+        "native-im-turn",
+        0,
+    )?;
+    // 同一conversation journal包含两类原事实；按typed payload检查，不把
+    // replay总数误当原生status数，也不能因手机不显示而丢输入生命周期。
+    let inputs = original
+        .events
+        .iter()
+        .filter(|event| matches!(&event.payload, ChatDriverEvent::InputLifecycle(_)))
+        .collect::<Vec<_>>();
+    let executions = original
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(&event.payload, ChatDriverEvent::Agent(envelope)
+            if matches!(&envelope.payload, AgentEvent::ExecutionStatus(_)))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(inputs.len(), 5);
+    assert_eq!(executions.len(), 2);
+    assert_eq!(
+        original.events.len(),
+        inputs.len().saturating_add(executions.len())
+    );
+    let mut phases = Vec::new();
+    for (actual, expected) in inputs.iter().zip(&expected_input_events) {
+        // 包含原envelope/sequence/hash/root及完整payload；不重造owner或phase。
+        assert_eq!(
+            serde_json::to_value(actual)?,
+            serde_json::to_value(expected)?
+        );
+        let ChatDriverEvent::InputLifecycle(fact) = &actual.payload else {
+            return Err(anyhow::anyhow!("原输入typed事实缺失"));
+        };
+        assert_eq!(fact.identity(), &submitted.identity);
+        let phase = match fact.as_ref() {
+            ConversationInputFact::Persisted { .. } => ConversationInputPhase::Persisted,
+            ConversationInputFact::AttemptStarted {
+                attempt: original, ..
+            } => {
+                assert_eq!(original, &attempt);
+                ConversationInputPhase::AttemptStarted
+            }
+            ConversationInputFact::MailboxAccepted {
+                attempt: original, ..
+            } => {
+                assert_eq!(original, &attempt);
+                ConversationInputPhase::MailboxAccepted
+            }
+            ConversationInputFact::Drained {
+                attempt: original, ..
+            } => {
+                assert_eq!(original, &attempt);
+                ConversationInputPhase::Drained
+            }
+            ConversationInputFact::TurnSettled {
+                attempt: original,
+                outcome,
+                drained,
+                ..
+            } => {
+                assert_eq!(original, &attempt);
+                assert_eq!(outcome, &ConversationInputOutcome::Failed);
+                assert!(*drained);
+                ConversationInputPhase::TurnSettled
+            }
+            _ => return Err(anyhow::anyhow!("原失败输入的生命周期phase改变")),
+        };
+        phases.push(phase);
+    }
+    assert_eq!(
+        phases,
+        vec![
+            ConversationInputPhase::Persisted,
+            ConversationInputPhase::AttemptStarted,
+            ConversationInputPhase::MailboxAccepted,
+            ConversationInputPhase::Drained,
+            ConversationInputPhase::TurnSettled
+        ]
+    );
+    for (actual, expected) in executions.iter().zip(&expected_execution_events) {
+        assert_eq!(
+            serde_json::to_value(actual)?,
+            serde_json::to_value(expected)?
+        );
+        let ChatDriverEvent::Agent(envelope) = &actual.payload else {
+            return Err(anyhow::anyhow!("原native envelope缺失"));
+        };
+        assert_eq!(envelope.stream_id.as_str(), "native-im-stream");
+        assert_eq!(envelope.turn_id.as_str(), "native-im-turn");
+        assert_eq!(
+            envelope.execution_id.as_ref().map(|id| id.as_str()),
+            Some("private-execution-id")
+        );
+        let AgentEvent::ExecutionStatus(status) = &envelope.payload else {
+            return Err(anyhow::anyhow!("原native ExecutionStatus缺失"));
+        };
+        assert_eq!(status.execution_id, "private-execution-id");
+        assert!(!status.adapter_generated);
+    }
+    assert_eq!(
+        serde_json::to_value(
+            log.replay(
+                "native-workspace",
+                Some("native-conversation"),
+                &submitted.identity.input_id,
+                0
+            )?
+            .events
+        )?,
+        serde_json::to_value(&original.events)?,
+        "两个root查询必须保同一conversation journal的原事实",
+    );
     Ok(())
 }

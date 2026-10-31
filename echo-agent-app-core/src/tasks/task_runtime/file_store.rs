@@ -151,7 +151,14 @@ impl FileTaskStore {
 
     /// The same provenance rule serves latest-conversation and historical views.
     pub(crate) fn task_ui_visible(&self, state: &RunStateSnapshot) -> Result<bool, FileReadError> {
-        Ok(!state.execution_profile.is_conversation_turn()
+        // 渠道和cron的每次原运行都是用户历史；不要求它先生成计划。
+        let external_trigger = state.run.conversation_id.starts_with("channel:")
+            || state
+                .run
+                .conversation_id
+                .starts_with(crate::scheduler::CRON_CONVERSATION_PREFIX);
+        Ok(external_trigger
+            || !state.execution_profile.is_conversation_turn()
             || self.read_plan_resilient(&state.run.run_id)?.is_some())
     }
 

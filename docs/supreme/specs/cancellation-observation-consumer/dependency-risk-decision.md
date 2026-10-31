@@ -451,3 +451,25 @@ Gov 的独立 B 新 epoch 已实际执行三项 HookTest，每项一通过、零
 三次 1078 项正式源码／元数据 guard、原 collector 两读和锁均保持当前冻结值。DB 报告 commit `2295466c4e9df26647fd67d8fa1c705ac2fc7f81`、1395 条 advisory，tracked 物理 blob／模式逐项核回、两次 FETCH_HEAD 时间真实推进，原六份未跟踪草稿字节／模式保留。canonical 原 helper 的独立审计锁仍为 `f6f52503a2de104add23c857ebd776eb060ddc18dca49d9ff19fc0f34e9e6b6d`，未覆盖实际锁3995／768包。原 stdout／stderr、scanner 自然码、gate／caller、三次源码与 DB 快照及原八控制都保在 `.echo-semantic/local/hook-test-fixture-formal-integration-20261031-r01/risk-fresh-525f-execution-r01/`，汇总 `two-fresh-official-risk-gates-qualified.json`。
 
 本段和 Root 后续规则文档更新属于非 consumer 后继，必须在实际最终字节上重新取得正常 Source／final，不沿 f173 旧票；Root／CLI AGENTS 与 ADR 当前绑定的准确文字交 Root 处理跨仓一致。该变更只有 cfg(test) 覆盖，无新 API、配置或示例调用，examples／官网不需变更。无新 Rust 编译、未重跑原三项或十项、未 stage/commit；原生、性能、main CI、发布与完整 Goal 独立。
+
+
+### 2026-11-01 IM/cron 历史与前台续接呈现的具名源码复核（执行前记录）
+
+原人类“继续保留原六个依赖，完成本次修复和验证（推荐）”以及退役后五项严格子集的来源与历史保持不变。本段仅维护本次具名源码绑定，不新增风险接受，不延续未来源码资格。
+
+当前正式 collector 连续两读为 `7441191402e2350ea32fdf72052c0a5f68c3ce0431f326608b37a3988b54bf74`／274 输入。相对 HEAD 667 的原 525f 切点仅八个既有 Rust 文件修改，新增／删除输入零：channel_runtime、native_message_tests、chat_driver、foreground_turn、scheduler/runner、task_runtime/continuation、file_store 与 store/tests。生产变化恢复渠道／定时运行的原历史可见性、保留续接 surface journal 根，并在同 generation 读回原 Run 后映射已有前台结果；私有瞬态观察不参与准入或执行，不创建 store／registry／第二套执行器。新测试保原失败证据、型别化输入与事件、工作空间／代际、物理等待和旧终态，Duration 只在新增 cfg(test) 函数局部导入。
+
+原锁 `399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f`／768 包及完整 accepted 五身份保持。runtime 与 quality 独审均已对具名生产增量 source-only 通过；测试导入桥不扩大 GTK／glib、相关宏或 native_notify 的 zbus／variant 调用面。没有新增依赖／feature／unsafe／权限或外部网络入口，checker、官方 URL、fetch、settings 与 ignore 均不修改。机器 policy 仅替换 consumer 字段，原 schema／decision 路径／锁与 accepted 数组保持。
+
+此刻仅为具名来源复核与执行前记录。原八项工具控制，以及默认 fresh actual-lock／canonical-origin 的官方 scanner 自然退出 1 和独立精确 gate／caller 0，仍须逐项实际记录；不能把 source review、当前编译或旧 525f 结果追标为本切点风险 GREEN。源码、锁、身份、advisory、warning、yanked 或 settings 漂移仍停止重新复核，不自动接受。
+
+本次没有新公开模型／协议或示例调用；examples 不需变更。中文 runtime 说明已同步；官网正式镜像由所属作者在合格源码后继中统一维护。最新 App、真人微信、性能、main CI、发布与完整 Goal 验收仍各自独立。
+
+
+### 2026-11-01 IM/cron 744 绑定的实际 fresh 结果
+
+上段为本切点来源与执行前记录；本后继只追加实际结果，不改旧 525f、人类原话、完整风险身份或任何失败。正式机器 policy 现为 `c1993eb7f64c36e81f18eec7768d08fb0045f16d0e74d11fcbcec5a10a5c0b9c`，唯一字段改动为 consumer 525f→744；锁 3995／768、accepted 五完整身份及 checker／helper／settings 保持。原 collector 在实际两 gate 后连续两读仍为 744／274。
+
+原八项工具控制实际 8/8、自然退出 0；测试临时目录固定到本任务主根内。默认 fresh actual-lock 与 canonical-origin 两原 caller 分别于 2026-11-01 00:53:25＋08:00、其后同一串行批启动：两个官方 scanner 均自然退出 1，零漏洞，恰四项 unmaintained 与一项 unsound；两个独立精确 gate／caller 均自然退出 0。默认 fetch、官方 URL、空 ignore 与原 settings 不变，无 no-fetch 或输出过滤。DB 报告为 `2295466c4e9df26647fd67d8fa1c705ac2fc7f81`／1395 条。完整官方 JSON、stderr、scanner 自然码、独立 gate、真实 caller、原八控制与输入绑定汇总保存在 `.echo-semantic/local/im-cron-history-fix-20261031-r01/risk-fresh-744/`。这表示符合原接受合同，不称风险已修复或零 warning 审计。
+
+本次风险通过只覆盖当前具名 744 来源，不替代本轮 Rust 行为、GUI 类型检查、正常 Source／final、最新 App／真人微信、性能、main CI、发布或整个 Goal。任何后继源码或 advisory 身份漂移都需重新复核；不把本次结果自动延续至未来输入。
