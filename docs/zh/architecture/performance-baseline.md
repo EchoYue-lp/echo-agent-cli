@@ -74,11 +74,23 @@ checkpoint 的已恢复 cut 不能单独证明 run-state/plan 已落到该 cut�
 
 `scripts/performance-baseline-runner.py` 的 `source_identity` 继续是唯一源码身份入口。普通 Git 输入必须是请求目录自身的真实 Git root；无 `.git` 的 owned 源不能向上借用 superproject HEAD，也不能在 Git 检查失败时自动选择另一来源。只有原 `--profile-metadata` 中明确提供 `source_inputs.eko/framework`、且 `kind=git_object_snapshot` 时才进入快照分支。
 
-快照 descriptor 必须绑定 repository、origin_commit，以及原 manifest、Git objects、compile_start 和 sourceguard 的路径／SHA。Framework 另绑定原 readonly permission phase 及其前置记录。入口核对实际 owned root、原编译 cwd／command、完整唯一文件与目录集合、kind／size／SHA、Git exec 和实际 fullmode；绝对／越根／重复路径、额外文件或空目录、缺失成员、symlink及错误模式均拒绝。EKO mode须与原Git对象一致；Framework只允许已绑定阶段规定的444／555文件与包括根在内的555目录，不泛化成忽略writebit。
+旧39c快照 descriptor 继续绑定 repository、origin_commit，以及原 manifest、Git objects、compile_start 和 sourceguard 的路径／SHA；Framework 另绑定原 readonly permission phase 及其前置记录。新增具名 `materialization-v1` 直接识别080实际源manifest和原postguard，不伪造旧39c状态；编译start／caller／FP按每个实际程序分别绑定。入口核对实际 owned root、原编译 cwd／command、完整唯一文件与目录集合、kind／size／SHA、Git exec 和实际 fullmode；绝对／越根／重复路径、额外文件或空目录、缺失成员、symlink及错误模式均拒绝。EKO mode须与原Git对象一致；Framework只允许已绑定阶段规定的444／555文件与包括根在内的555目录，不泛化成忽略writebit。
 
-该来源记录保留 `root=实际owned目录`、`source_kind=git_object_snapshot`、`origin_commit=原提交`、`head=null`、`status=null`。`origin_commit` 不冒充当前 Git HEAD；descriptor和完整成员共同进入原source摘要及capsule公式。capture后的seed、run和GUI沿同一record／profiles重新核回，不另建来源authority。原report复用同目录且以精路径／SHA绑定的runner实现，并分别绑定实际执行的 `evidence_reader` 与 `source_identity_reader`；两处原约束 `step.command/cwd == final.command/cwd`、`final.cwd == capsule.repository.root` 保持，原FP／profile／features／binary及成功编译回执仍须全部匹配。
+该来源记录保留 `root=实际owned目录`、`source_kind=git_object_snapshot`、`origin_commit=原提交`、`head=null`、`status=null`。`origin_commit` 不冒充当前 Git HEAD；descriptor和完整成员共同进入原source摘要及capsule公式。capture后的seed、run和GUI沿同一record／profiles重新核回，不另建来源authority。原report复用同目录且以精路径／SHA绑定的runner实现，并分别绑定实际执行的 `evidence_reader` 与 `source_identity_reader`；`step.command/cwd == final.command/cwd` 始终保持；没有具名独立同源证明时，`final.cwd == capsule.repository.root` 也保持。原F340 P1仅在独立完整双根证明与固定目录锚实际核回后建立“原编译root→qualified依赖root”的关系，两条路径和原cwd都不改；原FP／profile／features／binary及成功回执仍须匹配。
 
 Rust被测源码、实际编译cwd、profile与binary是一层来源，执行capture／reader的Python工程版本是另一层来源。后继正式采用工程脚本不回写已测39c快照或旧receipt，也不能用当前formal root替换原hostsourceRoot。该区分沿用[SLSA provenance材料摘要与执行上下文](https://slsa.dev/spec/v1.0/provenance)及[Cargo实际环境目录语义](https://doc.rust-lang.org/cargo/reference/environment-variables.html)，不新增性能协议、运行owner或Git失败fallback。
+
+## 具名逐程序来源与纯捕获合同
+
+工程工具按实际program／role分别保存原Cargo caller、start、argv／env／cwd、target、Executable、FP、dep-info与feature来源。requested selection来自原Cargo argv；CLI四role的resolved features还须与真实观察rustc argv中全部feature cfg精集合相同，并关联crate／test、extra-filename、out-dir、编译unit及原Executable／FP。大u64 profile只作无损十进制比较。原P1只有已接受的Cargo／FP／dep来源范围，observed cfg保留null，不给CLI缺失观测作fallback。
+
+新增证明路径按本轮具名080／F340／原P1组合交付，仍含精确状态、固定Root目录锚5397…及后置3874…、原捕获controller／接受材料哈希；它不是自动接受其它epoch的通用authority。原P1源码／cwd／FP不改，formal644／755与快照444／555分别实核。378目录的独立锚仅约束其当前采集点之后的生成／消费，不补称P1构建时目录metadata；缺失、错误root／SHA、目录mode／inode漂移均拒绝，prepare与reader不能自行重立expected。Root签票不能代替每次完整Git／成员／物理身份扫描。
+
+显式080快照核原Git objects及完整Bsource；postguard的formal_clean只表示原NoRun时点，不要求当前formalCLI回退、清洁或仍停080。formalF340及双根／目录锚则继续动态严格核验。历史源保origin_commit及head=null，不冒新D前端cut。
+
+`scripts/performance_baseline_native.py` 是原report加载的唯一纯capture／fixture合同，复用同一reader的SHA／JSON／argv原语，不启动进程或统计分位。它分别验证原707 child与外层Python事实，保原41文件／40成员双射、五份compiled Rust SHA和原callback／publication顺序；不是App／WebView构建或资源采样validator。一次性prepare／qualify／compose及其特定Root路径只保存在ignored工程证据，不进入正式scripts。
+
+本轮三份080／F340来源胶囊及派生fixture已通过其具名输入资格；原step9数组误走对象reader的exit1保原，独立compose-r04后继自然0。此历史受控资料不等于4c2a/D新frontend、assets或App已验。child监督、数据规模、5warmup／30hot／cold10、oracles与quiet边界不变；正式采用新Python字节不回写旧原件，也不把它们称为新cut样本。本次正式布局在独立新fixture补齐真实目录inode替换负控后，一次完整相关Python回归实际73pass／0fail（原58＋便携15），自然退出0；没有运行benchmark。新代码与模块布局验证由独立当前工具Evidence记录，Source／final及复审另列；旧原件不换绑新formal模块，实际GUI／RTL／nativepaint及发布继续独立验收。
 
 ## 2026-10-31：39c 的 Run1000 单组 after 实测
 

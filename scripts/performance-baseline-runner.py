@@ -21,6 +21,9 @@ import sys
 import time
 import uuid
 
+DIRECTORY_ANCHOR_SHA256 = "5397fbfcd06e78bd2875faacb92d149d89c129a97d71c31c22755d2f4005d409"
+DIRECTORY_POSTSCAN_SHA256 = "3874f11e64fa06dbac41fac7fa95c9a1253cffe4a51be78820233c0ba0d029df"
+
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
@@ -70,8 +73,273 @@ def command(args, cwd=None):
             "stderr": call.stderr.decode("utf-8", "replace")}
 
 
+def bound_document(descriptor):
+    """共同的来源引用读取；缺失/损坏不会选择另一个来源。"""
+    if not isinstance(descriptor, dict) or not {"path", "sha256"} <= descriptor.keys():
+        raise ValueError("bound source descriptor missing")
+    path = Path(descriptor["path"])
+    if not path.is_absolute() or path.resolve() != path or path.is_symlink() or not path.is_file():
+        raise ValueError("bound source must be an absolute regular file")
+    data = path.read_bytes()
+    if digest(data) != descriptor["sha256"] or ("bytes" in descriptor and len(data) != descriptor["bytes"]):
+        raise ValueError("bound source hash/size mismatch")
+    return json.loads(data)
+
+
+def source_member(path, row, mode, git_blob=None):
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("source member kind differs")
+    data = path.read_bytes()
+    if len(data) != row["bytes"] or digest(data) != row["sha256"] or stat.S_IMODE(path.stat().st_mode) != mode:
+        raise ValueError("source byte/size/fullmode drift: " + row["path"])
+    if git_blob is not None and hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest() != git_blob:
+        raise ValueError("source Git blob drift: " + row["path"])
+    return {"path": row["path"], "kind": "regular", "bytes": len(data), "sha256": digest(data)}
+
+
+def source_tree(root, expected, modes, readonly, blobs=None):
+    """旧/新来源共用完整集合与模式检查，不为生成物增加ignore。"""
+    directories = {"."}
+    for rel in expected:
+        directories.update(str(p) for p in Path(rel).parents)
+    actual = {}
+    for path in [root, *sorted(root.rglob("*"))]:
+        if path.is_symlink():
+            raise ValueError("source symlink rejected")
+        if path.is_dir():
+            if str(path.relative_to(root)) not in directories:
+                raise ValueError("extra source directory")
+            if readonly and stat.S_IMODE(path.stat().st_mode) != 0o555:
+                raise ValueError("readonly directory mode drift")
+            continue
+        rel = path.relative_to(root).as_posix()
+        if rel not in expected:
+            raise ValueError("extra/nonregular source entry")
+        actual[rel] = source_member(path, expected[rel], modes[rel] & ~0o222 if readonly else modes[rel],
+                                    blobs[rel] if blobs is not None else None)
+    if set(actual) != set(expected):
+        raise ValueError("missing source member")
+    return [actual[key] for key in sorted(actual)]
+
+
+def git_tree(root, commit):
+    def read(*args):
+        call = subprocess.run(["git", "-C", str(root), *args], capture_output=True)
+        if call.returncode != 0:
+            raise ValueError("source Git object read failed")
+        return call.stdout
+    if root.is_symlink() or root.resolve() != root or Path(os.fsdecode(read("rev-parse", "--show-toplevel")).strip()) != root:
+        raise ValueError("source Git root differs")
+    rows = {}
+    for entry in read("ls-tree", "-rz", "--full-tree", commit).split(b"\0"):
+        if not entry:
+            continue
+        header, name = entry.split(b"\t", 1)
+        mode, kind, blob = header.decode().split()
+        rel = os.fsdecode(name)
+        if kind != "blob" or mode not in ("100644", "100755") or rel in rows:
+            raise ValueError("unsupported or duplicate Git source member")
+        rows[rel] = {"git_mode": mode, "git_blob": blob}
+    return rows
+
+
+def materialization_source_identity(root, supplied):
+    if supplied.get("kind") != "git_object_snapshot" or supplied.get("repository") not in ("eko", "framework"):
+        raise ValueError("explicit material source kind/repository required")
+    if set(supplied) & {"git_objects", "compile_start", "permission_phase", "artifacts"}:
+        raise ValueError("mixed source proof formats")
+    if root.is_symlink() or root.resolve() != root or (root / ".git").exists():
+        raise ValueError("actual material root must be a real non-Git snapshot")
+    manifest = bound_document(supplied.get("manifest"))
+    guard = bound_document(supplied.get("sourceguard"))
+    if manifest.get("state") != "EXACT_080_F340_SOURCE_MATERIALIZED_NO_CARGO" or set(manifest.get("sources", {})) != {"eko", "framework"}:
+        raise ValueError("unrecognized material source authority")
+    repository = supplied["repository"]
+    source = manifest["sources"][repository]
+    result = guard.get("results", {}).get(repository, {})
+    if (source.get("actual_build_source") != str(root) or source.get("commit") != supplied.get("origin_commit") or
+            re.fullmatch(r"[0-9a-f]{40}", str(source.get("commit"))) is None or
+            guard.get("state") not in {"PASS080_ORDER1_POST_SOURCEGUARD0", "PASS080_ORDER2_POST_SOURCEGUARD0", "PASS080_ORDER3_POST_SOURCEGUARD0"} or
+            guard.get("source_manifest", {}).get("sha256") != supplied["manifest"]["sha256"] or
+            result.get("commit") != source["commit"] or result.get("full_bytes_Gitblob_mode_exec_unchanged") is not True or
+            result.get("formal_clean") is not True or source.get("relative_member_set_complete") is not True or source.get("Git_blob_bytes_verified") is not True):
+        raise ValueError("material source/guard/origin mismatch")
+    expected, modes, blobs = {}, {}, {}
+    tree = git_tree(Path(source["formal_root"]), source["commit"])
+    for row in source["files"]:
+        rel = row.get("path")
+        if (not isinstance(rel, str) or not rel or Path(rel).is_absolute() or "\\" in rel or
+                any(p in (".", "..", "") for p in rel.split("/")) or rel in expected or row.get("kind") != "regular" or
+                type(row.get("bytes")) is not int or row["bytes"] < 0 or re.fullmatch(r"[0-9a-f]{64}", str(row.get("sha256"))) is None or
+                tree.get(rel) != {key: row.get(key) for key in ("git_mode", "git_blob")}):
+            raise ValueError("material source member/object mismatch")
+        expected[rel], modes[rel], blobs[rel] = row, int(row["git_mode"], 8) & 0o777, row["git_blob"]
+        expected_mode = modes[rel] & ~0o222 if repository == "framework" else modes[rel]
+        if row.get("actual_mode") != oct(expected_mode):
+            raise ValueError("material original actual mode declaration differs")
+    if set(expected) != set(tree) or len(expected) != source.get("member_count") or len(expected) != result.get("files"):
+        raise ValueError("incomplete material source authority")
+    readonly = repository == "framework"
+    if readonly and (source.get("actual_readonly_root_and_children") is not True or source.get("writable_entries") != [] or result.get("writable_F_including_root") != []):
+        raise ValueError("material readonly permission proof missing")
+    files = source_tree(root, expected, modes, readonly, blobs)
+    return {"root": str(root), "head": None, "status": None, "source_kind": "git_object_snapshot", "origin_commit": source["commit"],
+            "source_input": supplied, "files": files, "sha256": digest(encoded({"files": files, "source_input": supplied})),
+            "locks": {name: digest((root / name).read_bytes()) for name in ["Cargo.lock", "Cargo.toml", "echo-agent-app-core/Cargo.toml",
+                       "web-frontend/package-lock.json", "web-frontend/package.json"] if (root / name).is_file()}}
+
+
+def verify_directory_anchor(bridge, source, directories, formal, target):
+    """消费Root的独立新冻结点；不产生/更新expected，不声称P1历史目录已验。"""
+    descriptor=bridge.get('directory_anchor');post_descriptor=bridge.get('directory_postscan')
+    if not isinstance(descriptor,dict) or not isinstance(post_descriptor,dict):
+        raise ValueError('directory anchor missing: current provenance gap')
+    authority=formal.parent/'.echo-semantic/local/root-full-framework-window-20261029'
+    if (descriptor.get('sha256')!=DIRECTORY_ANCHOR_SHA256 or post_descriptor.get('sha256')!=DIRECTORY_POSTSCAN_SHA256 or
+            descriptor.get('path')!=str(authority/'F340-dual-root-directory-freeze-20261101-r01.json') or
+            post_descriptor.get('path')!=str(authority/'F340-dual-root-directory-freeze-postscan-20261101-r01.json')):
+        raise ValueError('directory anchor unknown path/SHA authority')
+    anchor=bound_document(descriptor);post=bound_document(post_descriptor)
+    tree_call=subprocess.run(['git','--no-optional-locks','-C',str(formal),'rev-parse',source['commit']+'^{tree}'],capture_output=True)
+    if (tree_call.returncode or anchor.get('state')!='ROOT_INDEPENDENT_NEW_DIRECTORY_FREEZE_POINT_NOT_HISTORICAL_COMPILE_METADATA' or
+            anchor.get('formal_root')!=str(formal) or anchor.get('snapshot_root')!=str(target) or anchor.get('commit')!=source['commit'] or
+            anchor.get('git_tree')!=tree_call.stdout.decode().strip() or anchor.get('file_count')!=source['member_count'] or
+            anchor.get('directory_count')!=len(directories) or anchor.get('expected_directory_modes')!={'formal':'0o755','snapshot':'0o555'} or
+            post.get('state')!='ROOT_NEW_FREEZE_DIRECTORY_SECOND_SCAN_EXACT0' or
+            post.get('anchor')!={'path':descriptor['path'],'sha256':descriptor['sha256']} or post.get('drift')!=[] or
+            post.get('actual_roots')!={'formal':str(formal),'snapshot':str(target)} or
+            post.get('independently_checked_directory_count_per_root')!=len(directories) or post.get('device_inode_kind_fullmode_mtime_ctime_all_equal_anchor') is not True):
+        raise ValueError('directory anchor source/tree/root/new-freeze scope differs')
+    entries=anchor.get('directories',[])
+    by_path={row['path']:row for row in entries}
+    if len(by_path)!=len(entries) or set(by_path)!=directories:
+        raise ValueError('directory anchor complete expected set differs')
+    for relative,row in by_path.items():
+        for name,root in (('formal',formal),('snapshot',target)):
+            path=root/relative
+            if path.is_symlink() or not path.is_dir() or path.resolve()!=path:
+                raise ValueError('directory anchor kind/path drift')
+            info=path.lstat();expected=row[name]
+            actual={'path':str(path),'device':str(info.st_dev),'inode':str(info.st_ino),'mode':oct(stat.S_IMODE(info.st_mode)),
+                    'mtime_ns':str(info.st_mtime_ns),'ctime_ns':str(info.st_ctime_ns)}
+            if actual!=expected or actual['mode']!=anchor['expected_directory_modes'][name]:
+                raise ValueError('directory anchor physical/fullmode drift: '+name+'/'+relative)
+    return anchor
+
+
+def scan_same_source_bridge(bridge):
+    """独立重读两根完整源码；只输出当前诊断，不自行承认冻结。"""
+    if bridge.get("kind") != "framework-p1-same-source-v1":
+        raise ValueError("explicit same-source bridge kind required")
+    supplied = bridge["qualified_source"]
+    if supplied.get("repository") != "framework" or supplied.get("proof_format") != "materialization-v1":
+        raise ValueError("same-source bridge qualified format differs")
+    manifest = bound_document(supplied["manifest"])
+    source = manifest["sources"]["framework"]
+    target = Path(source["actual_build_source"])
+    materialization_source_identity(target, supplied)
+    index = bound_document(bridge["source_index"])
+    context = bound_document(bridge["compile_context"])
+    prior = bound_document(bridge["prior_freeze"])
+    if (prior.get("state") != "READONLY_DEBUG_PHASE3_PER_ROLE_PROVENANCE_ROOT_CAUSE_CONFIRMED" or
+            prior.get("source_manifest", {}).get("sha256") != supplied["manifest"]["sha256"] or
+            prior.get("P1_source_index", {}).get("sha256") != bridge["source_index"]["sha256"]):
+        raise ValueError("same-source independent prior freeze authority differs")
+    prior_roots = prior["framework_shared_source_diagnostic"]
+    formal = Path(index["root"])
+    if (str(formal) != source["formal_root"] or context.get("cwd") != str(formal) or
+            context.get("source_index_sha256") != bridge["source_index"]["sha256"] or index.get("HEAD") != source["commit"]):
+        raise ValueError("same-source bridge original cwd/object authority differs")
+    def current_git(*args):
+        call = subprocess.run(["git", "--no-optional-locks", "-C", str(formal), *args], capture_output=True)
+        if call.returncode:
+            raise ValueError("same-source formal Git read failed")
+        return call.stdout
+    if current_git("rev-parse", "HEAD").decode().strip() != index["HEAD"] or current_git("status", "--short") != b"":
+        raise ValueError("same-source formal RootF changed")
+    tree = git_tree(formal, index["HEAD"])
+    members = {row["path"]: row for row in index["members"]}
+    expected = {row["path"]: row for row in source["files"]}
+    if len(members) != len(index["members"]) or set(members) != set(expected) or set(tree) != set(expected):
+        raise ValueError("same-source complete member set differs")
+    observed = {"formal": [], "snapshot": []}
+    content = []
+    directories = {"."}
+    for rel in expected:
+        directories.update(str(p) for p in Path(rel).parents)
+    anchor=verify_directory_anchor(bridge,source,directories,formal,target)
+    anchor_files={row['path']:row for row in anchor.get('files',[])}
+    if len(anchor_files)!=len(anchor.get('files',[])) or set(anchor_files)!=set(expected):
+        raise ValueError('directory anchor independently checked file set differs')
+    # 先查路径中的目录，避免对已漂移为symlink的父目录读取任何成员。
+    for root in (formal, target):
+        for rel in directories:
+            path = root / rel
+            if path.is_symlink() or not path.is_dir():
+                raise ValueError("same-source directory identity differs")
+    for rel in sorted(expected):
+        row, prior = expected[rel], members[rel]
+        mode = int(row["git_mode"], 8) & 0o777
+        if (tree[rel] != {key: row[key] for key in ("git_mode", "git_blob")} or prior["bytes"] != row["bytes"] or
+                prior["sha256"] != row["sha256"] or prior["mode"] != mode):
+            raise ValueError("same-source original Git/bytes/fullmode authority differs")
+        for name, root, fullmode in (("formal", formal, mode), ("snapshot", target, mode & ~0o222)):
+            path = root / rel
+            source_member(path, row, fullmode, row["git_blob"])
+            info = path.stat()
+            if (anchor_files[rel].get('git_mode')!=row['git_mode'] or anchor_files[rel].get('git_blob')!=row['git_blob'] or
+                    anchor_files[rel].get(name)!={'bytes':row['bytes'],'sha256':row['sha256'],'mode':oct(fullmode),'device':str(info.st_dev),'inode':str(info.st_ino)}):
+                raise ValueError('directory anchor file/Git/physical relation differs')
+            observed[name].append([rel, info.st_dev, info.st_ino, fullmode, info.st_mtime_ns, info.st_ctime_ns])
+        if observed["formal"][-1][1:3] == observed["snapshot"][-1][1:3]:
+            raise ValueError("same-source roots unexpectedly share file inode")
+        content.append({key: row[key] for key in ("path", "bytes", "sha256", "git_blob", "git_mode")})
+        directories.update(str(p) for p in Path(rel).parents)
+    states = {}
+    for name, root in (("formal", formal), ("snapshot", target)):
+        dirs = []
+        for rel in sorted(directories):
+            path = root / rel
+            if path.is_symlink() or not path.is_dir():
+                raise ValueError("same-source directory identity differs")
+            info = path.stat()
+            dirs.append([rel, info.st_dev, info.st_ino, stat.S_IMODE(info.st_mode), info.st_mtime_ns, info.st_ctime_ns])
+        states[name] = {"root": str(root), "files_physical_sha256": digest(encoded(observed[name])), "directories_physical_sha256": digest(encoded(dirs))}
+    if current_git("rev-parse", "HEAD").decode().strip() != index["HEAD"] or current_git("status", "--short") != b"":
+        raise ValueError("same-source formal RootF changed during scan")
+    verify_directory_anchor(bridge,source,directories,formal,target)
+    formal_rows = {row[0]: row for row in observed["formal"]}
+    snapshot_rows = {row[0]: row for row in observed["snapshot"]}
+    physical = [[row["path"], *formal_rows[row["path"]][1:3], *formal_rows[row["path"]][4:6],
+                 *snapshot_rows[row["path"]][1:3], *snapshot_rows[row["path"]][4:6]] for row in source["files"]]
+    if (prior_roots.get("formal_root") != str(formal) or prior_roots.get("snapshot_root") != str(target) or
+            prior_roots.get("formal_root_mode") != oct(stat.S_IMODE(formal.stat().st_mode)) or
+            prior_roots.get("snapshot_root_mode") != oct(stat.S_IMODE(target.stat().st_mode)) or
+            prior_roots.get("physical_inode_time_binding_sha256") != digest(encoded(physical)) or
+            prior_roots.get("content_and_Gitmode_identity_sha256") != digest(encoded(content))):
+        raise ValueError("same-source independent prior freeze identity changed")
+    return {"origin_commit": index["HEAD"], "member_count": len(content), "Gitblob_bytes_Gitmode_exec_sha256": digest(encoded(content)),
+            "directory_provenance":{"anchor":bridge['directory_anchor'],'postscan':bridge['directory_postscan'],'collected_at':anchor['at'],
+                'scope':'current independent safe point onward only','P1_build_time_directory_metadata':'unknown'},
+            "actual_fullmodes_compared_separately": True, "roots": states}
+
+
+def verify_same_source_bridge(bridge, original_cwd, qualified_root):
+    if bridge.get("frozen_state") is None:
+        raise ValueError("same-source frozen state missing")
+    before = scan_same_source_bridge(bridge)
+    if (before != bridge["frozen_state"] or before["roots"]["formal"]["root"] != str(original_cwd) or
+            before["roots"]["snapshot"]["root"] != str(qualified_root) or scan_same_source_bridge(bridge) != before):
+        raise ValueError("same-source root/freeze identity changed")
+    return before
+
+
 def snapshot_source_identity(root, supplied):
     """同一来源权威的显式Git对象快照；无Git失败时绝不自动选择此分支。"""
+    if isinstance(supplied, dict) and "proof_format" in supplied:
+        if supplied["proof_format"] != "materialization-v1":
+            raise ValueError("unknown explicit source proof format")
+        return materialization_source_identity(root, supplied)
     def require(ok, message):
         if not ok:
             raise ValueError("source snapshot: " + message)
@@ -132,25 +400,7 @@ def snapshot_source_identity(root, supplied):
     require(set(modes) == set(expected) and len(expected) == proof["member_count"] and
             guarded["results"][repository]["file_count"] == len(expected) and
             digest(encoded(source["files"])) == source["files_sha256"], "incomplete source authority")
-    directories = {"."}
-    for rel in expected:
-        directories.update(str(p) for p in Path(rel).parents)
-    actual = {}
-    for path in [root, *sorted(root.rglob("*"))]:
-        require(not path.is_symlink(), "source symlink rejected")
-        mode = stat.S_IMODE(path.lstat().st_mode)
-        if path.is_dir():
-            require(str(path.relative_to(root)) in directories, "extra source directory")
-            require(not readonly or mode == 0o555, "readonly directory mode drift")
-            continue
-        rel = path.relative_to(root).as_posix()
-        require(path.is_file() and rel in expected, "extra/nonregular source entry")
-        row = expected[rel]
-        require(path.stat().st_size == row["bytes"] and digest(path.read_bytes()) == row["sha256"], "source byte/size drift: " + rel)
-        require(mode == (modes[rel] & ~0o222 if readonly else modes[rel]), "source fullmode/exec drift: " + rel)
-        actual[rel] = {"path": rel, "kind": "regular", "bytes": row["bytes"], "sha256": row["sha256"]}
-    require(set(actual) == set(expected), "missing source member")
-    files = [actual[k] for k in sorted(actual)]
+    files = source_tree(root, expected, modes, readonly)
     return {"root": str(root), "head": None, "status": None, "source_kind": "git_object_snapshot",
             "origin_commit": source["commit"], "source_input": supplied, "files": files,
             "sha256": digest(encoded({"files": files, "source_input": supplied})),
@@ -322,6 +572,25 @@ def workload_units(case):
     return units
 
 
+def qualify_before_child(source_path, profiles, source_records, binary=None):
+    """消费前复用唯一reader，整份视图含P1动态桥；不建立第二校验权威。"""
+    path = Path(__file__).with_name("performance-baseline-report.py")
+    descriptor = profiles.get("evidence_reader")
+    if not isinstance(descriptor, dict) or descriptor.get("path") != str(path) or descriptor.get("sha256") != digest(path.read_bytes()):
+        raise ValueError("consumer bound reader differs")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("consumer_bound_reader", path)
+    reader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reader)
+    if binary is not None and profiles["retained_binaries"].get(str(binary)) != digest(binary.read_bytes()):
+        raise ValueError("consumer program differs from exact role inventory")
+    result = reader.compile_qualification(source_path, profiles["compile_receipt"], set(), profiles,
+        {name: source_records[name]["root"] for name in ("framework", "eko")}, source_records=source_records)
+    if result["status"] != "recognized_success":
+        raise ValueError("consumer role provenance incomplete: " + str(result.get("gap")))
+    return result
+
+
 def seed(args):
     workspace = args.workspace.resolve(); snapshot = args.snapshot.resolve()
     if workspace == snapshot or workspace in snapshot.parents or snapshot in workspace.parents:
@@ -336,6 +605,7 @@ def seed(args):
         verify_source_record(qualified[name], qualified["profiles"])
     if qualified["profiles"]["retained_binaries"].get(str(args.binary.resolve())) != digest(args.binary.read_bytes()):
         raise ValueError("seed executable differs from qualified retained binary")
+    qualify_before_child(args.metadata, qualified["profiles"], {name: qualified[name] for name in ("framework", "eko")}, args.binary.resolve())
     with workspace_owner(workspace, create=True):
         env = {"EKO_PERF_ACTION": "seed", "EKO_PERF_CASE": args.case, "EKO_PERF_OBJECTS": str(args.objects),
                "EKO_PERF_HISTORY": str(args.history), "EKO_PERF_EVENTS": str(args.events),
@@ -346,9 +616,11 @@ def seed(args):
                 binary = Path(step["binary"]).resolve()
                 if qualified["profiles"]["retained_binaries"].get(str(binary)) != digest(binary.read_bytes()):
                     raise ValueError("post-step binary differs from qualified source")
+                qualify_before_child(args.metadata, qualified["profiles"], {name: qualified[name] for name in ("framework", "eko")}, binary)
                 child(binary, step["test"], workspace, {**env, "EKO_PERF_ACTION": step["action"]}, args.output / ("post-" + str(ordinal)))
         # Validation stays before freezing; runtime-history validation deliberately
         # does not repair discardable checkpoint variants before cold sampling.
+        qualify_before_child(args.metadata, qualified["profiles"], {name: qualified[name] for name in ("framework", "eko")}, args.binary.resolve())
         child(args.binary.resolve(), args.test, workspace, {**env, "EKO_PERF_ACTION": "validate"}, args.output / "validate")
         fixture = json.loads((workspace / "fixture.json").read_text())
         if fixture["case"] != args.case:
@@ -492,6 +764,7 @@ def run(args):
                    "EKO_PERF_DATASET_SHA256": manifest["dataset_sha256"], "EKO_PERF_SOURCE_SHA256": source_sha,
                    "EKO_PERF_PROTOCOL_SHA256": manifest["protocol_sha256"], "EKO_PERF_ENVIRONMENT_ID": environment_id,
                    "EKO_PERF_PROCESS_ID": process_id, "EKO_PERF_SAMPLES": str(samples.resolve())}
+            qualify_before_child(args.source, source["profiles"], {name: source[name] for name in ("framework", "eko")}, args.binary.resolve())
             receipt = child(args.binary.resolve(), args.test, workspace, env, args.output / process_id)
             remember_workspace(workspace)
             rows = [json.loads(line) for line in samples.read_text().splitlines()][before:]
@@ -525,6 +798,7 @@ def gui(args):
                "EKO_PERF_PROCESS_ID": process_id, "EKO_PERF_SAMPLES": str(samples.resolve())}
         args_list = [str(args.node.resolve()), str(args.vitest.resolve()), "run",
                      "src/components/task/TaskRuntimePanel.performance.test.tsx", "--pool=forks", "--maxWorkers=1", "--fileParallelism=false"]
+        qualify_before_child(args.source, source["profiles"], {name: source[name] for name in ("framework", "eko")})
         observation = child(args.node, "GUI", workspace, env, args.output / process_id, override=args_list, cwd=args.frontend.resolve())
         remember_workspace(workspace)
         rows = [json.loads(line) for line in samples.read_text().splitlines()]

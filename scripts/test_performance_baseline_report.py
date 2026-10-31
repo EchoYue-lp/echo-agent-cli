@@ -275,12 +275,17 @@ class SyntheticEvidenceTests(unittest.TestCase):
         run = json.loads(pair[0].read_text())
         binary = {"path": run["binary"]["path"], "sha256": run["binary"]["sha256"]}
         run.update(kind="gui", binary={"node": binary, "vitest_entry": binary})
+        # 两仓覆盖控制必须使用两个独立程序；重复owner由专门负控检验。
+        eko_binary = pair[0].with_name("synthetic-eko-binary.txt")
+        eko_binary.write_text("distinct synthetic EKO program; never executed\n")
+        eko_binaries = {str(eko_binary): REPORT.sha256_file(eko_binary)}
+        run["source"]["capsule"]["profiles"]["retained_binaries"].update(eko_binaries)
         self.write(pair[0], run)
         eko_command = ["env", "CARGO_BUILD_JOBS=1", "cargo", "test", "-p", "echo-agent-app-core", "--release", "--no-run"]
         self.rewrite_compilation(pair, lambda receipt: {"schemaVersion": 1, "steps": [receipt,
             {**receipt, "label": "synthetic-eko-compile", "command": eko_command}]},
             lambda finals: finals.append({**finals[0], "label": "synthetic-eko-compile",
-                                         "command": eko_command, "repository": "eko"}))
+                                         "command": eko_command, "repository": "eko", "retained_binaries": eko_binaries}))
         scope = {"theme": "dark", "viewport": {"width": 1400, "height": 900},
                  "native_layout_paint": "not_measured", "mock_boundary": "typed stores; backend absent",
                  "clock": "performance.now", "subagent_history": 0, "cpu_rss_io": "whole process"}

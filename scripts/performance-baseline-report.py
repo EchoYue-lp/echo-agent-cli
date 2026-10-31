@@ -17,6 +17,8 @@ import json
 import math
 from pathlib import Path
 import re
+import shlex
+import stat
 import sys
 
 
@@ -361,9 +363,10 @@ def snapshot_materials(source_path, profiles, roots, inputs, source_records=None
     materials = {}
     for name, source_input in supplied.items():
         require(isinstance(source_input, dict) and source_input.get("repository") == name, "snapshot repository mismatch")
-        for field in ("manifest", "git_objects", "compile_start", "sourceguard"):
+        current = source_input.get("proof_format") == "materialization-v1"
+        for field in (("manifest", "sourceguard") if current else ("manifest", "git_objects", "compile_start", "sourceguard")):
             bound_file(source_path, source_input.get(field), inputs)
-        if name == "framework":
+        if name == "framework" and not current:
             phase, _ = bound_file(source_path, source_input.get("permission_phase"), inputs)
             _, phase_doc = document(phase, inputs)
             bound_file(phase, phase_doc.get("prior_permission_phase"), inputs)
@@ -374,6 +377,193 @@ def snapshot_materials(source_path, profiles, roots, inputs, source_records=None
                            "origin_commit": identity["origin_commit"], "head": identity["head"],
                            "sha256": identity["sha256"], "source_input": source_input}
     return materials
+
+
+def profile_decimal(value):
+    """Cargo内部u64 ID；JSON整数和原十进制串均无损，bool/浮点不接受。"""
+    require(type(value) is int or isinstance(value, str), "profile must be an exact u64 integer/decimal string")
+    text = str(value)
+    require(len(text) <= 20 and re.fullmatch(r"0|[1-9][0-9]*", text) is not None and int(text) <= 18446744073709551615,
+            "profile decimal is not canonical u64")
+    return text
+
+
+def _bound_regular(parent, descriptor, inputs, mode=None):
+    path, value = bound_file(parent, descriptor, inputs)
+    require(path.is_absolute() and path.resolve() == path and not path.is_symlink() and path.is_file(), "role artifact must be absolute regular file")
+    if "bytes" in descriptor:
+        require(path.stat().st_size == descriptor["bytes"], "role artifact byte count differs")
+    if "mode" in descriptor:
+        require(isinstance(descriptor["mode"], str) and re.fullmatch(r"0o[0-7]{3}", descriptor["mode"]) is not None,
+                "role artifact recorded fullmode malformed")
+        recorded_mode = int(descriptor["mode"], 8)
+        require((mode is None or recorded_mode == mode) and stat.S_IMODE(path.stat().st_mode) == recorded_mode, "role artifact recorded fullmode differs")
+    if mode is not None:
+        require(stat.S_IMODE(path.stat().st_mode) == mode, "role artifact fullmode differs")
+    return path, value
+
+
+def _source_runner():
+    path = Path(__file__).with_name("performance-baseline-runner.py")
+    spec = importlib.util.spec_from_file_location("role_source_primitives", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def verify_observed_rustc(row, role, fp, crate, package, source_relative, environment, compile_cwd, target_root, terminal, raw):
+    """只解析原args字符串；不eval，不以start或requested features补实际cfg。"""
+    require(isinstance(row.get("args"), str), "observed rustc args missing")
+    argv = shlex.split(row["args"])
+    require(argv and argv[0] == environment.get("RUSTC"), "observed rustc executable differs")
+    def values(flag):
+        output=[]
+        for number, token in enumerate(argv):
+            if token == flag:
+                require(number+1 < len(argv), "observed rustc option missing value: "+flag)
+                output.append(argv[number+1])
+            elif token.startswith(flag+'='):
+                output.append(token.split('=',1)[1])
+        return output
+    require(values('--crate-name') == [crate] and argv.count('--test') == 1, "observed crate/test unit differs")
+    feature_cfg=[]
+    for value in values('--cfg'):
+        if value.startswith('feature='):
+            literal=value.split('=',1)[1]
+            feature=json.loads(literal) if literal.startswith('"') else literal
+            require(isinstance(feature,str) and feature, "observed feature cfg malformed")
+            feature_cfg.append(feature)
+        else:
+            require(value != 'feature' and not value.startswith('feature '), "observed feature cfg malformed")
+    resolved=json.loads(fp['features'])
+    require(isinstance(resolved,list) and all(isinstance(value,str) for value in resolved) and len(resolved)==len(set(resolved)) and
+            len(feature_cfg)==len(set(feature_cfg)) and set(feature_cfg)==set(resolved), "observed rustc feature cfg differs from original FP resolved features")
+    codegen=[]
+    for number,token in enumerate(argv):
+        if token=='-C':
+            require(number+1<len(argv), "observed codegen missing value");codegen.append(argv[number+1])
+        elif token.startswith('-C') and len(token)>2:codegen.append(token[2:])
+    require(codegen.count('opt-level=3')==1 and codegen.count('strip=debuginfo')==1, "observed release codegen differs")
+    extras=[value.split('=',1)[1] for value in codegen if value.startswith('extra-filename=')]
+    require(len(extras)==1 and re.fullmatch(r'-[0-9a-f]+',extras[0]) is not None, "observed extra-filename missing/ambiguous")
+    suffix=extras[0];stem=crate+suffix
+    out=values('--out-dir')
+    require(len(out)==1 and Path(out[0]).is_absolute() and out[0]==str(Path(target_root)/'release/deps') and
+            environment.get('CARGO_TARGET_DIR')==target_root, "observed out-dir differs from exact compile target")
+    executable=role.get('original_Executable',{})
+    require(executable.get('path')==str(Path(out[0])/stem) and executable in terminal.get('artifacts',[]), "observed unit extra-filename/Executable owner differs")
+    description='tests/performance_baseline.rs' if role['role']=='core_integration' else 'unittests src/lib.rs'
+    require(executable.get('description')==description and any(line.strip()=='Executable '+description+' ('+executable['path']+')' for line in raw.splitlines()), "original Cargo Executable differs from observed unit")
+    emitted=role.get('actual_emitted_binary',{});retained=role['retained_binary']
+    require(emitted.get('path')==executable['path'] and all(emitted.get(key)==retained.get(key) for key in ('sha256','bytes','mode')), "original emitted/retained unit binding differs")
+    fp_name=Path(role['actual_retained_FP']['path']).name
+    local=[item['CheckDepInfo']['dep_info'] for item in fp.get('local',[]) if isinstance(item,dict) and isinstance(item.get('CheckDepInfo'),dict) and 'dep_info' in item['CheckDepInfo']]
+    require(local==['release/.fingerprint/'+package+suffix+'/dep-'+fp_name.removesuffix('.json')], "original FP compilation unit suffix differs")
+    dep=Path(role['actual_dep_info']['path'])
+    require(dep.name==stem+'.d' and any(line.startswith(str(Path(out[0])/(stem+'.d'))+': ') for line in dep.read_text().splitlines()), "original dep-info unit differs")
+    units=[value for value in argv[1:] if value.endswith('.rs') and not value.startswith('-')]
+    require(len(units)==1, "observed compilation source unit missing/ambiguous")
+    unit=Path(units[0]);unit=unit if unit.is_absolute() else Path(compile_cwd)/unit
+    expected=Path(compile_cwd)/source_relative
+    require(unit.resolve(strict=True)==expected and expected.resolve(strict=True)==expected and not expected.is_symlink() and expected.is_file(), "observed compilation source unit differs")
+    return {'observed_cfg_features':sorted(feature_cfg),'crate_name':crate,'extra_filename':suffix,'out_dir':out[0],'source_unit':str(expected),'Executable':executable['path'],'FP_local_dep_info':local[0]}
+
+
+def qualify_role_provenance(source_path, final, step, receipt_path, receipt_sha, path, expected_sha, context, profiles, materials, roots, inputs):
+    """只适配既有原件；没有role来源就不借同repo其它批次的成功。"""
+    require(isinstance(context, dict) and context.get("kind") in ("materialization-role-v1", "framework-p1-role-v1"), "explicit role provenance kind required")
+    repository = final["repository"]
+    require(repository in materials and materials[repository]["source_input"].get("proof_format") == "materialization-v1", "role provenance requires current explicit source proof")
+    identity = materials[repository]
+    runner = _source_runner()
+    if context["kind"] == "materialization-role-v1":
+        require(repository == "eko" and final["cwd"] == roots[repository], "EKO actual compile cwd differs")
+        artifacts_path, _ = bound_file(source_path, context.get("artifacts"), inputs)
+        _, artifacts = document(artifacts_path, inputs)
+        require(artifacts.get("NoRun0_W0_postsourceguard0") is True, "actual artifact NoRun/W0 guard not qualified")
+        caller = artifacts.get("actual_NoRun_caller", {})
+        require(referenced(artifacts_path, caller.get("path")) == receipt_path and digest(caller.get("sha256")) == receipt_sha, "role artifacts original caller differs")
+        matches = [role for role in artifacts.get("roles", []) if role.get("role") == context.get("role") and role.get("retained_binary", {}).get("path") == path]
+        require(len(matches) == 1, "role/binary owner missing or ambiguous")
+        role = matches[0]
+        postguard = role.get("post_sourceguard", {})
+        require(role.get("source_commit") == identity["origin_commit"] and role.get("source_manifest", {}).get("sha256") == identity["source_input"]["manifest"]["sha256"] and
+                role.get("original_caller", {}).get("sha256") == receipt_sha and
+                all(postguard.get(key) == identity["source_input"]["sourceguard"].get(key) for key in ("path", "sha256", "bytes")), "role source/caller/postguard binding differs")
+        require("mode" in postguard, "current role postguard fullmode proof missing")
+        _bound_regular(artifacts_path, postguard, inputs)
+        start_path, _ = bound_file(source_path, context.get("compile_start"), inputs)
+        _, start = document(start_path, inputs)
+        require(start.get("command") == step["command"] and start.get("cwd") == step["cwd"] and start.get("source_manifest", {}).get("sha256") == identity["source_input"]["manifest"]["sha256"], "role original compile start differs")
+        environment = final.get("environment_overlay")
+        require(isinstance(environment, dict) and environment and start.get("exact_environment_overlay") == environment, "role original compile environment differs")
+        require(role.get("loader_environment", {}).get("DYLD_LIBRARY_PATH") == environment.get("DYLD_LIBRARY_PATH"), "role loader environment differs")
+        terminal_path, _ = bound_file(source_path, context.get("compile_terminal"), inputs)
+        _, terminal = document(terminal_path, inputs)
+        require(terminal.get("receipt") == step and terminal.get("warning_count") == terminal.get("error_count") == 0 and terminal.get("monitor_error") is None, "actual role compile terminal not0/W0")
+        log, _ = _bound_regular(source_path, {"path": step["logPath"], "sha256": terminal.get("raw_sha256")}, inputs)
+        require(log.stat().st_size == step["bytesWritten"], "original compile raw byte count differs")
+        binary, actual_sha = _bound_regular(artifacts_path, role["retained_binary"], inputs, 0o755)
+        require(str(binary) == path and actual_sha == expected_sha, "role retained binary differs")
+        fp_path, _ = _bound_regular(artifacts_path, role["actual_retained_FP"], inputs)
+        _, fp = document(fp_path, inputs)
+        _bound_regular(artifacts_path, role["actual_dep_info"], inputs)
+        require(isinstance(role.get("actual_profile_u64_decimal"), str) and profile_decimal(fp.get("profile")) == profile_decimal(role["actual_profile_u64_decimal"]), "actual FP/profile exact decimal differs")
+        require(fp.get("features") == role.get("actual_features_string"), "actual FP resolved features differ")
+        expected_roles = {
+            "core_default_lib": ("echo_agent_app_core", "test-lib-echo_agent_app_core.json", [], True, [], "echo-agent-app-core"),
+            "core_integration": ("performance_baseline", "test-integration-test-performance_baseline.json", [], True, [], "echo-agent-app-core"),
+            "core_testutils_lib": ("echo_agent_app_core", "test-lib-echo_agent_app_core.json", ["test-utils"], True, ["test-utils"], "echo-agent-app-core"),
+            "gui_lib": ("echo_agent_cli", "test-lib-echo_agent_cli.json", ["gui"], False, ["channels", "gui"], "echo-agent-cli"),
+        }
+        require(context["role"] in expected_roles, "unknown current program role")
+        crate, fp_name, explicit, default, resolved, package = expected_roles[context["role"]]
+        args = cargo_arguments(step["command"])
+        selection, gap = cargo_selection(args)
+        require(gap is None and selection["features"] == {"default_features": default, "all_features": False, "explicit": explicit} and
+                fp_path.name == fp_name and json.loads(fp["features"]) == resolved and args[args.index("-p") + 1] == package,
+                "role package/target/selection/FP differs")
+        observed = role.get("actual_final_rustc", [])
+        require(isinstance(observed, list) and observed, "role actual compiler evidence missing")
+        source_relative = 'src/lib.rs' if context['role']=='gui_lib' else ('echo-agent-app-core/tests/performance_baseline.rs' if context['role']=='core_integration' else 'echo-agent-app-core/src/lib.rs')
+        observed_units=[]
+        for row in observed:
+            observed_units.append(verify_observed_rustc(row,role,fp,crate,package,source_relative,environment,final['cwd'],artifacts['target'],terminal,log.read_text()))
+        return {"role": context["role"], "compile_source_root": final["cwd"], "qualified_root": roots[repository],
+                "actual_profile_u64_decimal": role["actual_profile_u64_decimal"], "actual_features_string": fp["features"],
+                "feature_provenance":{"kind":"observed-rustc-and-original-FP","observed_cfg_features":observed_units[0]['observed_cfg_features'],
+                    "observed_args_source":"original role.actual_final_rustc[*].args","resolved_features_source":role['actual_retained_FP'],"units":observed_units}}
+    require(repository == "framework", "P1 role repository differs")
+    preservation_path, _ = bound_file(source_path, context.get("preservation"), inputs)
+    _, preserved = document(preservation_path, inputs)
+    require(preserved.get("W0_qualified") is True and preserved.get("warning_count") == 0 and
+            referenced(preservation_path, preserved.get("compile_receipt")) == receipt_path and preserved.get("source_drift") == [] and
+            preserved.get("formal_HEAD") == identity["origin_commit"], "P1 original final preservation differs")
+    bridge = context.get("same_source_bridge")
+    require(isinstance(bridge, dict) and bridge.get("qualified_source") == identity["source_input"], "P1 qualified dependency source differs")
+    for field in ("source_index", "compile_context", "prior_freeze", "directory_anchor", "directory_postscan"):
+        bound_file(source_path, bridge.get(field), inputs)
+    freeze = runner.verify_same_source_bridge(bridge, final["cwd"], roots[repository])
+    compile_context = runner.bound_document(bridge["compile_context"])
+    require(compile_context.get("argv") == step["command"] and compile_context.get("cwd") == step["cwd"] and
+            compile_context.get("env") == final.get("environment_overlay") and compile_context.get("source_index_sha256") == preserved.get("source_index_sha256"), "P1 original compile context/env differs")
+    matches = [role for role in preserved.get("binaries", []) if role.get("role") == context.get("role") and role.get("sha256") == expected_sha]
+    require(len(matches) == 1 and context["role"] in ("framework-lib", "framework-integration"), "P1 program owner missing or ambiguous")
+    role = matches[0]
+    original = {"path": role["retained"], "sha256": role["sha256"], "bytes": role["bytes"]}
+    _bound_regular(preservation_path, original, inputs, role["mode"])
+    _bound_regular(source_path, {"path": path, "sha256": expected_sha, "bytes": role["bytes"]}, inputs, role["mode"])
+    expected_fp = "test-lib-echo_agent.json" if context["role"] == "framework-lib" else "test-integration-test-performance_baseline.json"
+    fps = [value for value in role["metadata"] if Path(value["path"]).name == expected_fp]
+    require(len(fps) == 1, "P1 actual FP missing or ambiguous")
+    fp_path, _ = _bound_regular(preservation_path, fps[0], inputs)
+    _, fp = document(fp_path, inputs)
+    require(fp.get("features") == '["default", "files"]', "P1 resolved feature identity differs")
+    _bound_regular(source_path, {"path": step["logPath"], "sha256": preserved["compile_log_sha256"]}, inputs)
+    return {"role": context["role"], "compile_source_root": final["cwd"], "qualified_root": roots[repository], "same_source": freeze,
+            "actual_profile_u64_decimal": profile_decimal(fp.get("profile")), "actual_features_string": fp["features"],
+            "feature_provenance":{"kind":"accepted-original-P1-Cargo-and-FP","observed_cfg_features":None,
+                "observed_args_source":None,"resolved_features_source":fps[0],"historical_limit":"bound P1 preservation has Cargo/Executable/dep/FP, no full observed rustc argv; no cfg reconstructed"}}
 
 
 def compile_qualification(source_path, descriptor, inputs, profiles, roots, binary_path=None, binary_sha=None, source_records=None):
@@ -399,6 +589,8 @@ def compile_qualification(source_path, descriptor, inputs, profiles, roots, bina
             return {**qualification, "gap": "compile_final_descriptor_does_not_bind_retained_binary"}
     if not selected:
         return {**qualification, "gap": "compile_final_step_descriptor_missing"}
+    all_owners = [path for final in selected for path in final["retained_binaries"]]
+    require(len(all_owners) == len(set(all_owners)), "ambiguous program owner across final compile steps")
     identities = set()
     for final in selected:
         for field in ("receipt", "label", "command", "cwd", "repository", "profile", "features", "retained_binaries"):
@@ -426,9 +618,18 @@ def compile_qualification(source_path, descriptor, inputs, profiles, roots, bina
             return {**qualification, "gap": "compile_final_command_wrapper_not_recognized"}
         require(step["command"] == final["command"] and step.get("cwd") == final["cwd"],
                 "final compile command/cwd differ from explicit expected identity")
-        require(final["repository"] in ("framework", "eko") and final["cwd"] == roots[final["repository"]],
-                "final compile cwd differs from qualified repository")
-        if final["repository"] in materials:
+        require(final["repository"] in ("framework", "eko"), "final compile repository unknown")
+        role_contexts = final.get("role_provenance")
+        role_results = []
+        current_source = materials.get(final["repository"], {}).get("source_input", {}).get("proof_format") == "materialization-v1"
+        if current_source or role_contexts is not None:
+            require(isinstance(role_contexts, dict) and set(role_contexts) == set(final["retained_binaries"]), "per-program role provenance missing or ambiguous")
+            for retained_path, retained_sha in final["retained_binaries"].items():
+                role_results.append(qualify_role_provenance(source_path, final, step, receipt_path, receipt_sha, retained_path, retained_sha,
+                                                          role_contexts[retained_path], profiles, materials, roots, inputs))
+        else:
+            require(final["cwd"] == roots[final["repository"]], "final compile cwd differs from qualified repository")
+        if final["repository"] in materials and not current_source:
             supplied = materials[final["repository"]]["source_input"]
             started, _ = bound_file(source_path, supplied["compile_start"], inputs)
             _, original_start = document(started, inputs)
@@ -499,11 +700,23 @@ def compile_qualification(source_path, descriptor, inputs, profiles, roots, bina
         require(type(step["bytesSeen"]) is int and type(step["bytesWritten"]) is int and
                 step["bytesSeen"] == step["bytesWritten"] and step["bytesSeen"] >= 0,
                 "compile receipt output is incomplete")
-        qualification["steps"].append({"descriptor": final, "receipt_sha256": receipt_sha, "step": step,
+        qualification["steps"].append({"descriptor": final, "receipt_sha256": receipt_sha, "step": step, "role_provenance": role_results,
                                        "other_original_steps": [item for item in steps if item is not step]})
     if binary_path is None and {step["descriptor"]["repository"] for step in qualification["steps"]} != {"framework", "eko"}:
         return {**qualification, "gap": "GUI_compile_repository_coverage_incomplete"}
     return {**qualification, "status": "recognized_success", "gap": None}
+
+
+def _native_api():
+    from types import SimpleNamespace
+    return SimpleNamespace(**globals())
+
+
+def native_contract():
+    spec = importlib.util.spec_from_file_location("bound_native_contract", Path(__file__).with_name("performance_baseline_native.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def gui_scope(rows, kind):

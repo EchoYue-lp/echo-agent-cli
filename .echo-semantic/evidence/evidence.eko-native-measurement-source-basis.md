@@ -115,3 +115,14 @@ Root已审定的工程runner707d／reader3091及四文件候选，先在Perf私�
 原after结果 `cf39292a9367121cdd1030fe67d74492c1e11d6e3f66d5373a4320ffcd1d081d` 及输入、原caller和背景观察位于顶层ignored `source-snapshot-reader-candidate-20261031-r01/actual-after-runs1000-hot-r02/`；完整入口和八行原Node分位数见 `docs/zh/architecture/performance-baseline.md` 本日段。原8×(5warmup＋30measurement)、240计时样本全correctness通过、runner／child／Node自然0；原工程reader仍自然2／incomplete／errors=[]，完整矩阵、RTL interaction、native paint三项global gap保持。旧before1000原300秒超时和14partial不作分位数或速度比；背景Renderer／cc-switch／aTrust等峰值保留，quiet释放不构成整机solo或因果加速证据。本节不是整体性能、当前App/native、mainCI或发行完成。
 
 仅私有Python工程来源与说明变化；Rust、锁及原风险consumer输入未改，正式采用后的原collector两读与字节桥在交付回执中实核。examples／官网没有新增公共API或调用方式，不增加局部性能宣传。后继Source／final按当前实际文件字节取得，不复用旧票，不修工具、schema或ignore。
+
+
+## 2026-11-01：逐role工程工具采用的独立当前关联
+
+本节只关联正式唯一writer本次工具采用；不修改上文旧observed_at、14路径观察及历史command／scenario资格。新增来源角色仅为 `scripts/performance_baseline_native.py`、`scripts/test_performance_baseline_provenance.py`、`scripts/test_performance_baseline_native.py`，及原runner／report／report测试的逐role增量；新三个文件的当前source_refs及本次观察单独登记到 evidence.eko-performance-tool-adoption，不追加到本文件旧观察，不借新SID刷新历史资格。
+
+唯一source身份与原report继续权威；新纯模块只消费原capture／fixture，不是第二reporter或新运行owner。具名080／F340/P1证明按原caller／FP和真实CLI rustc cfg分别核，F340独立双root及固定目录锚只能证明当前安全点以后，不补历史目录metadata。Root接受不是免扫描票。
+
+原candidate r0275、r03相关28与compose-r04六控分别只按各自精源输入保留；本次提取纯函数闭包／便携测试布局已在新冻源点一次运行完整相关Python集合，实际73pass／0fail、自然0；旧75/28没有移签。本次当前证据与结果在独立工具Evidence及其原件中绑定。080三capsule／fixture及原step9失败／后继0保持历史受控后端范围，4c2a/D frontend／assets／App、quiet／RTL／nativepaint／mainCI与整体Goal另验。examples／官网不新增产品API或性能数字。
+
+当前正式工具采用与便携回归由[独立当前工具Evidence](evidence.eko-performance-tool-adoption.md)绑定；本文件原observed_at、source_refs和历史资格不随该采用刷新。

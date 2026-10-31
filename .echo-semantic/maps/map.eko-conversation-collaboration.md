@@ -8,7 +8,7 @@ observed_at: 40fd80447cdf3d7627399af0b2069a8b4da5327a
 boundary_refs: [boundary.eko-conversation-collaboration]
 behavior_refs: [behavior.side-conversation-lifecycle, behavior.gui-conversation-fork, behavior.automatic-agent-collaboration-ui-boundary]
 rule_refs: [rule.conversation-collaboration-authorities]
-evidence_refs: [evidence.side-conversation-preflight, evidence.gui-conversation-fork, evidence.automatic-agent-collaboration-ui-retirement, evidence.eko-im-cron-history-foreground-outcome]
+evidence_refs: [evidence.side-conversation-preflight, evidence.gui-conversation-fork, evidence.automatic-agent-collaboration-ui-retirement, evidence.eko-im-cron-history-foreground-outcome, evidence.eko-performance-tool-adoption]
 finding_refs: [finding.manual-agent-collaboration-ui-retirement]
 audit_refs: [audit.automatic-agent-collaboration-ui-retirement]
 related_map_refs: []
@@ -92,3 +92,10 @@ GUI 左侧树和完整对话表面呈现 Side Conversation。依据用户提供�
 ## 未展开项
 
 TaskRun formal Subagent、跨 Workspace handoff、默认 worktree 隔离和自动代码合并不属于本边界。
+
+
+### 逐role性能工程来源的独立采用边界
+
+普通原生时间线的开发测试接缝不改变产品owner。后继工程采用仅扩展既有runner／report的逐program来源，原report同目录纯模块负责capture／fixture身份，原producer和个人Root绝对路径不搬入正式scripts。相关便携合成测试不访问ignored归档，也不产生用户App或性能样本。
+
+080／F340三来源胶囊与派生fixture只保其历史Rust／headless受控来源；formal后继D修复不因旧view被迫回退，也不被其签成latestGUI。原原件、失败和成功后继分别保留；本段不新增scenario matched／after revision／status或Source绿色声明，本次新工具的来源与73项便携工程结果由独立当前工具Evidence记录，原Map观察与旧场景资格保持；不在此反填新脚本的历史引用。
