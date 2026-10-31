@@ -1304,6 +1304,177 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn current_materialization_survives_cold_reopen_and_lru_without_rewrite() -> Result<(), String>
+    {
+        use crate::tasks::task_runtime::file_store::FileTaskStore;
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        let count = MAX_CACHED_RUN_AUTHORITIES
+            .checked_add(1)
+            .ok_or_else(|| "authority test count overflow".to_string())?;
+        for index in 0..count {
+            let run_id = format!("same-cut-{index}");
+            run_created(&shadow, &run_id).map_err(|error| error.to_string())?;
+            shadow
+                .ensure_projections_current(&run_id)
+                .map_err(|error| error.to_string())?;
+        }
+        // 记录实际已发布文件的身份；不靠 sleep、计时阈值或仅内容相等判断是否重写。
+        let mut before = Vec::new();
+        for index in 0..count {
+            for name in ["run-state.json", "checkpoint.json"] {
+                let path = shadow.run_dir(&format!("same-cut-{index}")).join(name);
+                let metadata = std::fs::metadata(&path).map_err(|error| error.to_string())?;
+                before.push((
+                    path.clone(),
+                    metadata.ino(),
+                    metadata.modified().map_err(|error| error.to_string())?,
+                    std::fs::read(&path).map_err(|error| error.to_string())?,
+                ));
+            }
+        }
+        let reader = FileTaskStore::new(shadow.clone());
+        if reader.list_runs().map_err(|error| error.to_string())?.len() != count {
+            return Err("LRU collection read lost a TaskRun".to_string());
+        }
+        if shadow.cached_authority_count_for_test() > MAX_CACHED_RUN_AUTHORITIES {
+            return Err("collection read expanded the bounded authority cache".to_string());
+        }
+        drop(reader);
+        drop(shadow);
+
+        let reopened = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        let reader = FileTaskStore::new(reopened.clone());
+        if reader.list_runs().map_err(|error| error.to_string())?.len() != count {
+            return Err("cold collection read lost a TaskRun".to_string());
+        }
+        if reopened.cached_authority_count_for_test() > MAX_CACHED_RUN_AUTHORITIES {
+            return Err("cold collection read expanded the authority cache".to_string());
+        }
+        for (path, inode, modified, bytes) in before {
+            let metadata = std::fs::metadata(&path).map_err(|error| error.to_string())?;
+            if metadata.ino() != inode
+                || metadata.modified().map_err(|error| error.to_string())? != modified
+                || std::fs::read(&path).map_err(|error| error.to_string())? != bytes
+            {
+                return Err(format!(
+                    "healthy same-cut read republished {}",
+                    path.display()
+                ));
+            }
+        }
+        let plan_path = reopened.run_dir("same-cut-0").join("plan.json");
+        if plan_path.exists() {
+            return Err("no-plan read created a plan projection".to_string());
+        }
+        // 原 no-plan API 返回 None，也不擅自删除既有 stale plan 文件。
+        std::fs::write(&plan_path, b"{stale-plan").map_err(|error| error.to_string())?;
+        if reader
+            .get_plan("same-cut-0")
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Err("no-plan run exposed an unrelated plan".to_string());
+        }
+        if std::fs::read(&plan_path).map_err(|error| error.to_string())? != b"{stale-plan".to_vec()
+        {
+            return Err("no-plan read changed the original stale-plan retention rule".to_string());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn replayed_checkpoint_cut_does_not_hide_an_old_materialized_readmodel() -> Result<(), String> {
+        use crate::tasks::task_runtime::file_store::FileTaskStore;
+
+        for advance_checkpoint_only in [false, true] {
+            let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+            run_created(&shadow, "tail-cut").map_err(|error| error.to_string())?;
+            shadow
+                .ensure_projections_current("tail-cut")
+                .map_err(|error| error.to_string())?;
+            let run_path = shadow.run_dir("tail-cut").join("run-state.json");
+            let checkpoint_path = shadow.run_dir("tail-cut").join("checkpoint.json");
+            let old_bytes = std::fs::read(&run_path).map_err(|error| error.to_string())?;
+            let old_state: RunStateSnapshot =
+                serde_json::from_slice(&old_bytes).map_err(|error| error.to_string())?;
+            let appended = shadow
+                .append_event_line(
+                    "tail-cut",
+                    None,
+                    None,
+                    RuntimeEventKind::RunStatusChanged,
+                    serde_json::json!({"from":"pending", "to":"running"}),
+                )
+                .map_err(|error| error.to_string())?;
+            let applied = u64::try_from(appended.seq).map_err(|error| error.to_string())?;
+            if applied <= old_state.journal_sequence {
+                return Err("tail fixture did not advance the real journal".to_string());
+            }
+            drop(shadow);
+            if advance_checkpoint_only {
+                // 原 read_events 会恢复并推进 checkpoint，但不会发布 run-state。
+                let history =
+                    FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+                let events = history
+                    .read_events("tail-cut")
+                    .map_err(|error| error.to_string())?;
+                if events.last().map(|event| event.seq) != Some(appended.seq) {
+                    return Err("history-only recovery lost the appended event".to_string());
+                }
+                let checkpoint: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(&checkpoint_path).map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+                if checkpoint
+                    .get("sequence")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(applied)
+                    || std::fs::read(&run_path).map_err(|error| error.to_string())? != old_bytes
+                {
+                    return Err(
+                        "checkpoint-ahead/readmodel-old fixture was not established".to_string()
+                    );
+                }
+                drop(history);
+            }
+            let reader =
+                FileTaskStore::from_root(temp.path()).map_err(|error| error.to_string())?;
+            let recovered = reader
+                .get_run_state("tail-cut")
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "replayed run state missing".to_string())?;
+            if recovered.journal_sequence != applied
+                || recovered.run.status != TaskRunStatus::Running
+            {
+                return Err("checkpoint cut skipped a real replay/readmodel update".to_string());
+            }
+            let disk: RunStateSnapshot = serde_json::from_slice(
+                &std::fs::read(&run_path).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            let checkpoint: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&checkpoint_path).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            if disk.journal_sequence != applied
+                || disk.run.status != TaskRunStatus::Running
+                || checkpoint
+                    .get("sequence")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(applied)
+            {
+                return Err("replayed cut was not materialized to the original files".to_string());
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn checkpoint_warm_suffix_preserves_usage_and_compaction_deduplication() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;

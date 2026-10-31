@@ -61,3 +61,11 @@ JS分别记录dispatch、真实React layout-effect提交及DOM-ready；原native
 完整工具捕获继续复用原`native_unknown_actual_backend_replay_capture`单个显式ignored入口，在原unknown/Guard案例之外增加`tool-progress-signed`。同一资源链producer保持Untouched原rows；可选测试renderer接到真实`bind_surface_chat_sink(Gui)`，ToolExecutionProjector先提交原仓库摘要，再经原callback交付并记录started/finished与envelope的实际顺序。捕获写出完整source rows、canonical、冷journal envelopes、tool-events、delivery-trace、实际Settled及已确认get publication，不手造summary/result或把Candidate改成Settled。
 
 新模块仍属原测试链，无产品入口/模型服务/App/poller。所有输出沿既有FILE/INDEX stdout marker和create-new文件语义，必须由准确最终源的真实warm/同源批运行，再逐bytes/SHA、retained binary及compiled source核对；source-only候选、rustfmt或更早来源的捕获都不获得最终native计时资格。阶段分组只能筛选原回调，不能把实际summary-before-envelope改排成想象顺序；private reader同时核原索引、stdout与全delivery trace。缺finished或错owner负控只变异内存副本，原件保持。
+
+## TaskRun 健康同 cut 读取控制
+
+Run 集合原 `all+validation` 入口保留 1000 个对象、完整结果/状态/排序校验、128 个 authority 的有界缓存及原 N/watchdog。热的含义是同一进程，不保证全部 Run authority 常驻。种子、snapshot restore 和根构造位于原计时边界之外，authority 冷恢复与产品读取副作用则按真实调用计入。
+
+checkpoint 的已恢复 cut 不能单独证明 run-state/plan 已落到该 cut。读取复用原 journal/checkpoint 恢复、原 typed projection builder 和现存派生文件；仅 Loaded checkpoint 的有效 cut 等于实际 applied cut，且所需 readmodel 的完整成功值与原 builder 输出相等时，复用当前投影标记。缺失、损坏、陈旧或不可证的投影继续原修复；尾部事件仍真实重放并发布，foreign/pruned 等原失败规则不放宽。no-plan 不增加派生文件清理。
+
+同 cut 冷重开/逐出不重写、checkpoint 后尾事件与“checkpoint 已前进但 readmodel 仍旧”、原冷投影修复矩阵均属 correctness 控制，不是性能样本。新增控制必须先在原 source+test-only 下实跑，再用同测试加生产增量核 GREEN；静态格式、可应用性和原 300 秒 baseline 失败都不代替这些结果。writer/目录持久化屏障不降低，before 原始数据及 partial 保持冻结。

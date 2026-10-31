@@ -191,3 +191,7 @@ checker要求当前固定五项完整warning集合，4/6/少项/重复/字段/se
 上述d027/399509五项严格子集已由唯一CLI writer正式采用。原actual-lock和canonical-origin两次调用均保持默认fresh fetch、完整官方输出与自然scanner退出1；独立精确风险gate实际各退出0。两报告均为0漏洞、4项unmaintained及1项unsound，五完整身份与原接受集严格相等，数据库报告commit为`40f5be6fb12ed93fc591bf4ab23b7d793b3f2239`、1381条；Root已对原raw、原caller出口和当前输入逐项复核。原DB六份未跟踪RUSTSEC-0000草稿的存在已如实保留记录，未修改或忽略它们，未将scanner自然1改称零warning审计。
 
 本段只将上节“候选/待正式采用和fresh gate”的本切点时态更新为已采用、已验证；不新增人类风险接受，不把风险标resolved，不续期未来source/lock/consumer变化。原human原话、全身份与暴露复评、真实失败、原six来源及各仓独立合同继续有效；Rust/文档/原生/全矩阵/SDK来源/mainCI和整体Goal仍分别验收。
+
+### 2026-10-31 CLI 当前 f173 精确绑定的真实门禁结果
+
+本节仅更新 CLI 当前绑定时态，保留原人类“继续保留原六个依赖，完成本次修复和验证（推荐）”、退役后五项严格子集及原失败；不新增风险接受，也不授未来来源自动续期。当前锁 SHA256 `399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f`（768 包）、原 collector `f17364a7e07685e35b90a40af4b70b5893ec60a300c3796aa058efb418e54aa1`（274 输入）及正式 policy `3144106beb2acb946ba313e0c12df4e378fcee6763c18ac59596a56047817294` 精确绑定，五项完整风险身份不变。原八项控制全部通过；默认 fresh actual-lock/canonical-origin 两次官方 scanner 均自然 1、零漏洞和恰五项已接受 warning，独立精确 gate／caller 各自然 0，DB 报告 `2295466c4e9df26647fd67d8fa1c705ac2fc7f81`／1395 条，原六份未跟踪草稿保持。具体原件与中文决定后继见 CLI 原 decision 及其本日 f173 执行回执。新 source/lock/身份/advisory/漏洞/warning/settings 漂移仍阻断，不增加 ignore、不关闭 fetch，不向 Framework／SDK 继承。本段不代替新决定字节的正常 Source／final、原生、性能、main CI 或完整 Goal 验收。

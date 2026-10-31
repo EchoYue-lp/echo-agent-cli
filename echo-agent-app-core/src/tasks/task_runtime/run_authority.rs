@@ -509,6 +509,48 @@ impl RunAuthority {
         if let HistoryProjectionApplyStatus::Degraded { error } = &history_status {
             tracing::warn!(path = %event_path.display(), %error, "TaskRuntime history projection recovery degraded");
         }
+        // checkpoint 的恢复 cut 只证明 reducer 的状态，不证明派生文件已就绪。
+        // 只复用原 builder 的完整序列化结果作等值确认；缺失、损坏、陈旧或
+        // 重放过尾部时保留 0，让原 refresh/read-resilient 路径负责修复。
+        let projection_sequence = if recovered_from_checkpoint
+            && valid_checkpoint_sequence == Some(recovery.last_applied_sequence)
+            && reducer.with_state(|projection| {
+                if validate_projection_health(projection).is_err() {
+                    return false;
+                }
+                let Ok(rebuilt) = projection.rebuilt_plan() else {
+                    return false;
+                };
+                let Ok(run_state) = serde_json::to_vec_pretty(
+                    &rebuilt.run_state_with_sequence(recovery.last_applied_sequence),
+                ) else {
+                    return false;
+                };
+                if std::fs::read(run_directory.join("run-state.json"))
+                    .ok()
+                    .as_deref()
+                    != Some(run_state.as_slice())
+                {
+                    return false;
+                }
+                if projection.has_committed_plan() {
+                    let Ok(plan) = serde_json::to_vec_pretty(&rebuilt.plan_revision()) else {
+                        return false;
+                    };
+                    if std::fs::read(run_directory.join("plan.json"))
+                        .ok()
+                        .as_deref()
+                        != Some(plan.as_slice())
+                    {
+                        return false;
+                    }
+                }
+                true
+            }) {
+            recovery.last_applied_sequence
+        } else {
+            0
+        };
         Ok(RunAuthorityState {
             journal,
             checkpoints,
@@ -516,7 +558,7 @@ impl RunAuthority {
             recovered_from_checkpoint,
             recovery_last_sequence: recovery.last_applied_sequence,
             recovery_folded_events,
-            projection_sequence: 0,
+            projection_sequence,
             durability_debt: None,
             history,
         })

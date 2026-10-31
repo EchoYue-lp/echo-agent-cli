@@ -1,6 +1,12 @@
 # ADR 0062：当前CLI五项风险子集的精确来源与绑定
 
-状态：当前GUI3后d027／273精确收紧候选；正式采用和fresh actual/canonical扫描门禁尚未执行。
+## 状态
+
+已批准。当前 f173／274 精确绑定及 2026-10-31 两次 fresh 风险门禁的实际结果以[原中文风险决定](../../supreme/specs/cancellation-observation-consumer/dependency-risk-decision.md)本日后继为准；本 ADR 的五身份合同与原人类接受范围不变，Source／final 和其它验收仍独立。
+
+以下为原阶段状态，保留其当时语义：
+
+> 状态：当前GUI3后d027／273精确收紧候选；正式采用和fresh actual/canonical扫描门禁尚未执行。
 
 ## 背景
 

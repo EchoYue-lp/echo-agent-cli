@@ -403,3 +403,29 @@ checker采用已审固定five和完整warning集合校验，少项/加项/重复
 此前正常Source于2026-10-30 16:19:30＋08:00退出0、正常final于16:25:40＋08:00退出0，仅覆盖旧决定字节 `2b61a3bd8bda177ca6bad2a9637985de668dda0468f5837f8840ab0451b2595e`；16:27:45＋08:00后准备的时态候选 `5c835ae55353cf2a024bcb3945294403c167a3745c04254e60dd067583b3ddfd` 及本后继新字节不继承这两票，正式采用后须另建metadata-only guard并重新取得Source／final实际结果。
 
 完整原raw／stderr／caller-run／gate、before／between／after DB和source快照、两metadata采用guard及正常Source／final实际收据保存在本仓 `.echo-semantic/local/eko-resume-20261029/store-owner-49d-consumer-epoch-20261030-r03/risk-fresh-78e10-execution-r01/`。本节只追加真实采用与门禁时态，不重跑未受影响的Rust／前端，不以文稿或旧raw替代本次fresh结果。
+
+
+### 2026-10-31 TaskRun 同 cut 修复后的精确绑定维护提案（尚未采用）
+
+原人类“继续保留原六个依赖，完成本次修复和验证（推荐）”及退役后五项严格子集的来源、完整身份、旧扫描与失败记录继续原样保留。本节是当前具名源码增量的复核与绑定提案，不新增风险接受，不延续未来源码资格。
+
+正式 CLI 仍为 HEAD `6c0bc7879bc2b3b0dd3b7dd086913405cbafe035` 上未提交的四文件增量。原 collector 的 274 项输入连续两读均为 `f17364a7e07685e35b90a40af4b70b5893ec60a300c3796aa058efb418e54aa1`；相对原 `78e10e9372eb354e861f6c0ee8944daa8d9f5264360c15035c1883f634596360` 为修改三项、新增零、删除零。`run_authority.rs` 是一项生产正确性变化，复用原 checkpoint/reducer、typed builder 与完整序列化结果判断现有派生文件；`file_shadow.rs`、`file_store.rs` 的增量均在既有 cfg(test) 范围。应用性能说明是第四个文件，不属于 collector 输入。
+
+生产增量没有新增依赖、feature、公共 API、unsafe、GTK/glib、通知 D-Bus 或 proc-macro-error 调用；新增的 serde_json/std 文件读取复用原类型与原派生修复路径。锁仍为 `399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f`、768 包，五项 name/version/source/checksum/advisory/kind 精确不变。这份源级暴露复核不表示上游风险已修复。
+
+已验 B 副本先取得真实目标 runtime RED，再取得原序十项 GREEN，各项精确选一、零忽略、Cargo 自然零和零编译告警；正式四文件全 fmt/check 与 diff-check 已零退出，并逐 byte 等于已验 B，其他正式源码与 Framework 内容/模式无差异。这些是正确性及来源证据，不替代风险 fresh 门禁或性能结果。
+
+本提案机器 policy 仅替换 consumer_inputs_sha256，schema、decision 路径、lock、accepted 五身份及 scanner 原命令/settings/URL/fetch/ignore 均不改变。Root 复核本提案后另行授权正式绑定及原 fresh actual-lock/canonical-origin 两门；本提案阶段尚未写正式 policy/本决定，尚未执行这两门，不继承旧 78e 绿票。官方 scanner 自然出口与独立精确 gate 出口继续分列；新漏洞、warning、yanked、身份、设置、锁或后继 consumer 漂移继续阻断。
+
+本次为内部 TaskRun 派生读取修复，无公共 API、配置、工具或示例调用变化；已同步应用性能说明，examples 与官网不需要改动。完整 Goal、原生 App、性能 after、main CI 和发布继续按各自实际证据验收。
+
+
+### 2026-10-31 精确 f173 绑定的真实采用与 fresh 门禁结果
+
+上节“尚未采用”保留为采用前提案历史。本节记录后续实际事实，不改原人类六项裁决、退役后五身份严格子集、旧 78e 扫描与失败记录。Root 独立核对三项 consumer 变化及最小两文件提案后，唯一 EKO writer 在原 policy `703b5bc5e9fd85e637de32ab40d662856bac352eb3470fc7f656d083a893f5e0`、决定 `1a0e47631e5e9da5b46db5b4f4d527f25a862d66400f008de0bc5a03a46ee18a` 的 SHA 预检通过后正常采用。正式 policy 现为 `3144106beb2acb946ba313e0c12df4e378fcee6763c18ac59596a56047817294`，仅将 consumer 绑定为 `f17364a7e07685e35b90a40af4b70b5893ec60a300c3796aa058efb418e54aa1`／274；锁 `399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f`／768 包、原五项完整身份、schema、decision 路径与 scanner 设置均不变。
+
+原六方法及既有缺 warning／settings 两负控共八项实际全部通过。原 actual-lock caller 于 2026-10-31 15:49:13＋08:00 启动，原 canonical-origin caller 于 15:49:27＋08:00 启动，均使用默认 fresh fetch、原官方 HTTPS URL、完整官方输出及原 checker。两次官方 scanner 自然出口均为 1、零漏洞、四项 unmaintained 与一项 unsound；两个独立精确 gate／caller 自然出口均为 0。没有关闭 fetch、改变来源、增加 ignore/filter、替换 scanner 或接受新 warning。这是精确已接受风险合同的实际门禁资格，不是零 warning 审计或上游风险修复。
+
+前／间／后 1078 项正式源码／元数据均匹配冻结 guard，原 collector 两读持续为 f173／274。官方报告数据库 commit 为 `2295466c4e9df26647fd67d8fa1c705ac2fc7f81`、1395 条 advisory，物理 tracked blob 与模式逐项一致；两次 FETCH_HEAD 修改时间均实际推进，原六份未跟踪草稿的字节与模式保持，未清理或忽略它们。canonical 原 helper 生成独立审计锁 `f6f52503a2de104add23c857ebd776eb060ddc18dca49d9ff19fc0f34e9e6b6d`，没有覆盖实际构建锁。
+
+原 stdout／stderr／gate／caller-run、三次源码及 DB 快照、控制结果与实核汇总保存在 `.echo-semantic/local/taskrun-materialization-formal-integration-20261031-r01/risk-fresh-f173-execution-r01/`，实核汇总为 `two-fresh-official-risk-gates-qualified.json`。本实际结果段是门禁结束后的非 consumer 文档后继，须对其精确新字节重新取得正常 Source／final，不能借用旧决定或旧票。Root／CLI AGENTS 的当前时态同步由 Root 统一处理；本 writer 没有改 Root AGENTS。原生 App、性能 after、main CI、发布及整体 Goal 继续分别验收。

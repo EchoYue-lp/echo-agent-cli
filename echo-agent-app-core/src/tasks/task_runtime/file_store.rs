@@ -627,6 +627,137 @@ mod tests {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "run did not recover the durable event tail".to_string())?;
         assert_eq!(recovered.status, TaskRunStatus::Running);
+        // 以下控制必须关闭所有旧 authority；不能用 warm handle 掩盖冷恢复分支。
+        use crate::tasks::task_runtime::event_rebuild::EventFoldState;
+        use echo_agent::state::journal::{CheckpointStore, FileCheckpointStore};
+
+        let run_path = tmp.path().join("rebuild-run/run-state.json");
+        let plan_path = tmp.path().join("rebuild-run/plan.json");
+        let checkpoint_path = tmp.path().join("rebuild-run/checkpoint.json");
+        let expected_run_bytes = std::fs::read(&run_path).map_err(|error| error.to_string())?;
+        let expected_plan_bytes = std::fs::read(&plan_path).map_err(|error| error.to_string())?;
+        let expected_checkpoint_bytes =
+            std::fs::read(&checkpoint_path).map_err(|error| error.to_string())?;
+        let expected_state: RunStateSnapshot =
+            serde_json::from_slice(&expected_run_bytes).map_err(|error| error.to_string())?;
+        drop(file);
+        drop(shadow);
+        drop(store);
+        for case in [
+            "missing-state",
+            "corrupt-state",
+            "stale-state",
+            "missing-plan",
+            "corrupt-plan",
+            "stale-plan",
+            "missing-checkpoint",
+            "corrupt-checkpoint",
+            "legacy-query-checkpoint",
+        ] {
+            for (path, bytes) in [
+                (&run_path, &expected_run_bytes),
+                (&plan_path, &expected_plan_bytes),
+                (&checkpoint_path, &expected_checkpoint_bytes),
+            ] {
+                std::fs::write(path, bytes).map_err(|error| error.to_string())?;
+            }
+            match case {
+                "missing-state" => {
+                    std::fs::remove_file(&run_path).map_err(|error| error.to_string())?
+                }
+                "corrupt-state" => {
+                    std::fs::write(&run_path, b"{partial").map_err(|error| error.to_string())?
+                }
+                "stale-state" => {
+                    let mut value: serde_json::Value = serde_json::from_slice(&expected_run_bytes)
+                        .map_err(|error| error.to_string())?;
+                    let goal = value
+                        .get_mut("run")
+                        .and_then(|run| run.get_mut("goal"))
+                        .ok_or_else(|| "run goal fixture field missing".to_string())?;
+                    *goal = serde_json::json!("陈旧但合法的同 cut 内容");
+                    std::fs::write(
+                        &run_path,
+                        serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())?,
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                "missing-plan" => {
+                    std::fs::remove_file(&plan_path).map_err(|error| error.to_string())?
+                }
+                "corrupt-plan" => {
+                    std::fs::write(&plan_path, b"{partial").map_err(|error| error.to_string())?
+                }
+                "stale-plan" => {
+                    let mut value: serde_json::Value = serde_json::from_slice(&expected_plan_bytes)
+                        .map_err(|error| error.to_string())?;
+                    let revision = value
+                        .get_mut("revision")
+                        .ok_or_else(|| "plan revision fixture field missing".to_string())?;
+                    *revision = serde_json::json!(0);
+                    std::fs::write(
+                        &plan_path,
+                        serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())?,
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                "missing-checkpoint" => {
+                    std::fs::remove_file(&checkpoint_path).map_err(|error| error.to_string())?
+                }
+                "corrupt-checkpoint" => std::fs::write(&checkpoint_path, b"{partial")
+                    .map_err(|error| error.to_string())?,
+                "legacy-query-checkpoint" => {
+                    // 原 typed store 重新计算原 digest；不是造一个无效CRC去替代旧schema控制。
+                    let checkpoints = FileCheckpointStore::<EventFoldState>::open(&checkpoint_path);
+                    let mut frame = checkpoints
+                        .load()
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| "checkpoint fixture missing".to_string())?;
+                    frame.state.clear_query_projection_schema_for_test();
+                    checkpoints
+                        .save(&frame.journal_identity, &frame.state, frame.sequence)
+                        .map_err(|error| error.to_string())?;
+                }
+                _ => return Err("unknown projection recovery control".to_string()),
+            }
+            let cold = FileTaskStore::from_root(tmp.path()).map_err(|error| error.to_string())?;
+            let state = cold
+                .get_run_state("rebuild-run")
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("{case}: run state did not recover"))?;
+            let repaired_plan = cold
+                .get_plan("rebuild-run")
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("{case}: plan did not recover"))?;
+            if state.journal_sequence != expected_state.journal_sequence
+                || state.run.status != TaskRunStatus::Running
+                || state.run.goal != "rebuild projections"
+                || repaired_plan.plan_id != "rebuild-plan"
+                || repaired_plan.revision != 1
+                || repaired_plan.tasks.len() != 1
+            {
+                return Err(format!(
+                    "{case}: cold recovery returned stale or incomplete data"
+                ));
+            }
+            if std::fs::read(&run_path).map_err(|error| error.to_string())? != expected_run_bytes
+                || std::fs::read(&plan_path).map_err(|error| error.to_string())?
+                    != expected_plan_bytes
+            {
+                return Err(format!(
+                    "{case}: cold recovery did not republish the original readmodel"
+                ));
+            }
+            let checkpoint = FileCheckpointStore::<EventFoldState>::open(&checkpoint_path)
+                .load()
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("{case}: recovered checkpoint missing"))?;
+            if checkpoint.sequence != expected_state.journal_sequence
+                || !checkpoint.state.has_current_query_projection_schema()
+            {
+                return Err(format!("{case}: checkpoint cut/schema did not recover"));
+            }
+        }
         Ok(())
     }
 
