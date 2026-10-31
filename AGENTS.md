@@ -195,3 +195,7 @@ checker要求当前固定五项完整warning集合，4/6/少项/重复/字段/se
 ### 2026-10-31 CLI 当前 f173 精确绑定的真实门禁结果
 
 本节仅更新 CLI 当前绑定时态，保留原人类“继续保留原六个依赖，完成本次修复和验证（推荐）”、退役后五项严格子集及原失败；不新增风险接受，也不授未来来源自动续期。当前锁 SHA256 `399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f`（768 包）、原 collector `f17364a7e07685e35b90a40af4b70b5893ec60a300c3796aa058efb418e54aa1`（274 输入）及正式 policy `3144106beb2acb946ba313e0c12df4e378fcee6763c18ac59596a56047817294` 精确绑定，五项完整风险身份不变。原八项控制全部通过；默认 fresh actual-lock/canonical-origin 两次官方 scanner 均自然 1、零漏洞和恰五项已接受 warning，独立精确 gate／caller 各自然 0，DB 报告 `2295466c4e9df26647fd67d8fa1c705ac2fc7f81`／1395 条，原六份未跟踪草稿保持。具体原件与中文决定后继见 CLI 原 decision 及其本日 f173 执行回执。新 source/lock/身份/advisory/漏洞/warning/settings 漂移仍阻断，不增加 ignore、不关闭 fetch，不向 Framework／SDK 继承。本段不代替新决定字节的正常 Source／final、原生、性能、main CI 或完整 Goal 验收。
+
+### 2026-10-31 CLI HookTest 单 cfg(test) 的 525f 精确绑定
+
+本节仅记录 Root 已具体审定的唯一测试源码增量：相对已保存 f173／bc08，原274输入仅既有 extension_control/tests.rs 一项修改、新增删除零，生产三文件及其它输入不变。当前 consumer `525f19abeb161c7b118cee03c2e3bbdcd5344cf9f1bf0911509fb969b215f55a`、锁 `399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f`／768包、policy `e99f7641ec5fb8fe0eb7b792b73470cfa6eb3a827b207daf79bc79b6590c2ff2` 精确绑定。原八工具控制全部通过，默认 fresh actual-lock／canonical-origin 两次官方 scanner 自然1、零漏洞、恰五项原已接受 warning，独立精确 gate／caller 各自然0；DB `2295466c4e9df26647fd67d8fa1c705ac2fc7f81`／1395条与原六draft保护均有真实回执。原人类六项来源、五身份严格子集及全部旧失败保留，不新增风险、ignore、过滤或未来输入自动续期，不向 Framework／SDK 继承。新 Source／final、原生、性能、main CI 和整体 Goal 仍独立；完整原件及中文决定后继在CLI本次 hook-test-fixture-formal-integration-20261031-r01 风险执行目录。

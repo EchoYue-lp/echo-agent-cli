@@ -429,3 +429,25 @@ checker采用已审固定five和完整warning集合校验，少项/加项/重复
 前／间／后 1078 项正式源码／元数据均匹配冻结 guard，原 collector 两读持续为 f173／274。官方报告数据库 commit 为 `2295466c4e9df26647fd67d8fa1c705ac2fc7f81`、1395 条 advisory，物理 tracked blob 与模式逐项一致；两次 FETCH_HEAD 修改时间均实际推进，原六份未跟踪草稿的字节与模式保持，未清理或忽略它们。canonical 原 helper 生成独立审计锁 `f6f52503a2de104add23c857ebd776eb060ddc18dca49d9ff19fc0f34e9e6b6d`，没有覆盖实际构建锁。
 
 原 stdout／stderr／gate／caller-run、三次源码及 DB 快照、控制结果与实核汇总保存在 `.echo-semantic/local/taskrun-materialization-formal-integration-20261031-r01/risk-fresh-f173-execution-r01/`，实核汇总为 `two-fresh-official-risk-gates-qualified.json`。本实际结果段是门禁结束后的非 consumer 文档后继，须对其精确新字节重新取得正常 Source／final，不能借用旧决定或旧票。Root／CLI AGENTS 的当前时态同步由 Root 统一处理；本 writer 没有改 Root AGENTS。原生 App、性能 after、main CI、发布及整体 Goal 继续分别验收。
+
+
+### 2026-10-31 HookTest 单 cfg(test) 增量的精确绑定（采用与门禁前记录）
+
+本段记录 Root 已具体批准的唯一测试源码增量，不扩原人类“继续保留原六个依赖，完成本次修复和验证（推荐）”的接受范围，不授未来输入续期。基于已保存的 `bc08ea4db89ec05071002fb0b76282d344ee2c4e`，唯一 EKO writer 正常应用已审 f00f 补丁到 `echo-agent-app-core/src/extension_control/tests.rs`，精 base 为 `9f5ace3bdc79b894d0d5bce03356cc8435dce4eb20e027754472af5a9b3c3015`，after 为 `11ae8258ffa30e9afcae67e2b9e9610ef763c5ce22600103bae2377087e029c5`。原19相关输入按当前已批准 bc08 基准核对；其中 CLI AGENTS 从旧6c准备稿到已提交 bc08 的差异明确保留来源，其余相关生产／依赖输入未变，不冒称旧19与新规则字节相同。
+
+Gov 的独立 B 新 epoch 已实际执行三项 HookTest，每项一通过、零失败／忽略／编译告警，原 raw／自然出口／冷 bin c23 与完整 restore 保全均另存，准备源与真实结果已独审。正式本文件与已验 B 逐 byte 一致，cargo fmt --all／check 与 diff-check 均自然零，未新增 Rust 编译或重复三项／旧十项。原 f173／bc08 结果继续保留其自身范围。
+
+原 collector 仍为274输入，相对 `f17364a7e07685e35b90a40af4b70b5893ec60a300c3796aa058efb418e54aa1` 只有上述既有 tests.rs 一项修改，新增／删除均零；两读当前摘要为 `525f19abeb161c7b118cee03c2e3bbdcd5344cf9f1bf0911509fb969b215f55a`。增量仅在原 cfg(test) 路径复用 fanout_fixture、ExtensionCommandDispatcher、typed Tested／Failed 回执，覆盖请求 workspace、generation 和 captured runtime；无生产路径、公共 API、权限、网络、unsafe、GTK/glib、proc-macro-error 或通知 D-Bus 调用变化。原三项 TaskRun 生产源码／测试及锁 `399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f`／768包、五完整身份、checker／settings 不变。机器 policy 仅替换 consumer 字段，原 human／schema／decision路径／accepted／URL／fetch／ignore 不动。
+
+此刻是本增量采用及 fresh 门禁前的具名来源记录，不能拿前次 f173 的两 gate 追标新源码；Root 已条件授权原八控制与原 fresh actual-lock／canonical-origin 两 caller，实际结果另作后继。任何额外 source、身份、漏洞、warning、yanked 或 settings 漂移都停止，不自动接受。只有本条具体已审源码与已复核条件成立才可绑定，不为未来源码提供自动规则。测试专用增量没有新 API、配置或示例调用，examples／官网不需修改；原生、性能、main CI 与整体 Goal 独立。
+
+
+### 2026-10-31 HookTest 525f 精确绑定的实际采用与 fresh 结果
+
+上一段为本增量采用与门禁前的原阶段记录。本后继只记录后来实际结果，不改前 f173／bc08 历史、人类六项原话、五身份严格子集或任何失败。Root 事先具体授权的唯一源码条件已实核：原 collector 两读 `525f19abeb161c7b118cee03c2e3bbdcd5344cf9f1bf0911509fb969b215f55a`／274，相对 f173 仅既有 `echo-agent-app-core/src/extension_control/tests.rs` 一项修改，新增／删除零；正式该文件字节等于 Gov 原实际三项测试源，生产三文件与其余输入、锁和工具不变。sole writer 正常 check/apply 后，机器 policy 为 `e99f7641ec5fb8fe0eb7b792b73470cfa6eb3a827b207daf79bc79b6590c2ff2`，仅 consumer 字段从 f173 替换为本摘要，原 schema／decision 路径／锁／完整 accepted 五身份保持。
+
+原八项工具控制实际全部通过。原 actual-lock caller 于 2026-10-31 16:31:13＋08:00 启动，原 canonical-origin caller 于 16:31:26＋08:00 启动，均采用默认 fresh fetch 与原官方 URL。官方 scanner 两次均自然退出 1、零漏洞、四项 unmaintained 与一项 unsound；两个独立精确 gate／caller 均自然退出 0，完整 settings 与五完整身份精确相等。无 no-fetch、filter、ignore、scanner／helper 或工具变更，不叫零 warning 审计或风险修复，也不接受后来源码。
+
+三次 1078 项正式源码／元数据 guard、原 collector 两读和锁均保持当前冻结值。DB 报告 commit `2295466c4e9df26647fd67d8fa1c705ac2fc7f81`、1395 条 advisory，tracked 物理 blob／模式逐项核回、两次 FETCH_HEAD 时间真实推进，原六份未跟踪草稿字节／模式保留。canonical 原 helper 的独立审计锁仍为 `f6f52503a2de104add23c857ebd776eb060ddc18dca49d9ff19fc0f34e9e6b6d`，未覆盖实际锁3995／768包。原 stdout／stderr、scanner 自然码、gate／caller、三次源码与 DB 快照及原八控制都保在 `.echo-semantic/local/hook-test-fixture-formal-integration-20261031-r01/risk-fresh-525f-execution-r01/`，汇总 `two-fresh-official-risk-gates-qualified.json`。
+
+本段和 Root 后续规则文档更新属于非 consumer 后继，必须在实际最终字节上重新取得正常 Source／final，不沿 f173 旧票；Root／CLI AGENTS 与 ADR 当前绑定的准确文字交 Root 处理跨仓一致。该变更只有 cfg(test) 覆盖，无新 API、配置或示例调用，examples／官网不需变更。无新 Rust 编译、未重跑原三项或十项、未 stage/commit；原生、性能、main CI、发布与完整 Goal 独立。

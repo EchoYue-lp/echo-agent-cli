@@ -214,6 +214,284 @@ mod tests {
         Ok(shutdown)
     }
 
+    async fn hook_test_target(
+        fixture: &FanoutFixture,
+        workspace_index: usize,
+        source_name: &str,
+        matcher: &str,
+    ) -> Result<
+        (
+            crate::extension_commands::ExtensionRequestScope,
+            crate::state::ScopedChatRuntime,
+        ),
+        String,
+    > {
+        use echo_agent::skills::hooks::{HookAction, HookEvent, HookRule, HooksDefinition};
+
+        let workspace = fixture
+            .workspaces
+            .get(workspace_index)
+            .ok_or_else(|| "Hook Test workspace fixture is missing".to_string())?;
+        let control = fixture
+            .state
+            .workspace_control_for_scope(workspace.id.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        let scope = crate::extension_commands::ExtensionRequestScope::new(
+            control.workspace_id(),
+            control.generation(),
+            None,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        let runtime = control.runtime().clone();
+        let registry = runtime
+            .primary_agent()
+            .read_async(|agent| Box::pin(async move { Arc::clone(agent.hook_registry()) }))
+            .await;
+        {
+            let mut hooks = registry.write().await;
+            // workspace fork会装载用户级规则；只隔离本测试目标registry，
+            // 不改进程环境或原fixture，也不滤掉回执来掩盖owner串流。
+            hooks.clear_user_hooks();
+            hooks.register(
+                source_name,
+                &control.project_root().display().to_string(),
+                HooksDefinition {
+                    rules: std::collections::HashMap::from([(
+                        HookEvent::PreToolUse,
+                        vec![HookRule {
+                            matcher: matcher.to_string(),
+                            hooks: vec![HookAction::Prompt {
+                                prompt: format!("只用于dry-run投影的来源：{source_name} 中文🌊"),
+                            }],
+                        }],
+                    )]),
+                },
+            );
+        }
+        Ok((scope, runtime))
+    }
+
+    fn hook_test_request(
+        scope: &crate::extension_commands::ExtensionRequestScope,
+        label: &str,
+        matcher: &str,
+    ) -> crate::extension_commands::ExtensionCommandRequest {
+        use crate::extension_commands::{ExtensionCommand, ExtensionCommandRequest, HookCommand};
+        ExtensionCommandRequest {
+            request_id: format!("hook-test-request-{label}"),
+            operation_id: format!("hook-test-operation-{label}"),
+            scope: Some(scope.clone()),
+            command: ExtensionCommand::Hooks(HookCommand::Test {
+                event: "PreToolUse".to_string(),
+                matcher: matcher.to_string(),
+            }),
+        }
+    }
+
+    fn checked_hook_test_matches(
+        receipt: crate::extension_commands::ExtensionCommandReceipt,
+        expected_scope: &crate::extension_commands::ExtensionRequestScope,
+        label: &str,
+        expected_matcher: &str,
+    ) -> Result<Vec<crate::extension_commands::HookTestMatchProjection>, String> {
+        use crate::extension_commands::{
+            ExtensionCommandReceipt, ExtensionCommandStatus, HookCommandReceipt,
+        };
+        let ExtensionCommandReceipt::Hooks {
+            meta,
+            receipt:
+                Some(HookCommandReceipt::Tested {
+                    event,
+                    matcher,
+                    matches,
+                }),
+        } = receipt
+        else {
+            return Err(format!(
+                "Hook Test did not return a typed Tested receipt: {receipt:?}"
+            ));
+        };
+        assert_eq!(meta.status, ExtensionCommandStatus::Settled);
+        assert_eq!(meta.request_id, format!("hook-test-request-{label}"));
+        assert_eq!(meta.operation_id, format!("hook-test-operation-{label}"));
+        assert_eq!(meta.authority_scope, expected_scope.workspace_id);
+        assert_eq!(
+            meta.workspace_generation,
+            expected_scope.workspace_generation
+        );
+        assert_eq!(meta.sender_id, expected_scope.sender_id);
+        assert_eq!(meta.sender_incarnation, expected_scope.sender_incarnation);
+        assert!(meta.error.is_none());
+        assert_eq!(event, "PreToolUse");
+        assert_eq!(matcher, expected_matcher);
+        assert_eq!(matches.omitted, 0);
+        Ok(matches.items)
+    }
+
+    #[tokio::test]
+    async fn scoped_hook_test_projects_matches_and_no_match_from_requested_workspace()
+    -> Result<(), String> {
+        use crate::extension_commands::ExtensionCommandDispatcher;
+        let fixture = fanout_fixture(2).await?;
+        let (scope_a, _runtime_a) = hook_test_target(&fixture, 0, "scoped-test-a", "read_file").await?;
+        let (scope_b, _runtime_b) =
+            hook_test_target(&fixture, 1, "scoped-test-b", "read_file|write_file").await?;
+        let current = fixture
+            .state
+            .current_product_data()
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(current.workspace_id(), scope_b.workspace_id);
+        drop(current);
+        let dispatcher = ExtensionCommandDispatcher::new(fixture.state.clone());
+
+        // 焦点在B；同名工具只准读取请求A的registry，不能改读当前焦点。
+        let matched = dispatcher
+            .dispatch_for_scope(
+                scope_a.clone(),
+                hook_test_request(&scope_a, "match-a", "read_file"),
+                "hook-test-a".to_string(),
+            )
+            .await;
+        let matches = checked_hook_test_matches(matched, &scope_a, "match-a", "read_file")?;
+        assert_eq!(matches.len(), 1);
+        let found = matches
+            .first()
+            .ok_or_else(|| "requested Hook match was absent".to_string())?;
+        assert_eq!(found.source, "skill:scoped-test-a");
+        assert_eq!(found.matcher, "read_file");
+        assert_eq!(found.action, "prompt");
+
+        // B有write_file匹配，A没有；空结果仍须来自A，不能fallback到B。
+        let unmatched = dispatcher
+            .dispatch_for_scope(
+                scope_a.clone(),
+                hook_test_request(&scope_a, "no-match-a", "write_file"),
+                "hook-test-a".to_string(),
+            )
+            .await;
+        assert!(checked_hook_test_matches(unmatched, &scope_a, "no-match-a", "write_file")?.is_empty());
+        let decoy_positive = dispatcher
+            .dispatch_for_scope(
+                scope_b.clone(),
+                hook_test_request(&scope_b, "match-b", "write_file"),
+                "hook-test-b".to_string(),
+            )
+            .await;
+        let matches = checked_hook_test_matches(decoy_positive, &scope_b, "match-b", "write_file")?;
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            matches.first().map(|item| item.source.as_str()),
+            Some("skill:scoped-test-b")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_hook_test_rejects_foreign_generation_and_unknown_workspace() -> Result<(), String> {
+        use crate::extension_commands::{
+            ExtensionCommandDispatcher, ExtensionCommandReceipt, ExtensionCommandStatus,
+        };
+        let fixture = fanout_fixture(2).await?;
+        let (scope_a, _runtime_a) = hook_test_target(&fixture, 0, "scoped-test-a", "read_file").await?;
+        let (scope_b, _runtime_b) = hook_test_target(&fixture, 1, "scoped-test-b", "read_file").await?;
+        let dispatcher = ExtensionCommandDispatcher::new(fixture.state.clone());
+        let mut foreign_generation = scope_a.clone();
+        foreign_generation.workspace_generation = scope_b.workspace_generation.clone();
+        let mut unknown_workspace = scope_a.clone();
+        unknown_workspace.workspace_id = "hook-test-unregistered-workspace".to_string();
+        for (label, scope) in [
+            ("foreign-generation", foreign_generation),
+            ("unknown-workspace", unknown_workspace),
+        ] {
+            let receipt = dispatcher
+                .dispatch_for_scope(
+                    scope.clone(),
+                    hook_test_request(&scope, label, "read_file"),
+                    "hook-test-rejected".to_string(),
+                )
+                .await;
+            let ExtensionCommandReceipt::Hooks {
+                meta,
+                receipt: None,
+            } = receipt
+            else {
+                return Err(format!(
+                    "invalid scope did not return a failed Hook receipt: {receipt:?}"
+                ));
+            };
+            assert_eq!(meta.status, ExtensionCommandStatus::Failed);
+            assert_eq!(meta.request_id, format!("hook-test-request-{label}"));
+            assert_eq!(meta.operation_id, format!("hook-test-operation-{label}"));
+            assert_eq!(meta.authority_scope, scope.workspace_id);
+            assert_eq!(meta.workspace_generation, scope.workspace_generation);
+            assert!(meta.error.as_deref().is_some_and(|error| !error.is_empty()));
+        }
+        // 两个合法owner仍可读；错误scope不能被“没有配置任何hook”掩盖。
+        for (label, scope, source) in [
+            ("valid-a-after-reject", scope_a, "skill:scoped-test-a"),
+            ("valid-b-after-reject", scope_b, "skill:scoped-test-b"),
+        ] {
+            let receipt = dispatcher
+                .dispatch_for_scope(
+                    scope.clone(),
+                    hook_test_request(&scope, label, "read_file"),
+                    "hook-test-positive".to_string(),
+                )
+                .await;
+            let matches = checked_hook_test_matches(receipt, &scope, label, "read_file")?;
+            assert_eq!(matches.len(), 1);
+            assert_eq!(
+                matches.first().map(|item| item.source.as_str()),
+                Some(source)
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_hook_test_keeps_captured_runtime_after_focus_switch() -> Result<(), String> {
+        use crate::extension_commands::ExtensionCommandDispatcher;
+        let fixture = fanout_fixture(2).await?;
+        let (scope_a, _runtime_a) = hook_test_target(&fixture, 0, "scoped-test-a", "read_file").await?;
+        let (scope_b, runtime_b) = hook_test_target(&fixture, 1, "scoped-test-b", "read_file").await?;
+        let next = fixture
+            .workspaces
+            .first()
+            .cloned()
+            .ok_or_else(|| "switch fixture was absent".to_string())?;
+        fixture
+            .state
+            .switch_workspace(next)
+            .await
+            .map_err(|error| error.to_string())?;
+        let current = fixture
+            .state
+            .current_product_data()
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(current.workspace_id(), scope_a.workspace_id);
+        drop(current);
+
+        // 使用同一dispatcher的captured入口；scope和runtime均在切换前捕获。
+        let receipt = ExtensionCommandDispatcher::new(fixture.state.clone())
+            .dispatch(
+                hook_test_request(&scope_b, "captured-b", "read_file"),
+                Some(runtime_b),
+                "hook-test-captured".to_string(),
+            )
+            .await;
+        let matches = checked_hook_test_matches(receipt, &scope_b, "captured-b", "read_file")?;
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            matches.first().map(|item| item.source.as_str()),
+            Some("skill:scoped-test-b")
+        );
+        Ok(())
+    }
+
     #[test]
     fn user_skill_source_is_exact_and_stable() {
         assert_eq!(
