@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { PluginMutationResult } from '../../api/endpoints';
 
 const fixture = vi.hoisted(() => ({
   current: { id: 'alpha', product_data_generation: 'generation-1' },
@@ -13,7 +14,8 @@ const fixture = vi.hoisted(() => ({
   validate: vi.fn(),
   applyTheme: vi.fn(),
 }));
-vi.mock('../../api/endpoints', () => ({
+vi.mock('../../api/endpoints', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../api/endpoints')>()),
   extensionRequestScope: (workspace: typeof fixture.current) => ({
     workspace_id: workspace.id,
     workspace_generation: workspace.product_data_generation,
@@ -235,5 +237,99 @@ describe('Plugin panel scope settlement', () => {
       workspace_id: 'alpha',
       workspace_generation: 'generation-1',
     });
+  });
+});
+
+function committedMutationResult(
+  status: 'settled' | 'degraded' | 'failed' = 'degraded',
+  scope = 'global'
+): PluginMutationResult & { plugin_id?: string } {
+  const receiptMeta = {
+    request_id: 'mutation-request',
+    operation_id: 'mutation-operation',
+    authority_scope: scope,
+    workspace_generation: scope === 'global' ? 'global' : 'generation-1',
+    sender_id: null,
+    sender_incarnation: null,
+    status,
+    error: null,
+  };
+  if (status === 'failed')
+    return {
+      success: false,
+      wiring_ok: false,
+      error: 'rollback completed',
+      receipt: { extension: 'plugins', meta: { ...receiptMeta, status: 'failed' }, receipt: null },
+    };
+  const errors = status === 'degraded' ? ['Warning: retained component diagnostic'] : [];
+  const projection = {
+    plugin_id: 'mixed-plugin',
+    plugin: null,
+    status,
+    target_receipts: { items: [], omitted: 0 },
+    summary: {
+      total: 1,
+      enabled: 1,
+      skills_loaded: 1,
+      hooks_registered: 0,
+      mcp_connected: 0,
+      agents_loaded: 0,
+      monitors_loaded: 0,
+      themes_loaded: 0,
+      output_styles_loaded: 0,
+      errors: { items: errors, omitted: 0 },
+    },
+    active_theme: null,
+    themes: { items: [], omitted: 0 },
+    active_output_style: null,
+    output_styles: { items: [], omitted: 0 },
+  };
+  return {
+    success: status === 'settled',
+    wiring_ok: status === 'settled',
+    plugin_id: 'mixed-plugin',
+    errors,
+    errors_omitted: 0,
+    settlement_status: status,
+    projection,
+    meta: receiptMeta,
+    receipt: {
+      extension: 'plugins',
+      meta: receiptMeta,
+      receipt: { action: 'mutation', projection },
+    },
+  };
+}
+
+describe('committed degraded reload remains scoped to its original view', () => {
+  it('refreshes the current view despite retained degraded settlement', async () => {
+    fixture.list
+      .mockResolvedValueOnce(listing('before-plugin'))
+      .mockResolvedValueOnce(listing('committed-plugin'));
+    const result = committedMutationResult('degraded', 'alpha');
+    fixture.reload.mockResolvedValue(result);
+    render(<PluginPanel />);
+    await screen.findByText('before-plugin');
+    fireEvent.click(screen.getByTitle('Reload plugins'));
+    expect(await screen.findByText('committed-plugin')).toBeTruthy();
+    expect(await screen.findByText(/已提交/)).toBeTruthy();
+    expect(result.success).toBe(false);
+    expect(fixture.list).toHaveBeenCalledTimes(2);
+  });
+  it('does not refresh a new generation from a departed degraded commit', async () => {
+    const old = deferred<ReturnType<typeof committedMutationResult>>();
+    fixture.reload.mockReturnValueOnce(old.promise);
+    const view = render(<PluginPanel />);
+    await screen.findByText('alpha-plugin');
+    fireEvent.click(screen.getByTitle('Reload plugins'));
+    fixture.current = { id: 'alpha', product_data_generation: 'generation-2' };
+    fixture.list.mockResolvedValue(listing('replacement-plugin'));
+    view.rerender(<PluginPanel />);
+    await screen.findByText('replacement-plugin');
+    const calls = fixture.list.mock.calls.length;
+    await act(async () => old.resolve(committedMutationResult('degraded', 'alpha')));
+    expect(fixture.list).toHaveBeenCalledTimes(calls);
+    expect(screen.getByText('replacement-plugin')).toBeTruthy();
+    expect(screen.queryByText(/已提交/)).toBeNull();
   });
 });

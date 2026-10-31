@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   pluginApi,
+  pluginMutationCommitted,
+  type PluginMutationResult,
   extensionRequestScope,
   type PluginInfo,
   type PluginOutputStyle,
@@ -75,12 +77,16 @@ export function PluginPanel() {
   }, []);
 
   const mutationMessage = (
-    result: { wiring_ok?: boolean; errors?: string[]; message?: string },
+    result: PluginMutationResult,
     fallback: string
   ): { type: 'success' | 'error'; text: string } => {
-    if (result.wiring_ok === false) {
-      const details = result.errors?.join('; ') || 'Some components could not be activated';
-      return { type: 'error', text: `${result.message || fallback}: ${details}` };
+    if (result.wiring_ok === false || result.settlement_status === 'degraded') {
+      const details = result.errors?.join('; ') || result.error || '部分组件未启用';
+      const omitted = result.errors_omitted ? `；另有 ${result.errors_omitted} 条诊断未展开` : '';
+      return {
+        type: 'error',
+        text: `已提交，部分组件未启用或存在诊断：${details}${omitted}`,
+      };
     }
     return { type: 'success', text: result.message || fallback };
   };
@@ -164,10 +170,10 @@ export function PluginPanel() {
     if (!view || !isCurrentView(view)) return;
     const result = await pluginApi.configure(view.scope, name, values);
     if (!isCurrentView(view)) return;
-    if (!result.success) {
+    if (!pluginMutationCommitted(result)) {
       throw new Error(result.errors?.join('; ') || result.error || 'Configuration failed');
     }
-    setMessage({ type: 'success', text: result.message || `Plugin '${name}' configured` });
+    setMessage(mutationMessage(result, `Plugin '${name}' configured`));
     await loadPlugins(view);
   };
 
@@ -203,7 +209,7 @@ export function PluginPanel() {
         scope: installScope,
       });
       if (!isCurrentView(view)) return;
-      if (result.success) {
+      if (pluginMutationCommitted(result)) {
         setMessage(mutationMessage(result, `Plugin '${result.plugin_id}' installed`));
         setInstallSource('');
         setShowInstall(false);
@@ -225,7 +231,7 @@ export function PluginPanel() {
     try {
       const result = await pluginApi.uninstall(view.scope, { name });
       if (!isCurrentView(view)) return;
-      if (result.success) {
+      if (pluginMutationCommitted(result)) {
         setMessage(mutationMessage(result, `Plugin '${name}' uninstalled`));
         await loadPlugins(view);
       } else {
@@ -244,7 +250,7 @@ export function PluginPanel() {
         ? await pluginApi.disable(view.scope, plugin.name)
         : await pluginApi.enable(view.scope, plugin.name);
       if (!isCurrentView(view)) return;
-      if (result.success) {
+      if (pluginMutationCommitted(result)) {
         setMessage(mutationMessage(result, `Plugin ${plugin.enabled ? 'disabled' : 'enabled'}`));
         await loadPlugins(view);
       } else {
@@ -262,8 +268,8 @@ export function PluginPanel() {
       setLoading(true);
       const result = await pluginApi.reload(view.scope);
       if (!isCurrentView(view)) return;
-      if (result.success) {
-        setMessage({ type: 'success', text: result.message || 'Plugins reloaded' });
+      if (pluginMutationCommitted(result)) {
+        setMessage(mutationMessage(result, 'Plugins reloaded'));
         await loadPlugins(view);
       } else {
         setMessage({ type: 'error', text: result.error || 'Reload failed' });

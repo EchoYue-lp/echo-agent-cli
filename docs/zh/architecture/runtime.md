@@ -317,6 +317,12 @@ framework examples 或 website。
 重试；未结算则构造失败。取消 shutdown 等待者不会取消独立持有资源的关停操作。
 参见 [ADR 0022](../adr/0022-framework-prepared-plugin-generations.md)。
 
+插件变更的提交事实与组件结算分开呈现。既有 `plugins/mutation` 成功回执只在原
+authority 完成变更后产生；其 `degraded` 仍保留 `success=false`、诊断和目标结算结果。
+设置页据该 typed 回执刷新真实目录与配置，并明确提示“已提交，部分组件未启用或存在诊断”。
+真正失败、已回滚或仅验证的回执不触发提交后的刷新。迟到结果仍受原 view、workspace
+generation 和列表请求序列守卫约束，不得污染新页面；没有新增存储、状态机或公开回执字段。
+
 MCP 后台操作与配置 generation 变更共享准入边界。已经失效的旧操作不能在新代确认
 连接后再启动 preparation；已经开始的 preparation 则由原任务持有直到清理完成。
 

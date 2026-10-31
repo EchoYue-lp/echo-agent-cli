@@ -15,6 +15,8 @@ import {
   hooksApi,
   mcpConfigDisposition,
   pluginApi,
+  pluginMutationCommitted,
+  type PluginMutationResult,
   skillsApi,
 } from './endpoints';
 
@@ -312,5 +314,115 @@ describe('typed Extension IPC adapters', () => {
       meta,
       receipt: { extension: 'hooks' },
     });
+  });
+});
+
+function committedMutationResult(
+  status: 'settled' | 'degraded' | 'failed' = 'degraded',
+  scope = 'global'
+): PluginMutationResult & { plugin_id?: string } {
+  const receiptMeta = {
+    request_id: 'mutation-request',
+    operation_id: 'mutation-operation',
+    authority_scope: scope,
+    workspace_generation: scope === 'global' ? 'global' : 'generation-1',
+    sender_id: null,
+    sender_incarnation: null,
+    status,
+    error: null,
+  };
+  if (status === 'failed')
+    return {
+      success: false,
+      wiring_ok: false,
+      error: 'rollback completed',
+      receipt: { extension: 'plugins', meta: { ...receiptMeta, status: 'failed' }, receipt: null },
+    };
+  const errors = status === 'degraded' ? ['Warning: retained component diagnostic'] : [];
+  const projection = {
+    plugin_id: 'mixed-plugin',
+    plugin: null,
+    status,
+    target_receipts: { items: [], omitted: 0 },
+    summary: {
+      total: 1,
+      enabled: 1,
+      skills_loaded: 1,
+      hooks_registered: 0,
+      mcp_connected: 0,
+      agents_loaded: 0,
+      monitors_loaded: 0,
+      themes_loaded: 0,
+      output_styles_loaded: 0,
+      errors: { items: errors, omitted: 0 },
+    },
+    active_theme: null,
+    themes: { items: [], omitted: 0 },
+    active_output_style: null,
+    output_styles: { items: [], omitted: 0 },
+  };
+  return {
+    success: status === 'settled',
+    wiring_ok: status === 'settled',
+    plugin_id: 'mixed-plugin',
+    errors,
+    errors_omitted: 0,
+    settlement_status: status,
+    projection,
+    meta: receiptMeta,
+    receipt: {
+      extension: 'plugins',
+      meta: receiptMeta,
+      receipt: { action: 'mutation', projection },
+    },
+  };
+}
+
+describe('Plugin authority commit projection', () => {
+  it('recognizes the successful mutation variant while keeping degraded success false', () => {
+    const degraded = committedMutationResult();
+    expect(degraded.success).toBe(false);
+    expect(degraded.wiring_ok).toBe(false);
+    expect(pluginMutationCommitted(degraded)).toBe(true);
+    expect(pluginMutationCommitted(committedMutationResult('settled'))).toBe(true);
+  });
+  it('does not turn rollback, validation-only or a bare degraded label into commit', () => {
+    expect(pluginMutationCommitted(committedMutationResult('failed'))).toBe(false);
+    const validation: PluginMutationResult = {
+      success: false,
+      receipt: {
+        extension: 'plugins',
+        meta: { ...meta, status: 'degraded' },
+        receipt: {
+          action: 'validated',
+          validation: {
+            valid: true,
+            name: 'mixed',
+            components: { items: ['skills'], omitted: 0 },
+            errors: { items: ['Warning: validation only'], omitted: 0 },
+          },
+        },
+      },
+    };
+    expect(pluginMutationCommitted(validation)).toBe(false);
+    expect(pluginMutationCommitted({ success: false, settlement_status: 'degraded' })).toBe(false);
+  });
+  it('refuses inconsistent typed mutation statuses and preserves the original explicit untyped result', () => {
+    const result = committedMutationResult();
+    const receipt = result.receipt;
+    if (!receipt || receipt.extension !== 'plugins' || receipt.receipt?.action !== 'mutation')
+      throw new Error('typed fixture missing');
+    const inconsistent: PluginMutationResult = {
+      ...result,
+      receipt: {
+        ...receipt,
+        receipt: {
+          action: 'mutation',
+          projection: { ...receipt.receipt.projection, status: 'settled' },
+        },
+      },
+    };
+    expect(pluginMutationCommitted(inconsistent)).toBe(false);
+    expect(pluginMutationCommitted({ success: true })).toBe(true);
   });
 });

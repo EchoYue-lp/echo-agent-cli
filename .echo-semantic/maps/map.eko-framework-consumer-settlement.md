@@ -15,6 +15,7 @@ behavior_refs:
 rule_refs:
 - rule.eko-framework-consumer-authorities
 evidence_refs:
+- evidence.eko-plugin-committed-degraded-gui
 - evidence.eko-im-cron-history-foreground-outcome
 - evidence.latest-framework-consumer-integration
 - evidence.background-review-entry-repair
@@ -31,6 +32,20 @@ audit_refs:
 related_map_refs:
 - map.eko-conversation-collaboration
 scenarios:
+  plugin-committed-degraded-gui-refresh:
+    status: mapped
+    source_refs:
+    - echo-agent-app-core/src/extension_commands.rs
+    - echo-agent-app-core/src/extension_control/service.rs
+    - echo-agent-app-core/src/plugin_runtime/runtime.rs
+    - web-frontend/src/api/endpoints.ts
+    - web-frontend/src/api/endpoints.extensions.test.ts
+    - web-frontend/src/components/plugins/PluginPanel.tsx
+    - docs/zh/architecture/runtime.md
+    rule_refs:
+    - rule.eko-framework-consumer-authorities
+    evidence_refs:
+    - evidence.eko-plugin-committed-degraded-gui
   independent-linux-validation-budgets:
     status: mapped
     source_refs:

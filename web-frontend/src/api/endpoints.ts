@@ -2688,6 +2688,17 @@ export interface PluginMutationResult {
   receipt?: ExtensionCommandReceipt;
 }
 
+/** 原mutation分支只在authority动作Ok后产生；结算降级仍保留真实提交事实。 */
+export function pluginMutationCommitted(result: PluginMutationResult): boolean {
+  const receipt = result.receipt;
+  if (!receipt) return result.success;
+  if (receipt.extension !== 'plugins' || receipt.receipt?.action !== 'mutation') return false;
+  const status = receipt.meta.status;
+  return (
+    (status === 'settled' || status === 'degraded') && receipt.receipt.projection.status === status
+  );
+}
+
 function pluginInfoFromProjection(plugin: PluginEntryProjection): PluginInfo {
   return {
     name: plugin.name,
