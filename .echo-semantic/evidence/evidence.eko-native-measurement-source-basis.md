@@ -15,6 +15,7 @@ source_refs:
 - scripts/performance-baseline.mjs
 - scripts/test_performance_baseline_report.py
 - scripts/test_performance_baseline_runner.py
+- docs/zh/architecture/performance-baseline.md
 - web-frontend/src/components/chat/ReplyForkDialog.tsx
 - web-frontend/src/components/subagent/SubagentNativeEvent.tsx
 - web-frontend/src/stores/subagentRunStore.ts
@@ -102,3 +103,15 @@ source402、native/手机/SSH/mainCI/发布均另取真实后继结果。本次�
 旧路径身份与退出范围由既有退役资产/Finding和正式ADR0050/0057保留；源码历史可在 `d17f88614b626d32a6176491b3bc60c92a84287f` 及后继具名Git保存点回读。新导航只指向现存原接管实现或退出决定，不能把旧observed_at解释成这些路径当时已经运行通过。unknown/needs_review、原动态/native/风险缺口不清；本候选没有执行Cargo或官方新Task校验，采用与真实来源绑定由EKO唯一writer按正常新Task合同完成。
 
 上文legacy getter返回Unknown的逐路径行属于原source513d历史观察；该模块现已按NoCompat退出，仅从本次前置导航清单撤去，不宣称旧来源恢复已由其它projector替代或通过。
+
+## 2026-10-31：显式快照来源的工程整合与有限 after 事实
+
+本节补充已经列为source_refs的runner／report与两个既有测试模块共四文件的当前职责，新增性能说明导航。上文 `observed_at`、旧43项控制、原失败及其它14条consumer观察继续保留其原阶段范围；不改其status、scenario／matched、after revision或全局unknown，不将本次局部结果扩成Map场景完成。既有Map的运行owner及场景边界没有变化，故不为这次工程来源适配新增Map或修改场景状态。
+
+唯一源码身份仍为runner `source_identity`。Git输入必须对应请求目录自身Git root；只有profile metadata显式给出 `git_object_snapshot` descriptor时，才对实际owned目录核原manifest／Git对象／compile-start／sourceguard及F只读阶段，拒绝成员或目录增减、错误SHA／mode／exec／commit、symlink、路径逃逸及错误实际cwd。快照保 `head=null`、`status=null`、真实root与origin_commit；没有向上借Top HEAD、自动fallback或伪Git。report从同目录精路径／SHA绑定的runner复用此oracle，原两条compile cwd／argv断言和FP／profile／features／binary回执资格保持。
+
+Root已审定的工程runner707d／reader3091及四文件候选，先在Perf私有目录通过58个既有及扩展方法和严格正反控，再用于本次真实39c capture／seed／validate和Run1000 after。EKO唯一writer后继正式采用相同四文件字节，仅同步所属中文性能说明及本Evidence；不会回写39c owned Rust编译源码、原hostsourceRoot、二进制／FP、旧receipt／capsule、before partial或本次原summary。本次正式source身份与该实验的Rust source epoch、私有工程执行路径分别保留，不把新正式HEAD追标为原测量编译版本。
+
+原after结果 `cf39292a9367121cdd1030fe67d74492c1e11d6e3f66d5373a4320ffcd1d081d` 及输入、原caller和背景观察位于顶层ignored `source-snapshot-reader-candidate-20261031-r01/actual-after-runs1000-hot-r02/`；完整入口和八行原Node分位数见 `docs/zh/architecture/performance-baseline.md` 本日段。原8×(5warmup＋30measurement)、240计时样本全correctness通过、runner／child／Node自然0；原工程reader仍自然2／incomplete／errors=[]，完整矩阵、RTL interaction、native paint三项global gap保持。旧before1000原300秒超时和14partial不作分位数或速度比；背景Renderer／cc-switch／aTrust等峰值保留，quiet释放不构成整机solo或因果加速证据。本节不是整体性能、当前App/native、mainCI或发行完成。
+
+仅私有Python工程来源与说明变化；Rust、锁及原风险consumer输入未改，正式采用后的原collector两读与字节桥在交付回执中实核。examples／官网没有新增公共API或调用方式，不增加局部性能宣传。后继Source／final按当前实际文件字节取得，不复用旧票，不修工具、schema或ignore。

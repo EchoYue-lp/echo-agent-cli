@@ -69,3 +69,36 @@ Run 集合原 `all+validation` 入口保留 1000 个对象、完整结果/状态
 checkpoint 的已恢复 cut 不能单独证明 run-state/plan 已落到该 cut。读取复用原 journal/checkpoint 恢复、原 typed projection builder 和现存派生文件；仅 Loaded checkpoint 的有效 cut 等于实际 applied cut，且所需 readmodel 的完整成功值与原 builder 输出相等时，复用当前投影标记。缺失、损坏、陈旧或不可证的投影继续原修复；尾部事件仍真实重放并发布，foreign/pruned 等原失败规则不放宽。no-plan 不增加派生文件清理。
 
 同 cut 冷重开/逐出不重写、checkpoint 后尾事件与“checkpoint 已前进但 readmodel 仍旧”、原冷投影修复矩阵均属 correctness 控制，不是性能样本。新增控制必须先在原 source+test-only 下实跑，再用同测试加生产增量核 GREEN；静态格式、可应用性和原 300 秒 baseline 失败都不代替这些结果。writer/目录持久化屏障不降低，before 原始数据及 partial 保持冻结。
+
+## 工程来源：真实 Git root 与显式对象快照
+
+`scripts/performance-baseline-runner.py` 的 `source_identity` 继续是唯一源码身份入口。普通 Git 输入必须是请求目录自身的真实 Git root；无 `.git` 的 owned 源不能向上借用 superproject HEAD，也不能在 Git 检查失败时自动选择另一来源。只有原 `--profile-metadata` 中明确提供 `source_inputs.eko/framework`、且 `kind=git_object_snapshot` 时才进入快照分支。
+
+快照 descriptor 必须绑定 repository、origin_commit，以及原 manifest、Git objects、compile_start 和 sourceguard 的路径／SHA。Framework 另绑定原 readonly permission phase 及其前置记录。入口核对实际 owned root、原编译 cwd／command、完整唯一文件与目录集合、kind／size／SHA、Git exec 和实际 fullmode；绝对／越根／重复路径、额外文件或空目录、缺失成员、symlink及错误模式均拒绝。EKO mode须与原Git对象一致；Framework只允许已绑定阶段规定的444／555文件与包括根在内的555目录，不泛化成忽略writebit。
+
+该来源记录保留 `root=实际owned目录`、`source_kind=git_object_snapshot`、`origin_commit=原提交`、`head=null`、`status=null`。`origin_commit` 不冒充当前 Git HEAD；descriptor和完整成员共同进入原source摘要及capsule公式。capture后的seed、run和GUI沿同一record／profiles重新核回，不另建来源authority。原report复用同目录且以精路径／SHA绑定的runner实现，并分别绑定实际执行的 `evidence_reader` 与 `source_identity_reader`；两处原约束 `step.command/cwd == final.command/cwd`、`final.cwd == capsule.repository.root` 保持，原FP／profile／features／binary及成功编译回执仍须全部匹配。
+
+Rust被测源码、实际编译cwd、profile与binary是一层来源，执行capture／reader的Python工程版本是另一层来源。后继正式采用工程脚本不回写已测39c快照或旧receipt，也不能用当前formal root替换原hostsourceRoot。该区分沿用[SLSA provenance材料摘要与执行上下文](https://slsa.dev/spec/v1.0/provenance)及[Cargo实际环境目录语义](https://doc.rust-lang.org/cargo/reference/environment-variables.html)，不新增性能协议、运行owner或Git失败fallback。
+
+## 2026-10-31：39c 的 Run1000 单组 after 实测
+
+本组被测EKO源码为 `39c28e7c44c54c9367884f3c08094788ff2f5f72` 的1078文件owned对象快照，实际依赖为F340的2850文件只读快照。原default app-core lib和integration NoRun均自然0，实际binary、FP／dep-info已保全且准确target已清理；本组调用integration程序 `af0349b71e51d130bb0a26f3a101059ef41734a223026d095c1641e611f06bce`。实际工程runner为 `707d628181304652f61cd623f772d8aeefa81937df2afb16d54d85b90e41f504`，reader为 `3091464948fb64c4b1eae9009f2cdc4a492be15609b7659dab3585de7d3ec76a`；它们的后继正式采用不改变该Rust source epoch。
+
+原capture／seed／validate及本组runner、Rust child均自然0。原八个场景各5次warmup、30次measurement，共280行，其中240条计时样本；全部原correctness校验通过，1000对象、128 authority容量、300秒watchdog与5秒清理期限均未改。下表只将原Node summary的ns转换为ms，没有重算统计或引用setup／validate耗时；每行measurement N=30、warmup N=5，不报p99。
+
+| 原场景（省略 `task-runtime/` 前缀） | median ms | p95 ms |
+| --- | ---: | ---: |
+| all+validation | 310.6825415 | 483.064917 |
+| pending+validation | 313.912188 | 512.838542 |
+| conversation-hit+validation | 304.131229 | 424.850958 |
+| conversation-miss+validation | 306.0085625 | 471.462916 |
+| formal-page/all/first+validation | 317.6835415 | 489.570416 |
+| formal-page/all/next+validation | 301.1655835 | 474.847791 |
+| formal-page/pending/first+validation | 307.4215625 | 532.194292 |
+| formal-page/pending/next+validation | 301.028646 | 504.511916 |
+
+原Node统计自然0；工程reader自然2、`incomplete`、`errors=[]`，编译识别为 `recognized_success`，仍保留 `complete_required_matrix_not_independently_established`、`real_RTL_interaction_not_established`、`native_paint_not_established` 三项global gap。因此本组仅证明这些输入在原期限内完成原N和全部校验，不代表完整性能矩阵、App／native paint或产品SLA通过。
+
+quiet租约已于北京时间2026-10-31 21:19:54.581至21:21:34.462实际取得并释放（原字段为UTC `13:19:54.581Z` 至 `13:21:34.462Z`）。103次周期观察未命中原named-heavy分类，但仍观察到Codex Renderer 108.9%、cc-switch 94.9%、fseventsd 77.3%、aTrustXtunnel 59.2%等背景峰值；周期top8不证明整机solo、持续低CPU或优化因果。整进程wait4资源只适用于child及其等待的后代，0／0 block操作不等于无I/O，不能摊成每次操作成本。
+
+旧before1000在原300秒超时，仅留14行partial、`accepted_samples=false`，不是有效分位数或速度比baseline；本次source／dataset／root亦有变化，未做A/B comparison或因果加速宣称。原错误、准入拒绝、partial和不同来源均保持。完整原件在顶层ignored目录 `.echo-semantic/local/parallel-executors-20261027/performance/source-snapshot-reader-candidate-20261031-r01/actual-after-runs1000-hot-r02/`；`result.json` SHA为 `cf39292a9367121cdd1030fe67d74492c1e11d6e3f66d5373a4320ffcd1d081d`，原Node `run/summary.json` SHA为 `5ec66bc906cab8e25cc615319c32218f4dd6aa927adc63da4ddabb1a7325c460`。这些本地原件和来源范围不因后继正式脚本提交而晋升；examples／官网不发布这组局部数值或增加产品API。

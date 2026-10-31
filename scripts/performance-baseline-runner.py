@@ -15,6 +15,7 @@ import platform
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -69,8 +70,102 @@ def command(args, cwd=None):
             "stderr": call.stderr.decode("utf-8", "replace")}
 
 
-def source_identity(root):
+def snapshot_source_identity(root, supplied):
+    """同一来源权威的显式Git对象快照；无Git失败时绝不自动选择此分支。"""
+    def require(ok, message):
+        if not ok:
+            raise ValueError("source snapshot: " + message)
+    def bound(descriptor):
+        require(isinstance(descriptor, dict) and set(descriptor) >= {"path", "sha256"}, "bound descriptor missing")
+        path = Path(descriptor["path"])
+        require(path.is_absolute() and path.absolute() == path.resolve() and not path.is_symlink(), "bound manifest path must be absolute and regular")
+        data = path.read_bytes()
+        require(digest(data) == descriptor["sha256"], "bound manifest hash mismatch")
+        return json.loads(data)
+    require(isinstance(supplied, dict) and supplied.get("kind") == "git_object_snapshot", "explicit source kind required")
+    repository = supplied.get("repository")
+    require(repository in ("eko", "framework"), "repository missing")
+    require(not root.is_symlink() and root.absolute() == root.resolve() and not (root / ".git").exists(), "actual build root must be a non-Git, non-symlink snapshot")
+    manifest = bound(supplied.get("manifest"))
+    objects = bound(supplied.get("git_objects"))
+    started = bound(supplied.get("compile_start"))
+    guarded = bound(supplied.get("sourceguard"))
+    require(started.get("source_manifest", {}).get("sha256") == supplied["manifest"]["sha256"] and
+            guarded.get("source_manifest_sha256") == supplied["manifest"]["sha256"], "compile source manifest not bound")
+    source = manifest["formal_sources"][repository]
+    proof = objects["formal_eko" if repository == "eko" else "formal_framework"]
+    require(source["materialized_root"] == str(root) == proof["materialized_root"], "foreign actual root")
+    require(started["cwd"] == manifest["formal_sources"]["eko"]["materialized_root"], "foreign compile cwd")
+    require(re.fullmatch(r"[0-9a-f]{40}", str(supplied.get("origin_commit"))) is not None and
+            source["commit"] == proof["commit"] == supplied.get("origin_commit") ==
+            guarded["results"][repository]["formal_head"], "wrong origin commit")
+    require(guarded.get("state") == "PASS_AFTER39C_POST_NORUN_SOURCEGUARD0" and
+            guarded["results"][repository].get("bytes_and_exec_and_actual_mode_match") is True and
+            proof.get("git_tree_object_bytes_verified") is True and proof.get("mode_bits_verified") is True,
+            "original sourceguard/object proof not qualified")
+    readonly = repository == "framework"
+    if readonly:
+        phase = bound(supplied.get("permission_phase"))
+        prior = bound(phase.get("prior_permission_phase"))
+        require(phase.get("state") == "F_SOURCE_ROOT_READONLY_SUCCESSOR_BOUND_31B" and
+                phase.get("owned_F_source_root") == str(root) and phase.get("root_mode_after") == "0o555" and
+                phase.get("writable_entries_after") == [] and phase.get("source_bytes_changed") is False and
+                phase.get("source_exec_bits_changed") is False and
+                prior.get("owned_F_source") == str(root) and prior.get("F_bytes_unchanged") is True and
+                prior.get("F_exec_bits_unchanged") is True, "readonly permission phase mismatch")
+    expected, modes = {}, {}
+    for row in source["files"]:
+        rel = row["path"]
+        require(isinstance(rel, str) and rel and not Path(rel).is_absolute() and "\\" not in rel and
+                all(p not in (".", "..") for p in rel.split("/")) and rel not in expected,
+                "invalid or duplicate relative path")
+        require(row.get("kind") == "regular" and type(row.get("bytes")) is int and row["bytes"] >= 0 and
+                re.fullmatch(r"[0-9a-f]{64}", str(row.get("sha256"))) is not None, "unsupported source kind/size/hash/symlink")
+        expected[rel] = row
+    for row in proof["members"]:
+        rel = row["path"]
+        require(rel in expected and rel not in modes and row["git_mode"] in ("100644", "100755") and
+                row["bytes"] == expected[rel]["bytes"] and row["sha256"] == expected[rel]["sha256"],
+                "Git object proof member mismatch")
+        modes[rel] = int(row["git_mode"], 8) & 0o777
+        require(int(row["actual_mode"], 8) == modes[rel], "original Git object fullmode proof differs")
+    require(set(modes) == set(expected) and len(expected) == proof["member_count"] and
+            guarded["results"][repository]["file_count"] == len(expected) and
+            digest(encoded(source["files"])) == source["files_sha256"], "incomplete source authority")
+    directories = {"."}
+    for rel in expected:
+        directories.update(str(p) for p in Path(rel).parents)
+    actual = {}
+    for path in [root, *sorted(root.rglob("*"))]:
+        require(not path.is_symlink(), "source symlink rejected")
+        mode = stat.S_IMODE(path.lstat().st_mode)
+        if path.is_dir():
+            require(str(path.relative_to(root)) in directories, "extra source directory")
+            require(not readonly or mode == 0o555, "readonly directory mode drift")
+            continue
+        rel = path.relative_to(root).as_posix()
+        require(path.is_file() and rel in expected, "extra/nonregular source entry")
+        row = expected[rel]
+        require(path.stat().st_size == row["bytes"] and digest(path.read_bytes()) == row["sha256"], "source byte/size drift: " + rel)
+        require(mode == (modes[rel] & ~0o222 if readonly else modes[rel]), "source fullmode/exec drift: " + rel)
+        actual[rel] = {"path": rel, "kind": "regular", "bytes": row["bytes"], "sha256": row["sha256"]}
+    require(set(actual) == set(expected), "missing source member")
+    files = [actual[k] for k in sorted(actual)]
+    return {"root": str(root), "head": None, "status": None, "source_kind": "git_object_snapshot",
+            "origin_commit": source["commit"], "source_input": supplied, "files": files,
+            "sha256": digest(encoded({"files": files, "source_input": supplied})),
+            "locks": {name: digest((root / name).read_bytes()) for name in
+                      ["Cargo.lock", "Cargo.toml", "echo-agent-app-core/Cargo.toml",
+                       "web-frontend/package-lock.json", "web-frontend/package.json"] if (root / name).is_file()}}
+
+
+def source_identity(root, source_input=None):
+    if source_input is not None:
+        return snapshot_source_identity(root, source_input)
     root = root.resolve()
+    discovered = subprocess.check_output(["git", "-C", str(root), "rev-parse", "--show-toplevel"], text=True).strip()
+    if Path(discovered).resolve() != root:
+        raise ValueError("source Git root differs from requested root; explicit snapshot input required")
     listing = subprocess.check_output(["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"])
     files = []
     for name in sorted(set(os.fsdecode(part) for part in listing.split(b"\0") if part)):
@@ -91,6 +186,21 @@ def source_identity(root):
                       ["Cargo.lock", "Cargo.toml", "echo-agent-app-core/Cargo.toml",
                        "web-frontend/package-lock.json", "web-frontend/package.json"]
                       if (root / name).is_file()}}
+
+
+def verify_source_record(record, profiles=None):
+    if record.get("source_input") is not None or record.get("source_kind") == "git_object_snapshot":
+        if record.get("source_kind") != "git_object_snapshot":
+            raise ValueError("explicit snapshot source kind missing")
+        if profiles is not None:
+            supplied = profiles.get("source_inputs", {})
+            repository = record.get("source_input", {}).get("repository")
+            if supplied.get(repository) != record.get("source_input"):
+                raise ValueError("source input differs from captured profile descriptor")
+    current = source_identity(Path(record["root"]), record.get("source_input"))
+    if current["sha256"] != record["sha256"] or (record.get("source_kind") == "git_object_snapshot" and current != record):
+        raise ValueError("source changed after qualified source identity")
+    return current
 
 
 def host_identity(workspace):
@@ -223,8 +333,7 @@ def seed(args):
         raise ValueError("measurement protocol identity mismatch")
     qualified = metadata["source"]
     for name in ["framework", "eko"]:
-        if source_identity(Path(qualified[name]["root"]))["sha256"] != qualified[name]["sha256"]:
-            raise ValueError("source changed before dataset generation")
+        verify_source_record(qualified[name], qualified["profiles"])
     if qualified["profiles"]["retained_binaries"].get(str(args.binary.resolve())) != digest(args.binary.read_bytes()):
         raise ValueError("seed executable differs from qualified retained binary")
     with workspace_owner(workspace, create=True):
@@ -362,9 +471,7 @@ def run(args):
     args.output.mkdir(parents=True, exist_ok=False)
     source = json.loads(args.source.read_text()); host = host_identity(workspace)
     for name in ["framework", "eko"]:
-        current = source_identity(Path(source[name]["root"]))
-        if current["sha256"] != source[name]["sha256"]:
-            raise ValueError("source changed after the qualified retained build: " + name)
+        verify_source_record(source[name], source["profiles"])
     retained = source["profiles"]["retained_binaries"]
     binary_sha = digest(args.binary.read_bytes())
     if retained.get(str(args.binary.resolve())) != binary_sha:
@@ -401,8 +508,7 @@ def gui(args):
         raise RuntimeError("less than 5 GiB free; do not start GUI observation")
     source = json.loads(args.source.read_text())
     for name in ["framework", "eko"]:
-        if source_identity(Path(source[name]["root"]))["sha256"] != source[name]["sha256"]:
-            raise ValueError("source changed before GUI observation")
+        verify_source_record(source[name], source["profiles"])
     args.output.mkdir(parents=True, exist_ok=False)
     host = host_identity(workspace); environment_id = digest(encoded(host)); process_id = str(uuid.uuid4())
     with workspace_owner(workspace):
@@ -464,8 +570,11 @@ def main():
         renderer.add_argument("--" + name, type=Path, required=True)
     args = parser.parse_args()
     if args.command == "capture":
-        f = source_identity(args.framework); e = source_identity(args.eko)
         profiles = json.loads(args.profile_metadata.read_text())
+        supplied = profiles.get("source_inputs", {})
+        if not isinstance(supplied, dict) or set(supplied) - {"eko", "framework"}:
+            raise ValueError("invalid explicit source input map")
+        f = source_identity(args.framework, supplied.get("framework")); e = source_identity(args.eko, supplied.get("eko"))
         for required in ["rustc", "cargo", "features", "profile", "durability", "compile_receipt", "retained_binaries"]:
             if not profiles.get(required):
                 raise ValueError("missing actual build-profile evidence: " + required)

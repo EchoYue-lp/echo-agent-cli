@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import hashlib
+import importlib.util
 import json
 import math
 from pathlib import Path
@@ -339,10 +340,49 @@ def cargo_selection(args):
         "explicit": sorted(explicit)}}, None
 
 
-def compile_qualification(source_path, descriptor, inputs, profiles, roots, binary_path=None, binary_sha=None):
+def snapshot_materials(source_path, profiles, roots, inputs, source_records=None):
+    """复用同一个source_identity；原caller/cwd合同不因快照来源而放宽。"""
+    supplied = profiles.get("source_inputs", {})
+    require(isinstance(supplied, dict) and set(supplied) <= {"framework", "eko"}, "invalid source input map")
+    if source_records:
+        for name, record in source_records.items():
+            if record.get("source_kind") == "git_object_snapshot":
+                require(name in supplied and supplied[name] == record.get("source_input"), "snapshot input missing or differs from capsule")
+    if not supplied:
+        return {}
+    # 工程入口显式绑定真实reader与同目录runner，不从证据路径加载可替换代码。
+    reader, _ = bound_file(source_path, profiles.get("evidence_reader"), inputs)
+    implementation, _ = bound_file(source_path, profiles.get("source_identity_reader"), inputs)
+    require(reader == Path(__file__).resolve() and implementation == Path(__file__).with_name("performance-baseline-runner.py").resolve(),
+            "source identity/engineering reader path differs from actual tools")
+    spec = importlib.util.spec_from_file_location("bound_source_identity_reader", implementation)
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    materials = {}
+    for name, source_input in supplied.items():
+        require(isinstance(source_input, dict) and source_input.get("repository") == name, "snapshot repository mismatch")
+        for field in ("manifest", "git_objects", "compile_start", "sourceguard"):
+            bound_file(source_path, source_input.get(field), inputs)
+        if name == "framework":
+            phase, _ = bound_file(source_path, source_input.get("permission_phase"), inputs)
+            _, phase_doc = document(phase, inputs)
+            bound_file(phase, phase_doc.get("prior_permission_phase"), inputs)
+        identity = runner.source_identity(Path(roots[name]), source_input)
+        if source_records:
+            require(identity == source_records[name], "snapshot source record differs from actual material identity")
+        materials[name] = {"source_kind": identity["source_kind"], "root": identity["root"],
+                           "origin_commit": identity["origin_commit"], "head": identity["head"],
+                           "sha256": identity["sha256"], "source_input": source_input}
+    return materials
+
+
+def compile_qualification(source_path, descriptor, inputs, profiles, roots, binary_path=None, binary_sha=None, source_records=None):
     """Qualify the explicitly bound final compile step, preserving historical attempts."""
     path, actual = bound_file(source_path, descriptor, inputs)
     qualification = {"path": str(path), "sha256": actual, "status": "unrecognized", "steps": []}
+    materials = snapshot_materials(source_path, profiles, roots, inputs, source_records)
+    if materials:
+        qualification["source_materials"] = materials
     final_steps = descriptor.get("final_steps")
     if not isinstance(final_steps, list) or not final_steps:
         return {**qualification, "gap": "compile_final_step_descriptor_missing"}
@@ -388,6 +428,30 @@ def compile_qualification(source_path, descriptor, inputs, profiles, roots, bina
                 "final compile command/cwd differ from explicit expected identity")
         require(final["repository"] in ("framework", "eko") and final["cwd"] == roots[final["repository"]],
                 "final compile cwd differs from qualified repository")
+        if final["repository"] in materials:
+            supplied = materials[final["repository"]]["source_input"]
+            started, _ = bound_file(source_path, supplied["compile_start"], inputs)
+            _, original_start = document(started, inputs)
+            require(original_start.get("command") == step["command"] and original_start.get("cwd") == step["cwd"],
+                    "snapshot source context differs from original compile caller")
+            artifacts_path, _ = bound_file(source_path, supplied.get("artifacts"), inputs)
+            _, artifacts = document(artifacts_path, inputs)
+            original_receipt = artifacts.get("actual_NoRun_receipt", {})
+            require(referenced(artifacts_path, original_receipt.get("path")) == receipt_path and
+                    digest(original_receipt.get("sha256")) == receipt_sha, "snapshot artifacts differ from actual compile receipt")
+            for retained_path, retained_sha in final["retained_binaries"].items():
+                matches = [r for r in artifacts.get("roles", []) if r.get("retained_binary", {}).get("path") == retained_path]
+                require(len(matches) == 1 and matches[0]["retained_binary"]["sha256"] == retained_sha,
+                        "snapshot binary role/source binding missing or ambiguous")
+                role = matches[0]
+                require(role.get("source_commit") == materials[final["repository"]]["origin_commit"] and
+                        role.get("source_manifest", {}).get("sha256") == supplied["manifest"]["sha256"] and
+                        role.get("original_compile_receipt", {}).get("sha256") == receipt_sha,
+                        "snapshot binary source provenance differs")
+                fp_path, _ = bound_file(artifacts_path, role["retained_fingerprint"], inputs)
+                _, fp = document(fp_path, inputs)
+                require(fp.get("profile") == role.get("actual_Cargo_profile_ID") and
+                        fp.get("features") == role.get("actual_features_string"), "snapshot artifact FP/profile/features mismatch")
         selection, selection_gap = cargo_selection(args)
         if selection_gap:
             return {**qualification, "gap": selection_gap}
@@ -516,7 +580,8 @@ def load_run(run_path, summary_path, inputs=None):
                                         inputs, metadata["profiles"],
                                         {key: metadata[key]["root"] for key in ("framework", "eko")},
                                         binary_path if run["kind"] == "rust" else None,
-                                        binary_sha if run["kind"] == "rust" else None)
+                                        binary_sha if run["kind"] == "rust" else None,
+                                        {key: metadata[key] for key in ("framework", "eko")})
     samples_path, samples_sha = bound_file(run_path, run["samples"], inputs)
     rows = []
     indices = set()
@@ -687,8 +752,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     inputs = {p.resolve() for p in (args.run, args.summary, args.compare_run, args.compare_summary) if p}
     report = {"schema_version": 1, "kind": "offline_performance_coverage_report",
+              "evidence_reader": {"path": str(Path(__file__).resolve()), "sha256": sha256_file(Path(__file__))},
               "status": "invalid", "runs": [], "errors": [], "comparison": None,
-              "validation_scope": "Offline byte/hash, identity, oracle, group-count and process-observation checks. No dataset regeneration, source-tree rescan or independent percentile calculation.",
+              "validation_scope": "Offline byte/hash, identity, oracle, group-count and process-observation checks; explicit snapshot inputs also rescan their bound material trees. No dataset regeneration or independent percentile calculation.",
               "completeness_policy": "Missing required-matrix, real RTL and native-paint proof remains incomplete; no SLA or causal/optimization verdict."}
     try:
         require(bool(args.compare_run) == bool(args.compare_summary), "comparison requires both run and summary")

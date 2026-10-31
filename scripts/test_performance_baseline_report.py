@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from test_performance_baseline_runner import snapshot_fixture, RUNNER
 
 
 SCRIPT = Path(__file__).with_name("performance-baseline-report.py")
@@ -614,6 +615,76 @@ class SyntheticEvidenceTests(unittest.TestCase):
         self.assertEqual(value["coverage_status"], "incomplete")
         self.assertIn("real_RTL_interaction_not_established", value["gaps"])
         self.assertIn("GUI_jsdom_or_other_synthetic_render_is_not_native_paint", value["gaps"])
+
+
+class SnapshotCompileControls(unittest.TestCase):
+    def fixture(self, root):
+        roots, supplied = snapshot_fixture(root)
+        def write(name, value):
+            p = root / name; p.write_text(json.dumps(value) + "\n")
+            return {"path": str(p), "sha256": REPORT.sha256_file(p)}
+        start = json.loads(Path(supplied["eko"]["compile_start"]["path"]).read_text())
+        receipt_value = {"label":"snapshot-synthetic-NoRun", "command":start["command"], "cwd":start["cwd"],
+                         "logPath":str(root/"compile.raw"), "exitCode":0, "signal":None, "errorCode":None,
+                         "truncated":False, "bytesSeen":0, "bytesWritten":0,
+                         "startedAt":"2026-10-31T00:00:00Z", "finishedAt":"2026-10-31T00:00:01Z"}
+        receipt = write("compile.json", receipt_value)
+        binary = root / "synthetic-retained.bin"; binary.write_text("synthetic metadata only, not executed\n")
+        binaries = {str(binary):REPORT.sha256_file(binary)}
+        fp = write("fingerprint.json", {"profile":77,"features":"[]"})
+        artifacts = write("artifacts.json", {"actual_NoRun_receipt":receipt, "roles":[{
+            "retained_binary":{"path":str(binary),"sha256":binaries[str(binary)]}, "retained_fingerprint":fp,
+            "actual_Cargo_profile_ID":77,"actual_features_string":"[]", "source_commit":supplied["eko"]["origin_commit"],
+            "source_manifest":supplied["eko"]["manifest"], "original_compile_receipt":receipt}]})
+        supplied["eko"]["artifacts"] = artifacts
+        features = {"eko":{"default_features":True,"all_features":False,"explicit":[]}}
+        final = {"receipt":receipt,"label":receipt_value["label"],"command":start["command"],"cwd":start["cwd"],
+                 "repository":"eko","profile":"release","features":features,"retained_binaries":binaries}
+        descriptor = {**receipt,"final_steps":[final]}
+        profiles = {"profile":"release","features":features,"retained_binaries":binaries,"source_inputs":supplied,
+                    "evidence_reader":{"path":str(SCRIPT.resolve()),"sha256":REPORT.sha256_file(SCRIPT)},
+                    "source_identity_reader":{"path":str(Path(SCRIPT).with_name("performance-baseline-runner.py").resolve()),
+                                              "sha256":REPORT.sha256_file(Path(SCRIPT).with_name("performance-baseline-runner.py"))}}
+        identities = {name:RUNNER.source_identity(roots[name], supplied[name]) for name in roots}
+        return {"roots":{name:str(path) for name,path in roots.items()},"descriptor":descriptor,"profiles":profiles,
+                "binary":binary,"sha":binaries[str(binary)],"identities":identities,"receipt_value":receipt_value}
+
+    def qualify(self, root, fixture):
+        return REPORT.compile_qualification(root/"capsule-not-written.json", fixture["descriptor"], set(),
+            fixture["profiles"], fixture["roots"], fixture["binary"], fixture["sha"], fixture["identities"])
+
+    def test_snapshot_compile_positive_keeps_real_cwd_and_material_refs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); f=self.fixture(root); result=self.qualify(root,f)
+            self.assertEqual(result["status"],"recognized_success")
+            self.assertEqual(result["steps"][0]["step"]["cwd"],f["roots"]["eko"])
+            self.assertEqual(result["source_materials"]["eko"]["head"],None)
+            self.assertEqual(result["source_materials"]["framework"]["source_kind"],"git_object_snapshot")
+
+    def test_missing_bridge_and_old_parent_git_cannot_be_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); f=self.fixture(root); f["profiles"].pop("source_inputs")
+            with self.assertRaisesRegex(REPORT.InvalidEvidence,"snapshot input missing"):
+                self.qualify(root,f)
+
+    def test_snapshot_keeps_existing_cwd_argv_profile_feature_binary_FP_rejections(self):
+        for change in ("cwd","argv","profile","features","binary","FP","reader","runner","origin","manifesthash","fullset"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory); f=self.fixture(root); final=f["descriptor"]["final_steps"][0]
+                supplied=f["profiles"]["source_inputs"]["eko"]
+                if change=="cwd": final["cwd"]=str(root/"foreign")
+                elif change=="argv": final["command"]=["cargo","test","--no-run"]
+                elif change=="profile": final["profile"]="test"
+                elif change=="features": f["profiles"]["features"]["eko"]["explicit"]=["unrequested"]
+                elif change=="binary": final["retained_binaries"][str(f["binary"]) ]="f"*64
+                elif change=="FP": (root/"fingerprint.json").write_text('{"profile":78,"features":"[]"}')
+                elif change=="reader": f["profiles"]["evidence_reader"]["sha256"]="0"*64
+                elif change=="runner": f["profiles"]["source_identity_reader"]["sha256"]="0"*64
+                elif change=="origin": supplied["origin_commit"]="c"*40
+                elif change=="manifesthash": supplied["manifest"]["sha256"]="0"*64
+                else: (Path(f["roots"]["eko"])/"untracked").write_text("extra")
+                with self.assertRaises((ValueError,REPORT.InvalidEvidence)):
+                    self.qualify(root,f)
 
 
 if __name__ == "__main__":
