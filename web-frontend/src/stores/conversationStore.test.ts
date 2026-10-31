@@ -1,5 +1,12 @@
 // @vitest-environment jsdom
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+
+vi.hoisted(() => {
+  Object.defineProperty(window, 'matchMedia', {
+    configurable: true,
+    value: () => ({ matches: false }),
+  });
+});
 import { createElement } from 'react';
 import { cleanup, fireEvent, render, screen, within, waitFor } from '@testing-library/react';
 import { useToolExecutionStore } from './toolExecutionStore';

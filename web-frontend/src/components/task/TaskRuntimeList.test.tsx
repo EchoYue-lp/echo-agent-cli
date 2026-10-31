@@ -1,6 +1,13 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.hoisted(() => {
+  Object.defineProperty(window, 'matchMedia', {
+    configurable: true,
+    value: () => ({ matches: false }),
+  });
+});
 import { TaskRuntimePanel } from './TaskRuntimePanel';
 import { RightRail } from '../layout/RightRail';
 import { useWorkspaceStore } from '../../stores/workspaceStore';

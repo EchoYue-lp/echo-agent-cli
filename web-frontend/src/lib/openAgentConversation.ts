@@ -1,21 +1,14 @@
 import type { ConversationTarget } from '../generated';
+import { useConversationStore } from '../stores/conversationStore';
+import { useUiStore } from '../stores/uiStore';
+import { useWorkspaceStore } from '../stores/workspaceStore';
+import { useWorkspaceViewStore } from '../stores/workspaceViewStore';
 import { GLOBAL_WORKSPACE_ID } from './viewAddress';
 import { GLOBAL_WORKSPACE_GENERATION, productDataScope } from './productDataScope';
 
 /** Same navigation admission as the existing sidebar. This never sends, creates or executes. */
 export async function openAgentConversation(target: ConversationTarget): Promise<void> {
-  // Navigation stores initialize only on a click; merely rendering a tool row has no navigation side effects.
-  const [
-    { useWorkspaceStore },
-    { useConversationStore },
-    { useUiStore },
-    { useWorkspaceViewStore },
-  ] = await Promise.all([
-    import('../stores/workspaceStore'),
-    import('../stores/conversationStore'),
-    import('../stores/uiStore'),
-    import('../stores/workspaceViewStore'),
-  ]);
+  // 复用主界面已加载的 Store；仅显式点击调用导航，渲染工具行不会切换会话。
   const epoch = useUiStore.getState().beginNavigation();
   const before = useWorkspaceStore.getState();
   const registered = before.workspaces.find((workspace) => workspace.id === target.workspace_id);

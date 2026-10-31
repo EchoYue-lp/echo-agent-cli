@@ -7,22 +7,15 @@ import type {
   SchedulerRunReference,
 } from '../../api/endpoints';
 import { useToastStore } from '../../stores/toastStore';
+import { useConversationStore } from '../../stores/conversationStore';
+import { useUiStore } from '../../stores/uiStore';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
+import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { WeixinNotificationResult } from './WeixinNotification';
 
 export function SchedulerRunLink({ run }: { run: SchedulerRunReference }) {
   const open = async () => {
     try {
-      const [
-        { useWorkspaceStore },
-        { useConversationStore },
-        { useUiStore },
-        { useTaskRuntimeStore },
-      ] = await Promise.all([
-        import('../../stores/workspaceStore'),
-        import('../../stores/conversationStore'),
-        import('../../stores/uiStore'),
-        import('../../stores/taskRuntimeStore'),
-      ]);
       const workspaces = useWorkspaceStore.getState();
       if ((workspaces.current?.id ?? 'global') !== run.workspace_id) {
         if (run.workspace_id === 'global') await workspaces.exit();
