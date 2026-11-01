@@ -15,6 +15,7 @@ behavior_refs:
 rule_refs:
 - rule.eko-framework-consumer-authorities
 evidence_refs:
+- evidence.eko-scheduler-desktop-arguments
 - evidence.eko-plugin-committed-degraded-gui
 - evidence.eko-im-cron-history-foreground-outcome
 - evidence.latest-framework-consumer-integration
@@ -32,6 +33,12 @@ audit_refs:
 related_map_refs:
 - map.eko-conversation-collaboration
 scenarios:
+  scheduler-desktop-argument-adaptation:
+    status: mapped
+    source_refs:
+    - web-frontend/src/api/endpoints.ts
+    evidence_refs:
+    - evidence.eko-scheduler-desktop-arguments
   plugin-committed-degraded-gui-refresh:
     status: mapped
     source_refs:

@@ -3513,7 +3513,7 @@ export const schedulerApi = {
     isTauri()
       ? apiInvoke<{ success: boolean }>('add_scheduler_task', {
           name: data.name,
-          cron_expr: data.cron_expr,
+          cronExpr: data.cron_expr,
           prompt: data.prompt,
         })
       : post<{ success: boolean }>('/scheduler/tasks', data),

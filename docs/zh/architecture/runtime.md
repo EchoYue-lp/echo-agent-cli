@@ -437,6 +437,11 @@ EKO 配置只提供新运行默认值。原 RunCreated 的执行 profile 拥有�
 
 原 IM owner 归位 app-core `channel_runtime`，bin 入口仅转发；ApplicationServices 与 Tauri 共用同一 Arc。ConfigState 只在 owned 持久化成功后发布 UUID revision，transport epoch 与 applied revision 保持各自含义。原生命周期 channels slot 持有 manager/coordinator/pump 句柄到真实物理结算；所有权未知时阻止依赖提前关闭。桌面 X 隐藏；明确退出在 Tokio 存活期间等待原 receipt 的 final 发布，其它 bounded 观察不变。已结算失败可为 final Err，Unknown 不构成 final。Cron 视图只消费原 edit/manual/history 收据和已有精确 run 事实。数据流、恢复边界、参考实现及待验 Rust/native 范围见 [ADR0053](../adr/0053-im-cron-gui-control.md)。
 
+Scheduler 的桌面创建适配遵守 Tauri 默认顶层 camelCase 参数：Rust 的 `cron_expr`
+通过 IPC 发送为 `cronExpr`，`apiInvoke` 不自动转换键名。表单、REST JSON 和编辑命令内
+`expected`／`edit` 的 serde 字段仍使用 `cron_expr`，不能递归改名。运行历史游标仍为
+原生产端生成的 opaque JSON 字符串或 null，前端原样传递，避免解析 u64 后丢失精度。
+
 ## 绑定到 TaskRun 的领域插件
 
 专业方法通过原插件 prepare/publication 读取 EKO `domain.yaml`，不再由四套编译内
