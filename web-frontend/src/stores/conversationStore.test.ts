@@ -435,7 +435,7 @@ describe('conversation message identity', () => {
 
     await useConversationStore.getState().startNew();
     pendingRecord.resolve({ messages: [] });
-    await load;
+    expect(await load).toBe(false);
 
     expect(useConversationStore.getState()).toMatchObject({ activeId: null, isLoading: false });
     expect(mocks.restoreConversation).not.toHaveBeenCalled();
@@ -451,7 +451,7 @@ describe('conversation message identity', () => {
     const load = useConversationStore.getState().loadConversation('side-1');
     const refresh = useConversationStore.getState().init('workspace-1');
     pendingRecord.resolve({ messages: [] });
-    await load;
+    expect(await load).toBe(true);
 
     expect(useConversationStore.getState()).toMatchObject({
       activeId: 'side-1',
@@ -1410,7 +1410,9 @@ describe('canonical tool transcript recovery', () => {
       messages: [{ role: 'assistant', content: '可读历史' }],
     });
     mocks.restoreConversation.mockRejectedValueOnce(new Error('current context restore failed'));
-    await useConversationStore.getState().loadConversation('current-failed-restore');
+    expect(await useConversationStore.getState().loadConversation('current-failed-restore')).toBe(
+      true
+    );
     expect(useConversationStore.getState().activeId).toBe('current-failed-restore');
     expect(useChatStore.getState().isHistoryView).toBe(true);
     expect(useChatStore.getState().messages.map((message) => message.content)).toEqual([
@@ -1482,7 +1484,7 @@ describe('canonical tool transcript recovery', () => {
     await useConversationStore.getState().loadConversation('conversation-B');
     expect(useChatStore.getState().isHistoryView).toBe(false);
     rejectRestore(new Error('late inner A restore error'));
-    await loadingA;
+    expect(await loadingA).toBe(false);
     expect(useConversationStore.getState().activeId).toBe('conversation-B');
     expect(useChatStore.getState().messages.map((message) => message.content)).toEqual(['B正文']);
     expect(useChatStore.getState().isHistoryView).toBe(false);
@@ -1568,7 +1570,7 @@ describe('canonical tool transcript recovery', () => {
     ];
     useChatStore.setState({ messages });
     mocks.getConversation.mockRejectedValueOnce(new Error('tool history parse failed'));
-    await useConversationStore.getState().loadConversation('bad-history');
+    expect(await useConversationStore.getState().loadConversation('bad-history')).toBe(false);
     expect(useConversationStore.getState().activeId).toBe('old-selection');
     expect(useChatStore.getState().messages).toBe(messages);
     expect(useConversationStore.getState().isLoading).toBe(false);
@@ -1579,6 +1581,35 @@ describe('canonical tool transcript recovery', () => {
       }),
     ]);
   });
+
+  it.each(['before-restore', 'after-restore'])(
+    'returns false and preserves the old view when projection is refused %s',
+    async (phase) => {
+      useConversationStore.setState({ activeId: 'retained-view' });
+      const messages: ChatMessage[] = [
+        { id: 'retained-message', role: 'assistant', content: '保留旧视图', timestamp: 1 },
+      ];
+      useChatStore.setState({ messages });
+      mocks.getConversation.mockResolvedValueOnce({ messages: [] });
+      let canProject = phase !== 'before-restore';
+      if (phase === 'after-restore')
+        mocks.restoreConversation.mockImplementationOnce(async () => {
+          canProject = false;
+        });
+      expect(
+        await useConversationStore.getState().loadConversation('refused-view', () => canProject)
+      ).toBe(false);
+      expect(useConversationStore.getState()).toMatchObject({
+        activeId: 'retained-view',
+        isLoading: false,
+      });
+      expect(useChatStore.getState().messages).toBe(messages);
+      expect(useToastStore.getState().toasts).toEqual([]);
+      if (phase === 'before-restore') expect(mocks.restoreConversation).not.toHaveBeenCalled();
+      else
+        expect(mocks.restoreConversation).toHaveBeenCalledExactlyOnceWith('global', 'refused-view');
+    }
+  );
 
   it('does not send a failed old request toast into a newer selected conversation', async () => {
     let rejectOld: (error: Error) => void = () => undefined;

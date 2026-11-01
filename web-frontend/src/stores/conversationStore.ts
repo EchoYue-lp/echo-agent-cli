@@ -83,8 +83,8 @@ interface ConversationState {
     messages: ChatMessage[],
     onCreated?: (address: ViewAddress) => void
   ) => Promise<ViewAddress | null>;
-  /** Load a conversation and display it */
-  loadConversation: (id: string, canProject?: () => boolean) => Promise<void>;
+  /** 仅本次已投影 transcript 时返回 true；包含上下文恢复失败后的只读历史。 */
+  loadConversation: (id: string, canProject?: () => boolean) => Promise<boolean>;
   /** Branch the canonical transcript immediately before one user turn. */
   branchCurrent: (userTurnIndex: number) => Promise<{ id: string; targetContent: string }>;
   /** Copy through a completed reply, refresh the list, and open the ordinary fork. */
@@ -619,21 +619,21 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         toolExecutionApi.list(workspaceId, id),
       ]);
       if (generation !== loadGeneration || get().workspaceId !== workspaceId || !canProject())
-        return;
+        return false;
       // Restore agent context on the backend so conversation can continue.
       let restoreReady = true;
       try {
         await conversationApi.restore(workspaceId, id);
       } catch (e) {
         if (generation !== loadGeneration || get().workspaceId !== workspaceId || !canProject())
-          return;
+          return false;
         restoreReady = false;
         console.error('Failed to restore agent context:', e);
         useToastStore.getState().addToast('error', '会话上下文恢复失败，已切换为只读历史视图');
         useChatStore.getState().setHistoryView(true);
       }
       if (generation !== loadGeneration || get().workspaceId !== workspaceId || !canProject())
-        return;
+        return false;
       // Keep the source projection until hydration and navigation admission
       // both finish; closing a fork observer must not erase the current chat.
       useChatStore.getState().clearMessages();
@@ -716,6 +716,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         ),
       }));
       loadingConversationId = null;
+      return true;
     } catch (e) {
       console.error('Failed to load conversation:', e);
       if (generation === loadGeneration && get().workspaceId === workspaceId && canProject()) {
@@ -723,6 +724,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         set({ isLoading: false });
         useToastStore.getState().addToast('error', '无法加载会话或工具历史；原始记录保留，请重试');
       }
+      return false;
     } finally {
       if (generation === loadGeneration && get().workspaceId === workspaceId && !canProject()) {
         loadingConversationId = null;

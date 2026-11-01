@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { schedulerApi } from '../../api/endpoints';
+import { conversationApi, schedulerApi } from '../../api/endpoints';
 import type {
   SchedulerHistoryCursor,
   SchedulerHistoryRecord,
@@ -11,27 +11,67 @@ import { useConversationStore } from '../../stores/conversationStore';
 import { useUiStore } from '../../stores/uiStore';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
+import { useContextPaneStore } from '../../stores/contextPaneStore';
+import { useWorkspaceViewStore } from '../../stores/workspaceViewStore';
+import { productDataScope, sameProductDataScope } from '../../lib/productDataScope';
 import { WeixinNotificationResult } from './WeixinNotification';
 
 export function SchedulerRunLink({ run }: { run: SchedulerRunReference }) {
   const open = async () => {
+    const epoch = useUiStore.getState().beginNavigation();
     try {
       const workspaces = useWorkspaceStore.getState();
-      if ((workspaces.current?.id ?? 'global') !== run.workspace_id) {
-        if (run.workspace_id === 'global') await workspaces.exit();
-        else await workspaces.switchTo(run.workspace_id);
+      const target = workspaces.workspaces.find((workspace) => workspace.id === run.workspace_id);
+      if (run.workspace_id !== 'global' && !target) throw new Error('原任务工作区已不可用');
+      const scope = productDataScope(target);
+      const transition =
+        (workspaces.current?.id ?? 'global') === run.workspace_id
+          ? null
+          : run.workspace_id === 'global'
+            ? workspaces.exit()
+            : workspaces.switchTo(run.workspace_id);
+      // 与侧栏相同，切换同步分离旧会话后捕获新稿代次；后继导航不接收迟到结果。
+      const draftEpoch = useConversationStore.getState().newConversationEpoch;
+      const canOpen = () =>
+        useUiStore.getState().navigationEpoch === epoch &&
+        useConversationStore.getState().newConversationEpoch === draftEpoch &&
+        useConversationStore.getState().workspaceId === scope.workspaceId &&
+        sameProductDataScope(productDataScope(useWorkspaceStore.getState().current), scope);
+      if (transition) await transition;
+      if (!canOpen()) return;
+      // Run 可早于 transcript 失败。只按原元数据确认存在性，不把读取错误当成不存在。
+      const conversations = await conversationApi.list(scope.workspaceId);
+      if (!canOpen()) return;
+      if (conversations.some((item) => item.conversation_id === run.conversation_id)) {
+        const projected = await useConversationStore
+          .getState()
+          .loadConversation(run.conversation_id, canOpen);
+        if (!projected || !canOpen()) return;
+        if (useConversationStore.getState().activeId !== run.conversation_id)
+          throw new Error('原会话尚未载入；原任务记录保留');
       }
-      if ((useWorkspaceStore.getState().current?.id ?? 'global') !== run.workspace_id)
-        throw new Error('工作区切换未确认');
-      await useConversationStore.getState().loadConversation(run.conversation_id);
-      await useTaskRuntimeStore.getState().refresh(run.workspace_id, run.run_id);
-      if (useTaskRuntimeStore.getState().activeRun?.run_id !== run.run_id)
-        throw new Error('原任务结果尚未载入');
+      await useTaskRuntimeStore.getState().loadByRun(scope, run.run_id);
+      if (!canOpen()) return;
+      const tasks = useTaskRuntimeStore.getState();
+      if (tasks.historyError) throw new Error(tasks.historyError);
+      const loaded = tasks.historySnapshot?.activeRun;
+      if (
+        tasks.selectedRunId !== run.run_id ||
+        !tasks.taskScope ||
+        !sameProductDataScope(tasks.taskScope, scope) ||
+        loaded?.run_id !== run.run_id ||
+        loaded.workspace_id !== run.workspace_id ||
+        loaded.conversation_id !== run.conversation_id
+      )
+        throw new Error('原任务结果尚未载入或身份不匹配');
+      useWorkspaceViewStore.getState().openChat();
+      useContextPaneStore.getState().openTasks();
       useUiStore.getState().closeSettings();
     } catch (error) {
-      useToastStore
-        .getState()
-        .addToast('error', error instanceof Error ? error.message : String(error));
+      if (useUiStore.getState().navigationEpoch === epoch)
+        useToastStore
+          .getState()
+          .addToast('error', error instanceof Error ? error.message : String(error));
     }
   };
   return (

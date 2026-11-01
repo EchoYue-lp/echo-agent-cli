@@ -468,6 +468,17 @@ primary、计划 Subagent、Verification 与 review 消费持久规则。原 poo
 
 页面可见时每五秒刷新已请求范围内的有限 Run 页，至多两个 scope 顺序读取；隐藏时停止后继轮询，回到前台立即刷新。周期刷新不扫描完整会话列表，初次显示、工作空间/GUI 会话变化和回前台才沿既有会话元数据入口更新。关闭页面会注销监听并取消后继刷新；迟到响应必须仍匹配原 scope/generation。失败早于 transcript 保存时仍可直接打开原 Run 详情，不补造会话、计划或第二套历史 store。
 
+Scheduler 运行历史的“查看任务结果”与侧栏复用同一 `loadByRun(scope, run_id)` 精确历史入口，
+不再用聊天态 `refresh` 代替历史选择。工作区切换确认后，仅当原会话元数据确认 transcript
+存在时才加载会话；没有 transcript 的 Failed Run 仍直接读取原 journal、状态和错误。
+元数据、会话或 Run 读取失败保持错误可见，不能当成“会话不存在”继续成功导航。加载完成后核对
+workspace、generation、run 和 conversation 身份，再打开聊天中的任务详情面板并关闭设置页。
+会话读取使用 `loadConversation` 本次返回的投影结果：成功呈现 transcript（含上下文恢复失败后的
+只读历史）为 true；读取失败、旧请求或投影准入失效为 false。历史链接在 false 时停止后续
+Run 读取与页面打开，不能把原本相同的 `activeId` 当成本次载入成功；原错误提示与旧视图保留。
+后继导航、新稿或工作区代次变化使迟到结果失去打开页面的资格；历史快照不替换当前聊天 Run，
+也不补造会话、改写失败状态或重新执行任务。
+
 选择旧 run 后，详情、轮询和控制使用其精确 run_id，而非会话 latest。运行页/事件页不建立第二个任务或事件 store。事件读取返回有限片段、无精度损失的后续 sequence 和未读尾部标记，Subagent 历史未读完仍明确提示。原类型化控制回执区分 no-op、已接受请求、排期/恢复重试与物理或语义完成。同 ID 工作区换 generation 以及迟到请求由原 scope 和 GUI 选择世代隔离。
 
 有限传输不意味着已有索引或常量扫描。合法任务图/查询测量，以及浅深色、常用/最小窗口的原生行为仍需验收。Framework/SDK 示例不变，官网等待合格 EKO 源统一镜像。参见[任务面板指南](../guides/gui-task-runtime-panel.md)与[ADR 0008](../adr/0008-taskruntime-bounded-query-projections.md)。
