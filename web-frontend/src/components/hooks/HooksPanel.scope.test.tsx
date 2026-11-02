@@ -210,4 +210,84 @@ describe('Hook panel scope settlement', () => {
       workspace_generation: 'generation-1',
     });
   });
+
+  it('keeps an event catalog error visible after the source list succeeds and retries only event metadata', async () => {
+    const sources = deferred<ReturnType<typeof listing>>();
+    fixture.list.mockReturnValueOnce(sources.promise);
+    fixture.events.mockRejectedValueOnce(new Error('事件目录暂不可读'));
+    fixture.test.mockResolvedValue({ event: 'Stop', matches: [], matches_omitted: 0 });
+    render(<HooksPanel />);
+    expect((await screen.findByRole('alert')).textContent).toContain('事件目录暂不可读');
+    await act(async () => sources.resolve(listing('plugin:alpha')));
+    expect(await screen.findByText('plugin:alpha')).toBeTruthy();
+    expect(screen.getByRole('alert').textContent).toContain('事件目录暂不可读');
+    expect(
+      (screen.getByRole('button', { name: 'Dry-run hook matching' }) as HTMLButtonElement).disabled
+    ).toBe(true);
+
+    fixture.events.mockResolvedValueOnce(['Stop']);
+    fireEvent.click(screen.getByRole('button', { name: '重新加载事件' }));
+    await waitFor(() =>
+      expect(
+        (screen.getByRole('combobox', { name: 'Hook event' }) as HTMLSelectElement).value
+      ).toBe('Stop')
+    );
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(fixture.events).toHaveBeenCalledTimes(2);
+    expect(fixture.list).toHaveBeenCalledTimes(1);
+    expect(fixture.reload).not.toHaveBeenCalled();
+    expect(fixture.test).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Dry-run hook matching' }));
+    await screen.findByText('Stop dry-run matched no actions');
+    expect(fixture.test).toHaveBeenCalledWith(
+      expect.objectContaining({ workspace_id: 'alpha', workspace_generation: 'generation-1' }),
+      'Stop',
+      '*'
+    );
+  });
+
+  it('retains the current source list and event retry when the retry itself fails', async () => {
+    fixture.events
+      .mockRejectedValueOnce(new Error('初次事件读取失败'))
+      .mockRejectedValueOnce(new Error('再次事件读取失败'));
+    render(<HooksPanel />);
+    await screen.findByText('plugin:alpha');
+    await screen.findByRole('alert');
+    fireEvent.click(screen.getByRole('button', { name: '重新加载事件' }));
+    await waitFor(() =>
+      expect(screen.getByRole('alert').textContent).toContain('再次事件读取失败')
+    );
+    expect(screen.getByText('plugin:alpha')).toBeTruthy();
+    expect(
+      (screen.getByRole('button', { name: '重新加载事件' }) as HTMLButtonElement).disabled
+    ).toBe(false);
+    expect(fixture.list).toHaveBeenCalledTimes(1);
+    expect(fixture.events).toHaveBeenCalledTimes(2);
+    expect(fixture.reload).not.toHaveBeenCalled();
+    expect(fixture.test).not.toHaveBeenCalled();
+  });
+
+  it('ignores an event retry rejection from a departed workspace and leaves the new catalog usable', async () => {
+    const retry = deferred<string[]>();
+    fixture.events.mockRejectedValueOnce(new Error('alpha事件读取失败'));
+    const view = render(<HooksPanel />);
+    await screen.findByText('plugin:alpha');
+    await screen.findByRole('alert');
+    fixture.events.mockReturnValueOnce(retry.promise);
+    fireEvent.click(screen.getByRole('button', { name: '重新加载事件' }));
+    await waitFor(() => expect(fixture.events).toHaveBeenCalledTimes(2));
+    fixture.current = { id: 'beta', product_data_generation: 'generation-2' };
+    fixture.list.mockResolvedValue(listing('plugin:beta'));
+    fixture.events.mockResolvedValue(['PreToolUse']);
+    view.rerender(<HooksPanel />);
+    await screen.findByText('plugin:beta');
+    await act(async () => retry.reject(new Error('旧alpha事件重读失败')));
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByText('旧alpha事件重读失败')).toBeNull();
+    expect(
+      (screen.getByRole('button', { name: 'Dry-run hook matching' }) as HTMLButtonElement).disabled
+    ).toBe(false);
+    expect(fixture.reload).not.toHaveBeenCalled();
+    expect(fixture.test).not.toHaveBeenCalled();
+  });
 });

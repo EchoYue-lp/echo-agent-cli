@@ -36,6 +36,7 @@ type HookView = {
   scope: ReturnType<typeof extensionRequestScope>;
   active: boolean;
   listSequence: number;
+  eventsSequence: number;
 };
 
 export function HooksPanel() {
@@ -46,6 +47,8 @@ export function HooksPanel() {
   const [loading, setLoading] = useState(true);
   const [testing, setTesting] = useState(false);
   const [events, setEvents] = useState<string[]>([]);
+  const [eventsLoading, setEventsLoading] = useState(false);
+  const [eventsError, setEventsError] = useState<string | null>(null);
   const [selectedEvent, setSelectedEvent] = useState('PreToolUse');
   const [matcher, setMatcher] = useState('*');
   const [error, setError] = useState<string | null>(null);
@@ -88,6 +91,29 @@ export function HooksPanel() {
     [isCurrentView]
   );
 
+  const loadEvents = useCallback(
+    async (view: HookView) => {
+      if (!isCurrentView(view)) return;
+      const sequence = ++view.eventsSequence;
+      const isLatest = () => isCurrentView(view) && sequence === view.eventsSequence;
+      setEventsLoading(true);
+      try {
+        const available = await hooksApi.events();
+        if (!isLatest()) return;
+        setEvents(available);
+        setSelectedEvent((current) =>
+          available.length > 0 && !available.includes(current) ? available[0] : current
+        );
+        setEventsError(null);
+      } catch (e: any) {
+        if (isLatest()) setEventsError(e.message || 'Failed to load hook events');
+      } finally {
+        if (isLatest()) setEventsLoading(false);
+      }
+    },
+    [isCurrentView]
+  );
+
   useEffect(() => {
     // 每次访问独立失效，避免 A→B→A 时复活第一次 A 的迟到回执。
     // 后端操作继续由原 owner 结算；这里只限制当前面板可消费的结果。
@@ -95,6 +121,7 @@ export function HooksPanel() {
       scope: requestScope,
       active: true,
       listSequence: 0,
+      eventsSequence: 0,
     };
     currentView.current = view;
     setSources([]);
@@ -103,23 +130,13 @@ export function HooksPanel() {
     setMessage(null);
     setTesting(false);
     setEvents([]);
+    setEventsError(null);
     void loadHooks(view);
-    hooksApi
-      .events()
-      .then((available) => {
-        if (!isCurrentView(view)) return;
-        setEvents(available);
-        setSelectedEvent((current) =>
-          available.length > 0 && !available.includes(current) ? available[0] : current
-        );
-      })
-      .catch((e: any) => {
-        if (isCurrentView(view)) setError(e.message || 'Failed to load hook events');
-      });
+    void loadEvents(view);
     return () => {
       view.active = false;
     };
-  }, [isCurrentView, loadHooks, requestScope]);
+  }, [isCurrentView, loadEvents, loadHooks, requestScope]);
 
   const handleReload = async () => {
     const view = currentView.current;
@@ -155,7 +172,7 @@ export function HooksPanel() {
 
   const handleTest = async () => {
     const view = currentView.current;
-    if (!view || !isCurrentView(view)) return;
+    if (!view || !isCurrentView(view) || eventsLoading || events.length === 0) return;
     try {
       setTesting(true);
       setMessage(null);
@@ -212,7 +229,7 @@ export function HooksPanel() {
           <select
             value={selectedEvent}
             onChange={(event) => setSelectedEvent(event.target.value)}
-            disabled={events.length === 0 || testing}
+            disabled={events.length === 0 || eventsLoading || testing}
             className="h-9 max-w-48 rounded-md border bg-[var(--bg-secondary)] px-2 text-xs"
             style={{
               color: 'var(--text-secondary)',
@@ -228,7 +245,7 @@ export function HooksPanel() {
           </select>
           <button
             onClick={handleTest}
-            disabled={events.length === 0 || testing}
+            disabled={events.length === 0 || eventsLoading || testing}
             className="flex h-9 w-9 items-center justify-center rounded-md transition-colors disabled:opacity-50 hover:bg-[var(--bg-hover)]"
             style={{
               color: 'var(--text-secondary)',
@@ -286,6 +303,28 @@ export function HooksPanel() {
           <span className="break-all">{message.text}</span>
           <button onClick={() => setMessage(null)} className="ml-auto flex-shrink-0">
             <X className="w-3 h-3" />
+          </button>
+        </div>
+      )}
+
+      {eventsError && (
+        <div
+          role="alert"
+          className="flex items-center gap-2 px-3 py-2 text-sm"
+          style={{ color: 'var(--color-error, #ef4444)' }}
+        >
+          <AlertCircle className="w-4 h-4" />
+          <span>Hook 事件列表加载失败：{eventsError}</span>
+          <button
+            type="button"
+            disabled={eventsLoading}
+            onClick={() => {
+              const view = currentView.current;
+              if (view && isCurrentView(view)) void loadEvents(view);
+            }}
+            className="ml-auto rounded border px-2 py-1 text-xs disabled:opacity-50"
+          >
+            重新加载事件
           </button>
         </div>
       )}
