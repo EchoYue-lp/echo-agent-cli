@@ -473,3 +473,55 @@ Gov 的独立 B 新 epoch 已实际执行三项 HookTest，每项一通过、零
 原八项工具控制实际 8/8、自然退出 0；测试临时目录固定到本任务主根内。默认 fresh actual-lock 与 canonical-origin 两原 caller 分别于 2026-11-01 00:53:25＋08:00、其后同一串行批启动：两个官方 scanner 均自然退出 1，零漏洞，恰四项 unmaintained 与一项 unsound；两个独立精确 gate／caller 均自然退出 0。默认 fetch、官方 URL、空 ignore 与原 settings 不变，无 no-fetch 或输出过滤。DB 报告为 `2295466c4e9df26647fd67d8fa1c705ac2fc7f81`／1395 条。完整官方 JSON、stderr、scanner 自然码、独立 gate、真实 caller、原八控制与输入绑定汇总保存在 `.echo-semantic/local/im-cron-history-fix-20261031-r01/risk-fresh-744/`。这表示符合原接受合同，不称风险已修复或零 warning 审计。
 
 本次风险通过只覆盖当前具名 744 来源，不替代本轮 Rust 行为、GUI 类型检查、正常 Source／final、最新 App／真人微信、性能、main CI、发布或整个 Goal。任何后继源码或 advisory 身份漂移都需重新复核；不把本次结果自动延续至未来输入。
+
+
+### 2026-11-02 r03 真实进度消费者单 cfg(test) 的精确机械绑定
+
+Root 已亲读并审定本次具名 test-only 源码与持有者，Source 审查 pass C0/I0/M0；这不是新的风险接受、运行通过或未来输入续期。原人类本轮“继续保留原六个依赖，完成本次修复和验证（推荐）”、退役后五完整身份及全部旧失败继续保留。CLI 当前基底 b04c5923dc207869c22b17916874feb43fc19f94，Framework 固定 clean a8a8511d9ec2cd3da382bd5f7b151ac537374aa8。
+
+仅既有 echo-agent-app-core/src/turn_context.rs 的 cfg(test) 模块增加一个显式 opt-in consumer；生产前缀 15116 字节未变，无新增或删除 consumer 输入。正式采用后原 collector 实际连续两读均为 cdef66173e81c681c4c88129526cf75777e11f079c34bbfa30dcf7fd7ea084a7／274，相对旧744只此一个Rust文件变化，after SHA08912a582d73e99c1b1c80f418dd49098886b4846d38c3f6d8db7981d4d69263。不是把候选编码预估当实际读取。
+
+本 case 在隔离产品数据与loopback下调用真实OpenAiClient、ShellTool和原drive_chat/projector，验证原默认60／120秒期限、typed ToolResult、公开Unknown与同注册进度提醒；没有更改生产函数、依赖、feature、unsafe、GTK/glib或通知D-Bus调用面。holder仍是本地受控测试持有者，不改用户App或UserRoot/Auth/config。该source-only暴露复查不等编译、60秒、owner正常/中断/取证失败或完整native通过。
+
+锁仍为399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f／768包；原五项name/version/source/checksum/advisory/kind及schema/decision路径/settings/官方URL/fetch/ignore保持。机器policy仅consumer_inputs_sha256由744替换为本次精cdef。Root具体授权本次机械维护与受控focused，AGENTS不改，不新增风险、ignore或冻结依赖升级，也不向Framework/SDK继承。
+
+原八控制与默认fresh actual-lock/canonical-origin两门禁随后实际执行；官方scanner自然1、恰五原warning/零漏洞与独立gate0须分列记录，当前这一段是采用及执行前来源事实，不提前声明门禁或测试成功。任何新的风险、identity、source、warning或编译告警仍阻断；若编译需要改已审Rust，保留原失败和最小差量交Root重审，不自动追随新digest。examples/官网无新公共调用，本case不需要新增API示例；Rust、GUI、完整矩阵、mainCI、发行与整个Goal仍独立。
+
+
+### 2026-11-02 r03 两处测试编译错误的具名修正与 3cea 精确绑定
+
+原 cdef／08912 来源的默认 fresh actual-lock 与 canonical-origin 两 gate 已分别实际自然 0，官方 scanner 均自然 1、零漏洞及原五项 warning；原网络失败、原 raw 与其精确来源资格全部保留。其后同批 focused NoRun 实际自然 101、零 warning、两项 error：E0433 指向不存在的 infra::factory 子模块，E0277 是本最小 feature 中 Uuid 未实现 Serialize。原失败日志及 2557 份 FP／dep-info 已在 target 外保全，未运行 list、正常用例或三个 owner 控制；不能把风险 gate 或 Source 通过改称 Rust 通过。
+
+Root 依原完整诊断、infra 的 include! 与既有生产路径及 uuid v4 依赖核因，原 reviewer 对精确 aabeef 补丁给出 Source delta pass C0/I0/M0；Root 随后具体授权本次两处 test-only 修正。turn_context.rs 的 after 为 8db76b265d78a05d75c74b74cae11a2dd7ed32f9adc00638d9a88bc1149bfa69：改用原 infra 同层 Critic owner 常量；Uuid 内存类型及所有注册身份断言不变，仅为本测试观测字段增加 collect_str 序列化。生产前缀、holder／wrapper、原 60／120 秒期限、真实 client／ShellTool、typed 结果、Unknown／reset／0-1-0 及 final／settled／原 driver EOF 断言均不改，不新增依赖或 feature。
+
+采用前原 collector 实际两读 cdef／274，原其余 273 项输入均与冻结来源一致。采用后原 collector 实际连续两读为 3cea0bd9f6db2ad796db30c73e7d44d950d24333eaded8401044cc475b9cb93f／274，仅上述一个文件改变，路径新增删除均为零；此前内存预估不充作本次实际读取。机器 policy 只将 consumer_inputs_sha256 从 cdef 机械替换为 3cea，锁仍为 399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f／768 包，原五完整风险身份、decision 路径、settings、官方 URL、默认 fetch 和 ignore 保持。这是本次具名精源的机械维护，不是新风险接受或未来来源续期，不改 AGENTS。
+
+本段仅记录采用及执行前事实：新来源的正常 fresh 预检／Source、原八控制、双默认 fresh gate 及同 target／同 profile 的原 NoRun 尚须另取真实结果；旧 cdef 绿票不能重命名为 3cea 绿票。NoRun 零 warning 且实际 list 精确选中 1 后才继续正常用例，正常通过后才做三个 owner 控制。任何新差异仍停止核因，不增 feature、不换 Mock、不放宽断言或自动追 hash。本次为既有测试的编译修正，无新公共 API 或示例调用，examples／官网无需改动；GUI／App／完整矩阵／main CI／发布及整个 Goal 仍独立验收。
+
+
+### 2026-11-02 r03 平台命令后继 dd438／dd9c 的具名精确绑定
+
+上一精源 8db／3cea 已取得原 Source、八控制和两默认 fresh 风险 gate 资格，随后同 target 原 NoRun 实际自然 0、零 warning／error，实际新程序 c0cab 精确 list 1。首次真实 normal 选中 1、通过 0、失败 1，Rust 自然 101、holder 自然 1；原第二 ToolCall 参数为 /bin/true，原 typed ToolResult 是 Permanent／Stop StructuredError，最早可见 cause 为 OS spawn 的 ENOENT。原 cwd 存在，本机不存在 /bin/true，存在可执行 /usr/bin/true；没有证据指向权限拒绝、共享 cancel 或应用状态。permission_mode 未单独取证，保持 unknown。第一条真实 Timeout 为 60003ms，driver Completed、fixture close／portgone 与测试失败各 scope 保留，三个 owner 控制未启动，所有原件不改写。
+
+Root 派 Provider 唯一作者另存新 epoch，Model 仅将 FAST_COMMAND 一个字面量改为 /usr/bin/true，wrapper 仅更新来源路径和 SHA；原失败 cwd 中直接 /usr/bin/true 自然 0 只是主机命令检查，不冒充 typed ShellTool 或完整 case 通过。Provider 41f65 入口及原 reviewer 对 28 refs 的新组装 Source 均为 pass C0/I0/M0。Root 具体批准 Model 0578e3d0df9ee6335a8aca4352c9bb1773a640833e6d53dffb0532dcfcc5a146、wrapper dae152d98294331c3b9a08a76d11bc3e251bcec0b25b8231b9f8b34626af80dc、Rust dd438a3a3e125e00f329aa2366166aa2a1d6b45516dc545d267bae5d3e69031a，以及另存新 owned holder c4d9acaae1d860a7f5e3b9d4cdcb785d11aab286b7d27a84fea7338d1abafe6d；旧 5f／5db／e903／c0cab 全保。
+
+本次 Rust 仅改 Model SHA 与快速命令预期两处编译常量，生产前缀和其余测试字节不变；holder 只改 entry 路径、wrapper SHA 与 Model SHA 三绑定，原生命周期不变。原 Timeout／CommandOutput exit0、phase／body 原身份、Unknown／reset／0-1-0、60／120 秒及 cleanup 全部强断言保留；不加动态名单、失配 fallback 或伪 SHA 来复用旧程序。
+
+正式采用前原 collector 两实际读为 3cea／274，原其余 273 项与冻结来源逐项一致；采用后原 collector 两实际读必须并已均为 dd9c5cd0bb460792b7a8c482eb043edb81f1cc135ba80c25a43bc2e9c3e507ee／274，仅 turn_context.rs 一项变化，路径增删零。机器 policy 仅将 consumer_inputs_sha256 改为本次精 dd9c，完整 policy 为 54ae3981bc10f031ac1ac7aababd917e31542d544711fd6681f7faeb0cff75ee；原锁 399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f／768 包、原五完整风险身份、decision／settings／官方 URL／默认 fetch／ignore 保持。此前 dd9c 预估不冒充本次采用后实际读；本授权不接受未来来源，不改 AGENTS，不向 Framework／SDK 继承。
+
+本段仅为采用和执行前事实。新来源仍须实际完整 manifest、原 Source／八控制／双默认 fresh gate，官方 scanner 自然 1、零漏洞和恰原五 warning 与独立 gate 0 分列；旧 3cea gate 不给 dd9c 签票。必要同 target／同 profile NoRun W0、真实新程序／FP／SHA 与精 list 1 后只跑一次 normal，正常 0 才三 owner 控制。网络只在纯 IO 失败时允许同默认参数一次新 prefix 有界复试，原失败保存；其它变化停止核因，不自动追 hash 或放宽断言。本次没有公共 API／示例或产品行为变更，examples／官网不需修改；GUI／App／完整矩阵／main CI／发行及整个 Goal 仍独立。
+
+
+### 2026-11-02 dd9c 平台后继的本批实际结果
+
+本后继只追加当前具名输入的实际结果，不改原错误、旧来源资格或人类裁决。dd438／dd9c 与新 Model0578／wrapperdae1／holderc4d9 的完整实际来源 manifest 已覆盖 CLI1089、Framework2853、498 个前端文件以及 13 份工程输入；当时 F 为 clean a8，源工具／配置／holder／Model 逐项无漂。ignored holder 被误列为正式语义查询时的预检拒绝 1 及只读诊断 2 均保原；按官方工具合同对三个正式路径 fresh 预检实际 0，ignored 工程输入仍经独审与精 manifest 核对，不改工具、schema、ignore 或风险档位。
+
+新来源 task Source 实际 0，原八项控制 8／8、自然 0。原 actual-lock 与 canonical-origin 默认 fresh 各首轮实际通过，官方 scanner 均自然 1、零漏洞、恰原五完整身份 warning，两个独立精确 gate／caller 均自然 0；本轮未触发有界网络复试。完整官方 JSON／stderr、自然出口及全部旧网络失败继续分列保留，表示符合原接受合同，不是风险修复或零 warning 审计；旧 3cea gate 不冒充本次 dd9c gate。
+
+原同 target／同 profile 的必要 NoRun 实际自然 0、零 warning／error；实际 features=[]、test opt0／debug0，j2／incremental0 与原冻结 1.99.1 保持。新的实际程序 SHA256 为 8c7bb907fff5b06e20064933c531c1e364963f5b0dada42ea304a2b508ff374e，496621056 字节，明确不同旧 c0cab；新程序及 2559 份真实 FP／dep-info 已在 target 外保全并逐项读回。该次真实程序的 exact＋ignored list 自然 0，精确 1 test／0 benchmarks。
+
+唯一新 normal 实际 selected1／pass1／fail0／ignored0，Rust、原 holder、fixture 各自然 0。原首条 typed Timeout 为 60005ms，第二条是原 typed CommandOutput exit0，主三请求实际提醒为 0／1／0；两处不同公开 Unknown、原 provider／body／同注册 reset、唯一 final、最后 Settled、原 driver return 与注册退休等全部原强断言完整执行通过。它是实际 EKO drive_chat／projector／client／ShellTool 的受控 loopback library consumer 结果，不是完整 AppState／GUI／真实外部 provider 验收。旧 normal1／0／1 与 ENOENT 仍保原。
+
+正常通过后才依次执行三个新 owner 控制，实际原 owner 自然退出分别为 130（SIGINT＋cleanup 取证槽失败）、143（SIGTERM）、1（终态 JSON 槽失败）。三个原 Rust child 均沿原预算自然结算并先被回收，fixture listener／handler 随后关闭并 join，原端口消失；原中断／取证失败未被后来的 child0 覆盖。终态槽失败的原 JSON 仍缺失且槽为目录，不补造成功 terminal；单独物理回收证据保留。三项故障控制符合各自预期，不把它们改写成三张正常 EKO 成功票。
+
+截至该切点全部 owned handles 已终态，12 个具名原 holder／consumer／fixture PID 的 ps 退出 1 且 stdout／stderr 均空，准确 target 及新 retained program 的 lsof 亦退出 1 两空；必要新程序／元数据／原始日志均已保全。这是准确官方 clean 的前置事实，clean 和最终 Source／Final 自然出口另有回执后才可作相应声明；Root 保留唯一 stage／commit 权限。当前原 collector 在全部运行后两实际读仍为 dd9c／274，锁／五身份／policy54ae 不变，不预授未来来源。App47013、live fixture38255／1420／1451 和 UserRoot／Auth／配置／MCP／历史未操作；整矩阵、main CI、发布与整个 Goal 仍各自独立。

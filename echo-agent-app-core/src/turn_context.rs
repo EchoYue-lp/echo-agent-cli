@@ -402,6 +402,517 @@ fn render_turn_contract(contract: TurnContract) -> String {
 mod tests {
     use super::*;
 
+    /// 需 Root 的独立 loopback fixture 与真实默认 shell 期限；不属于普通离线快检。
+    #[tokio::test]
+    #[ignore = "requires Root-focused real r03 loopback fixture and default 60-second ShellTool"]
+    async fn r03_loopback_two_shell_results_reset_public_unknown_and_remove_reminder()
+    -> anyhow::Result<()> {
+        use crate::chat_driver::{ChatDriverEvent, ChatSink};
+        use echo_agent::agent::{
+            Agent, AgentEvent, AssistantPhase, EventEnvelope, ExecutionStatusKind,
+        };
+        use echo_agent::llm::{LlmApiProtocol, LlmClient, LlmConfig, OpenAiClient};
+        use echo_agent::tools::{ToolExecutionConfig, ToolFailureCategory, ToolResultKind};
+        use std::path::PathBuf;
+        use std::sync::Mutex;
+
+        fn serialize_registration_id<S: serde::Serializer>(
+            id: &uuid::Uuid,
+            serializer: S,
+        ) -> std::result::Result<S::Ok, S::Error> {
+            serializer.collect_str(id)
+        }
+
+        #[derive(serde::Serialize)]
+        struct ProgressEffect {
+            event_id: String,
+            label: String,
+            #[serde(serialize_with = "serialize_registration_id")]
+            registration_id: uuid::Uuid,
+            clock_changed: bool,
+        }
+        #[derive(Default)]
+        struct Observed {
+            events: Vec<EventEnvelope>,
+            registration: Option<uuid::Uuid>,
+            turn_id: Option<String>,
+            previous: Option<(ProgressEffect, Instant)>,
+            effects: Vec<ProgressEffect>,
+            error: Option<String>,
+        }
+        struct Sink {
+            observed: Arc<Mutex<Observed>>,
+            registry: Arc<TurnPromptContextRegistry>,
+        }
+        impl ChatSink for Sink {
+            fn on_event(&self, event: ChatDriverEvent) -> bool {
+                let ChatDriverEvent::Agent(envelope) = event else {
+                    return true;
+                };
+                let record = (|| -> anyhow::Result<()> {
+                    let entries = self
+                        .registry
+                        .registrations
+                        .read()
+                        .unwrap_or_else(|error| error.into_inner());
+                    let registration = entries
+                        .get(envelope.turn_id.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("original progress registration missing"))?;
+                    let mut observed = self
+                        .observed
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if let Some(id) = observed.registration {
+                        anyhow::ensure!(id == registration.id, "progress registration changed");
+                        anyhow::ensure!(
+                            observed.turn_id.as_deref() == Some(envelope.turn_id.as_str()),
+                            "turn changed"
+                        );
+                    } else {
+                        anyhow::ensure!(
+                            matches!(&envelope.payload, AgentEvent::ExecutionStatus(status) if status.status == ExecutionStatusKind::Started),
+                            "first original event was not Started"
+                        );
+                        observed.registration = Some(registration.id);
+                        observed.turn_id = Some(envelope.turn_id.to_string());
+                    }
+                    // 仅观察；reported 在原 sink 返回 true 后运行。本例从不改钟或注册状态。
+                    if let Some((mut effect, before)) = observed.previous.take() {
+                        anyhow::ensure!(
+                            effect.registration_id == registration.id,
+                            "report effect crossed its registration"
+                        );
+                        effect.clock_changed = registration.progress.last_report != before;
+                        observed.effects.push(effect);
+                    }
+                    let label = match &envelope.payload {
+                        AgentEvent::AssistantMessage { block }
+                            if !block.delta.trim().is_empty() =>
+                        {
+                            format!("public:{:?}", block.phase)
+                        }
+                        AgentEvent::ToolCall { .. } => "tool_call".to_string(),
+                        AgentEvent::ToolResult { .. } => "tool_result".to_string(),
+                        AgentEvent::ExecutionStatus(_) => "status".to_string(),
+                        AgentEvent::FinalAnswer(_) => "confirmed_final".to_string(),
+                        _ => "other".to_string(),
+                    };
+                    observed.previous = Some((
+                        ProgressEffect {
+                            event_id: envelope.event_id.to_string(),
+                            label,
+                            registration_id: registration.id,
+                            clock_changed: false,
+                        },
+                        registration.progress.last_report,
+                    ));
+                    observed.events.push(*envelope);
+                    Ok(())
+                })();
+                if let Err(error) = record {
+                    self.observed
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .error = Some(error.to_string());
+                    return false;
+                }
+                true
+            }
+        }
+        fn json_lines(path: &std::path::Path) -> anyhow::Result<Vec<serde_json::Value>> {
+            std::fs::read_to_string(path)?
+                .lines()
+                .map(|line| Ok(serde_json::from_str(line)?))
+                .collect()
+        }
+
+        let binding_path = PathBuf::from(std::env::var("EKO_R03_FIXTURE_BINDING")?);
+        let binding: serde_json::Value = serde_json::from_slice(&std::fs::read(&binding_path)?)?;
+        anyhow::ensure!(
+            binding["fixture_sha256"]
+                == "0578e3d0df9ee6335a8aca4352c9bb1773a640833e6d53dffb0532dcfcc5a146",
+            "wrong frozen r03 model"
+        );
+        anyhow::ensure!(
+            binding["protocol"] == "chat_completions" && binding["model"] == "native-controlled",
+            "wrong model/protocol binding"
+        );
+        let endpoint = binding["endpoint"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("endpoint missing"))?;
+        let url = reqwest::Url::parse(endpoint)?;
+        anyhow::ensure!(
+            url.scheme() == "http" && url.host_str() == Some("127.0.0.1") && url.port().is_some(),
+            "must use exact independent loopback endpoint"
+        );
+        let runtime = binding_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("binding parent missing"))?;
+        anyhow::ensure!(
+            runtime.starts_with("/Users/ls/MyWork/code/ylp_agent_learn/lp-agent/.echo-semantic/local")
+                || runtime.starts_with(
+                    "/Users/ls/MyWork/code/ylp_agent_learn/lp-agent/echo-agent-cli/.echo-semantic/local"
+                ),
+            "runtime is not an owned lane"
+        );
+        anyhow::ensure!(
+            binding["runtime_dir"].as_str() == Some(runtime.to_string_lossy().as_ref()),
+            "runtime binding differs"
+        );
+        anyhow::ensure!(
+            !runtime.join("model-requests.jsonl").exists(),
+            "fixture already consumed requests"
+        );
+        let config = LlmConfig::for_provider(
+            "local",
+            endpoint,
+            "",
+            "native-controlled",
+            LlmApiProtocol::ChatCompletions,
+        )?;
+        let client: Arc<dyn LlmClient> = Arc::new(OpenAiClient::new(config.clone())?);
+        let app_config = crate::config::EkoConfig::default();
+        anyhow::ensure!(
+            app_config.agent.tool_timeout_ms == 120_000,
+            "EKO outer default changed"
+        );
+        let mut react = echo_agent::agent::ReactAgentBuilder::new()
+            .configured_llm_client(client.clone(), config)
+            .working_dir(runtime)
+            .tool(Box::new(
+                echo_agent::tools::shell::ShellTool::new()
+                    .with_command_policy(Arc::new(crate::permission::EkoCommandPolicy)),
+            ))
+            .tool_execution(ToolExecutionConfig {
+                timeout_ms: app_config.agent.tool_timeout_ms,
+                ..Default::default()
+            })
+            .build()?;
+        react.set_pre_model_context_projector(Some(Arc::new(EkoContextProjector::new(
+            crate::tasks::task_runtime::compact_context::task_runtime_projection_registry(),
+            turn_prompt_context_registry(),
+        ))));
+        // 与生产factory相同的真实传输/阈值接线；不替换成通过型假Critic。
+        react.set_owned_critic(
+            crate::infra::EKO_MODEL_CRITIC_OWNER,
+            Arc::new(echo_agent::agent::critic::LlmCritic::new(client).with_pass_threshold(7.0)),
+        );
+        react.config_mut().set_verifier_enabled(true);
+        let agent = crate::agent_handle::AgentHandle::new(react);
+        let store = Arc::new(crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()?);
+        let _resource_scope = store.test_resource_scope();
+        let workspace_id = crate::workspace::WorkspaceId::from_name(&store.active_workspace_id());
+        let root_id = format!("r03-real-progress-{}", uuid::Uuid::new_v4());
+        let observed = Arc::new(Mutex::new(Observed::default()));
+        let registry = turn_prompt_context_registry();
+        let sink: Arc<dyn ChatSink> = Arc::new(Sink {
+            observed: observed.clone(),
+            registry: registry.clone(),
+        });
+        let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: crate::workspace::WorkspaceExecutionScope::workspace(
+                &workspace_id,
+                runtime,
+            ),
+            workspace_io_receipt: None,
+            pool: None,
+            store: Some(store.clone()),
+            sink,
+            webhook_emitter: None,
+            conv_id: Some(root_id.clone()),
+            root_message_id: root_id,
+            attachments: Vec::new(),
+            cancel: echo_agent::agent::CancellationToken::new(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let turn = crate::prepared_turn::PreparedUserTurn {
+            instruction: "NATIVE_LONG_TOOL_COMMENTARY65".to_string(),
+            resources: Vec::new(),
+            authorship: InstructionAuthorship::User,
+            agent_input: None,
+        };
+        let started = Instant::now();
+        let driven = crate::chat_driver::drive_chat(&agent, &turn, resources).await;
+        let elapsed_ms = started.elapsed().as_millis().to_string();
+        let close = agent.inner().read().await.close().await;
+        let observed = observed.lock().unwrap_or_else(|error| error.into_inner());
+        let requests = json_lines(&runtime.join("three-request-commentary.jsonl"))?;
+        let observations = serde_json::json!({
+            "binding": binding, "events": observed.events, "progress_effects": observed.effects,
+            "sink_error": observed.error, "elapsed_ms": elapsed_ms,
+            "outcome_debug": format!("{driven:?}"), "agent_close_debug": format!("{close:?}"),
+            "fixture_observations": requests, "clock_aged": false,
+            "real_OpenAiClient_and_ShellTool": true,
+            "factory_scope": "actual EKO drive_chat/projector/command policy/default budget/Critic; not full AppState/factory/bootstrap/native GUI",
+            "source_EOF_scope": "original drive_chat return after owned driver finishes; no fixture server-close inference",
+            "fixture_owner_must_close_and_join_after_test": true
+        });
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(runtime.join("eko-consumer-observation.json"))?;
+        serde_json::to_writer_pretty(file, &observations)?;
+        close?;
+        let outcome = driven.map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        anyhow::ensure!(
+            outcome == echo_agent::runtime::TurnOutcome::Completed,
+            "actual EKO driver did not complete"
+        );
+        anyhow::ensure!(
+            observed.error.is_none(),
+            "sink rejected original event: {:?}",
+            observed.error
+        );
+        anyhow::ensure!(
+            started.elapsed() >= Duration::from_secs(60),
+            "real monotonic wait did not reach default60"
+        );
+        let events = &observed.events;
+        anyhow::ensure!(
+            events
+                .iter()
+                .filter(|event| event.payload.is_execution_terminal())
+                .count()
+                == 1,
+            "execution terminal is not unique"
+        );
+        anyhow::ensure!(
+            events
+                .iter()
+                .filter(|event| matches!(&event.payload, AgentEvent::FinalAnswer(_)))
+                .count()
+                == 1,
+            "confirmed final is not unique"
+        );
+        anyhow::ensure!(
+            matches!(events.last().map(|event| &event.payload), Some(AgentEvent::ExecutionStatus(status)) if status.status == ExecutionStatusKind::Settled),
+            "source did not end after Settled"
+        );
+        let actual_turn = observed
+            .turn_id
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("turn not observed"))?;
+        anyhow::ensure!(
+            !registry.contains(actual_turn),
+            "original turn registration did not retire"
+        );
+        let calls = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                AgentEvent::ToolCall {
+                    call_id,
+                    invocation,
+                } if invocation.name == "shell" => Some((call_id, invocation)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(calls.len() == 2, "expected exactly two actual shell calls");
+        for (index, command) in ["/bin/sleep 65", "/usr/bin/true"].iter().enumerate() {
+            let (id, invocation) = calls
+                .get(index)
+                .ok_or_else(|| anyhow::anyhow!("shell call missing"))?;
+            anyhow::ensure!(
+                invocation.args == serde_json::json!({ "command": command }),
+                "tool args changed or timeout/background added"
+            );
+            let results = events
+                .iter()
+                .filter_map(|event| match &event.payload {
+                    AgentEvent::ToolResult {
+                        call_id,
+                        name,
+                        result,
+                    } if name == "shell" && call_id == *id => Some(result),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            anyhow::ensure!(results.len() == 1, "typed result missing or duplicated");
+            let result = results
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("typed result missing"))?;
+            if index == 0 {
+                anyhow::ensure!(
+                    !result.success
+                        && result
+                            .failure
+                            .as_ref()
+                            .is_some_and(|failure| failure.category == ToolFailureCategory::Timeout),
+                    "first actual result is not typed Timeout"
+                );
+                let duration_ms = result
+                    .metadata
+                    .get("duration_ms")
+                    .ok_or_else(|| anyhow::anyhow!("actual duration missing"))?
+                    .parse::<u64>()?;
+                anyhow::ensure!(duration_ms >= 60_000, "actual shell did not use default60");
+            } else {
+                anyhow::ensure!(
+                    result.success
+                        && result.failure.is_none()
+                        && matches!(
+                            &result.kind,
+                            ToolResultKind::CommandOutput { exit_code: Some(0) }
+                        )
+                        && result.metadata.get("exit_code").map(String::as_str) == Some("0"),
+                    "actual second shell did not succeed"
+                );
+            }
+        }
+        let main_requests = requests
+            .iter()
+            .filter(|row| {
+                row["scenario"] == "NATIVE_LONG_TOOL_COMMENTARY65"
+                    && ((row["internal_stage"] == "commentary_tool_requested"
+                        && row["selected_tool"] == "shell")
+                        || row["internal_stage"] == "final_after_commentary")
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            main_requests.len() == 3,
+            "actual main requests not exactly3; classifier/Critic are separate"
+        );
+        for (index, count) in [0_u64, 1, 0].iter().enumerate() {
+            let row = main_requests
+                .get(index)
+                .ok_or_else(|| anyhow::anyhow!("main request missing"))?;
+            anyhow::ensure!(
+                row["progress_reminder_count"].as_u64() == Some(*count),
+                "actual reminder projection is not0/1/0"
+            );
+            let ids = row["tool_call_ids"]
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("observed call identities missing"))?;
+            anyhow::ensure!(ids.len() == index, "main tool history changed");
+            for (position, id) in ids.iter().enumerate() {
+                anyhow::ensure!(
+                    id.as_str() == calls.get(position).map(|(id, _)| id.as_str()),
+                    "model/sink tool IDs differ"
+                );
+            }
+            anyhow::ensure!(
+                row["phase"].is_null(),
+                "fixture intent label promoted to native phase"
+            );
+        }
+        let mut public_block_ids = std::collections::HashSet::new();
+        let mut response_ids = std::collections::HashSet::new();
+        for index in 0..2 {
+            let request = main_requests
+                .get(index)
+                .ok_or_else(|| anyhow::anyhow!("tool request missing"))?;
+            let response_id = request["response_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("native response ID missing"))?;
+            anyhow::ensure!(
+                !response_id.is_empty() && response_ids.insert(response_id),
+                "native tool response IDs not unique"
+            );
+            let (call_id, _) = calls
+                .get(index)
+                .ok_or_else(|| anyhow::anyhow!("original tool call missing"))?;
+            let call_position = events
+                .iter()
+                .position(|event| {
+                    matches!(&event.payload,
+                AgentEvent::ToolCall { call_id: id, .. } if id == *call_id)
+                })
+                .ok_or_else(|| anyhow::anyhow!("original tool event missing"))?;
+            let preceding_result = if index == 0 {
+                None
+            } else {
+                let (previous_id, _) = calls
+                    .get(index - 1)
+                    .ok_or_else(|| anyhow::anyhow!("previous tool missing"))?;
+                Some(
+                    events
+                        .iter()
+                        .position(|event| {
+                            matches!(&event.payload,
+                    AgentEvent::ToolResult { call_id: id, .. } if id == *previous_id)
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("previous typed result missing"))?,
+                )
+            };
+            let blocks = events
+                .iter()
+                .enumerate()
+                .filter_map(|(position, event)| match &event.payload {
+                    AgentEvent::AssistantMessage { block }
+                        if block
+                            .provider_source
+                            .as_ref()
+                            .is_some_and(|source| source.request_id == response_id)
+                            && !block.delta.trim().is_empty() =>
+                    {
+                        Some((position, event, block))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                !blocks.is_empty(),
+                "each tool response must publish its own nonempty body; final cannot substitute"
+            );
+            let mut identities = std::collections::HashSet::new();
+            let mut reset_by_this_response = false;
+            for (position, event, block) in blocks {
+                anyhow::ensure!(
+                    block.phase == AssistantPhase::Unknown,
+                    "tool-preceding body lost original Unknown phase"
+                );
+                anyhow::ensure!(
+                    !block.block_id.is_empty() && !block.request_id.is_empty(),
+                    "canonical body identity missing"
+                );
+                identities.insert((block.request_id.clone(), block.block_id.clone()));
+                anyhow::ensure!(
+                    position < call_position
+                        && preceding_result.is_none_or(|previous| previous < position),
+                    "public body is not before its own tool and after the prior result"
+                );
+                let effect = observed
+                    .effects
+                    .iter()
+                    .find(|effect| effect.event_id == event.event_id.as_str())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("accepted body lacks exact-event clock observation")
+                    })?;
+                anyhow::ensure!(
+                    Some(effect.registration_id) == observed.registration
+                        && effect.label == "public:Unknown",
+                    "body reset is not from the same original registration"
+                );
+                reset_by_this_response |= effect.clock_changed;
+            }
+            anyhow::ensure!(
+                identities.len() == 1 && reset_by_this_response,
+                "each distinct tool response must reset its own original body clock"
+            );
+            let identity = identities
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("body identity missing"))?;
+            anyhow::ensure!(
+                public_block_ids.insert(identity),
+                "two tool responses reused one public block"
+            );
+        }
+        anyhow::ensure!(
+            observed
+                .effects
+                .iter()
+                .filter(|effect| matches!(
+                    effect.label.as_str(),
+                    "tool_call" | "tool_result" | "status"
+                ))
+                .all(|effect| !effect.clock_changed),
+            "tool/status reset report clock"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn published_unknown_report_resets_original_sink_progress_without_counting_observations()
     -> anyhow::Result<()> {
