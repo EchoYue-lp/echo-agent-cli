@@ -15,6 +15,12 @@ const mocks = vi.hoisted(() => ({
   load: vi.fn(),
   toast: vi.fn(),
   openChat: vi.fn(),
+  runtime: {
+    taskScope: null as { workspaceId: string; workspaceGeneration: string } | null,
+    selectedRunId: null as string | null,
+    historySnapshot: null as { activeRun: TaskRun } | null,
+    historyError: null as string | null,
+  },
   ui: {
     navigationEpoch: 0,
     theme: 'light',
@@ -37,7 +43,7 @@ const mocks = vi.hoisted(() => ({
     workspaceId: 'global',
     conversations: [],
     sideConversations: [],
-    activeId: null,
+    activeId: null as string | null,
     isLoading: false,
     newConversationEpoch: 0,
     loadConversation: vi.fn(),
@@ -76,7 +82,7 @@ vi.mock('../../api/endpoints', () => ({
   taskRuntimeApi: { listRuns: mocks.listRuns },
 }));
 vi.mock('../../stores/taskRuntimeStore', () => ({
-  useTaskRuntimeStore: { getState: () => ({ loadByRun: mocks.loadByRun }) },
+  useTaskRuntimeStore: { getState: () => ({ ...mocks.runtime, loadByRun: mocks.loadByRun }) },
 }));
 vi.mock('../../stores/contextPaneStore', () => ({
   useContextPaneStore: { getState: () => ({ openTasks: mocks.openTasks }) },
@@ -112,6 +118,7 @@ function deferred<T>() {
   return { promise, resolve };
 }
 afterEach(cleanup);
+const runtimeRuns = new Map<string, TaskRun>();
 beforeEach(() => {
   vi.clearAllMocks();
   const a = workspace('a');
@@ -120,6 +127,7 @@ beforeEach(() => {
   mocks.workspace.current = a;
   mocks.workspace.isLoading = false;
   mocks.conversation.workspaceId = 'a';
+  mocks.conversation.activeId = null;
   mocks.conversation.newConversationEpoch = 0;
   mocks.ui.navigationEpoch = 0;
   mocks.ui.beginNavigation = () => ++mocks.ui.navigationEpoch;
@@ -131,31 +139,205 @@ beforeEach(() => {
     mocks.workspace.current = mocks.workspace.workspaces.find((item) => item.id === id) ?? null;
     mocks.conversation.workspaceId = id;
   });
-  mocks.load.mockResolvedValue(undefined);
+  mocks.load.mockResolvedValue(true);
   mocks.listRuns.mockReset();
   mocks.listRuns.mockResolvedValue({ items: [], next_continuation: null });
-  mocks.loadByRun.mockResolvedValue(undefined);
+  runtimeRuns.clear();
+  mocks.runtime.taskScope = null;
+  mocks.runtime.selectedRunId = null;
+  mocks.runtime.historySnapshot = null;
+  mocks.runtime.historyError = null;
+  mocks.loadByRun.mockImplementation(
+    async (scope: { workspaceId: string; workspaceGeneration: string }, id: string) => {
+      mocks.runtime.taskScope = scope;
+      const original = runtimeRuns.get(id);
+      if (!original) throw new Error('test fixture missing original run');
+      mocks.runtime.selectedRunId = id;
+      mocks.runtime.historySnapshot = { activeRun: original };
+    }
+  );
   mocks.search.mockReset();
   mocks.search.mockResolvedValue([]);
 });
 
 describe('task and workspace navigation', () => {
-  const run = (id: string, conversationId: string): TaskRun => ({
-    run_id: id,
-    workspace_id: 'a',
-    conversation_id: conversationId,
-    root_message_id: `root-${id}`,
-    domain_profile: 'general',
-    domain_binding: null,
-    status: 'failed',
-    goal: `运行 ${id}`,
-    goal_revision: 1,
-    goal_sha256: `goal-${id}`,
-    plan_id: null,
-    route: 'agent_task_plan',
-    attended_mode: 'attended',
-    created_at: '2026-10-31T15:17:00Z',
-    updated_at: '2026-10-31T15:17:20Z',
+  const run = (id: string, conversationId: string): TaskRun => {
+    const original: TaskRun = {
+      run_id: id,
+      workspace_id: 'a',
+      conversation_id: conversationId,
+      root_message_id: `root-${id}`,
+      domain_profile: 'general',
+      domain_binding: null,
+      status: 'failed',
+      goal: `运行 ${id}`,
+      goal_revision: 1,
+      goal_sha256: `goal-${id}`,
+      plan_id: null,
+      route: 'agent_task_plan',
+      attended_mode: 'attended',
+      created_at: '2026-10-31T15:17:00Z',
+      updated_at: '2026-10-31T15:17:20Z',
+    };
+    runtimeRuns.set(id, original);
+    return original;
+  };
+  it.each(['different', 'same'] as const)(
+    'stops recent navigation when transcript loading returns false with %s activeId',
+    async (selection) => {
+      const original = run('failed-recent', 'cron:daily:failed-recent');
+      mocks.conversation.activeId = selection === 'same' ? original.conversation_id : 'old-chat';
+      mocks.list.mockImplementation(async (id: string) =>
+        id === 'a' ? [task(original.conversation_id)] : []
+      );
+      mocks.listRuns.mockImplementation(async (scope: { workspaceId: string }) => ({
+        items: scope.workspaceId === 'a' ? [original] : [],
+        next_continuation: null,
+      }));
+      mocks.load.mockImplementation(async () => {
+        mocks.toast('error', '无法加载会话或工具历史；原始记录保留，请重试');
+        return false;
+      });
+      const view = render(<LeftSidebar onNewTask={vi.fn()} />);
+      fireEvent.click(await view.findByRole('button', { name: '打开任务 运行 failed-recent，a' }));
+      await act(async () => {});
+      expect(mocks.load).toHaveBeenCalledExactlyOnceWith(original.conversation_id);
+      expect(mocks.loadByRun).not.toHaveBeenCalled();
+      expect(mocks.openChat).not.toHaveBeenCalled();
+      expect(mocks.openTasks).not.toHaveBeenCalled();
+      expect(mocks.conversation.activeId).toBe(
+        selection === 'same' ? original.conversation_id : 'old-chat'
+      );
+      expect(mocks.toast).toHaveBeenCalledExactlyOnceWith(
+        'error',
+        '无法加载会话或工具历史；原始记录保留，请重试'
+      );
+    }
+  );
+  it.each(['different', 'same'] as const)(
+    'does not open an ordinary conversation after a false load with %s activeId',
+    async (selection) => {
+      const conversationId = 'ordinary-unreadable';
+      const previousId = selection === 'same' ? conversationId : 'old-chat';
+      mocks.conversation.activeId = previousId;
+      mocks.list.mockImplementation(async (id: string) =>
+        id === 'a' ? [task(conversationId)] : []
+      );
+      mocks.load.mockImplementation(async () => {
+        mocks.toast('error', '无法加载会话或工具历史；原始记录保留，请重试');
+        return false;
+      });
+      const view = render(<LeftSidebar onNewTask={vi.fn()} />);
+      fireEvent.click(await view.findByRole('button', { name: '打开任务 ordinary-unreadable，a' }));
+      await act(async () => {});
+      expect(mocks.load).toHaveBeenCalledExactlyOnceWith(conversationId);
+      expect(mocks.conversation.activeId).toBe(previousId);
+      expect(mocks.loadByRun).not.toHaveBeenCalled();
+      expect(mocks.openChat).not.toHaveBeenCalled();
+      expect(mocks.openTasks).not.toHaveBeenCalled();
+      expect(mocks.toast).toHaveBeenCalledExactlyOnceWith(
+        'error',
+        '无法加载会话或工具历史；原始记录保留，请重试'
+      );
+    }
+  );
+  it('does not mistake a retained same-run snapshot for a successful reload', async () => {
+    const original = run('same-unreadable', 'cron:daily:same-unreadable');
+    mocks.list.mockResolvedValue([]);
+    mocks.listRuns.mockImplementation(async (scope: { workspaceId: string }) => ({
+      items: scope.workspaceId === 'a' ? [original] : [],
+      next_continuation: null,
+    }));
+    mocks.runtime.taskScope = { workspaceId: 'a', workspaceGeneration: 'a-v1' };
+    mocks.runtime.selectedRunId = original.run_id;
+    mocks.runtime.historySnapshot = { activeRun: original };
+    mocks.loadByRun.mockImplementation(async () => {
+      mocks.runtime.historyError = 'same-run journal read failed';
+    });
+    const view = render(<LeftSidebar onNewTask={vi.fn()} />);
+    fireEvent.click(await view.findByRole('button', { name: '打开任务 运行 same-unreadable，a' }));
+    await waitFor(() =>
+      expect(mocks.toast).toHaveBeenCalledWith('error', 'same-run journal read failed')
+    );
+    expect(mocks.runtime.selectedRunId).toBe(original.run_id);
+    expect(mocks.runtime.historySnapshot?.activeRun).toBe(original);
+    expect(mocks.openChat).not.toHaveBeenCalled();
+    expect(mocks.openTasks).not.toHaveBeenCalled();
+  });
+  it.each([
+    'selected run',
+    'scope',
+    'generation',
+    'snapshot run',
+    'snapshot workspace',
+    'snapshot conversation',
+  ])('does not navigate when the loaded %s differs from the selected row', async (mismatch) => {
+    const original = run('identity-check', 'cron:daily:identity-check');
+    mocks.list.mockResolvedValue([]);
+    mocks.listRuns.mockImplementation(async (scope: { workspaceId: string }) => ({
+      items: scope.workspaceId === 'a' ? [original] : [],
+      next_continuation: null,
+    }));
+    mocks.loadByRun.mockImplementation(async () => {
+      mocks.runtime.taskScope = {
+        workspaceId: mismatch === 'scope' ? 'b' : 'a',
+        workspaceGeneration: mismatch === 'generation' ? 'a-v2' : 'a-v1',
+      };
+      mocks.runtime.selectedRunId = mismatch === 'selected run' ? 'other-run' : original.run_id;
+      mocks.runtime.historySnapshot = {
+        activeRun: {
+          ...original,
+          run_id: mismatch === 'snapshot run' ? 'other-run' : original.run_id,
+          workspace_id: mismatch === 'snapshot workspace' ? 'b' : original.workspace_id,
+          conversation_id:
+            mismatch === 'snapshot conversation' ? 'other-conversation' : original.conversation_id,
+        },
+      };
+    });
+    const view = render(<LeftSidebar onNewTask={vi.fn()} />);
+    fireEvent.click(await view.findByRole('button', { name: '打开任务 运行 identity-check，a' }));
+    await waitFor(() =>
+      expect(mocks.toast).toHaveBeenCalledWith('error', '原任务结果尚未载入或身份不匹配')
+    );
+    expect(mocks.openChat).not.toHaveBeenCalled();
+    expect(mocks.openTasks).not.toHaveBeenCalled();
+  });
+  it('preserves ordinary conversation navigation after a successful read', async () => {
+    mocks.list.mockImplementation(async (id: string) =>
+      id === 'a' ? [task('ordinary-readable')] : []
+    );
+    const view = render(<LeftSidebar onNewTask={vi.fn()} />);
+    fireEvent.click(await view.findByRole('button', { name: '打开任务 ordinary-readable，a' }));
+    await waitFor(() => expect(mocks.openChat).toHaveBeenCalledOnce());
+    expect(mocks.load).toHaveBeenCalledExactlyOnceWith('ordinary-readable');
+    expect(mocks.loadByRun).not.toHaveBeenCalled();
+    expect(mocks.openTasks).not.toHaveBeenCalled();
+    expect(mocks.toast).not.toHaveBeenCalled();
+  });
+  it('keeps the previous run selection and error without opening it after an unavailable run read', async () => {
+    const original = run('unreadable', 'cron:daily:unreadable');
+    const previous = run('previous', 'cron:daily:previous');
+    mocks.list.mockResolvedValue([]);
+    mocks.listRuns.mockImplementation(async (scope: { workspaceId: string }) => ({
+      items: scope.workspaceId === 'a' ? [original] : [],
+      next_continuation: null,
+    }));
+    mocks.runtime.selectedRunId = previous.run_id;
+    mocks.runtime.historySnapshot = { activeRun: previous };
+    // 与原loadByRun一致：失败保持旧选择，通过historyError报告，不抛异常。
+    mocks.loadByRun.mockImplementation(async () => {
+      mocks.runtime.historyError = 'journal permission denied';
+    });
+    const view = render(<LeftSidebar onNewTask={vi.fn()} />);
+    fireEvent.click(await view.findByRole('button', { name: '打开任务 运行 unreadable，a' }));
+    await waitFor(() =>
+      expect(mocks.toast).toHaveBeenCalledWith('error', 'journal permission denied')
+    );
+    expect(mocks.runtime.selectedRunId).toBe(previous.run_id);
+    expect(mocks.runtime.historySnapshot?.activeRun).toBe(previous);
+    expect(mocks.openChat).not.toHaveBeenCalled();
+    expect(mocks.openTasks).not.toHaveBeenCalled();
+    expect(mocks.load).not.toHaveBeenCalled();
   });
   it('shows persisted IM and cron runs even when no GUI conversation has been opened', async () => {
     mocks.list.mockResolvedValue([]);

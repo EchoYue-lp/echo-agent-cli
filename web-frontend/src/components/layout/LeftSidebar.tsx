@@ -353,19 +353,40 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
         useConversationStore.getState().workspaceId !== task.workspaceId
       )
         return;
-      if (task.hasConversation !== false) await loadConversation(task.conversation.conversation_id);
+      if (task.hasConversation !== false) {
+        const projected = await loadConversation(task.conversation.conversation_id);
+        if (!projected) return;
+      }
       if (
         useUiStore.getState().navigationEpoch !== epoch ||
         useConversationStore.getState().newConversationEpoch !== draftEpoch
       )
         return;
-      if (task.run)
+      if (task.run) {
         await useTaskRuntimeStore
           .getState()
           .loadByRun(
             { workspaceId: task.workspaceId, workspaceGeneration: task.workspaceGeneration },
             task.run.run_id
           );
+        if (
+          useUiStore.getState().navigationEpoch !== epoch ||
+          useConversationStore.getState().newConversationEpoch !== draftEpoch
+        )
+          return;
+        const state = useTaskRuntimeStore.getState();
+        if (state.historyError) throw new Error(state.historyError);
+        const loaded = state.historySnapshot?.activeRun;
+        if (
+          state.selectedRunId !== task.run.run_id ||
+          state.taskScope?.workspaceId !== task.workspaceId ||
+          state.taskScope.workspaceGeneration !== task.workspaceGeneration ||
+          loaded?.run_id !== task.run.run_id ||
+          loaded.workspace_id !== task.workspaceId ||
+          loaded.conversation_id !== task.conversation.conversation_id
+        )
+          throw new Error('原任务结果尚未载入或身份不匹配');
+      }
       if (
         useUiStore.getState().navigationEpoch === epoch &&
         useConversationStore.getState().newConversationEpoch === draftEpoch
