@@ -36,6 +36,7 @@ export function ToolsPanel() {
   const [details, setDetails] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [catalogConfirmed, setCatalogConfirmed] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const epoch = useRef(0);
@@ -55,6 +56,7 @@ export function ToolsPanel() {
     const scope = productDataScope(useWorkspaceStore.getState().current);
     setLoading(true);
     setBusy(false);
+    setCatalogConfirmed(false);
     setError(null);
     setNotice(null);
     loadedScope.current = null;
@@ -62,6 +64,7 @@ export function ToolsPanel() {
       const data = await toolsApi.list(scope);
       if (!current(ticket, scope)) return;
       loadedScope.current = scope;
+      setCatalogConfirmed(true);
       setTools(data);
     } catch (failure) {
       if (current(ticket, scope)) setError(`工具列表加载失败：${String(failure)}`);
@@ -89,7 +92,7 @@ export function ToolsPanel() {
 
   const mutate = async (names: string[], enable: boolean, label: string) => {
     const scope = loadedScope.current;
-    if (busy || loading || !scope || names.length === 0) return;
+    if (busy || loading || !catalogConfirmed || !scope || names.length === 0) return;
     const ticket = epoch.current;
     setBusy(true);
     setError(null);
@@ -147,7 +150,10 @@ export function ToolsPanel() {
         setTools(authoritative);
       } catch (failure) {
         if (!current(ticket, scope)) return;
-        failures.push(`操作结束后目录刷新失败，请重新加载：${String(failure)}`);
+        // 旧列表及已返回回执保留供查看；缺权威回读时不能再据旧选择提交下一次变更。
+        loadedScope.current = null;
+        setCatalogConfirmed(false);
+        failures.push(`操作结束后目录刷新失败，工具状态尚未确认，请重新加载：${String(failure)}`);
       }
       if (current(ticket, scope)) {
         setNotice(`${label}：已处理 ${succeeded} 项可选工具；系统必需项保持开启。`);
@@ -265,7 +271,7 @@ export function ToolsPanel() {
                 ref={(element) => {
                   if (element) element.indeterminate = mixed;
                 }}
-                disabled={busy || loading || optional.length === 0}
+                disabled={busy || loading || !catalogConfirmed || optional.length === 0}
                 onChange={(event) =>
                   void mutate(
                     optional.map((tool) => tool.name),
@@ -308,7 +314,9 @@ export function ToolsPanel() {
                         role="switch"
                         aria-label={`${tool.name}启用选择`}
                         checked={tool.policy_enabled}
-                        disabled={Boolean(tool.required_reason) || busy || loading}
+                        disabled={
+                          Boolean(tool.required_reason) || busy || loading || !catalogConfirmed
+                        }
                         onChange={(event) =>
                           void mutate([tool.name], event.target.checked, tool.name)
                         }

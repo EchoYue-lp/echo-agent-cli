@@ -347,5 +347,78 @@ describe('后端已变更但操作回执失败时重新读取权威目录', () =
       (screen.getByRole('switch', { name: 'shell启用选择' }) as HTMLInputElement).checked
     ).toBe(false);
     expect(mocks.disable).toHaveBeenCalledTimes(1);
+    expect(
+      (screen.getByRole('switch', { name: 'shell启用选择' }) as HTMLInputElement).disabled
+    ).toBe(true);
+    expect(
+      (screen.getByRole('checkbox', { name: '切换命令与运行全部可选工具' }) as HTMLInputElement)
+        .disabled
+    ).toBe(true);
+  });
+
+  it('requires an explicit successful reload after both a committed mutation failure and an unreadable catalog', async () => {
+    rows = [
+      tool('shell'),
+      tool('run_code'),
+      tool('task_list', {
+        category: 'task_collaboration',
+        required_reason: '唯一任务图',
+      }),
+    ];
+    mocks.list
+      .mockResolvedValueOnce(rows)
+      .mockResolvedValueOnce(rows)
+      .mockRejectedValueOnce(new Error('目录暂不可读'))
+      .mockRejectedValueOnce(new Error('重载仍不可读'));
+    mocks.disable.mockImplementationOnce(async (name: string) => {
+      rows = rows.map((entry) =>
+        entry.name === name ? { ...entry, policy_enabled: false, enabled: false } : entry
+      );
+      throw new Error('策略已提交，发布回执失败');
+    });
+    render(<ToolsPanel />);
+    await openCommands();
+    fireEvent.click(screen.getByRole('switch', { name: 'shell启用选择' }));
+    await waitFor(() =>
+      expect(screen.getByRole('alert').textContent).toContain('工具状态尚未确认')
+    );
+    expect(screen.getByRole('alert').textContent).toContain('发布回执失败');
+    const shell = screen.getByRole('switch', { name: 'shell启用选择' }) as HTMLInputElement;
+    const category = screen.getByRole('checkbox', {
+      name: '切换命令与运行全部可选工具',
+    }) as HTMLInputElement;
+    // 未返回成功回执，旧显示仍开启；不把它当成当前后端事实或自动回滚。
+    expect(shell.checked).toBe(true);
+    expect(shell.disabled).toBe(true);
+    expect(category.disabled).toBe(true);
+    fireEvent.click(shell);
+    fireEvent.click(category);
+    expect(mocks.disable).toHaveBeenCalledTimes(1);
+    expect(mocks.enable).not.toHaveBeenCalled();
+    expect(mocks.list).toHaveBeenCalledTimes(3);
+
+    fireEvent.click(screen.getByRole('button', { name: '重新加载' }));
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('重载仍不可读'));
+    expect(
+      (screen.getByRole('switch', { name: 'shell启用选择' }) as HTMLInputElement).disabled
+    ).toBe(true);
+    expect(mocks.disable).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole('button', { name: '重新加载' }));
+    await waitFor(() =>
+      expect(
+        (screen.getByRole('switch', { name: 'shell启用选择' }) as HTMLInputElement).checked
+      ).toBe(false)
+    );
+    expect(
+      (screen.getByRole('switch', { name: 'shell启用选择' }) as HTMLInputElement).disabled
+    ).toBe(false);
+    expect(mocks.list).toHaveBeenCalledTimes(5);
+    expect(mocks.disable).toHaveBeenCalledTimes(1);
+    expect(mocks.enable).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: /任务与协作/ }));
+    expect(
+      (screen.getByRole('switch', { name: 'task_list启用选择' }) as HTMLInputElement).disabled
+    ).toBe(true);
   });
 });
