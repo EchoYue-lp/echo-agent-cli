@@ -428,7 +428,7 @@ fn timeout_secs(command: &SandboxCommand, limits: &ResourceLimits) -> u64 {
         .map(Duration::from_secs)
         .map(|limit| limit.min(command.timeout))
         .unwrap_or(command.timeout);
-    u64::try_from(timeout.as_secs()).unwrap_or(u64::MAX).max(1)
+    timeout.as_secs().max(1)
 }
 
 /// 用 POSIX `sh` 包一层看门狗，让目标机器在到点时真正终止负载。
