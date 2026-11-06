@@ -16,7 +16,9 @@ use tokio::sync::{Mutex, broadcast};
 use tokio::task::JoinHandle;
 
 mod project_ssh;
-pub use project_ssh::{ProjectSshConnection, ProjectSshFileSystem, ProjectSshSandbox};
+pub use project_ssh::{
+    ProjectSshConnection, ProjectSshFileSystem, ProjectSshSandbox, RemoteContentSearch,
+};
 
 pub const MAX_TERMINAL_WRITE_BYTES: usize = 64 * 1024;
 const DEFAULT_EVENT_CAPACITY: usize = 256;

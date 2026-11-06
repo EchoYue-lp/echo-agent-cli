@@ -67,7 +67,9 @@ impl ProjectSshSandbox {
             )
             .into());
         }
-        let script = command_script(&command)?;
+        // 远端截止时间：由目标机器自己看门狗终止负载，而不是本机只观察。
+        // 这样 `timeout` 到点时命令真的会停，而不是等它自然结束（可能是几十分钟）。
+        let script = deadline_script(&command_script(&command)?, timeout_secs(&command, &limits))?;
         let target = connection.effective_target().map_err(unavailable)?.clone();
         let lease = connection.operation().map_err(unavailable)?;
         let timeout = limits
@@ -282,6 +284,13 @@ impl ProjectSshSandbox {
                         }
                     };
                     let result = result?;
+                    // 远端看门狗用 124 表示"到点并已实际终止负载"：这是有证据的
+                    // 超时，不是"本机不看了"。取消仍然只观察（真实终止在后续阶段）。
+                    if timeout_observed && !cancellation_requested && result.exit_code == 124 {
+                        let mut timed_out = result;
+                        timed_out.timed_out = true;
+                        return Ok(timed_out);
+                    }
                     if cancellation_requested || timeout_observed {
                         return Err(remote_failure(format!("{} was requested; original remote command subsequently completed with exit {}. Verify effects before retry", if cancellation_requested { "Cancellation" } else { "Timeout" }, result.exit_code), true));
                     }
@@ -383,6 +392,53 @@ fn validate_capabilities(command: &SandboxCommand, limits: &ResourceLimits) -> R
         return Err(SandboxError::Unavailable("requested remote memory/process/network/mount restrictions cannot be enforced by plain SSH; no local sandbox receipt is substituted".into()).into());
     }
     Ok(())
+}
+
+/// 远端看门狗执行的有效期限（秒）。与本地观察用的 `timeout` 同源，
+/// 保证"本机判定超时"和"远端真的开始终止"是同一时刻，而不是两套口径。
+fn timeout_secs(command: &SandboxCommand, limits: &ResourceLimits) -> u64 {
+    let timeout = limits
+        .cpu_time_secs
+        .map(Duration::from_secs)
+        .map(|limit| limit.min(command.timeout))
+        .unwrap_or(command.timeout);
+    u64::try_from(timeout.as_secs()).unwrap_or(u64::MAX).max(1)
+}
+
+/// 用 POSIX `sh` 包一层看门狗，让目标机器在到点时真正终止负载。
+///
+/// 负载本身仍是原来的 `cd ... || exit 125; exec ...` 脚本，因此 shell 语义、
+/// 环境变量和退出码都不变；只有"到点后由谁负责结束"从本机观察变成远端执行。
+/// 终止顺序是先 `TERM` 再宽限 `KILL`；是否真的走到终止用标记文件回报，
+/// 命中时统一以 124 退出（与 `timeout(1)` 的约定一致），由本地映射成超时结果。
+fn deadline_script(script: &str, timeout_seconds: u64) -> Result<String> {
+    let payload = shell_quote(script).map_err(unavailable)?;
+    // 看门狗自己轮询，负载提前结束就立刻退出，避免每次命令都在远端留一个
+    // 睡到超时的孤儿 sleep。标记文件按会话派生，先删再跑，防止上次异常退出
+    // 留下的残留被误读成"本次已到点"。
+    Ok(format!(
+        "eko_marker=\"${{TMPDIR:-/tmp}}/.eko-deadline-$$\"\n\
+         rm -f \"$eko_marker\"\n\
+         sh -c {payload} &\n\
+         eko_child=$!\n\
+         ( eko_elapsed=0\n\
+           while [ \"$eko_elapsed\" -lt {timeout_seconds} ]; do\n\
+             sleep 1\n\
+             eko_elapsed=$((eko_elapsed + 1))\n\
+             kill -0 \"$eko_child\" 2>/dev/null || exit 0\n\
+           done\n\
+           : > \"$eko_marker\"\n\
+           kill -TERM \"$eko_child\" 2>/dev/null\n\
+           sleep 5\n\
+           kill -KILL \"$eko_child\" 2>/dev/null ) &\n\
+         eko_watchdog=$!\n\
+         wait \"$eko_child\"\n\
+         eko_status=$?\n\
+         kill \"$eko_watchdog\" 2>/dev/null\n\
+         if [ -f \"$eko_marker\" ]; then rm -f \"$eko_marker\"; exit 124; fi\n\
+         rm -f \"$eko_marker\"\n\
+         exit $eko_status"
+    ))
 }
 
 fn command_script(command: &SandboxCommand) -> Result<String> {
@@ -753,6 +809,54 @@ mod tests {
                 .active_operations
                 .load(std::sync::atomic::Ordering::Acquire),
             0
+        );
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod deadline_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn run_wrapped(script: &str, seconds: u64) -> std::io::Result<std::process::Output> {
+        let wrapped = deadline_script(script, seconds).map_err(std::io::Error::other)?;
+        Command::new("/bin/sh").arg("-c").arg(wrapped).output()
+    }
+
+    /// 远端看门狗必须在到点时真正结束负载，而不是等它自然跑完。
+    #[test]
+    fn watchdog_terminates_payload_at_the_deadline()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let started = std::time::Instant::now();
+        let output = run_wrapped("sleep 30", 1)?;
+        assert_eq!(output.status.code(), Some(124), "deadline must map to 124");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "watchdog must not wait for the payload to finish naturally"
+        );
+        Ok(())
+    }
+
+    /// 正常结束的命令必须原样保留退出码与输出，包装不改变语义。
+    #[test]
+    fn watchdog_preserves_exit_code_and_output_for_fast_payloads()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let output = run_wrapped("printf 'hello'; exit 7", 30)?;
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "hello");
+        Ok(())
+    }
+
+    /// 负载比期限短时看门狗要自行退出，不能把孤儿 sleep 留到超时。
+    #[test]
+    fn watchdog_exits_early_when_payload_finishes()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let started = std::time::Instant::now();
+        let _output = run_wrapped("true", 30)?;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "wrapper must return as soon as the payload exits"
         );
         Ok(())
     }

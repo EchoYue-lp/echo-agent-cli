@@ -29,7 +29,7 @@ impl SftpChannel {
             .add_destination(&mut command)
             .map_err(unavailable)?;
         command.arg("sftp");
-        let mut child = command
+        let child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -37,6 +37,16 @@ impl SftpChannel {
             .map_err(|error| {
                 unavailable(format!("cannot start system SSH SFTP channel: {error}"))
             })?;
+        Self::from_spawned(connection, registration, child, operation, target).await
+    }
+
+    pub(super) async fn from_spawned(
+        connection: Arc<ProjectSshConnection>,
+        registration: Arc<OnceLock<Arc<RemoteOperationResources>>>,
+        mut child: tokio::process::Child,
+        operation: super::ProjectSshOperation,
+        target: crate::terminal::TerminalTarget,
+    ) -> Result<Self> {
         let resources = registration
             .get_or_init(|| {
                 connection.retain_remote_operation(&child, target, operation, Vec::new())
@@ -103,6 +113,18 @@ impl SftpChannel {
         })
     }
 
+    /// 车道可以安全复用：没有其它持有者仍握着客户端克隆，因此
+    /// `finish()` 的独占结算证据不会被池化破坏。
+    pub(super) fn can_reuse(&self) -> bool {
+        Arc::strong_count(&self.client) == 1
+    }
+
+    /// 这条通道是否带有未确认的远端副作用负债。带负债的车道必须丢弃，
+    /// 不能继续服务后续请求。
+    pub(super) fn has_unknown_debt(&self) -> bool {
+        self.resources.stop_is_unknown()
+    }
+
     pub(super) async fn finish(self, mutating: bool) -> Result<()> {
         let Self {
             client,
@@ -133,7 +155,18 @@ impl SftpChannel {
         // ordinary error just because the local subsystem child reached EOF.
         if mutating && resources.stop_is_unknown() && closed.is_err() {
             resources.mark_stop_unknown("standard SFTP mutation response/close proof was lost");
-            resources.wait_for_settlement().await;
+            // 该负债没有任何其它 settle 来源，必须是有界观察：超时保留
+            // unknown 并继续返回失败，不能挂起调用工具线程。
+            if !super::wait_for_unknown_settlement(
+                &resources,
+                super::super::CLOSE_OBSERVATION_TIMEOUT,
+            )
+            .await
+            {
+                tracing::warn!(
+                    "project SSH SFTP mutation settlement observation timed out; unknown debt retained"
+                );
+            }
         } else {
             // Successful request/close acknowledgement, or an operation with
             // no outstanding mutation, is different from unknown file contents.
@@ -373,6 +406,55 @@ mod tests {
         assert!(!resources.stop_is_unknown());
         resources.complete_with_proof();
         connection.observe_idle().await.map_err(unavailable)?;
+        Ok(())
+    }
+
+    /// 该负债没有其它 settle 来源：无界等待会让调用工具线程永久挂起。
+    /// 这里用自有本地夹具进程证明等待是有界的、并且超时后负债仍然保留。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unknown_settlement_wait_is_bounded_and_keeps_the_debt() -> Result<()> {
+        let service = crate::terminal::TerminalService::new();
+        let target = crate::terminal::TerminalTarget::Ssh {
+            host: "fixture.invalid".into(),
+            user: Some("fixture".into()),
+            port: Some(22),
+        };
+        let connection = ProjectSshConnection::prepare(&service, "bounded-fixture", target.clone())
+            .map_err(unavailable)?;
+        connection
+            .effective_target
+            .set(target.clone())
+            .map_err(|_| unavailable("duplicate fixture target"))?;
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .spawn()?;
+        let operation = connection.operation().map_err(unavailable)?;
+        let resources = connection.retain_remote_operation(&child, target, operation, Vec::new());
+        resources.mark_stop_unknown("bounded-settlement fixture");
+
+        let started = std::time::Instant::now();
+        let settled = super::super::wait_for_unknown_settlement(
+            &resources,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        assert!(
+            !settled,
+            "an unsettled remote operation must not report settlement"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "unknown settlement observation must be bounded"
+        );
+        // 超时不等于清债：原负债仍必须保留，供关闭/重试继续拒绝。
+        assert!(!resources.is_settled());
+        assert!(resources.stop_is_unknown());
+
+        // 仅清理本测试自有的本地夹具进程，不是远端停止证据。
+        resources.complete_with_proof();
+        child.start_kill()?;
+        let _reaped = child.wait().await?;
         Ok(())
     }
 }

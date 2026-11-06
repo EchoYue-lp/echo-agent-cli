@@ -404,6 +404,8 @@ mod tests {
                 file_type: echo_agent::tools::filesystem::FileType::File,
                 len: u64::try_from(self.bytes.len()).unwrap_or(u64::MAX),
                 mode: None,
+                // 内存中的派生文件没有目标文件系统时间。
+                modified: None,
             })
         }
         fn symlink_metadata(

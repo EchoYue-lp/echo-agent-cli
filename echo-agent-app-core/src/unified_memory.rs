@@ -247,6 +247,28 @@ pub(crate) fn load_instruction_projection_with_file_system(
     ))
 }
 
+/// 每条消息的准备入口：项目根与 cwd 已解析，规则正文按提供者的 stat 指纹复用。
+///
+/// 复用只发生在 `FileSystem::cache_namespace() == Some(_)` 的提供者上，且每次
+/// 仍先 `symlink_metadata` 校验 mtime/len；本地/默认提供者保持每次真实读取。
+/// 投影 revision 仍由本次实际拿到（或校验后复用）的正文哈希决定，缓存不会让
+/// 旧正文混进新 revision；读哪些文件与优先级仍由 [`InstructionProvider`] 决定。
+pub(crate) fn load_resolved_instruction_projection(
+    working_dir: Option<&std::path::Path>,
+    project_root: Option<&std::path::Path>,
+    state_dir: Option<&std::path::Path>,
+    files: &dyn echo_agent::tools::filesystem::FileSystem,
+) -> echo_agent::error::Result<InstructionProjectionSnapshot> {
+    Ok(instruction_projection_from_provider(
+        InstructionProvider::load_for_resolved_project(
+            working_dir,
+            project_root,
+            state_dir,
+            files,
+        )?,
+    ))
+}
+
 fn instruction_projection_from_provider(
     provider: InstructionProvider,
 ) -> InstructionProjectionSnapshot {

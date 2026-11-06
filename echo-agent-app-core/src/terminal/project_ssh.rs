@@ -114,12 +114,31 @@ impl RemoteOperationResources {
     }
 }
 
+/// 有界等待一次原物理操作的结算。
+///
+/// `retry_retained_children` 明确跳过 `RemoteOperation`，所以除了该操作
+/// 自己的 `complete_with_proof` 没有任何路径会发布 settle 通知。对这条
+/// 负债无界等待会让调用工具线程永久挂起；超时只能返回“尚未结算”，
+/// 由调用者保留 unknown 负债并返回失败，不能假装已经结算或清债。
+pub(super) async fn wait_for_unknown_settlement(
+    resources: &RemoteOperationResources,
+    timeout: std::time::Duration,
+) -> bool {
+    matches!(
+        tokio::time::timeout(timeout, resources.wait_for_settlement()).await,
+        Ok(())
+    )
+}
+
 mod cas;
 mod channel;
 mod effective;
+mod lanes;
 mod reader;
+mod remote_search;
 mod sandbox;
 mod sftp;
+pub use remote_search::RemoteContentSearch;
 pub use sandbox::ProjectSshSandbox;
 pub use sftp::ProjectSshFileSystem;
 
@@ -137,6 +156,9 @@ pub struct ProjectSshConnection {
     // Original process handles whose wait failed stay with this same owner;
     // retrying project close observes them rather than inventing settled state.
     retained_children: ResourceMutex<Vec<RetainedSshResource>>,
+    // 连接级 SFTP 车道：按需创建，随本连接一起关闭。弱引用关系使
+    // 车道不反过来持有连接。
+    sftp_lanes: OnceLock<Arc<lanes::SftpLanes>>,
 }
 
 pub(super) struct ProjectTerminalLaunch {
@@ -190,6 +212,7 @@ impl ProjectSshConnection {
             active_operations: AtomicUsize::new(0),
             operations_changed: Notify::new(),
             retained_children: ResourceMutex::new(Vec::new()),
+            sftp_lanes: OnceLock::new(),
         }))
     }
 
@@ -471,7 +494,12 @@ impl ProjectSshConnection {
             })
     }
 
-    async fn observe_idle(&self) -> Result<(), String> {
+    async fn observe_idle(self: &Arc<Self>) -> Result<(), String> {
+        // 车道是长寿命的常驻通道：不先关闭它们，`active_operations`
+        // 永远不会归零，关闭观察必然超时。车道关闭本身等待在途操作归还。
+        if let Some(lanes) = self.sftp_lanes.get() {
+            lanes.shutdown().await.map_err(|error| error.to_string())?;
+        }
         self.begin_shutdown();
         let idle = async {
             loop {
@@ -545,6 +573,14 @@ impl ProjectSshConnection {
 
     pub fn sandbox(self: &Arc<Self>) -> Arc<ProjectSshSandbox> {
         Arc::new(ProjectSshSandbox::new(Arc::clone(self)))
+    }
+
+    /// 连接级 SFTP 车道。惰性创建：从未用过 SFTP 的连接不持有任何常驻通道。
+    pub(super) fn sftp_lanes(self: &Arc<Self>) -> Arc<lanes::SftpLanes> {
+        Arc::clone(
+            self.sftp_lanes
+                .get_or_init(|| Arc::new(lanes::SftpLanes::new(self))),
+        )
     }
 
     /// The caller must be the existing offloaded project/tool preparation

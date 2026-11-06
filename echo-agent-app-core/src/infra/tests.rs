@@ -25,6 +25,7 @@ mod llm_config_tests {
         assert!(created.agent.model_name().is_empty());
         assert!(created.agent.llm_config().is_none());
         assert!(created.agent.llm_client().is_none());
+        assert_eq!(created.agent.config().get_temperature(), None);
         let parent_store = created
             .agent
             .store()
@@ -39,6 +40,12 @@ mod llm_config_tests {
             .await
             .ok_or_else(|| "reviewer Subagent has no memory store".to_string())?;
         assert!(Arc::ptr_eq(&parent_store, &inherited_store));
+        assert_eq!(
+            inherited
+                .read(|agent| agent.config().get_temperature())
+                .await,
+            None
+        );
         Ok(())
     }
 
@@ -75,7 +82,6 @@ mod llm_config_tests {
             base_url: Some("http://127.0.0.1:11434/v1/chat/completions".to_string()),
             api_key_env: None,
             requires_api_key: false,
-            temperature: None,
             max_tokens: None,
             context_window: None,
             thinking_profile: echo_agent::llm::ThinkingProfile::unknown(),
@@ -105,7 +111,6 @@ mod llm_config_tests {
             base_url: Some("https://api.openai.com/v1/responses".to_string()),
             api_key_env: None,
             requires_api_key: true,
-            temperature: None,
             max_tokens: None,
             context_window: None,
             thinking_profile: echo_agent::llm::ThinkingProfile::unknown(),
@@ -128,7 +133,6 @@ mod llm_config_tests {
             base_url: Some("https://gateway.example/v1".to_string()),
             api_key_env: Some("GATEWAY_API_KEY".to_string()),
             requires_api_key: true,
-            temperature: None,
             max_tokens: None,
             context_window: None,
             thinking_profile: echo_agent::llm::ThinkingProfile::unknown(),
@@ -242,19 +246,169 @@ mod llm_config_tests {
     }
 }
 
-#[test]
-fn zero_primary_iteration_config_uses_framework_unlimited_sentinel() {
-    assert_eq!(resolved_max_iterations(0), usize::MAX);
-    assert_eq!(resolved_max_iterations(1), 1);
-    assert_eq!(resolved_max_iterations(100), 100);
+#[cfg(test)]
+mod temperature_request_tests {
+    use super::*;
+    use axum::{Json, Router, extract::State, routing::post};
+
+    #[test]
+    fn configured_model_projection_drops_retired_temperature_without_losing_limits()
+    -> anyhow::Result<()> {
+        let model: crate::config::ConfiguredModel = serde_json::from_value(serde_json::json!({
+            "id": "local:test", "provider": "local", "model": "test",
+            "temperature": 1.2, "max_tokens": 4096, "context_window": 128000
+        }))?;
+        let encoded = serde_json::to_value(&model)?;
+        assert!(encoded.get("temperature").is_none());
+        assert_eq!(model.max_tokens, Some(4096));
+        assert_eq!(model.context_window, Some(128000));
+        let config = EkoConfig {
+            configured_models: vec![model],
+            ..EkoConfig::default()
+        };
+        let view = serde_json::to_value(crate::model_config::configured_model_views(&config))?;
+        let first = view
+            .as_array()
+            .and_then(|rows| rows.first())
+            .ok_or_else(|| anyhow::anyhow!("configured model view missing"))?;
+        assert!(first.get("temperature").is_none());
+        let profile: crate::profiles::Profile = serde_json::from_value(serde_json::json!({
+            "name": "test", "model": "test", "temperature": 0.9,
+            "created_at": "2026-11-03", "updated_at": "2026-11-03"
+        }))?;
+        assert!(serde_json::to_value(profile)?.get("temperature").is_none());
+        Ok(())
+    }
+
+    async fn capture_response(
+        State(requests): State<Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        requests.lock().await.push(body);
+        Json(serde_json::json!({
+            "id": "resp_loopback", "object": "response", "created_at": 1,
+            "model": "deepseek-flash", "status": "completed",
+            "output": [{"type": "message", "id": "msg_loopback", "role": "assistant",
+                "content": [{"type": "output_text", "text": "OK", "annotations": []}]}],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+        }))
+    }
+
+    #[tokio::test]
+    async fn shared_gui_connection_request_omits_temperature_over_real_responses_http()
+    -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        let endpoint = format!("http://{}/v1/responses", listener.local_addr()?);
+        let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let router = Router::new()
+            .route("/v1/responses", post(capture_response))
+            .with_state(requests.clone());
+        let (shutdown, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+        });
+        let mut config = EkoConfig::default();
+        config.model_providers.insert(
+            "deepseek".to_string(),
+            crate::config::ModelProviderConfig {
+                base_url: Some(endpoint),
+                ..Default::default()
+            },
+        );
+        config
+            .configured_models
+            .push(serde_json::from_value(serde_json::json!({
+                "id": "deepseek:test", "provider": "deepseek", "model": "deepseek-flash",
+                "api_protocol": "responses", "temperature": 0.8
+            }))?);
+        let runtime = model_config::resolve_runtime_model(&config, None)?;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            test_runtime_llm_connection(&runtime),
+        )
+        .await;
+        let doctor = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            probe_runtime_model_connectivity(&runtime),
+        )
+        .await;
+        let _ = shutdown.send(());
+        let fixture_result = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+        let response = result?.map_err(anyhow::Error::msg)?;
+        doctor??;
+        fixture_result???;
+        assert_eq!(response.response, "OK");
+        let bodies = requests.lock().await;
+        assert_eq!(bodies.len(), 2);
+        for body in bodies.iter() {
+            assert!(
+                body.get("temperature").is_none(),
+                "request contains retired temperature: {body}"
+            );
+            assert_eq!(
+                body.get("model").and_then(serde_json::Value::as_str),
+                Some("deepseek-flash")
+            );
+            assert!(body.get("input").is_some());
+        }
+        assert_eq!(
+            bodies
+                .get(1)
+                .and_then(|body| body.get("max_output_tokens"))
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        Ok(())
+    }
 }
 
 #[tokio::test]
-async fn zero_primary_iteration_config_builds_a_framework_valid_agent() -> Result<(), String> {
+async fn unbounded_main_agent_ignores_a_legacy_finite_iteration_setting() -> Result<(), String> {
     let mut config = EkoConfig::default();
-    config.agent.max_iterations = 0;
+    config.agent.max_iterations = 10;
     let created = create_agent_with_diagnostics(&AgentCreateParams::default(), &config).await?;
     assert_eq!(created.agent.config().get_max_iterations(), usize::MAX);
+    Ok(())
+}
+
+#[tokio::test]
+async fn unbounded_main_agent_completes_after_twelve_tool_iterations() -> Result<(), String> {
+    use echo_agent::agent::{Agent, critic::StaticCritic};
+    use echo_agent::testing::{MockLlmClient, MockTool};
+    use std::sync::Arc;
+
+    let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let mut script = MockLlmClient::new();
+    for iteration in 0..12 {
+        script = script.then_tool_call(format!("read-{iteration}"), "iteration_probe", "{}");
+    }
+    let transport = Arc::new(script.with_response("已完成十二轮工具查询。"));
+    let mut config = EkoConfig::default();
+    config.agent.max_iterations = 10;
+    let created = create_agent_with_diagnostics(
+        &AgentCreateParams {
+            working_dir: Some(directory.path().to_path_buf()),
+            ..Default::default()
+        },
+        &config,
+    )
+    .await?;
+    let mut agent = created.agent;
+    agent.set_llm_client(transport.clone());
+    agent.set_critic(Arc::new(StaticCritic::always_pass()));
+    agent.register_tool(Box::new(
+        MockTool::new("iteration_probe").with_default_success("本轮查询已完成"),
+    ));
+    let answer = agent
+        .execute("完成十二轮工具查询后给出结论。")
+        .await
+        .map_err(|error| error.to_string())?;
+    assert!(answer.contains("已完成十二轮工具查询"));
+    assert_eq!(transport.call_count(), 13);
     Ok(())
 }
 
@@ -364,7 +518,6 @@ mod resolve_subagent_model_tests {
             model: "parent-a".to_string(),
             llm_config: None,
             llm_client: None,
-            temperature: None,
             max_tokens: None,
             token_limit: 16_384,
             thinking: None,
@@ -396,7 +549,6 @@ mod resolve_subagent_model_tests {
             model: "parent-a".to_string(),
             llm_config: None,
             llm_client: None,
-            temperature: None,
             max_tokens: None,
             token_limit: 16_384,
             thinking: Some(echo_agent::llm::ThinkingConfig::Level(
@@ -416,7 +568,7 @@ mod resolve_subagent_model_tests {
         );
 
         // Explicit model but NO thinking spec → the registration-time parent
-        // thinking is copied (mirrors temperature/max_tokens).
+        // thinking is copied (mirrors max_tokens).
         let no_spec = subagent_model_binding(Some("inherit"), None, &config, &parent, &authority);
         assert_eq!(no_spec.snapshot().await.thinking, parent.thinking);
 
@@ -449,7 +601,6 @@ mod resolve_subagent_model_tests {
             model: "parent-model".to_string(),
             llm_config: None,
             llm_client: None,
-            temperature: None,
             max_tokens: None,
             token_limit: 16_384,
             thinking: None,
@@ -476,7 +627,6 @@ mod resolve_subagent_model_tests {
             model: "parent-model".to_string(),
             llm_config: None,
             llm_client: None,
-            temperature: Some(0.4),
             max_tokens: Some(2_048),
             token_limit: 16_384,
             thinking: Some(echo_agent::llm::ThinkingConfig::Level(
@@ -489,7 +639,6 @@ mod resolve_subagent_model_tests {
             &parent,
         );
         assert_eq!(fixed.model, parent.model);
-        assert_eq!(fixed.temperature, parent.temperature);
         assert_eq!(fixed.max_tokens, parent.max_tokens);
         assert_eq!(fixed.token_limit, parent.token_limit);
         assert_eq!(fixed.thinking, parent.thinking);
@@ -518,7 +667,6 @@ mod resolve_subagent_model_tests {
             None,
             None,
             None,
-            None,
             8_192,
             None,
             30_000,
@@ -539,6 +687,7 @@ mod resolve_subagent_model_tests {
         )?;
 
         assert!(subagent.sandbox_manager().is_some());
+        assert_eq!(subagent.config().get_temperature(), None);
         assert!(!subagent.is_plan_mode());
         for tool in ["apply_patch", "shell"] {
             assert!(
@@ -563,7 +712,6 @@ mod resolve_subagent_model_tests {
             "writer",
             "exercise local shell policy",
             "test-model",
-            None,
             None,
             None,
             None,
@@ -607,7 +755,6 @@ mod resolve_subagent_model_tests {
             None,
             None,
             None,
-            None,
             8_192,
             None,
             30_000,
@@ -647,7 +794,6 @@ mod resolve_subagent_model_tests {
             None,
             None,
             None,
-            None,
             8_192,
             Some(low.clone()),
             30_000,
@@ -658,6 +804,7 @@ mod resolve_subagent_model_tests {
             Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler),
             Arc::new(SubagentRegistry::new()),
             None,
+            Arc::new(SandboxManager::local_sandbox()),
             test_command_cells()?,
             None,
             Arc::new(echo_agent::tools::files::LocalFileSystem),
@@ -672,7 +819,6 @@ mod resolve_subagent_model_tests {
             None,
             None,
             None,
-            None,
             8_192,
             None,
             30_000,
@@ -683,6 +829,7 @@ mod resolve_subagent_model_tests {
             Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler),
             Arc::new(SubagentRegistry::new()),
             None,
+            Arc::new(SandboxManager::local_sandbox()),
             test_command_cells()?,
             None,
             Arc::new(echo_agent::tools::files::LocalFileSystem),
@@ -702,7 +849,6 @@ mod resolve_subagent_model_tests {
             None,
             None,
             None,
-            None,
             8_192,
             None,
             30_000,
@@ -713,11 +859,13 @@ mod resolve_subagent_model_tests {
             Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler),
             Arc::new(SubagentRegistry::new()),
             None,
+            Arc::new(SandboxManager::local_sandbox()),
             test_command_cells()?,
             None,
             Arc::new(echo_agent::tools::files::LocalFileSystem),
         )?;
         let readonly_names = readonly.tool_names();
+        assert_eq!(readonly.config().get_temperature(), None);
         for expected in ["wait", "stop_cell", "list_cells"] {
             assert!(
                 readonly_names.contains(&expected.to_string()),
@@ -762,7 +910,6 @@ mod resolve_subagent_model_tests {
             None,
             None,
             None,
-            None,
             8_192,
             None,
             30_000,
@@ -774,6 +921,7 @@ mod resolve_subagent_model_tests {
                 as Arc<dyn SubagentPromptCompiler>,
             Arc::new(SubagentRegistry::new()),
             None,
+            Arc::new(SandboxManager::local_sandbox()),
             test_command_cells()?,
             Some(memory_store.clone()),
             Arc::new(echo_agent::tools::files::LocalFileSystem),
@@ -824,7 +972,7 @@ mod readonly_factory_consumer_tests {
                 .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?
                 .push((
                     system_text.contains("READONLY_FACTORY_TMP_PROJECT"),
-                    system_text.contains("# echo-agent-cli(EKO)AGENTS.md"),
+                    system_text.contains("# echo-agent-cli(Eclip)AGENTS.md"),
                 ));
             self.schemas
                 .lock()
@@ -872,7 +1020,7 @@ mod readonly_factory_consumer_tests {
             old_instructions
                 .repository_level
                 .as_deref()
-                .is_some_and(|text| text.contains("# echo-agent-cli(EKO)AGENTS.md"))
+                .is_some_and(|text| text.contains("# echo-agent-cli(Eclip)AGENTS.md"))
         );
         // TMPDIR位于主仓内；用真实VCS边界代表独立项目，不改生产resolver或删仓库规则。
         let initialized = std::process::Command::new("git")
@@ -907,7 +1055,7 @@ mod readonly_factory_consumer_tests {
             .as_deref()
             .ok_or_else(|| "隔离项目规则未加载".to_string())?;
         assert!(bound_rules.contains("READONLY_FACTORY_TMP_PROJECT"));
-        assert!(!bound_rules.contains("# echo-agent-cli(EKO)AGENTS.md"));
+        assert!(!bound_rules.contains("# echo-agent-cli(Eclip)AGENTS.md"));
         Ok(fixture)
     }
 
@@ -960,7 +1108,6 @@ mod readonly_factory_consumer_tests {
                 model: "mock-model".to_string(),
                 llm_config: None,
                 llm_client: Some(transport.clone()),
-                temperature: None,
                 // Mock模型窗口仍为8k；显式输出配置1024避免默认8192占满整个窗口。
                 max_tokens: Some(1_024),
                 token_limit: 8_192,
@@ -1288,7 +1435,6 @@ mod readonly_factory_consumer_tests {
                 model: "mock-model".to_string(),
                 llm_config: None,
                 llm_client: Some(transport.clone()),
-                temperature: None,
                 max_tokens: None,
                 token_limit: effective_token_limit(&EkoConfig::default(), None),
                 thinking: None,
@@ -1555,6 +1701,156 @@ mod readonly_factory_consumer_tests {
         }
         drop(primary);
         drop(consumers);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod provider_identity_tests {
+    use super::*;
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::{HeaderMap, StatusCode, Uri, header::CONTENT_TYPE},
+        response::{IntoResponse, Response},
+        routing::post,
+    };
+    use echo_agent::llm::ChatRequest;
+    use echo_agent::llm::types::Message;
+    use serde_json::{Value, json};
+
+    type Captured = Arc<tokio::sync::Mutex<Vec<(HeaderMap, Value)>>>;
+
+    fn completed_response() -> Value {
+        json!({
+            "id": "resp_identity", "object": "response", "created_at": 1,
+            "model": "identity-model", "status": "completed",
+            "output": [{"type": "message", "id": "msg_identity", "role": "assistant",
+                "content": [{"type": "output_text", "text": "OK", "annotations": []}]}],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+        })
+    }
+
+    async fn capture(
+        State(captured): State<Captured>,
+        uri: Uri,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Result<Response, StatusCode> {
+        captured.lock().await.push((headers.clone(), body.clone()));
+        // 模拟本次网关的关键边界，遗漏真实应用身份时必须失败。
+        if headers.get("user-agent").and_then(|v| v.to_str().ok())
+            != Some(concat!("Eclip/", env!("CARGO_PKG_VERSION")))
+        {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        let streaming = body.get("stream").and_then(Value::as_bool) == Some(true);
+        let response = match (uri.path(), streaming) {
+            ("/v1/chat/completions", false) => Json(json!({
+                "id": "chat_identity", "object": "chat.completion", "created": 1,
+                "model": "identity-model",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"},
+                    "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })).into_response(),
+            ("/v1/responses", false) => Json(completed_response()).into_response(),
+            ("/v1/messages", false) => Json(json!({
+                "id": "msg_identity", "type": "message", "role": "assistant", "model": "identity-model",
+                "content": [{"type": "text", "text": "OK"}], "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })).into_response(),
+            ("/v1/chat/completions", true) => {
+                let chunk = json!({"id": "chat_identity", "object": "chat.completion.chunk", "created": 1,
+                    "model": "identity-model", "choices": [{"index": 0,
+                        "delta": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]});
+                ([(CONTENT_TYPE, "text/event-stream")], format!("data: {chunk}\n\ndata: [DONE]\n\n")).into_response()
+            }
+            ("/v1/responses", true) => {
+                let delta = json!({"type": "response.output_text.delta", "item_id": "msg_identity",
+                    "output_index": 0, "content_index": 0, "delta": "OK"});
+                let completed = json!({"type": "response.completed", "response": completed_response()});
+                ([(CONTENT_TYPE, "text/event-stream")], format!(
+                    "event: response.output_text.delta\ndata: {delta}\n\nevent: response.completed\ndata: {completed}\n\n"
+                )).into_response()
+            }
+            ("/v1/messages", true) => {
+                let events = [
+                    json!({"type": "message_start", "message": {"id": "msg_identity", "type": "message",
+                        "role": "assistant", "model": "identity-model", "content": [],
+                        "usage": {"input_tokens": 1, "output_tokens": 0}}}),
+                    json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+                    json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "OK"}}),
+                    json!({"type": "content_block_stop", "index": 0}),
+                    json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}}),
+                    json!({"type": "message_stop"}),
+                ];
+                let wire = events.iter().map(|event| format!("data: {event}\n\n")).collect::<String>();
+                ([(CONTENT_TYPE, "text/event-stream")], wire).into_response()
+            }
+            _ => return Err(StatusCode::NOT_FOUND),
+        };
+        Ok(response)
+    }
+
+    #[tokio::test]
+    async fn eclip_identity_reaches_all_runtime_protocols_and_streams() -> anyhow::Result<()> {
+        use futures::StreamExt;
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        let root = format!("http://{}/v1", listener.local_addr()?);
+        let captured: Captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let router = Router::new()
+            .route("/v1/chat/completions", post(capture))
+            .route("/v1/responses", post(capture))
+            .route("/v1/messages", post(capture))
+            .with_state(captured.clone());
+        let (shutdown, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+        });
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            for protocol in [LlmApiProtocol::ChatCompletions, LlmApiProtocol::Responses, LlmApiProtocol::Anthropic] {
+                let mut config = EkoConfig::default();
+                config.model_providers.insert("identity-gateway".into(), crate::config::ModelProviderConfig {
+                    base_url: Some(root.clone()), auth_token: Some("fixture-key".into()), ..Default::default()
+                });
+                config.configured_models.push(serde_json::from_value(json!({
+                    "id": "identity:model", "provider": "identity-gateway", "model": "identity-model",
+                    "api_protocol": protocol
+                }))?);
+                let runtime = model_config::resolve_runtime_model(&config, None).map_err(anyhow::Error::msg)?;
+                let probe = test_runtime_llm_connection(&runtime).await.map_err(anyhow::Error::msg)?;
+                assert_eq!(probe.response, "OK", "connection probe {protocol:?}");
+                let prepared = prepare_runtime_llm(&runtime).map_err(anyhow::Error::msg)?;
+                let mut stream = prepared.client.chat_stream(ChatRequest {
+                    messages: vec![Message::user("Reply OK".to_string())], max_tokens: Some(64), ..Default::default()
+                }).await?;
+                let mut text = String::new();
+                let mut finished = false;
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk?;
+                    if let Some(content) = chunk.delta.content { text.push_str(&content); }
+                    finished |= chunk.finish_reason.is_some();
+                }
+                assert_eq!(text, "OK", "stream {protocol:?}");
+                assert!(finished, "stream ended without finish reason: {protocol:?}");
+            }
+            anyhow::Ok(())
+        }).await;
+        let _ = shutdown.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(5), server).await???;
+        outcome??;
+        let requests = captured.lock().await;
+        assert_eq!(requests.len(), 6);
+        for (headers, _) in requests.iter() {
+            assert_eq!(
+                headers.get("authorization").and_then(|v| v.to_str().ok()),
+                (!headers.contains_key("x-api-key")).then_some("Bearer fixture-key")
+            );
+        }
         Ok(())
     }
 }

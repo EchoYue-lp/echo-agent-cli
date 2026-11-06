@@ -13,10 +13,131 @@
 //! Static, file-only loader: no DB, no embeddings, no recall. Query-dependent
 //! dynamic memories are handled separately by the layered memory store.
 //!
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, SystemTime};
+
+use echo_agent::tools::filesystem::FileType;
 
 /// File name for auto-promoted rules (evolution system output).
 const LEARNED_RULES_FILE: &str = "learned-rules.md";
+
+// ── 规则正文指纹缓存 ────────────────────────────────────────────────
+//
+// 背景：SSH 远程项目下每条消息的准备阶段都要重读 AGENTS/AGENTS.override 链与
+// `.eko/*.md`，每次 `read` 都是一次网络往返。ADR 0063 明确拒绝"永久缓存规则
+// 正文"——无法保证每条消息使用当前规则。这里采用"缓存正文 + 每次 stat 校验"：
+// 只有本次 `symlink_metadata` 与缓存签名一致时才复用正文；指纹变化或无法证明
+// 稳定就重读。
+//
+// 缓存是"内容来源"而不是"读取决策"：读哪些文件、按什么优先级、符号链接和
+// 非普通文件如何拒绝，仍完全由加载器决定；缓存只替换"已经确定要读这个路径"
+// 之后的那次 `read`。
+//
+// 只在 `cache_namespace() == Some(_)` 的提供者上生效。本地提供者返回 None：
+// 本地读取便宜，缓存没有收益，也避免本地目录被远端缓存污染。
+
+/// 缓存条目只存活在本进程内存中；容量上限只约束内存，不落盘、不引新依赖。
+const INSTRUCTION_CACHE_CAPACITY: usize = 256;
+
+/// SFTP v3 的 mtime 只有秒级精度：mtime 落在当前时间该窗口内的文件视为不稳定，
+/// 即使指纹相同也强制重读。否则"同一秒内二次编辑"会一直命中旧正文。
+const UNSTABLE_MODIFIED_WINDOW: Duration = Duration::from_secs(2);
+
+/// 命中所需的 stat 指纹与正文。`file_type` 一定来自已通过拒绝规则的普通文件。
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CachedInstructionBody {
+    modified: SystemTime,
+    len: u64,
+    file_type: FileType,
+    content: String,
+}
+
+/// 键是 `(namespace, 绝对路径)`：namespace 隔离不同物理目标（不同主机/连接/
+/// 项目根）上的同名路径，路径是本次准备阶段实际读取的那个 token。
+static INSTRUCTION_BODY_CACHE: LazyLock<
+    Mutex<HashMap<String, HashMap<PathBuf, CachedInstructionBody>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 查表本身不做 I/O，也不改变缓存；比较全部在锁内完成，命中的正文克隆后再放锁。
+fn instruction_cache_lookup(
+    namespace: &str,
+    path: &Path,
+    modified: SystemTime,
+    len: u64,
+    file_type: FileType,
+) -> Option<String> {
+    let cache = INSTRUCTION_BODY_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cached = cache.get(namespace)?.get(path)?;
+    (cached.modified == modified && cached.len == len && cached.file_type == file_type)
+        .then(|| cached.content.clone())
+}
+
+fn instruction_cache_store(namespace: &str, path: &Path, body: CachedInstructionBody) {
+    let mut cache = INSTRUCTION_BODY_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entries = cache.values().map(HashMap::len).sum::<usize>();
+    if entries >= INSTRUCTION_CACHE_CAPACITY {
+        evict_one_instruction_entry(&mut cache);
+    }
+    cache
+        .entry(namespace.to_string())
+        .or_default()
+        .insert(path.to_path_buf(), body);
+}
+
+/// 简单淘汰：任意一条即可。被淘汰只会让下次读取多一次 `read`，不影响正确性，
+/// 因此不维护真正的 LRU 顺序。
+fn evict_one_instruction_entry(
+    cache: &mut HashMap<String, HashMap<PathBuf, CachedInstructionBody>>,
+) {
+    let Some(victim_namespace) = cache
+        .iter()
+        .find(|(_, paths)| !paths.is_empty())
+        .map(|(namespace, _)| namespace.clone())
+    else {
+        return;
+    };
+    let mut remove_namespace = false;
+    if let Some(paths) = cache.get_mut(&victim_namespace) {
+        if let Some(victim_path) = paths.keys().next().cloned() {
+            paths.remove(&victim_path);
+        }
+        remove_namespace = paths.is_empty();
+    }
+    if remove_namespace {
+        cache.remove(&victim_namespace);
+    }
+}
+
+/// 失效必须同时清掉空的命名空间层，避免重连后留下无法命中的空壳。
+fn instruction_cache_remove(namespace: &str, path: &Path) {
+    let mut cache = INSTRUCTION_BODY_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let empty = match cache.get_mut(namespace) {
+        Some(paths) => {
+            paths.remove(path);
+            paths.is_empty()
+        }
+        None => false,
+    };
+    if empty {
+        cache.remove(namespace);
+    }
+}
+
+/// mtime 能否充当稳定指纹。未来时间（时钟偏差或被改写）同样不可信。
+fn instruction_fingerprint_is_stable(modified: SystemTime) -> bool {
+    matches!(
+        SystemTime::now().duration_since(modified),
+        Ok(age) if age >= UNSTABLE_MODIFIED_WINDOW
+    )
+}
 
 /// Layered instruction-file loader (user / repository / project / learned / local).
 pub struct InstructionProvider {
@@ -46,10 +167,19 @@ impl InstructionProvider {
                     .map(|root| root.unwrap_or_else(|| path.to_path_buf()))
             })
             .transpose()?;
+        Self::load_for_resolved_project(working_dir, project_root.as_deref(), state_dir, files)
+    }
+
+    /// 根目录已经由当前准备阶段解析；保留 cwd，不再重复远程发现。
+    pub(crate) fn load_for_resolved_project(
+        working_dir: Option<&Path>,
+        project_root: Option<&Path>,
+        state_dir: Option<&Path>,
+        files: &dyn echo_agent::tools::filesystem::FileSystem,
+    ) -> echo_agent::error::Result<Self> {
         let project_level = project_optional_text(
             files,
             project_root
-                .as_deref()
                 .map(|root| root.join(".eko/project.md"))
                 .as_deref(),
         )?;
@@ -60,7 +190,7 @@ impl InstructionProvider {
                 .as_deref(),
         )?;
         let repository_level =
-            repository_instructions_with_reader(working_dir, project_root.as_deref(), |path| {
+            repository_instructions_with_reader(working_dir, project_root, |path| {
                 project_optional_text(files, Some(path))
             })?;
         let user_level = strict_optional_text(Some(&crate::data_root::user_data_path("user.md")))?;
@@ -454,6 +584,8 @@ fn repository_instructions_with_reader<E: From<std::io::Error>>(
     Ok((!blocks.is_empty()).then(|| blocks.join("\n\n")))
 }
 
+/// 读一个"可选"投影文件：不存在返回 `None`，符号链接/非普通文件与读取、
+/// UTF-8 失败仍按原顺序失败；只有正文可能来自指纹缓存。
 fn project_optional_text(
     files: &dyn echo_agent::tools::filesystem::FileSystem,
     path: Option<&Path>,
@@ -461,16 +593,30 @@ fn project_optional_text(
     let Some(path) = path else {
         return Ok(None);
     };
+    let namespace = files.cache_namespace();
     let metadata = match files.symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(echo_agent::error::ReactError::Io(error))
             if error.kind() == std::io::ErrorKind::NotFound =>
         {
+            // 文件已经消失：旧正文必须同时失效，不能继续返回上一条消息的规则。
+            if let Some(namespace) = namespace.as_deref() {
+                instruction_cache_remove(namespace, path);
+            }
             return Ok(None);
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            // stat 都不能完成的条目不可信；保留原来的错误类型与传播顺序。
+            if let Some(namespace) = namespace.as_deref() {
+                instruction_cache_remove(namespace, path);
+            }
+            return Err(error);
+        }
     };
     if !metadata.is_file() || metadata.file_type.is_symlink() {
+        if let Some(namespace) = namespace.as_deref() {
+            instruction_cache_remove(namespace, path);
+        }
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
@@ -480,8 +626,52 @@ fn project_optional_text(
         )
         .into());
     }
+    let Some(namespace) = namespace else {
+        // 没有命名空间的提供者（默认/本地）逐字保持改动前的行为。
+        return project_text(files, path).map(Some);
+    };
+    // 提供者不报告 mtime 时无法证明内容未变：既不读缓存也不写缓存。
+    let Some(modified) = metadata.modified else {
+        instruction_cache_remove(namespace.as_str(), path);
+        return project_text(files, path).map(Some);
+    };
+    if instruction_fingerprint_is_stable(modified)
+        && let Some(content) = instruction_cache_lookup(
+            namespace.as_str(),
+            path,
+            modified,
+            metadata.len,
+            metadata.file_type,
+        )
+    {
+        return Ok(Some(content));
+    }
+    let content = match project_text(files, path) {
+        Ok(content) => content,
+        Err(error) => {
+            // 读取或 UTF-8 校验失败：旧正文不能再充当"当前规则"。
+            instruction_cache_remove(namespace.as_str(), path);
+            return Err(error);
+        }
+    };
+    instruction_cache_store(
+        namespace.as_str(),
+        path,
+        CachedInstructionBody {
+            modified,
+            len: metadata.len,
+            file_type: metadata.file_type,
+            content: content.clone(),
+        },
+    );
+    Ok(Some(content))
+}
+
+fn project_text(
+    files: &dyn echo_agent::tools::filesystem::FileSystem,
+    path: &Path,
+) -> echo_agent::error::Result<String> {
     String::from_utf8(files.read(path)?)
-        .map(Some)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error).into())
 }
 
@@ -494,6 +684,388 @@ impl Default for InstructionProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use echo_agent::tools::files::LocalFileSystem;
+    use echo_agent::tools::filesystem::{FileEntry, FileMetadata, FileSystem};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 夹具报告的 mtime 策略：真实值、固定值，或模拟不暴露 mtime 的提供者。
+    #[derive(Clone, Copy)]
+    enum ModifiedPolicy {
+        Real,
+        Fixed(SystemTime),
+        Missing,
+    }
+
+    /// 计数/注入夹具：真实读取走本地实现，但命名空间和 mtime 由测试决定，
+    /// 以便确定性验证缓存命中、秒级窗口与跨目标隔离。
+    ///
+    /// 不直接改宿主文件 mtime：测试不受文件系统时间精度和并发写入影响。
+    struct FingerprintFiles {
+        namespace: Option<String>,
+        modified: Mutex<ModifiedPolicy>,
+        stats: AtomicUsize,
+        reads: AtomicUsize,
+    }
+
+    impl FingerprintFiles {
+        fn new(namespace: Option<String>) -> Self {
+            Self {
+                namespace,
+                modified: Mutex::new(ModifiedPolicy::Real),
+                stats: AtomicUsize::new(0),
+                reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn set_modified(&self, modified: Option<SystemTime>) {
+            let policy = match modified {
+                Some(modified) => ModifiedPolicy::Fixed(modified),
+                None => ModifiedPolicy::Missing,
+            };
+            *self
+                .modified
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy;
+        }
+
+        fn reset_counts(&self) {
+            self.stats.store(0, Ordering::SeqCst);
+            self.reads.store(0, Ordering::SeqCst);
+        }
+
+        fn stats(&self) -> usize {
+            self.stats.load(Ordering::SeqCst)
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    impl FileSystem for FingerprintFiles {
+        fn cache_namespace(&self) -> Option<String> {
+            self.namespace.clone()
+        }
+
+        fn current_dir(&self) -> echo_agent::error::Result<PathBuf> {
+            LocalFileSystem.current_dir()
+        }
+
+        fn canonicalize(&self, path: &Path) -> echo_agent::error::Result<PathBuf> {
+            LocalFileSystem.canonicalize(path)
+        }
+
+        fn metadata(&self, path: &Path) -> echo_agent::error::Result<FileMetadata> {
+            self.stats.fetch_add(1, Ordering::SeqCst);
+            LocalFileSystem.metadata(path)
+        }
+
+        fn symlink_metadata(&self, path: &Path) -> echo_agent::error::Result<FileMetadata> {
+            self.stats.fetch_add(1, Ordering::SeqCst);
+            let mut metadata = LocalFileSystem.symlink_metadata(path)?;
+            match *self
+                .modified
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            {
+                ModifiedPolicy::Real => {}
+                ModifiedPolicy::Fixed(modified) => metadata.modified = Some(modified),
+                ModifiedPolicy::Missing => metadata.modified = None,
+            }
+            Ok(metadata)
+        }
+
+        fn read(&self, path: &Path) -> echo_agent::error::Result<Vec<u8>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            LocalFileSystem.read(path)
+        }
+
+        fn read_dir(&self, path: &Path) -> echo_agent::error::Result<Vec<FileEntry>> {
+            LocalFileSystem.read_dir(path)
+        }
+
+        fn create_dir_all(&self, path: &Path) -> echo_agent::error::Result<()> {
+            LocalFileSystem.create_dir_all(path)
+        }
+
+        fn create_file(&self, path: &Path) -> echo_agent::error::Result<()> {
+            LocalFileSystem.create_file(path)
+        }
+
+        fn write(&self, path: &Path, bytes: &[u8]) -> echo_agent::error::Result<()> {
+            LocalFileSystem.write(path, bytes)
+        }
+
+        fn append(&self, path: &Path, bytes: &[u8]) -> echo_agent::error::Result<()> {
+            LocalFileSystem.append(path, bytes)
+        }
+
+        fn rename(&self, from: &Path, to: &Path) -> echo_agent::error::Result<()> {
+            LocalFileSystem.rename(from, to)
+        }
+
+        fn remove_file(&self, path: &Path) -> echo_agent::error::Result<()> {
+            LocalFileSystem.remove_file(path)
+        }
+
+        fn remove_dir(&self, path: &Path) -> echo_agent::error::Result<()> {
+            LocalFileSystem.remove_dir(path)
+        }
+
+        fn remove_dir_all(&self, path: &Path) -> echo_agent::error::Result<()> {
+            LocalFileSystem.remove_dir_all(path)
+        }
+
+        fn set_mode(&self, path: &Path, mode: u32) -> echo_agent::error::Result<()> {
+            LocalFileSystem.set_mode(path, mode)
+        }
+
+        fn atomic_write(&self, path: &Path, bytes: &[u8]) -> echo_agent::error::Result<()> {
+            LocalFileSystem.atomic_write(path, bytes)
+        }
+
+        fn checkpoint(&self, path: &Path) -> echo_agent::error::Result<Option<String>> {
+            LocalFileSystem.checkpoint(path)
+        }
+    }
+
+    /// 每个夹具用独立命名空间，避免并行测试共享进程级缓存时互相命中。
+    fn fixture_namespace(temp: &tempfile::TempDir) -> String {
+        format!("test-namespace:{}", temp.path().display())
+    }
+
+    fn stable_modified() -> SystemTime {
+        SystemTime::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+    }
+
+    #[test]
+    fn fingerprint_cache_reuses_body_without_read_but_still_stats()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("AGENTS.md");
+        std::fs::write(&path, "CACHED_RULE")?;
+        let files = FingerprintFiles::new(Some(fixture_namespace(&temp)));
+        files.set_modified(Some(stable_modified()));
+
+        assert_eq!(
+            project_optional_text(&files, Some(&path))?.as_deref(),
+            Some("CACHED_RULE")
+        );
+        assert_eq!((files.reads(), files.stats()), (1, 1));
+
+        files.reset_counts();
+        assert_eq!(
+            project_optional_text(&files, Some(&path))?.as_deref(),
+            Some("CACHED_RULE")
+        );
+        // 命中只证明"这次没有 read"，仍有一次 symlink_metadata 证明指纹没变。
+        assert_eq!((files.reads(), files.stats()), (0, 1));
+        Ok(())
+    }
+
+    #[test]
+    fn fingerprint_cache_reads_new_body_after_change()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("AGENTS.md");
+        std::fs::write(&path, "VERSION_ONE")?;
+        let files = FingerprintFiles::new(Some(fixture_namespace(&temp)));
+        let first_modified = stable_modified();
+        files.set_modified(Some(first_modified));
+        assert_eq!(
+            project_optional_text(&files, Some(&path))?.as_deref(),
+            Some("VERSION_ONE")
+        );
+
+        std::fs::write(&path, "VERSION_TWO")?;
+        files.set_modified(first_modified.checked_add(Duration::from_secs(10)));
+        files.reset_counts();
+        assert_eq!(
+            project_optional_text(&files, Some(&path))?.as_deref(),
+            Some("VERSION_TWO")
+        );
+        assert_eq!(files.reads(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn fingerprint_cache_forces_reread_for_recent_modified_time()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("AGENTS.md");
+        // 同一秒内、长度相同的两次编辑：mtime/len 指纹完全一致，
+        // 只有"2 秒内强制重读"能防住旧正文。
+        let recent = SystemTime::now()
+            .checked_sub(Duration::from_millis(500))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        std::fs::write(&path, "SEC_ONE")?;
+        let files = FingerprintFiles::new(Some(fixture_namespace(&temp)));
+        files.set_modified(Some(recent));
+        assert_eq!(
+            project_optional_text(&files, Some(&path))?.as_deref(),
+            Some("SEC_ONE")
+        );
+
+        std::fs::write(&path, "SEC_TWO")?;
+        files.reset_counts();
+        assert_eq!(
+            project_optional_text(&files, Some(&path))?.as_deref(),
+            Some("SEC_TWO")
+        );
+        assert_eq!(files.reads(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn fingerprint_cache_isolates_namespaces() -> std::result::Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("AGENTS.md");
+        let modified = stable_modified();
+        std::fs::write(&path, "A_CONTENT")?;
+        let left = FingerprintFiles::new(Some(format!("left:{}", temp.path().display())));
+        left.set_modified(Some(modified));
+        assert_eq!(
+            project_optional_text(&left, Some(&path))?.as_deref(),
+            Some("A_CONTENT")
+        );
+
+        // 同一绝对路径、同一 len、同一 mtime，只是物理目标不同：
+        // B 必须真的读取，绝不能返回 A 的正文。
+        std::fs::write(&path, "B_CONTENT")?;
+        let right = FingerprintFiles::new(Some(format!("right:{}", temp.path().display())));
+        right.set_modified(Some(modified));
+        assert_eq!(
+            project_optional_text(&right, Some(&path))?.as_deref(),
+            Some("B_CONTENT")
+        );
+        assert_eq!(right.reads(), 1);
+
+        // A 自己的缓存仍只属于 A：磁盘现在虽然是 B_CONTENT，A 仍返回它的旧正文。
+        left.reset_counts();
+        assert_eq!(
+            project_optional_text(&left, Some(&path))?.as_deref(),
+            Some("A_CONTENT")
+        );
+        assert_eq!(left.reads(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn fingerprint_cache_is_disabled_without_namespace()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("AGENTS.md");
+        std::fs::write(&path, "LOCAL_RULE")?;
+        let files = FingerprintFiles::new(None);
+        files.set_modified(Some(stable_modified()));
+
+        for _ in 0..2 {
+            assert_eq!(
+                project_optional_text(&files, Some(&path))?.as_deref(),
+                Some("LOCAL_RULE")
+            );
+        }
+        // 没有命名空间时与改动前逐字一致：每次都真的读。
+        assert_eq!((files.reads(), files.stats()), (2, 2));
+        Ok(())
+    }
+
+    #[test]
+    fn fingerprint_cache_drops_body_after_deletion()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("AGENTS.md");
+        let modified = stable_modified();
+        std::fs::write(&path, "DELETED_V1")?;
+        let files = FingerprintFiles::new(Some(fixture_namespace(&temp)));
+        files.set_modified(Some(modified));
+        assert_eq!(
+            project_optional_text(&files, Some(&path))?.as_deref(),
+            Some("DELETED_V1")
+        );
+
+        std::fs::remove_file(&path)?;
+        files.reset_counts();
+        assert!(project_optional_text(&files, Some(&path))?.is_none());
+        assert_eq!(files.reads(), 0);
+
+        // 同长度、同 mtime 重建：若删除时没有清除缓存键，这里会错误命中旧正文。
+        std::fs::write(&path, "DELETED_V2")?;
+        files.reset_counts();
+        assert_eq!(
+            project_optional_text(&files, Some(&path))?.as_deref(),
+            Some("DELETED_V2")
+        );
+        assert_eq!(files.reads(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn fingerprint_cache_does_not_remember_missing_modified()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("AGENTS.md");
+        std::fs::write(&path, "NO_MTIME")?;
+        let files = FingerprintFiles::new(Some(fixture_namespace(&temp)));
+        files.set_modified(Some(stable_modified()));
+        assert_eq!(
+            project_optional_text(&files, Some(&path))?.as_deref(),
+            Some("NO_MTIME")
+        );
+
+        // 提供者不再报告 mtime：不能继续复用之前缓存的正文。
+        std::fs::write(&path, "NO_MTIME_V2")?;
+        files.set_modified(None);
+        files.reset_counts();
+        assert_eq!(
+            project_optional_text(&files, Some(&path))?.as_deref(),
+            Some("NO_MTIME_V2")
+        );
+        assert_eq!(files.reads(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn repository_chain_keeps_override_priority_across_cached_loads()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::create_dir_all(root.join(".eko"))?;
+        std::fs::write(root.join("AGENTS.md"), "ROOT_RULE")?;
+        std::fs::write(root.join("AGENTS.override.md"), "OVERRIDE_RULE")?;
+        let files = FingerprintFiles::new(Some(fixture_namespace(&temp)));
+        let modified = stable_modified();
+        files.set_modified(Some(modified));
+
+        let first =
+            InstructionProvider::load_for_resolved_project(Some(&root), Some(&root), None, &files)?;
+        let repository = first.repository_level.unwrap_or_default();
+        assert!(repository.contains("OVERRIDE_RULE"));
+        assert!(!repository.contains("ROOT_RULE"));
+
+        files.reset_counts();
+        let second =
+            InstructionProvider::load_for_resolved_project(Some(&root), Some(&root), None, &files)?;
+        assert_eq!(second.repository_level, Some(repository));
+        // 3 个候选各一次 symlink_metadata；正文全部命中，不产生 read。
+        assert_eq!(files.stats(), 3);
+        assert_eq!(files.reads(), 0);
+
+        std::fs::write(root.join("AGENTS.override.md"), "OVERRIDE_RULE_V2")?;
+        files.set_modified(modified.checked_add(Duration::from_secs(10)));
+        files.reset_counts();
+        let third =
+            InstructionProvider::load_for_resolved_project(Some(&root), Some(&root), None, &files)?;
+        let repository = third.repository_level.unwrap_or_default();
+        assert!(repository.contains("OVERRIDE_RULE_V2"));
+        assert!(!repository.contains("ROOT_RULE"));
+        assert_eq!(files.reads(), 1);
+        Ok(())
+    }
 
     #[test]
     fn test_load_empty_instructions() {
