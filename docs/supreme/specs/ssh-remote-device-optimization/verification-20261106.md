@@ -87,3 +87,10 @@
 - 看门狗自己轮询并在负载提前结束时立即退出，避免每条快命令在远端留一个睡到超时的孤儿 `sleep`。
 - 新增 3 条 shell 级用例：到点终止并返回 124、快命令退出码与 stdout 原样透传、负载提前结束时包装立即返回。
 - 验证：`terminal::project_ssh` **62 passed**，其中 `sandbox::deadline_tests` 3 条全部通过。
+
+## WP6 收尾（档 1 + 档 2）
+
+- **取消结论结构化**：取消后不再只回一句"取消已请求"，而是区分两种情况——被远端看门狗在截止时实际终止（exit 124，消息带该命令的截止秒数），或在截止前自行结束（带真实 exit code）。模型据此才能判断该核对什么。
+- **取消时记录上界**：请求取消的那一刻写 `tracing::warn!`，带 `deadline_secs`，说明还要等多久、由谁终止。
+- **期限来源校验**：新增 `deadline_follows_the_command_timeout_not_a_default`，断言看门狗期限来自 `command.timeout`（后台 cell 会把 cell 剩余期限写进去）与更紧的 `cpu_time_secs`，零期限兜底为 1 秒——防止将来有人把它退回硬编码默认值而提前杀掉长构建。
+- 验证：`terminal::project_ssh` **63 passed**，`sandbox::deadline_tests` 4 条全绿。

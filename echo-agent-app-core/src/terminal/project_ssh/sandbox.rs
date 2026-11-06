@@ -69,7 +69,8 @@ impl ProjectSshSandbox {
         }
         // 远端截止时间：由目标机器自己看门狗终止负载，而不是本机只观察。
         // 这样 `timeout` 到点时命令真的会停，而不是等它自然结束（可能是几十分钟）。
-        let script = deadline_script(&command_script(&command)?, timeout_secs(&command, &limits))?;
+        let effective_deadline_secs = timeout_secs(&command, &limits);
+        let script = deadline_script(&command_script(&command)?, effective_deadline_secs)?;
         let target = connection.effective_target().map_err(unavailable)?.clone();
         let lease = connection.operation().map_err(unavailable)?;
         let timeout = limits
@@ -285,18 +286,43 @@ impl ProjectSshSandbox {
                     };
                     let result = result?;
                     // 远端看门狗用 124 表示"到点并已实际终止负载"：这是有证据的
-                    // 超时，不是"本机不看了"。取消仍然只观察（真实终止在后续阶段）。
+                    // 超时，不是"本机不看了"。
                     if timeout_observed && !cancellation_requested && result.exit_code == 124 {
                         let mut timed_out = result;
                         timed_out.timed_out = true;
                         return Ok(timed_out);
                     }
-                    if cancellation_requested || timeout_observed {
-                        return Err(remote_failure(format!("{} was requested; original remote command subsequently completed with exit {}. Verify effects before retry", if cancellation_requested { "Cancellation" } else { "Timeout" }, result.exit_code), true));
+                    // 取消仍不主动终止（真实终止属于后续独立决策），但必须把
+                    // "命令是被截止时间杀掉的，还是自己跑完的"说清楚，否则用户
+                    // 无法判断该核对什么。
+                    if cancellation_requested {
+                        let message = if result.exit_code == 124 {
+                            format!(
+                                "取消已请求；远端看门狗在该命令的 {effective_deadline_secs} 秒截止时实际终止了负载（exit 124）。副作用需先核对再重试"
+                            )
+                        } else {
+                            format!(
+                                "取消已请求；远端命令在截止时间之前自行结束（exit {}）。副作用需先核对再重试",
+                                result.exit_code
+                            )
+                        };
+                        return Err(remote_failure(message, true));
+                    }
+                    if timeout_observed {
+                        return Err(remote_failure(format!("Timeout was requested; original remote command subsequently completed with exit {}. Verify effects before retry", result.exit_code), true));
                     }
                     return Ok(result);
                 },
-                _ = &mut cancellation, if !cancellation_requested => cancellation_requested = true,
+                _ = &mut cancellation, if !cancellation_requested => {
+                    cancellation_requested = true;
+                    // 取消不会立刻结束物理执行：远端看门狗仍在该命令自己的
+                    // 截止时间终止负载。把上界写进日志，验收和排障都能看出
+                    // "为什么还要等"。
+                    tracing::warn!(
+                        deadline_secs = effective_deadline_secs,
+                        "remote command cancellation requested; target-side watchdog will terminate the payload at its deadline"
+                    );
+                }
                 _ = &mut deadline, if !timeout_observed => timeout_observed = true,
             }
         }
@@ -836,6 +862,24 @@ mod deadline_tests {
             "watchdog must not wait for the payload to finish naturally"
         );
         Ok(())
+    }
+
+    /// 远端看门狗的期限必须来自这条命令自己的 timeout，而不是任何一个
+    /// 硬编码默认值：后台 cell 会把 cell 剩余期限写进 `command.timeout`，
+    /// 若这里退回 30 秒默认值，长构建会被提前杀掉。
+    #[test]
+    fn deadline_follows_the_command_timeout_not_a_default() {
+        let mut command = SandboxCommand::shell("true");
+        command.timeout = Duration::from_secs(300);
+        assert_eq!(timeout_secs(&command, &ResourceLimits::unrestricted()), 300);
+
+        let mut limited = ResourceLimits::unrestricted();
+        limited.cpu_time_secs = Some(5);
+        assert_eq!(timeout_secs(&command, &limited), 5, "更紧的上限生效");
+
+        // 零期限也必须至少给 1 秒，避免看门狗立即杀进程把命令当失败。
+        command.timeout = Duration::from_secs(0);
+        assert_eq!(timeout_secs(&command, &ResourceLimits::unrestricted()), 1);
     }
 
     /// 正常结束的命令必须原样保留退出码与输出，包装不改变语义。
