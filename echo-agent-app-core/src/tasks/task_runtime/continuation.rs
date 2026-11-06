@@ -914,6 +914,14 @@ impl TaskContinuationRuntime {
     }
 }
 
+/// 自动续接的输入指令：只指向权威 TaskRuntime 投影，不复制第二份 Goal、
+/// 总结或完成规则，也不重放用户原文。测试复用同一措辞，避免测试与生产漂移。
+pub(crate) fn continuation_turn_instruction(run_id: &str) -> String {
+    format!(
+        "Continue the existing TaskRun {run_id} toward its unchanged Goal. Reload the authoritative TaskRuntime projection, execute the next useful work, and use task_execute for the current revision when ready. This is internal continuation context, not a new user request."
+    )
+}
+
 async fn drive_continuation_turn(
     launcher: ContinuationLauncher,
     store: Arc<TaskRuntimeStore>,
@@ -938,9 +946,7 @@ async fn drive_continuation_turn(
     });
     let progress = launcher.foreground.clone();
     let execute = move |resources: Arc<ChatResources>| async move {
-        let turn = PreparedUserTurn::runtime_instruction(format!(
-            "Continue the existing TaskRun {run_id} toward its unchanged Goal. Reload the authoritative TaskRuntime projection, execute the next useful work, and use task_execute for the current revision when ready. This is internal continuation context, not a new user request."
-        ));
+        let turn = PreparedUserTurn::runtime_instruction(continuation_turn_instruction(&run_id));
         let human_loop_provider = resources.human_loop_provider.clone();
         if let Some(pool) = resources.pool.clone() {
             let pool_key = resources
@@ -2592,6 +2598,147 @@ mod tests {
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())?;
         assert_eq!(completion.reason, ContinuationCompletionReason::Deferred);
+        Ok(())
+    }
+
+    /// 自动续接的真实模型请求：唯一一次主模型调用必须携带共享 Goal 合同与
+    /// 轮次收尾要求，并且不能为“补总结”再发起独立请求。
+    #[tokio::test]
+    async fn continuation_model_request_carries_shared_goal_round_review() -> anyhow::Result<()> {
+        use super::super::types::{
+            AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, RunTurnOrigin,
+            TurnVisibility,
+        };
+        use crate::chat_driver::{RunTurnDriveOutcome, drive_chat_continuation_turn};
+        use crate::prepared_turn::PreparedUserTurn;
+        use crate::tasks::task_runtime::compact_context::{
+            RUNTIME_GOAL_MARKER, TaskRuntimeContextProjector, task_runtime_projection_registry,
+        };
+        use echo_agent::agent::{AgentHandle, ReactAgentBuilder};
+
+        let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+        let _resource_scope = store.test_resource_scope();
+        let workspace_id = store.active_workspace_id();
+        let execution_scope = crate::workspace::WorkspaceExecutionScope::workspace(
+            &crate::workspace::WorkspaceId::from_name(&workspace_id),
+            ".",
+        );
+        let run_id = "round-review-continuation";
+        let goal = "总Goal：A 导出数据；B 补齐回归验收；C 更新发布说明";
+        store.create_run(
+            run_id,
+            &workspace_id,
+            "round-review-conversation",
+            "round-review-root",
+            DomainProfile::General,
+            goal,
+            "agent_task_plan",
+            AttendedMode::Attended,
+        )?;
+        store.attach_plan_for_test(&super::super::types::TaskPlan {
+            domain_binding: None,
+            plan_id: "round-review-plan".to_string(),
+            run_id: run_id.to_string(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            goal_revision: 1,
+            goal_sha256: super::super::task_goal_sha256(goal),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![PlanTask {
+                id: "obligation-a".to_string(),
+                title: "推进 A".to_string(),
+                kind: PlanTaskKind::Implementation,
+                agent_role: "implementer".to_string(),
+                ..PlanTask::default()
+            }],
+        })?;
+        store.transition_run(run_id, TaskRunStatus::Running)?;
+        store.configure_run_continuation(run_id, true, false, None, None)?;
+        let _registration = task_runtime_projection_registry().register(run_id, store.clone());
+
+        let model = Arc::new(
+            echo_agent::testing::MockLlmClient::new().with_response("本轮推进 A，B/C 仍未完成。"),
+        );
+        let raw = ReactAgentBuilder::new()
+            .model("round-review-continuation")
+            .llm_client(model.clone())
+            .build()?;
+        raw.set_pre_model_context_projector(Some(Arc::new(TaskRuntimeContextProjector::new(
+            task_runtime_projection_registry(),
+        ))));
+        let agent = AgentHandle::new(raw);
+        let resources = Arc::new(ChatResources {
+            execution_scope,
+            workspace_io_receipt: None,
+            pool: None,
+            store: Some(store.clone()),
+            sink: Arc::new(DetachedContinuationSink),
+            webhook_emitter: None,
+            conv_id: Some("round-review-conversation".to_string()),
+            root_message_id: "round-review-root".to_string(),
+            attachments: Vec::new(),
+            cancel: CancellationToken::new(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let turn = PreparedUserTurn::runtime_instruction(continuation_turn_instruction(run_id));
+        let outcome = drive_chat_continuation_turn(
+            &agent,
+            &turn,
+            resources,
+            RunTurnBinding {
+                domain_plugin: None,
+                run_id: Some(run_id.to_string()),
+                turn_id: "round-review-turn".to_string(),
+                root_message_id: "round-review-root".to_string(),
+                origin: RunTurnOrigin::Continuation,
+                transcript_visibility: TurnVisibility::Internal,
+                expected_resume: None,
+            },
+        )
+        .await?;
+        assert!(
+            matches!(outcome, RunTurnDriveOutcome::Driven(_)),
+            "续接必须真实到达模型而不是被拒绝或延后"
+        );
+
+        let calls = model.all_calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "续接只允许一次主模型请求，不能为了收尾总结再发一次调用"
+        );
+        let request = calls
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("续接请求缺失"))?;
+        let contracts = request
+            .iter()
+            .filter_map(|message| message.content.as_text_ref())
+            .filter(|text| text.contains(RUNTIME_GOAL_MARKER))
+            .collect::<Vec<_>>();
+        assert_eq!(contracts.len(), 1, "续接请求只允许一份共享 Goal 投影");
+        let contract = contracts
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("续接请求缺少共享 Goal 合同"))?;
+        assert!(contract.contains(goal), "续接必须引用当前 canonical Goal");
+        assert!(contract.contains("read-only for you"));
+        assert!(contract.contains("which Goal obligation this turn advanced"));
+        assert!(contract.contains("the obligations still open"));
+        assert!(contract.contains("does not modify the Goal"));
+        assert!(
+            request.iter().any(|message| message
+                .content
+                .as_text_ref()
+                .is_some_and(|text| text.contains("Continue the existing TaskRun"))),
+            "续接请求必须来自原有续接指令，而不是伪造的用户输入"
+        );
+        store
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         Ok(())
     }
 }

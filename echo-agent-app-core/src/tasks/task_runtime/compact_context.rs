@@ -41,6 +41,19 @@ pub const TASK_CONTEXT_MARKER: &str = "[task_context]";
 
 pub(crate) const MAX_GOAL_CHARS: usize = 420;
 const MAX_GOAL_CONTRACT_CHARS: usize = 8_000;
+
+/// 应用层轮次收尾要求：只扩展现有共享 Goal 合同的措辞，不新增独立轮次
+/// Goal、总结存储、完成判定或额外模型调用。总 Goal 对模型只读，本轮执行
+/// 重点只是模型从剩余义务中派生的可变选择；收尾说明仍是当前 turn 的正常
+/// 回复，运行时终态继续由 TaskRuntime 完成门禁决定。
+const GOAL_ROUND_REVIEW_RULES: &str = "\
+Round review (part of this turn's normal reply, not a separate model call, store, or completion signal):\n\
+- The user Goal above is read-only for you. Only an explicit user change creates a new Goal revision through the existing path. Your focus for this turn is your own selection from its remaining obligations; that focus is never a new, smaller goal and never retires an obligation.\n\
+- Before you close this turn naturally, briefly state which Goal obligation this turn advanced, the concrete evidence and its verification level, the obligations still open, the current blocker if any, and the next step. One short paragraph may cover all of it; do not repeat the plan. No fixed five-heading template is required; follow the user's explicitly requested output format.\n\
+- Prefer executable progress over writing a summary. If this turn produced no new acceptance evidence (for example, only organizing material), say so plainly instead of implying completion.\n\
+- Do not let material organization, passing tests, native operations, or publication status stand in for one another, and never present unverified work as done.\n\
+- The canonical Goal and current runtime facts outrank earlier summaries, plan text, and your own next-step suggestion; earlier summaries never retire unfinished obligations. An ordinary Steer does not modify the Goal.\n\
+- This wording adds no independent reflection model call, no summary store, and no completion authority. TaskRuntime completion blockers still decide the run terminal.\n";
 pub(crate) const MAX_TASK_TITLE_CHARS: usize = 96;
 const MAX_TASK_DESC_CHARS: usize = 220;
 const MAX_SUMMARY_CHARS: usize = 260;
@@ -812,6 +825,7 @@ fn build_runtime_goal_contract_checked(
          - Before completion, audit the original objective, current plan, artifacts, and verification evidence.\n\
          - TaskRuntime completion blockers are authoritative; final wording never overrides them.\n\
          - On a recoverable blocker, record the concrete blocker and preserve resumable state.\n\
+         {round_review}\
          Budget: tokens_used={}, token_budget={}, tokens_remaining={}; time_used_seconds={}, time_budget_seconds={}, time_remaining_seconds={}\n",
         run.run_id,
         run.status.as_str(),
@@ -848,6 +862,7 @@ fn build_runtime_goal_contract_checked(
         remaining_time_seconds
             .map(|seconds| seconds.to_string())
             .unwrap_or_else(|| "unbounded".to_string()),
+        round_review = GOAL_ROUND_REVIEW_RULES,
     );
     if let Some(reference) = goal_reference {
         contract.push_str(&format_goal_reference(&reference)?);
@@ -1458,6 +1473,10 @@ mod tests {
         if build_runtime_recovery_capsule(&store, "r2").is_some() {
             return Err("ordinary chat run should not get a capsule".to_string());
         }
+        // 普通聊天没有持续 Goal/continuation，不获得轮次收尾模板。
+        if build_runtime_goal_contract(&store, "r2").is_some() {
+            return Err("ordinary chat run should not get a goal contract".to_string());
+        }
         Ok(())
     }
 
@@ -1483,7 +1502,9 @@ mod tests {
         store
             .record_run_steer("r3", "turn-1", "不要引入新依赖,优先修改现有实现")
             .map_err(|err| format!("record steer failed: {err}"))?;
-        let capsule = build_runtime_recovery_capsule(&store, "r3")
+        // 保留底层错误，避免间歇失败时被公开 Option helper 折叠成缺失摘要。
+        let capsule = build_runtime_recovery_capsule_checked(&store, "r3")
+            .map_err(|error| format!("recorded steer projection failed: {error}"))?
             .ok_or_else(|| "capsule should be built after a recorded steer".to_string())?;
         if !capsule.contains("Recent user constraints") || !capsule.contains("不要引入新依赖")
         {
@@ -2806,6 +2827,35 @@ mod tests {
             let calls = first.all_calls();
             assert_eq!(calls.len(), 1);
             let messages = calls.first().ok_or("实际Goal模型请求缺失")?;
+            let round_review_contracts = messages
+                .iter()
+                .filter(|message| {
+                    message.content.as_text_ref().is_some_and(|text| {
+                        text.contains(RUNTIME_GOAL_MARKER)
+                            && text.contains("which Goal obligation this turn advanced")
+                            && text.contains("read-only for you")
+                    })
+                })
+                .count();
+            if continuation {
+                assert_eq!(
+                    round_review_contracts, 1,
+                    "启用continuation的首轮真实请求必须带共享Goal和轮次收尾要求"
+                );
+            } else {
+                assert_eq!(
+                    round_review_contracts, 0,
+                    "未启用continuation的普通聊天不得套用固定轮次总结模板"
+                );
+                assert!(
+                    !messages
+                        .iter()
+                        .any(|message| message.content.as_text_ref().is_some_and(
+                            |text| text.contains("which Goal obligation this turn advanced")
+                        )),
+                    "普通聊天请求里不能残留轮次收尾模板"
+                );
+            }
             assert!(
                 !messages.iter().any(|message| message
                     .content
@@ -2829,11 +2879,14 @@ mod tests {
                 serde_json::from_str(encoded).map_err(|error| error.to_string())?;
             assert_eq!(reference.goal_revision, 2);
             assert_eq!(reference.goal_sha256, user_goal.goal_sha256);
+            // macOS 上 tempdir 可能是 /var 而物化路径已解析为 /private/var，
+            // 比较 canonical 根而不是原始前缀，避免把真实落点误判成越界。
+            let artifacts_root = std::fs::canonicalize(directory.path().join(".eko/artifacts"))
+                .map_err(|error| error.to_string())?;
             assert!(
-                reference
-                    .artifact
-                    .path
-                    .starts_with(directory.path().join(".eko/artifacts"))
+                reference.artifact.path.starts_with(&artifacts_root),
+                "当前Goal原文必须落在本Run的host artifacts下: {:?}",
+                reference.artifact.path
             );
             let descriptor = echo_agent::tools::artifact::ToolOutputArtifactRef {
                 path: reference.artifact.path.clone(),
@@ -3814,6 +3867,12 @@ mod tests {
             );
             assert!(texts.iter().any(|text| text.contains(&sha256)));
             assert!(!texts.iter().any(|text| text.contains(&constraint)));
+            assert!(
+                texts
+                    .iter()
+                    .any(|text| text.contains("which Goal obligation this turn advanced")),
+                "轮次收尾要求必须经受真实压缩仍可见"
+            );
             assert_eq!(
                 texts
                     .iter()
@@ -3951,6 +4010,11 @@ mod tests {
             if !contract.contains("跨窗口目标") || !contract.contains("bounded here") {
                 return Err("UTF-8 Goal contract was not safely bounded".to_string());
             }
+            if !contract.contains("which Goal obligation this turn advanced")
+                || !contract.contains("does not modify the Goal")
+            {
+                return Err("round review requirement disappeared on refresh".to_string());
+            }
             let capsule = projections
                 .get(1)
                 .and_then(|projection| projection.message.as_ref())
@@ -3984,6 +4048,283 @@ mod tests {
             .count();
         assert_eq!(goal_contracts, 1);
         assert_eq!(recovery_capsules, 1);
+        Ok(())
+    }
+
+    /// 两个自然结束的 RunTurn 只推进 A/B，canonical Goal 的原文、revision、
+    /// hash 与共享合同都不变；任务推进只改计划状态，不产生新的 Goal 版本。
+    #[test]
+    fn two_finished_run_turns_keep_one_unchanged_goal_contract() -> Result<(), String> {
+        use super::super::store::{RunTurnClaimOutcome, RunTurnCompletion};
+        use super::super::types::{RunTurnOrigin, RunTurnStatus as TurnStatus, TurnVisibility};
+
+        let store = TaskRuntimeStore::new_in_memory()
+            .map_err(|error| format!("seed store failed: {error}"))?;
+        let goal = "总Goal：A 导出数据；B 补齐回归验收；C 更新发布说明";
+        let goal_sha256 = crate::tasks::task_runtime::task_goal_sha256(goal);
+        store
+            .create_run(
+                "two-turn-run",
+                "default",
+                "two-turn-conversation",
+                "two-turn-root",
+                DomainProfile::General,
+                goal,
+                "agent_task_plan",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+                plan_id: "two-turn-plan".to_string(),
+                run_id: "two-turn-run".to_string(),
+                revision: 1,
+                domain_profile: DomainProfile::General,
+                goal_revision: 1,
+                goal_sha256: goal_sha256.clone(),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::Sequential,
+                tasks: vec![PlanTask {
+                    id: "obligation-a".to_string(),
+                    title: "推进 A".to_string(),
+                    kind: PlanTaskKind::Implementation,
+                    agent_role: "implementer".to_string(),
+                    ..PlanTask::default()
+                }],
+            })
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation("two-turn-run", true, false, None, None)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("two-turn-run", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+
+        let first = build_runtime_goal_contract(&store, "two-turn-run")
+            .ok_or_else(|| "启用续接的Run必须有共享Goal合同".to_string())?;
+
+        for (turn_id, message_id) in [("turn-1", "message-1"), ("turn-2", "message-2")] {
+            let claim = store
+                .claim_run_turn(
+                    "two-turn-run",
+                    turn_id,
+                    RunTurnOrigin::User,
+                    TurnVisibility::Internal,
+                )
+                .map_err(|error| error.to_string())?;
+            assert!(
+                matches!(claim, RunTurnClaimOutcome::Started(_)),
+                "第 {turn_id} 轮必须作为真实 RunTurn 开始"
+            );
+            store
+                .finish_run_turn(
+                    "two-turn-run",
+                    RunTurnCompletion {
+                        turn_id,
+                        status: TurnStatus::Ended,
+                        elapsed_seconds: 1,
+                        final_message_id: Some(message_id),
+                        error_fingerprint: None,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+        }
+
+        let second = build_runtime_goal_contract(&store, "two-turn-run")
+            .ok_or_else(|| "两个自然结束Turn后合同不能消失".to_string())?;
+        // 预算计数会随真实 turn 的耗时前进，但 Goal 身份（Run/状态/目标 hash/
+        // 计划版本）与收尾要求必须逐字不变。
+        let goal_identity = |contract: &str| {
+            contract
+                .split("Continuation contract:")
+                .next()
+                .map(str::to_string)
+        };
+        assert_eq!(
+            goal_identity(&second),
+            goal_identity(&first),
+            "两个自然结束的 RunTurn 不能改写 Goal 身份或计划版本"
+        );
+        assert!(
+            second.contains("which Goal obligation this turn advanced"),
+            "两个自然结束Turn后收尾要求仍须可见"
+        );
+
+        // 推进 A、下一轮改做 B：只允许计划/任务状态变化，Goal 不变。
+        store
+            .set_task_status(
+                "two-turn-run",
+                "obligation-a",
+                echo_agent::tasks::TaskStatus::Completed,
+                Some("implementer"),
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        let third = build_runtime_goal_contract(&store, "two-turn-run")
+            .ok_or_else(|| "任务推进后合同不能消失".to_string())?;
+        assert!(third.contains(goal), "A/B/C 总目标不能因推进 A 而缩小");
+        assert!(third.contains(&goal_sha256));
+        assert!(third.contains("which Goal obligation this turn advanced"));
+
+        let run = store
+            .get_run("two-turn-run")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Run缺失".to_string())?;
+        assert_eq!(run.goal, goal);
+        assert_eq!(run.goal_revision, 1);
+        assert_eq!(run.goal_sha256, goal_sha256);
+        let goal_updates = store
+            .list_events("two-turn-run", 0)
+            .map_err(|error| error.to_string())?
+            .iter()
+            .filter(|event| {
+                event.event_type == super::super::types::RuntimeEventKind::RunGoalUpdated
+            })
+            .count();
+        assert_eq!(goal_updates, 0, "轮次推进不能产生新的 Goal 版本事实");
+        Ok(())
+    }
+
+    /// 跨轮负控：A/B/C 总目标下，本轮只推进 A、下轮改做 B，以及普通 Steer
+    /// 和轮次文字都不能改写 canonical Goal 的原文、revision 或 hash；只有
+    /// 用户显式更新才沿原 CAS 路径产生新版本并保留历史原文。
+    #[test]
+    fn round_focus_and_steer_never_rewrite_canonical_goal_but_user_update_does()
+    -> Result<(), String> {
+        let store = TaskRuntimeStore::new_in_memory()
+            .map_err(|error| format!("seed store failed: {error}"))?;
+        let goal = "总Goal：A 导出数据；B 补齐回归验收；C 更新发布说明";
+        store
+            .create_run(
+                "focus-run",
+                "default",
+                "focus-conversation",
+                "focus-root",
+                DomainProfile::General,
+                goal,
+                "agent_task_plan",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation("focus-run", true, false, None, None)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("focus-run", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+
+        let goal_sha256 = crate::tasks::task_runtime::task_goal_sha256(goal);
+        let first = build_runtime_goal_contract(&store, "focus-run")
+            .ok_or_else(|| "启用续接的Run必须有共享Goal合同".to_string())?;
+        assert_eq!(first.matches(RUNTIME_GOAL_MARKER).count(), 1);
+        assert!(first.contains(goal));
+        assert!(first.contains(&goal_sha256));
+        for required in [
+            "read-only for you",
+            "Only an explicit user change creates a new Goal revision",
+            "which Goal obligation this turn advanced",
+            "the concrete evidence and its verification level",
+            "the obligations still open",
+            "the next step",
+            "no new acceptance evidence",
+            "never present unverified work as done",
+            "does not modify the Goal",
+            "no independent reflection model call, no summary store, and no completion authority",
+        ] {
+            assert!(
+                first.contains(required),
+                "共享Goal合同缺少收尾要求: {required}"
+            );
+        }
+        assert!(
+            first.contains("No fixed five-heading template is required")
+                && first.contains("follow the user's explicitly requested output format"),
+            "收尾不强制五标题，也不能禁止用户明确要求的报告格式"
+        );
+
+        // 本轮只推进 A，下一轮改做 B：steer 与轮次文字都只是执行选择。
+        store
+            .record_run_steer(
+                "focus-run",
+                "turn-1",
+                "本轮执行重点：先只推进 A，另两项保留",
+            )
+            .map_err(|error| error.to_string())?;
+        let second = build_runtime_goal_contract(&store, "focus-run")
+            .ok_or_else(|| "同一Run的合同不能因Steer消失".to_string())?;
+        store
+            .record_run_steer(
+                "focus-run",
+                "turn-2",
+                "下轮执行重点：改为推进 B，A/C 未完成义务不消失",
+            )
+            .map_err(|error| error.to_string())?;
+        let third = build_runtime_goal_contract(&store, "focus-run")
+            .ok_or_else(|| "下一轮合同不能因执行重点变化消失".to_string())?;
+        for contract in [&second, &third] {
+            assert!(
+                contract.contains(goal),
+                "A/B/C 总目标不能在执行重点变化后消失"
+            );
+            assert!(contract.contains(&goal_sha256));
+            assert!(contract.contains("which Goal obligation this turn advanced"));
+        }
+        let steady = store
+            .get_run("focus-run")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Run缺失".to_string())?;
+        assert_eq!(steady.goal, goal);
+        assert_eq!(steady.goal_revision, 1);
+        assert_eq!(steady.goal_sha256, goal_sha256);
+
+        // 用户显式更新：沿用原 revision/CAS 路径产生后继版本。
+        store
+            .transition_run("focus-run", TaskRunStatus::Paused)
+            .map_err(|error| error.to_string())?;
+        let revised = "更新后的总Goal：导出数据与回归验收合并交付；更新发布说明；补充迁移文档";
+        let updated = store
+            .update_run_goal(
+                "focus-run",
+                1,
+                revised,
+                "用户显式追加 D",
+                super::super::types::RunGoalActorSource::Gui,
+            )
+            .map_err(|error| error.to_string())?;
+        assert_eq!(updated.goal_revision, 2);
+        let fourth = build_runtime_goal_contract(&store, "focus-run")
+            .ok_or_else(|| "用户更新后合同必须引用当前Goal".to_string())?;
+        assert!(fourth.contains(revised));
+        assert!(fourth.contains(&updated.goal_sha256));
+        assert!(!fourth.contains(goal), "合同只能引用当前 canonical Goal");
+        assert!(fourth.contains("which Goal obligation this turn advanced"));
+
+        // 历史原文仍保留在 run journal：原创建目标不被覆盖。
+        let events = store
+            .list_events("focus-run", 0)
+            .map_err(|error| error.to_string())?;
+        assert!(
+            events.iter().any(|event| event.event_type
+                == super::super::types::RuntimeEventKind::RunGoalUpdated
+                && event
+                    .payload
+                    .get("new_goal")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(revised)),
+            "用户更新必须留下可审阅的显式变更事实"
+        );
+        assert!(
+            events.iter().any(|event| event.event_type
+                == super::super::types::RuntimeEventKind::RunCreated
+                && event
+                    .payload
+                    .get("goal")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(goal)),
+            "原Goal原文必须保留"
+        );
         Ok(())
     }
 }
