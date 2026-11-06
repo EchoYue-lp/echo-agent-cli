@@ -1,4 +1,4 @@
-//! EKO-owned product configuration.
+//! Eclip-owned product configuration.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use echo_agent::llm::{LlmApiProtocol, ModelInputModality};
 use echo_agent::skills::hooks::HooksDefinition;
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_EKO_SYSTEM_PROMPT: &str = r#"You are EKO, a local personal AI assistant running on the user's machine.
+pub const DEFAULT_EKO_SYSTEM_PROMPT: &str = r#"You are Eclip, a local personal AI assistant running on the user's machine.
 
 - Establish facts from available files, configuration, logs, tests, and tool output before making claims.
 - Use tools when they can verify, inspect, execute, or make concrete progress.
@@ -87,7 +87,7 @@ where
         for removed in ["enable_tools", "enable_memory", "enable_human_in_loop"] {
             if fields.contains_key(removed) {
                 return Err(serde::de::Error::custom(format!(
-                    "agent.{removed} is not configurable in EKO"
+                    "agent.{removed} is not configurable in Eclip"
                 )));
             }
         }
@@ -234,7 +234,7 @@ pub struct ChannelsConfig {
     pub session: SessionYamlConfig,
 }
 
-/// EKO's local account policy. Protocol types stay optional with `channels`,
+/// Eclip's local account policy. Protocol types stay optional with `channels`,
 /// so ordinary config loading does not activate a transport dependency.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -435,7 +435,7 @@ pub fn load_config_file(path: &Path) -> Result<EkoConfig, String> {
 pub fn save_config_file(path: &Path, config: &EkoConfig) -> Result<(), String> {
     let yaml = serde_yaml::to_string(config)
         .map_err(|error| format!("configuration serialization failed: {error}"))?;
-    let content = format!("# EKO Configuration\n\n{yaml}");
+    let content = format!("# Eclip Configuration\n\n{yaml}");
     echo_agent::utils::fs::atomic_write(path, content.as_bytes())
         .map_err(|error| format!("configuration write failed: {error}"))?;
     #[cfg(unix)]
@@ -454,7 +454,7 @@ pub fn save_config(config: &EkoConfig) -> Result<(), String> {
         .find(|path| path.exists())
         .or_else(|| search.get(1))
         .or_else(|| search.first())
-        .ok_or_else(|| "no EKO configuration path is available".to_string())?;
+        .ok_or_else(|| "no Eclip configuration path is available".to_string())?;
     save_config_file(target, config)
 }
 
@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn eko_defaults_are_owned_by_the_application() {
         let config = EkoConfig::default();
-        assert!(config.agent.system_prompt.contains("EKO"));
+        assert!(config.agent.system_prompt.contains("Eclip"));
         assert!(config.agent.enable_tools);
         assert!(config.agent.enable_memory);
         assert_eq!(config.server.host, "127.0.0.1");

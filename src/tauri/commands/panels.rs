@@ -135,7 +135,7 @@ pub async fn add_permission_rule(
         matcher: matcher.clone(),
         behavior,
         source,
-        description: Some("EKO application permission rule".to_string()),
+        description: Some("Eclip application permission rule".to_string()),
     };
     let permission_service = state
         .app_state
@@ -545,7 +545,7 @@ pub async fn execute_workflow(
 
 /// Isolation floor every GUI sandbox entry point must clear.
 ///
-/// EKO is a local personal assistant on the user's own machine, so this floor is
+/// Eclip is a local personal assistant on the user's own machine, so this floor is
 /// **not** about separating tenants from each other. A process-only backend
 /// inherits the user's whole filesystem, network and credentials: if the framework
 /// mis-renders a command, mis-evaluates the policy, or a shell/code language is
@@ -591,7 +591,7 @@ fn eko_local_sandbox_backend_label(local_available: bool) -> &'static str {
 
 fn eko_local_sandbox_unavailable_message() -> &'static str {
     if cfg!(target_os = "windows") {
-        "Native Windows sandbox is not supported by EKO. Run EKO inside WSL2 so it can use Linux bubblewrap (bwrap)."
+        "Native Windows sandbox is not supported by Eclip. Run Eclip inside WSL2 so it can use Linux bubblewrap (bwrap)."
     } else {
         "Local sandbox backend is unavailable. On macOS this requires sandbox-exec; on Linux/WSL2 this requires bubblewrap (bwrap)."
     }
@@ -2498,7 +2498,7 @@ mod scoped_control_tests {
         git(&["add", "--", "notes.txt"])?;
         git(&[
             "-c",
-            "user.name=EKO Test",
+            "user.name=Eclip Test",
             "-c",
             "user.email=eko@example.invalid",
             "-c",
@@ -2648,7 +2648,7 @@ mod scoped_control_tests {
                 "-c",
                 "commit.gpgsign=false",
                 "-c",
-                "user.name=EKO Fixture",
+                "user.name=Eclip Fixture",
                 "-c",
                 "user.email=fixture@eko.invalid",
                 "commit",
@@ -2861,7 +2861,7 @@ mod scoped_control_tests {
                 "-c",
                 "commit.gpgsign=false",
                 "-c",
-                "user.name=EKO Fixture",
+                "user.name=Eclip Fixture",
                 "-c",
                 "user.email=fixture@eko.invalid",
                 "commit",

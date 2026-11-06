@@ -52,3 +52,8 @@ model 时，runtime resolver 还能从 mirror 合成一个模型。
 - GUI、TUI、CLI/JSONL、channel、Cron 与未来 pooled Agent 共用同一个 typed resolver/error。
 - YAML schema 在开发期直接变化，不保留 compatibility mirror。
 - framework 的其它复用方仍保留三个通用能力开关；只有 EKO 产品 schema 固定启用它们。
+
+
+## 2026-11-06：Eclip 产品身份
+
+当前 GUI 品牌为 Eclip。应用在既有 `prepare_runtime_llm` 主路径创建带有 `Eclip/<版本>` User-Agent 的 reqwest::Client，经 framework 的 `build_client_with_http_client` 注入；不在应用重做协议分派，也不在通用框架硬编码品牌。模型配置结构与现有用户数据位置保持原合同。普通/流式、三协议及连接测试的实际请求头由 loopback 回归覆盖；真实 Ls-ds 的无头 403/有头 200 为修复前的故障证据。

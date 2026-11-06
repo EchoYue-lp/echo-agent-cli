@@ -1,4 +1,4 @@
-# EKO 配置指南
+# Eclip 配置指南
 
 ## GUI 设置入口
 
@@ -16,7 +16,7 @@ QQ、飞书和个人微信统一从侧栏“IM 渠道”管理；设置分类不
 
 ## 最大子智能体层数
 
-在 GUI“设置 → 基础配置”或 EKO 独有的顶层 YAML 字段中设置。只接受整数 1、2、3，默认 1；主智能体为第 0 层。仅对新运行/turn 生效，已运行任务及同 Run 新任务、重试和恢复保持原绑定。非法配置文件明确失败，不静默加载默认配置。
+在 GUI“设置 → 基础配置”或 Eclip 独有的顶层 YAML 字段中设置。只接受整数 1、2、3，默认 1；主智能体为第 0 层。仅对新运行/turn 生效，已运行任务及同 Run 新任务、重试和恢复保持原绑定。非法配置文件明确失败，不静默加载默认配置。
 
 ```yaml
 max_subagent_depth: 1
@@ -26,9 +26,9 @@ max_subagent_depth: 1
 
 ## 配置位置与优先级
 
-EKO 在 app-core 中拥有 `EkoConfig` 与 `~/.eko` 数据根。runtime bootstrap 只选择
+Eclip 在 app-core 中拥有 `EkoConfig` 与 `~/.eko` 数据根。runtime bootstrap 只选择
 framework `FrameworkConfig` 所需的 provider-neutral 字段、typed `PermissionMode` 和显式
-路径；framework 不发现 EKO 配置文件。
+路径；framework 不发现 Eclip 配置文件。
 `EKO_DATA_DIR` 可以覆盖整个产品数据根，适合测试或隔离实例。
 
 主配置查找顺序：
@@ -41,7 +41,7 @@ framework `FrameworkConfig` 所需的 provider-neutral 字段、typed `Permissio
 GUI、IM与cron读取同一份 `EkoConfig`；独立console产品不再是配置消费者。GUI 变更通过统一 AppState mutation
 原子保存；包含密钥的配置在 Unix 上写成 `0600`。
 
-EKO channel 通过 `AgentPool` 复用与其它 surface 相同的 provider/model 解析和显式
+Eclip channel 通过 `AgentPool` 复用与其它 surface 相同的 provider/model 解析和显式
 `LlmClient`，不调用 framework 的 `AgentChannelHandler` 便捷构造器。framework 独立复用方
 使用 `AgentChannelHandler::from_config` 时必须显式传入 `LlmConfig`，或使用
 `from_config_with_client` 传入已构造的共享 client；不存在默认 LLM 或环境变量回退。
@@ -137,7 +137,7 @@ GUI沿原配置保存接口管理Provider密钥；环境变量仍按`api_key_env
 顶层 `model` 只保存 `default_model_id`；connection、credential、protocol、sampling 与
 context 字段不会再镜像到这里；该 section 的未知字段会被拒绝。
 
-`agent` section 直接反序列化为 framework `AgentSettings`。EKO 只提供产品默认值，不再
+`agent` section 直接反序列化为 framework `AgentSettings`。Eclip 只提供产品默认值，不再
 维护平行的 Agent settings DTO。
 
 本地 OpenAI-compatible 服务示例：
@@ -168,7 +168,7 @@ GUI压缩面板及保留应用入口沿当前策略处理可选重点文本；�
 Goal、recovery capsule 和最近用户 steer 由 TaskRuntime projection 保留，完整历史仍由
 ConversationStore 保存。详见 [ADR 0048](./adr/0048-context-compression-product-policy.md)。
 
-工具、workspace memory 与 human-loop 是 EKO 固定启用的完整 Agent 能力；EKO YAML 不接受
+工具、workspace memory 与 human-loop 是 Eclip 固定启用的完整 Agent 能力；Eclip YAML 不接受
 framework 通用的 `enable_tools`、`enable_memory`、`enable_human_in_loop` 开关。
 
 | 字段                     | 含义                                                         |
@@ -181,8 +181,8 @@ framework 通用的 `enable_tools`、`enable_memory`、`enable_human_in_loop` �
 | `compress_window`        | 默认 `0`：近期原文按窗口 25%、至多 20K token 选择完整 turn；正数显式使用旧消息条数上限 |
 | `subagent_timeout_secs`  | Subagent 派发默认超时；`0` 表示无超时                        |
 
-EKO 的 workspace memory 由文件化 layered memory 管理。不要在应用配置里启用 SQLite
-store；framework 的其它复用方是否使用 SQLite 与 EKO 无关。
+Eclip 的 workspace memory 由文件化 layered memory 管理。不要在应用配置里启用 SQLite
+store；framework 的其它复用方是否使用 SQLite 与 Eclip 无关。
 
 ## MCP
 
@@ -208,7 +208,7 @@ MCP 配置源优先级：
 }
 ```
 
-EKO 对用户配置的 MCP 不做权限级拦截。stdio 命令只做明显输入校验；HTTP endpoint
+Eclip 对用户配置的 MCP 不做权限级拦截。stdio 命令只做明显输入校验；HTTP endpoint
 允许本地/内网明文地址，远程地址要求 HTTPS。Plugin 与用户 MCP 同名时，用户配置优先。
 所有配置 mutation 进入 `ExtensionControlService` 并由 `McpConfigRuntime` durable commit +
 真实 reconcile；health 按 captured workspace authority scope 保存，不读取 bootstrap Agent 的
@@ -279,22 +279,22 @@ Plugin 使用根 `plugin.json` 和固定组件位置。Skill 安装、启用和�
 flat Skill map，每项为 `{enabled}`，通过同目录 staging 与 `atomic_write` 原子替换。
 旧文件中的 `category`、`baseline`、generation、operation identity、content identity 与
 repair debt 字段会被忽略，但已有外部 Skill 的 `enabled` 选择会保留。损坏或不可读配置
-回退空集合并记录 warn；EKO 不再生成默认启用集。项目 Skill 由当前项目的运行时直接发现，
+回退空集合并记录 warn；Eclip 不再生成默认启用集。项目 Skill 由当前项目的运行时直接发现，
 不写入用户启用文件，也不受用户 Skill 的卸载操作影响。
 
 `ExtensionControlService` 在同一 mutation 锁内写文件，再向 global seed、已加载 workspace
 和 AgentPool 发布。`SkillSyncReceipt` 只返回本次操作的 `Settled` 或 `Degraded` 即时结果及
 逐 target 错误。文件已写但运行时同步失败时不回滚配置；下一次 Skill 操作、应用启动或
-workspace load 会重新读取 flat policy 并收敛，不保留精确重放状态。EKO 不扫描源码树
+workspace load 会重新读取 flat policy 并收敛，不保留精确重放状态。Eclip 不扫描源码树
 `skills/`，也不向 Agent 注入方法论 baseline；仓库 `.agents/skills/` 仅用于开发协作。
 
 ## 项目指令
 
-EKO 使用当前项目标准 `AGENTS.md` / `AGENTS.override.md` 的 root-to-cwd chain，并组合 EKO 自己的
-用户/项目/本地记忆投影。应用不会把 `.echo-agent/AGENT.md` 或 `CLAUDE.md` 当成 EKO
+Eclip 使用当前项目标准 `AGENTS.md` / `AGENTS.override.md` 的 root-to-cwd chain，并组合 Eclip 自己的
+用户/项目/本地记忆投影。应用不会把 `.echo-agent/AGENT.md` 或 `CLAUDE.md` 当成 Eclip
 项目指令来源。
 
-常用 EKO 文件：
+常用 Eclip 文件：
 
 - `~/.eko/user.md`：用户级长期偏好
 - `<project>/.eko/learned-rules.md`：无独立 workspace 时的已采纳项目规则；链接 workspace
@@ -318,7 +318,7 @@ FEISHU_APP_ID=...
 FEISHU_APP_SECRET=...
 ```
 
-飞书支持 `long_poll` 与 `webhook`。Channel 是完整 Agent surface，使用与GUI及原后台触发相同的chat driver、TaskRuntime、HITL 和 memory 权威。framework 与 EKO 都按
+飞书支持 `long_poll` 与 `webhook`。Channel 是完整 Agent surface，使用与GUI及原后台触发相同的chat driver、TaskRuntime、HITL 和 memory 权威。framework 与 Eclip 都按
 `channel_id + conversation_id + sender_id` 隔离会话；同一群聊的不同 sender 不共享 Agent
 上下文、TaskRun、cache 或 foreground control。timeout/reset 会轮换 Agent runtime/checkpoint/cache
 identity，但保留稳定产品 transcript 与 TaskRun；旧 incarnation 在 foreground/lease 与 pool
@@ -347,7 +347,7 @@ channels:
 群聊、媒体及混合媒体不执行残余文字。不安装 OpenClaw Gateway，也不接管桌面微信。
 
 定时任务页可为准确的 task definition 启用微信结果通知，目标为已连接账号的扫码本人；需先从手机发过单聊以取得原 context reference。
-`notifications` 属于 EKO 配置，不向通用 CronTask 添加产品字段。原 occurrence 准入在同一 TaskRuntime journal 提交中冻结 account、credential generation、peer、context reference、workspace、channel conversation 和 definition。
+`notifications` 属于 Eclip 配置，不向通用 CronTask 添加产品字段。原 occurrence 准入在同一 TaskRuntime journal 提交中冻结 account、credential generation、peer、context reference、workspace、channel conversation 和 definition。
 之后改配置、切项目或重新授权不重选已准入目标。真实完成结果与产物引用沿原 DeliveryLedger/TaskRuntime journal 投递；通知失败或 Unknown 不改任务结果、不重跑 prompt，潜在已发送的 Unknown 不自动重发。
 窗口、额度、无 context 或重启后主动发送是否被服务接受均须实际验证，不能承诺必达。
 
@@ -379,7 +379,7 @@ Provider API Key 使用各 Provider 的 `api_key_env`，无需维护固定厂商
 
 ## IM 人工请求的回复身份
 
-EKO 渠道中的每个活动审批、输入或选择提示都会给出 response target。使用 `/reply <response-target> <answer>` 回复，使用 `/reply <response-target> /cancel` 拒绝。审批继续支持 `y`、`a`、`n [reason]`、`m [feedback]`；选择沿原选项数字或名称；自由输入保留 answer 后缀的中文、emoji 与换行。有 pending 时裸文本不回答请求。缺失、旧、非 front 或其它会话的 target 明确拒绝且不进入普通聊天；无 pending 的普通文本仍可聊天。
+Eclip 渠道中的每个活动审批、输入或选择提示都会给出 response target。使用 `/reply <response-target> <answer>` 回复，使用 `/reply <response-target> /cancel` 拒绝。审批继续支持 `y`、`a`、`n [reason]`、`m [feedback]`；选择沿原选项数字或名称；自由输入保留 answer 后缀的中文、emoji 与换行。有 pending 时裸文本不回答请求。缺失、旧、非 front 或其它会话的 target 明确拒绝且不进入普通聊天；无 pending 的普通文本仍可聊天。
 
 submitted 不等于原 provider/dispatcher 已选定的 effective answer。GUI 回复携带原投递 scope/target，不因切页重绑，缺 target 的历史事件不重新激活。合同与待完成的 Rust/native、实际双端组合及 IM/cron 验收边界见 [ADR0053](adr/0053-im-cron-gui-control.md)。身份源码 checkpoint 不表示完整渠道管理页或原生平台投递已验证。
 
@@ -409,3 +409,10 @@ style provider 进入绑定，纯 theme 颜色不进入。来源缺失或变化�
 旧用户配置和数据文件不随源码删除清理；保存、迁移及错误仍走原配置owner。
 GUI PTY／SSH终端、Agent shell、IM、cron、Task/Subagent、附件、HITL和共享恢复继续保留。
 包仍名`echo-agent-cli`，identifier与`~/.eko`／workspace `.eko`路径不改。
+
+
+### Eclip 产品身份与 Provider 请求头
+
+GUI 产品名统一为 **Eclip**；窗口、启动/崩溃弹窗、默认助手身份和包描述均沿用此名称。历史 `EKO_*` 环境变量、`.eko` 数据目录和 `com.eko.desktop` 应用标识继续定位现有实例与用户数据。
+
+Eclip 在共享模型客户端组装路径统一设置 `User-Agent: Eclip/<应用核心包版本>`，当前为 `Eclip/1.0.0`。GUI 连接测试、真实对话、Subagent 与后台模型调用复用该路径，Chat Completions、Responses、Anthropic 的普通和流式请求均携带真实身份。无需改 Key、模型或添加 Provider 配置；对于本次 Ls-ds 的 `abuse_rule_rejected`，缺少该头是已通过真实请求对照确认的触发条件。

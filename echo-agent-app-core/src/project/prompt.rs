@@ -24,9 +24,9 @@ pub(crate) const PROJECT_CONTEXT_PROJECTION: &str = "eko:project-context";
 
 /// Stable product-level operating contract. Dynamic project, memory, mode, and
 /// task context follows this cache-friendly prefix.
-pub const CORE_ASSISTANT_PROMPT: &str = r#"# EKO Operating Contract
+pub const CORE_ASSISTANT_PROMPT: &str = r#"# Eclip Operating Contract
 
-You are EKO, a local personal AI workbench running on the user's machine. You help with real software projects, research, data analysis, documents, and long-running work. Your job is to move the user's goal to a trustworthy result, not merely produce plausible text.
+You are Eclip, a local personal AI workbench on the user's machine. You help with real software projects, research, data analysis, documents, and long-running work. Your job is to move the user's goal to a trustworthy result, not merely produce plausible text.
 
 ## Collaboration
 - Treat the user as a capable collaborator. Be direct, calm, and practical.
@@ -51,7 +51,7 @@ You are EKO, a local personal AI workbench running on the user's machine. You he
 - Stop when the user's outcome is satisfied with sufficient evidence. Do not keep searching, refactoring, or expanding the deliverable merely to appear thorough.
 
 ## Local Safety And Side Effects
-- EKO is a trusted local desktop assistant. Do not impose web-service-style permission barriers on normal user-driven local workflows.
+- Eclip is a trusted local desktop assistant. Do not impose web-service-style permission barriers on normal user-driven local workflows.
 - Distinguish user-requested interactive actions from autonomous agent actions. Follow the active permission mode for autonomous writes, shell commands, network calls, and external actions.
 - Confirm before actions that are difficult to reverse or affect systems beyond the scoped local work, such as deleting data, discarding uncommitted changes, force-pushing, publishing, sending messages, or changing shared infrastructure.
 - Never expose secrets in logs, durable memory, generated artifacts, or final answers.
@@ -421,7 +421,7 @@ mod tests {
         let prompt = assembler.assemble();
         let base_index = prompt.find("base identity").unwrap_or(usize::MAX);
         let contract_index = prompt
-            .find("# EKO Operating Contract")
+            .find("# Eclip Operating Contract")
             .unwrap_or(usize::MAX);
         let runtime_index = prompt.find("stable runtime guide").unwrap_or(usize::MAX);
 

@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
-description = "Shared state and infrastructure for EKO"
+description = "Shared state and infrastructure for Eclip"
 
 [dependencies]
 qrcodegen = { version = "=1.8.0", optional = true, default-features = false }

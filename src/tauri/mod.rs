@@ -307,9 +307,9 @@ pub fn build_tauri_app(
             if let tauri::WindowEvent::CloseRequested {api,..} = event
                 && let Err(error) = desktop::hide_requested_window(||api.prevent_close(),||window.hide()) {
                     use tauri_plugin_dialog::DialogExt;
-                    tracing::error!(%error,"Unable to hide EKO window");
-                    if let Err(show_error) = window.show() {tracing::error!(%show_error,"Unable to restore visible EKO window");}
-                    window.dialog().message("无法隐藏窗口，应用保持运行。请重试或使用托盘退出。").title("EKO").show(|_|{});
+                    tracing::error!(%error,"Unable to hide Eclip window");
+                    if let Err(show_error) = window.show() {tracing::error!(%show_error,"Unable to restore visible Eclip window");}
+                    window.dialog().message("无法隐藏窗口，应用保持运行。请重试或使用托盘退出。").title("Eclip").show(|_|{});
             }
         })
         .setup(move |app| {
@@ -324,9 +324,9 @@ pub fn build_tauri_app(
                 .on_menu_event(move |app,event| match event.id.as_ref() {
                     "eko-show" => {
                         if let Some(window) = app.get_webview_window("main") {
-                            if let Err(error) = window.show() {tracing::error!(%error,"Unable to show EKO window");}
-                            if let Err(error) = window.unminimize() {tracing::error!(%error,"Unable to restore EKO window");}
-                            if let Err(error) = window.set_focus() {tracing::error!(%error,"Unable to focus EKO window");}
+                            if let Err(error) = window.show() {tracing::error!(%error,"Unable to show Eclip window");}
+                            if let Err(error) = window.unminimize() {tracing::error!(%error,"Unable to restore Eclip window");}
+                            if let Err(error) = window.set_focus() {tracing::error!(%error,"Unable to focus Eclip window");}
                         }
                     }
                     "eko-quit" => {

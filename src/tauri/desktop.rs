@@ -1,4 +1,4 @@
-//! EKO — Tauri desktop runtime.
+//! Eclip — Tauri desktop runtime.
 //!
 //! Shared by the dedicated `echo-agent-tauri` binary and by the package-name
 //! binary when Tauri CLI builds the app with `--no-default-features --features gui`.
@@ -29,7 +29,7 @@ fn install_panic_hook() {
             let _ = std::fs::create_dir_all(parent);
         }
         let message = format!(
-            "EKO crashed at {}\n\
+            "Eclip crashed at {}\n\
              Location: {:?}\n\n\
              {}\n\n\
              Please report this issue or check your configuration.\n",
@@ -53,11 +53,11 @@ fn install_panic_hook() {
             let _ = Command::new("osascript")
                 .arg("-e")
                 .arg(
-                    "display dialog \"EKO crashed during startup.\\n\\n\
+                    "display dialog \"Eclip crashed during startup.\\n\\n\
                      Details have been written to the crash log.\\n\\n\
                      Run from Terminal to see full output:\\n\
                      /Applications/Eclip.app/Contents/MacOS/echo-agent-tauri\" \
-                     with title \"EKO\" buttons {\"OK\"} default button \"OK\"",
+                     with title \"Eclip\" buttons {\"OK\"} default button \"OK\"",
                 )
                 .output();
         }
@@ -110,7 +110,7 @@ pub async fn run_desktop_entry() -> anyhow::Result<()> {
         let _ = std::fs::write(
             &log_path,
             format!(
-                "EKO starting at {}\n\
+                "Eclip starting at {}\n\
                  If you see this file, the app is running but may have failed to display.\n\
                  Try running from Terminal:\n\
                  /Applications/Eclip.app/Contents/MacOS/echo-agent-tauri\n",
@@ -124,7 +124,7 @@ pub async fn run_desktop_entry() -> anyhow::Result<()> {
         Err(error) => {
             let log_path = crash_log_path();
             let message = format!(
-                "EKO failed at {}\n\nError: {:?}\n",
+                "Eclip failed at {}\n\nError: {:?}\n",
                 chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
                 error
             );
@@ -137,10 +137,10 @@ pub async fn run_desktop_entry() -> anyhow::Result<()> {
                 let _ = Command::new("osascript")
                     .arg("-e")
                     .arg(format!(
-                        "display dialog \"EKO failed.\\n\\n\
+                        "display dialog \"Eclip failed.\\n\\n\
                          Error: {}\\n\\n\
                          Crash log: {}\" \
-                         with title \"EKO\" buttons {{\"OK\"}} default button \"OK\"",
+                         with title \"Eclip\" buttons {{\"OK\"}} default button \"OK\"",
                         format!("{:?}", error).replace('"', "\\\""),
                         log_path.display()
                     ))
@@ -341,7 +341,7 @@ where
 /// Configuration inputs consumed by the existing desktop bootstrap. Console
 /// interaction flags are deliberately absent rather than silently ignored.
 #[derive(Parser, Debug)]
-#[command(name = "echo-agent-tauri", version, about = "EKO desktop assistant")]
+#[command(name = "echo-agent-tauri", version, about = "Eclip desktop assistant")]
 struct DesktopArgs {
     /// Configured model ID or unique model name; otherwise use the default.
     #[arg(long, short = 'm', env = "MODEL_NAME")]
@@ -355,7 +355,7 @@ struct DesktopArgs {
     #[arg(long)]
     mcp_config: Option<String>,
 
-    /// EKO configuration file (eko.yaml).
+    /// Eclip configuration file (eko.yaml).
     #[arg(long)]
     config: Option<String>,
 }
@@ -366,7 +366,7 @@ fn parse_desktop_args(
     let args = args
         .into_iter()
         // Finder may add a process-serial-number argument when launching a
-        // macOS application bundle. It is platform metadata, not an EKO flag.
+        // macOS application bundle. It is platform metadata, not an Eclip flag.
         .filter(|arg| !arg.to_string_lossy().starts_with("-psn_"));
     DesktopArgs::try_parse_from(args)
 }

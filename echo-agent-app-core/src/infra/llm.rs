@@ -109,8 +109,14 @@ pub fn prepare_runtime_llm(
 ) -> Result<PreparedRuntimeLlm, String> {
     model_config::validate_runtime_model_requirements(runtime)?;
     let config = build_runtime_llm_config(runtime)?;
+    // 产品身份由应用统一注入：连接测试、主 Agent 和 Subagent 共用真实 Eclip 标识。
+    // 部分兼容网关会拒绝缺少 User-Agent 的请求；版本随应用包构建，不借用其它产品身份。
+    let http_client = reqwest::Client::builder()
+        .user_agent(concat!("Eclip/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|error| format!("Failed to create Eclip HTTP client: {error}"))?;
     let client: Arc<dyn LlmClient> = config
-        .build_client()
+        .build_client_with_http_client(Arc::new(http_client))
         .map(Arc::from)
         .map_err(|error| format!("Failed to create client: {error}"))?;
     Ok(PreparedRuntimeLlm {

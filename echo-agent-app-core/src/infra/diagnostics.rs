@@ -278,7 +278,7 @@ pub async fn fire_startup_hook(agent: &AgentHandle) {
 pub fn print_doctor_result(result: &DoctorResult) {
     println!();
     println!("╭─────────────────────────────────────────────────────────────╮");
-    println!("│                    🏥 EKO 诊断                        │");
+    println!("│                    🏥 Eclip 诊断                        │");
     println!("╰─────────────────────────────────────────────────────────────╯");
 
     if !result.issues.is_empty() {

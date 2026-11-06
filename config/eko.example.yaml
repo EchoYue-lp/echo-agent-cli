@@ -1,7 +1,7 @@
 # 新任务最大子层数：主智能体为0，默认1，可选1/2/3；旧运行保持原绑定。
 max_subagent_depth: 1
 
-# EKO 配置文件
+# Eclip 配置文件
 # 复制为 eko.yaml 并根据实际情况修改
 
 # ── 模型配置 ─────────────────────────────────────────────────────
@@ -35,7 +35,7 @@ configured_models:
 # ── Agent 配置 ─────────────────────────────────────────────────────
 agent:
   name: "echo-assistant"                              # Agent 名称
-  system_prompt: "You are EKO, the user's local personal AI workbench. Work as a capable, evidence-driven collaborator across software, research, data, documents, and long-running tasks. Move authorized work to a verified result while respecting the user's instructions, workspace, and control over external side effects."  # 稳定身份；详细执行合同由应用层 PromptAssembler 注入
+  system_prompt: "You are Eclip, the user's local personal AI workbench. Work as a capable, evidence-driven collaborator across software, research, data, documents, and long-running tasks. Move authorized work to a verified result while respecting the user's instructions, workspace, and control over external side effects."  # 稳定身份；详细执行合同由应用层 PromptAssembler 注入
   max_iterations: 0            # ReAct 最大迭代次数（0 = 无限制，直到任务完成或用户取消）
   memory_path: "~/.eko/store.json"  # 记忆存储路径
   tool_timeout_ms: 120000     # 单次工具调用超时（毫秒）
