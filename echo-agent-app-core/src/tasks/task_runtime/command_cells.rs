@@ -22,7 +22,6 @@ use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -227,6 +226,12 @@ struct CommandCellWatchLeaseTestBarrier {
     release: tokio::sync::oneshot::Receiver<()>,
 }
 
+#[cfg(test)]
+struct CommandCellLaunchRegistrationTestBarrier {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CommandCellDeliveryAgentKey {
     workspace_id: String,
@@ -239,13 +244,29 @@ pub struct CommandCellProjectionDiagnostic {
     pub message: String,
 }
 
+// 持久化债务同时保有原观察 lease：只有真实修复或服务退出才能释放资源。
+struct CommandCellProjectionDebt {
+    diagnostic: CommandCellProjectionDiagnostic,
+    _observation: Mutex<Option<CommandCellObservationLease>>,
+}
+
+type CellLaunchResult = Result<CommandCellLaunchReceipt, CommandCellError>;
+
+// 原调用的回执观察槽，不调度命令；唯一 producer 仍由原 TaskTracker 持有。
+// 只按完整调用身份复用，命令相同但 call_id 不同始终是新执行。
+struct CommandCellLaunchObservation {
+    fingerprint: String,
+    result: tokio::sync::watch::Receiver<Option<CellLaunchResult>>,
+}
+
 pub struct CommandCellRuntimeService {
     inner: Arc<BackgroundCommandManager>,
+    launch_observations: Mutex<HashMap<String, CommandCellLaunchObservation>>,
     run_cells: RwLock<HashMap<RunCellScope, HashSet<String>>>,
     chat_cells: RwLock<HashMap<ChatCellScope, HashSet<String>>>,
     cell_deadlines: RwLock<HashMap<String, chrono::DateTime<chrono::Utc>>>,
     stores_by_workspace: RwLock<HashMap<String, Weak<TaskRuntimeStore>>>,
-    projection_degraded: RwLock<HashMap<String, CommandCellProjectionDiagnostic>>,
+    projection_degraded: RwLock<HashMap<String, CommandCellProjectionDebt>>,
     governor: Arc<super::executor::ProcessExecutionGovernor>,
     observers: TaskTracker,
     shutdown: CancellationToken,
@@ -271,6 +292,10 @@ pub struct CommandCellRuntimeService {
     command_cell_watch_snapshot_barrier: Mutex<Option<CommandCellWatchSnapshotTestBarrier>>,
     #[cfg(test)]
     command_cell_watch_lease_barrier: Mutex<Option<CommandCellWatchLeaseTestBarrier>>,
+    #[cfg(test)]
+    launch_registration_barrier: Mutex<Option<CommandCellLaunchRegistrationTestBarrier>>,
+    #[cfg(test)]
+    shutdown_registration_probe: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 impl CommandCellRuntimeService {
@@ -287,6 +312,7 @@ impl CommandCellRuntimeService {
                 BackgroundCommandManagerConfig::default(),
                 executor,
             )?),
+            launch_observations: Mutex::new(HashMap::new()),
             run_cells: RwLock::new(HashMap::new()),
             chat_cells: RwLock::new(HashMap::new()),
             cell_deadlines: RwLock::new(HashMap::new()),
@@ -314,6 +340,10 @@ impl CommandCellRuntimeService {
             command_cell_watch_snapshot_barrier: Mutex::new(None),
             #[cfg(test)]
             command_cell_watch_lease_barrier: Mutex::new(None),
+            #[cfg(test)]
+            launch_registration_barrier: Mutex::new(None),
+            #[cfg(test)]
+            shutdown_registration_probe: Mutex::new(None),
         });
         service.spawn_started_command_cell_watch_recovery();
         Ok(service)
@@ -542,21 +572,55 @@ impl CommandCellRuntimeService {
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .values()
-            .cloned()
+            .map(|debt| debt.diagnostic.clone())
             .collect()
     }
 
     fn mark_projection_degraded(&self, cell_id: &str, message: impl Into<String>) {
-        self.projection_degraded
+        let diagnostic = CommandCellProjectionDiagnostic {
+            cell_id: cell_id.to_string(),
+            message: message.into(),
+        };
+        let mut debts = self
+            .projection_degraded
             .write()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(
-                cell_id.to_string(),
-                CommandCellProjectionDiagnostic {
+            .unwrap_or_else(|error| error.into_inner());
+        match debts.get_mut(cell_id) {
+            Some(debt) => debt.diagnostic = diagnostic,
+            None => {
+                debts.insert(
+                    cell_id.to_string(),
+                    CommandCellProjectionDebt {
+                        diagnostic,
+                        _observation: Mutex::new(None),
+                    },
+                );
+            }
+        }
+    }
+
+    fn retain_projection_observation(
+        &self,
+        cell_id: &str,
+        observation: CommandCellObservationLease,
+    ) {
+        let mut debts = self
+            .projection_degraded
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let debt = debts
+            .entry(cell_id.to_string())
+            .or_insert_with(|| CommandCellProjectionDebt {
+                diagnostic: CommandCellProjectionDiagnostic {
                     cell_id: cell_id.to_string(),
-                    message: message.into(),
+                    message: "terminal persistence exhausted its repair budget".to_string(),
                 },
-            );
+                _observation: Mutex::new(None),
+            });
+        *debt
+            ._observation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(observation);
     }
 
     fn clear_projection_degraded(&self, cell_id: &str) {
@@ -1416,7 +1480,48 @@ impl CommandCellRuntimeService {
             .count()
     }
 
+    #[cfg(test)]
+    fn wait_before_launch_registration_for_test(&self) -> Result<(), CommandCellError> {
+        let barrier = self
+            .launch_registration_barrier
+            .lock()
+            .map_err(|error| CommandCellError::Runtime {
+                message: error.to_string(),
+            })?
+            .take();
+        if let Some(barrier) = barrier {
+            barrier
+                .entered
+                .send(())
+                .map_err(|error| CommandCellError::Runtime {
+                    message: error.to_string(),
+                })?;
+            barrier
+                .release
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|error| CommandCellError::Runtime {
+                    message: format!("launch registration test barrier did not release: {error}"),
+                })?;
+        }
+        Ok(())
+    }
+
     pub fn begin_shutdown(&self) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(probe) = self
+            .shutdown_registration_probe
+            .lock()
+            .map_err(|error| error.to_string())?
+            .take()
+        {
+            let _ = probe.send(());
+        }
+        // 与 launch 共用入口临界区：关闭检查通过的调用必须先登记原 producer，
+        // 再关闭 TaskTracker；否则 close 后的晚登记可能逃过 shutdown 的等待。
+        let launch_admission = self
+            .launch_observations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         self.shutdown.cancel();
         let active_command_cell_watches = {
             let mut state = self
@@ -1431,6 +1536,7 @@ impl CommandCellRuntimeService {
                 .collect::<Vec<_>>()
         };
         self.observers.close();
+        drop(launch_admission);
         let active_cells = {
             let run_cells = self
                 .run_cells
@@ -1510,7 +1616,12 @@ impl CommandCellRuntimeService {
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .values()
-            .map(|diagnostic| format!("{}: {}", diagnostic.cell_id, diagnostic.message))
+            .map(|diagnostic| {
+                format!(
+                    "{}: {}",
+                    diagnostic.diagnostic.cell_id, diagnostic.diagnostic.message
+                )
+            })
             .collect::<Vec<_>>();
         if !degraded.is_empty() {
             failures.push(format!(
@@ -1528,6 +1639,7 @@ impl CommandCellRuntimeService {
     }
 }
 
+#[derive(Clone)]
 struct ScopedCommandCellRegistry {
     service: Arc<CommandCellRuntimeService>,
     execution_scope: crate::workspace::WorkspaceExecutionScope,
@@ -1544,7 +1656,6 @@ impl ScopedCommandCellRegistry {
         cell_id: String,
         name: String,
         call_id: Option<String>,
-        shell_permit: Option<OwnedSemaphorePermit>,
         operation_reservation: super::executor::TaskRuntimeSettlementReservation,
     ) -> Result<(), CommandCellError> {
         let runtime =
@@ -1561,8 +1672,6 @@ impl ScopedCommandCellRegistry {
             "observe command-cell terminal",
             operation_reservation,
             async move {
-                let _observation = observation;
-                let _shell_permit = shell_permit;
                 let persisted = observe_terminal_cell(
                     registry,
                     operation_store,
@@ -1580,6 +1689,7 @@ impl ScopedCommandCellRegistry {
                     let error = super::store::StoreError::InvalidPlan(format!(
                         "command-cell '{cell_id}' terminal persistence exhausted its repair budget"
                     ));
+                    service.retain_projection_observation(&cell_id, observation);
                     debt_owner.record_lifecycle_debt("observe command-cell terminal", &error);
                     Err(error)
                 }
@@ -1607,7 +1717,6 @@ impl ScopedCommandCellRegistry {
         observation: CommandCellObservationLease,
         scope: ChatCellScope,
         started: BackgroundCellState,
-        shell_permit: Option<OwnedSemaphorePermit>,
         operation_reservation: super::executor::TaskRuntimeSettlementReservation,
     ) -> Result<(), CommandCellError> {
         let runtime =
@@ -1628,9 +1737,7 @@ impl ScopedCommandCellRegistry {
                 "observe ordinary-chat command-cell terminal",
                 operation_reservation,
                 async move {
-                    let _observation = observation;
-                    let _shell_permit = shell_permit;
-                    let cell_id = started.cell_id.clone();
+                        let cell_id = started.cell_id.clone();
                     let persisted = observe_chat_terminal_cell(
                         registry,
                         service.clone(),
@@ -1645,6 +1752,7 @@ impl ScopedCommandCellRegistry {
                         let error = super::store::StoreError::InvalidPlan(format!(
                             "ordinary-chat command-cell '{cell_id}' terminal persistence exhausted its repair budget"
                         ));
+                        service.retain_projection_observation(&cell_id, observation);
                         debt_owner.record_lifecycle_debt(
                             "observe ordinary-chat command-cell terminal",
                             &error,
@@ -1748,45 +1856,17 @@ impl ScopedCommandCellRegistry {
         }
         self.service.track_chat(&scope, &cell_id, receipt.deadline);
 
-        let deadline = (receipt.deadline - chrono::Utc::now())
-            .to_std()
-            .unwrap_or_default();
-        let shell = self.service.governor.shell_semaphore().acquire_owned();
-        let shell_permit = tokio::select! {
-            _ = self.service.shutdown.cancelled() => Err(CommandCellError::Shutdown),
-            result = tokio::time::timeout(deadline, shell) => result
-                .map_err(|_| CommandCellError::CapacityDeadline)
-                .and_then(|permit| permit.map_err(|_| CommandCellError::Shutdown)),
-        };
-        let shell_permit = match shell_permit {
-            Ok(permit) => permit,
-            Err(error) => {
-                let _ = self.service.inner.abort_prepared(
-                    reservation,
-                    format!("process shell admission failed: {error}"),
-                );
-                self.spawn_chat_observer(observation, scope, started, None, operation_reservation)?;
-                return Err(error);
-            }
-        };
+        // The process-wide shell ceiling is enforced by the framework cell
+        // runner through `resource_admission`, after the cell was accepted and
+        // queued. Waiting for the slot here would let an unrelated long-running
+        // command consume this call's tool budget and downgrade an accepted
+        // cell into a lost receipt.
         let start_result = self.service.inner.start_prepared(reservation).await;
         if let Err(error) = start_result {
-            self.spawn_chat_observer(
-                observation,
-                scope,
-                started,
-                Some(shell_permit),
-                operation_reservation,
-            )?;
+            self.spawn_chat_observer(observation, scope, started, operation_reservation)?;
             return Err(error);
         }
-        self.spawn_chat_observer(
-            observation,
-            scope,
-            started,
-            Some(shell_permit),
-            operation_reservation,
-        )?;
+        self.spawn_chat_observer(observation, scope, started, operation_reservation)?;
         Ok(receipt)
     }
 }
@@ -1940,8 +2020,8 @@ impl Tool for InterruptCommandCellWatchTool {
     }
 }
 
-impl CommandCellRegistry for ScopedCommandCellRegistry {
-    fn launch(
+impl ScopedCommandCellRegistry {
+    fn launch_once(
         &self,
         mut request: CommandCellRequest,
     ) -> BoxFuture<'_, Result<CommandCellLaunchReceipt, CommandCellError>> {
@@ -1960,6 +2040,10 @@ impl CommandCellRegistry for ScopedCommandCellRegistry {
                 request.executor = Some(executor.clone());
                 request.require_sandbox = true;
             }
+            // Scope-local adapters never inherit another host's product
+            // resource policy: every Eclip cell, ordinary Chat or run-owned,
+            // shares the same process-wide shell ceiling.
+            request.resource_admission = Some(self.service.governor.shell_admission());
             let owner = request.owner.clone();
             let name = request.command.chars().take(80).collect::<String>();
             let command_hash = format!("{:x}", Sha256::digest(request.command.as_bytes()));
@@ -2054,7 +2138,6 @@ impl CommandCellRegistry for ScopedCommandCellRegistry {
                         cell_id,
                         name,
                         owner.call_id,
-                        None,
                         operation_reservation,
                     )?;
                     return Err(CommandCellError::Runtime {
@@ -2074,36 +2157,10 @@ impl CommandCellRegistry for ScopedCommandCellRegistry {
                 }
             }
 
-            let deadline = (receipt.deadline - chrono::Utc::now())
-                .to_std()
-                .unwrap_or_default();
-            let shell = self.service.governor.shell_semaphore().acquire_owned();
-            let shell_permit = tokio::select! {
-                _ = self.service.shutdown.cancelled() => Err(CommandCellError::Shutdown),
-                result = tokio::time::timeout(deadline, shell) => result
-                    .map_err(|_| CommandCellError::CapacityDeadline)
-                    .and_then(|permit| permit.map_err(|_| CommandCellError::Shutdown)),
-            };
-            let shell_permit = match shell_permit {
-                Ok(permit) => permit,
-                Err(error) => {
-                    let _ = self.service.inner.abort_prepared(
-                        reservation,
-                        format!("process shell admission failed: {error}"),
-                    );
-                    self.spawn_observer(
-                        observation,
-                        store,
-                        scope,
-                        cell_id,
-                        name,
-                        owner.call_id,
-                        None,
-                        operation_reservation,
-                    )?;
-                    return Err(error);
-                }
-            };
+            // The process-wide shell ceiling is enforced by the framework cell
+            // runner through `resource_admission`, after this cell was accepted
+            // and queued; the receipt below therefore returns immediately. See
+            // `launch_chat` for the same contract.
             let start_result = self.service.inner.start_prepared(reservation).await;
             if let Err(error) = start_result {
                 self.spawn_observer(
@@ -2113,7 +2170,6 @@ impl CommandCellRegistry for ScopedCommandCellRegistry {
                     cell_id,
                     name,
                     owner.call_id,
-                    Some(shell_permit),
                     operation_reservation,
                 )?;
                 return Err(error);
@@ -2125,11 +2181,110 @@ impl CommandCellRegistry for ScopedCommandCellRegistry {
                 cell_id,
                 name,
                 owner.call_id,
-                Some(shell_permit),
                 operation_reservation,
             )?;
 
             Ok(receipt)
+        })
+    }
+}
+
+impl CommandCellRegistry for ScopedCommandCellRegistry {
+    fn launch(&self, request: CommandCellRequest) -> BoxFuture<'_, CellLaunchResult> {
+        Box::pin(async move {
+            let canonical = request
+                .owner
+                .execution_id
+                .as_ref()
+                .zip(request.owner.call_id.as_ref())
+                .filter(|(execution, call)| !execution.is_empty() && !call.is_empty())
+                .map(|_| {
+                    serde_json::json!([
+                        self.execution_scope.workspace_id(),
+                        request.owner.conversation_id,
+                        request.owner.run_id,
+                        request.owner.message_id,
+                        request.owner.turn_id,
+                        request.owner.execution_id,
+                        request.owner.call_id
+                    ])
+                    .to_string()
+                });
+            let fingerprint = format!(
+                "{:x}",
+                Sha256::digest(
+                    serde_json::json!([
+                        request.command,
+                        request.working_dir,
+                        request.timeout_secs,
+                        request.require_sandbox,
+                        request
+                            .executor
+                            .as_ref()
+                            .map(|executor| format!("{:p}", Arc::as_ptr(executor)))
+                    ])
+                    .to_string()
+                    .as_bytes()
+                )
+            );
+            let mut result = {
+                let mut observations =
+                    self.service.launch_observations.lock().map_err(|error| {
+                        CommandCellError::Runtime {
+                            message: error.to_string(),
+                        }
+                    })?;
+                if let Some(previous) = canonical.as_ref().and_then(|key| observations.get(key)) {
+                    if previous.fingerprint != fingerprint {
+                        return Err(CommandCellError::Validation { message: "canonical cell call identity was reused with different launch input".to_string() });
+                    }
+                    previous.result.clone()
+                } else {
+                    if self.service.shutdown.is_cancelled() {
+                        return Err(CommandCellError::Shutdown);
+                    }
+                    #[cfg(test)]
+                    self.service.wait_before_launch_registration_for_test()?;
+                    let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+                        CommandCellError::Runtime {
+                            message: error.to_string(),
+                        }
+                    })?;
+                    let (send, receive) = tokio::sync::watch::channel(None);
+                    if let Some(key) = canonical {
+                        observations.insert(
+                            key,
+                            CommandCellLaunchObservation {
+                                fingerprint,
+                                result: receive.clone(),
+                            },
+                        );
+                    }
+                    let registry = self.clone();
+                    // 调用方 Future 被撤回也不能丢弃 prepared/Started/observer 的交接。
+                    // admission token 决定交接前是否可执行；交接后保留原回执供重取。
+                    drop(self.service.observers.spawn_on(
+                        async move {
+                            let settled = registry.launch_once(request).await;
+                            let _ = send.send(Some(settled));
+                        },
+                        &runtime,
+                    ));
+                    receive
+                }
+            };
+            loop {
+                let observed = result.borrow().clone();
+                if let Some(settled) = observed {
+                    return settled;
+                }
+                result
+                    .changed()
+                    .await
+                    .map_err(|_| CommandCellError::Runtime {
+                        message: "original cell launch owner closed without a receipt".to_string(),
+                    })?;
+            }
         })
     }
 
@@ -2569,6 +2724,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         Ok(Arc::new(CommandCellRuntimeService {
             inner: Arc::new(BackgroundCommandManager::new(manager_config)?),
+            launch_observations: Mutex::new(HashMap::new()),
             run_cells: RwLock::new(HashMap::new()),
             chat_cells: RwLock::new(HashMap::new()),
             cell_deadlines: RwLock::new(HashMap::new()),
@@ -2591,6 +2747,8 @@ mod tests {
             command_cell_watch_started_barrier: Mutex::new(None),
             command_cell_watch_snapshot_barrier: Mutex::new(None),
             command_cell_watch_lease_barrier: Mutex::new(None),
+            launch_registration_barrier: Mutex::new(None),
+            shutdown_registration_probe: Mutex::new(None),
         }))
     }
 
@@ -4178,6 +4336,272 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn occupied_product_slot_returns_recoverable_receipts_for_chat_and_run()
+    -> Result<(), String> {
+        for run_owned in [false, true] {
+            let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+            let service = test_service(temp.path())?;
+            let store = Arc::new(
+                TaskRuntimeStore::open_for_workspace(temp.path().join("tasks"), "global")
+                    .map_err(|e| e.to_string())?,
+            );
+            if run_owned {
+                store
+                    .create_run(
+                        "receipt-run",
+                        "global",
+                        "conversation",
+                        "root",
+                        DomainProfile::AiCoding,
+                        "receipt",
+                        "task",
+                        AttendedMode::Attended,
+                    )
+                    .map_err(|e| e.to_string())?;
+                store
+                    .transition_run("receipt-run", TaskRunStatus::Running)
+                    .map_err(|e| e.to_string())?;
+            }
+            let registry = service.scoped(
+                crate::workspace::WorkspaceExecutionScope::global(temp.path()),
+                Some(store.clone()),
+            );
+            let held = service
+                .governor
+                .shell_semaphore()
+                .acquire_owned()
+                .await
+                .map_err(|e| e.to_string())?;
+            let cancel = Arc::new(CancellationToken::new());
+            let request = CommandCellRequest {
+                command: "exit 101".to_string(),
+                admission: echo_agent::tools::cell::CommandCellAdmission {
+                    cancel: Some(cancel.clone()),
+                    deadline: None,
+                },
+                owner: CommandCellOwner {
+                    conversation_id: Some("conversation".to_string()),
+                    message_id: Some("root".to_string()),
+                    turn_id: Some("turn".to_string()),
+                    execution_id: Some("execution".to_string()),
+                    call_id: Some("call".to_string()),
+                    run_id: run_owned.then(|| "receipt-run".to_string()),
+                },
+                ..Default::default()
+            };
+            let receipt =
+                tokio::time::timeout(Duration::from_secs(2), registry.launch(request.clone()))
+                    .await
+                    .map_err(|_| "receipt waited for product slot".to_string())?
+                    .map_err(|e| e.to_string())?;
+            let queued = registry
+                .wait(&receipt.cell_id, 0, 0)
+                .await
+                .map_err(|e| e.to_string())?;
+            assert_eq!(
+                queued.snapshot.phase,
+                echo_agent::tools::cell::CommandCellPhase::Queued
+            );
+            cancel.cancel(); // 已交接后的前台调用撤回不影响 cell 的 lifetime。
+            let recovered = registry
+                .launch(request.clone())
+                .await
+                .map_err(|e| e.to_string())?;
+            assert_eq!(receipt, recovered);
+            let mut wrong = request.clone();
+            wrong.command = "printf wrong".to_string();
+            assert!(matches!(
+                registry.launch(wrong).await,
+                Err(CommandCellError::Validation { .. })
+            ));
+            let mut intentional = request;
+            intentional.owner.call_id = Some("new-call".to_string());
+            intentional.admission = Default::default();
+            let second = registry
+                .launch(intentional)
+                .await
+                .map_err(|e| e.to_string())?;
+            assert_ne!(second.cell_id, receipt.cell_id);
+            drop(held);
+            for id in [&receipt.cell_id, &second.cell_id] {
+                let terminal = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let value = registry.wait(id, 0, 500).await.map_err(|e| e.to_string())?;
+                        if value.snapshot.phase.is_terminal() {
+                            return Ok::<_, String>(value);
+                        }
+                    }
+                })
+                .await
+                .map_err(|e| e.to_string())??;
+                assert_eq!(terminal.snapshot.exit_code, Some(101));
+            }
+            service.shutdown().await?;
+            assert_eq!(service.governor.shell_semaphore().available_permits(), 1);
+            store.shutdown_operations().await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn started_io_withdrawal_and_lost_observer_keep_the_original_launch_owner()
+    -> Result<(), String> {
+        for withdraw in [true, false] {
+            let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+            let service = test_service(temp.path())?;
+            let store = Arc::new(
+                TaskRuntimeStore::open_for_workspace(temp.path().join("tasks"), "global")
+                    .map_err(|e| e.to_string())?,
+            );
+            let registry = service.scoped(
+                crate::workspace::WorkspaceExecutionScope::global(temp.path()),
+                Some(store.clone()),
+            );
+            let (entered_send, entered) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            service.product_data_flow.service().install_test_barrier(
+                "persist ordinary-chat command cell",
+                entered_send,
+                released,
+            );
+            let cancel = Arc::new(CancellationToken::new());
+            let request = CommandCellRequest {
+                command: "printf once >> effect".to_string(),
+                working_dir: Some(temp.path().display().to_string()),
+                admission: echo_agent::tools::cell::CommandCellAdmission {
+                    cancel: Some(cancel.clone()),
+                    deadline: None,
+                },
+                owner: CommandCellOwner {
+                    conversation_id: Some("conversation".to_string()),
+                    message_id: Some("root".to_string()),
+                    execution_id: Some("execution".to_string()),
+                    call_id: Some("call".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let observer = tokio::spawn({
+                let registry = registry.clone();
+                let request = request.clone();
+                async move { registry.launch(request).await }
+            });
+            tokio::time::timeout(Duration::from_secs(2), entered)
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            assert!(!temp.path().join("effect").exists());
+            if withdraw {
+                cancel.cancel();
+            }
+            observer.abort();
+            assert!(observer.await.is_err_and(|error| error.is_cancelled()));
+            release
+                .send(())
+                .map_err(|_| "Started I/O owner was lost".to_string())?;
+            let result =
+                tokio::time::timeout(Duration::from_secs(3), registry.launch(request.clone()))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            if withdraw {
+                assert_eq!(result.err(), Some(CommandCellError::Cancelled));
+                assert!(!temp.path().join("effect").exists());
+            } else {
+                let receipt = result.map_err(|e| e.to_string())?;
+                let terminal =
+                    wait_for_chat_cell_terminal(&service, "conversation", "root", &receipt.cell_id)
+                        .await?;
+                assert_eq!(terminal.exit_code, Some(0));
+                assert_eq!(
+                    std::fs::read_to_string(temp.path().join("effect"))
+                        .map_err(|e| e.to_string())?,
+                    "once"
+                );
+                assert_eq!(
+                    registry.launch(request).await.map_err(|e| e.to_string())?,
+                    receipt
+                );
+            }
+            service.shutdown().await?;
+            store.shutdown_operations().await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordinary_chat_terminal_debt_keeps_original_cell_and_shell_resource()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let service = test_service(temp.path())?;
+        let store = Arc::new(
+            TaskRuntimeStore::open_for_workspace(temp.path().join("tasks"), "global")
+                .map_err(|e| e.to_string())?,
+        );
+        let registry = service.scoped(
+            crate::workspace::WorkspaceExecutionScope::global(temp.path()),
+            Some(store.clone()),
+        );
+        let held = service
+            .governor
+            .shell_semaphore()
+            .acquire_owned()
+            .await
+            .map_err(|e| e.to_string())?;
+        let receipt = registry
+            .launch(CommandCellRequest {
+                command: "printf chat-debt".to_string(),
+                owner: CommandCellOwner {
+                    conversation_id: Some("conversation".to_string()),
+                    message_id: Some("root".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        // Started 已持久化；关闭原产品 I/O flow，迫使后续 Finished 真实失败。
+        service.product_data_flow.settle(None);
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let retained = service
+                    .projection_degraded
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&receipt.cell_id)
+                    .is_some_and(|debt| {
+                        debt._observation
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .is_some()
+                    });
+                if retained {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        assert_eq!(service.governor.shell_semaphore().available_permits(), 0);
+        let terminal = registry
+            .wait(&receipt.cell_id, 0, 0)
+            .await
+            .map_err(|e| e.to_string())?;
+        assert!(terminal.snapshot.phase.is_terminal());
+        assert_eq!(terminal.snapshot.exit_code, Some(0));
+        assert!(terminal.new_output.contains("chat-debt"));
+        let error = service
+            .shutdown()
+            .await
+            .err()
+            .ok_or_else(|| "shutdown lost terminal debt".to_string())?;
+        assert!(error.contains("command-cell projection debt"));
+        assert!(store.shutdown_operations().await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn ordinary_chat_cell_uses_exact_conversation_and_root_message_journal()
     -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
@@ -4291,6 +4715,105 @@ mod tests {
             ));
             assert!(!side_effect.exists());
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_launch_admission_before_producer_registration() -> Result<(), String>
+    {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = test_service(temp.path())?;
+        let store = Arc::new(
+            TaskRuntimeStore::open_for_workspace(temp.path().join("tasks"), "global")
+                .map_err(|error| error.to_string())?,
+        );
+        let registry = service.scoped(
+            crate::workspace::WorkspaceExecutionScope::global(temp.path()),
+            Some(store.clone()),
+        );
+        let held = service
+            .governor
+            .shell_semaphore()
+            .acquire_owned()
+            .await
+            .map_err(|error| error.to_string())?;
+        let (entered_send, entered) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        *service
+            .launch_registration_barrier
+            .lock()
+            .map_err(|error| error.to_string())? = Some(CommandCellLaunchRegistrationTestBarrier {
+            entered: entered_send,
+            release: released,
+        });
+        let (closing_send, closing) = std::sync::mpsc::channel();
+        *service
+            .shutdown_registration_probe
+            .lock()
+            .map_err(|error| error.to_string())? = Some(closing_send);
+
+        // 阻塞型测试屏障放在 Tokio blocking pool；实际 launch/shutdown 仍走原服务，
+        // 不占用 async 执行线程，也不靠休眠猜测是否已越过关闭检查。
+        let runtime = tokio::runtime::Handle::current();
+        let launch = tokio::task::spawn_blocking(move || {
+            runtime.block_on(registry.launch(CommandCellRequest {
+                command: "printf must-not-start".to_string(),
+                owner: CommandCellOwner {
+                    conversation_id: Some("conversation".to_string()),
+                    message_id: Some("root".to_string()),
+                    execution_id: Some("registration-execution".to_string()),
+                    call_id: Some("registration-call".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+        });
+        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(2)))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| format!("launch never crossed its admission check: {error}"))?;
+        assert!(service.observers.is_empty());
+        let runtime = tokio::runtime::Handle::current();
+        let closing_service = service.clone();
+        let mut shutdown =
+            tokio::task::spawn_blocking(move || runtime.block_on(closing_service.shutdown()));
+        tokio::task::spawn_blocking(move || closing.recv_timeout(Duration::from_secs(2)))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| format!("shutdown never entered admission closure: {error}"))?;
+        let early_shutdown = tokio::time::timeout(Duration::from_millis(100), &mut shutdown).await;
+        let returned_before_registration = early_shutdown.is_ok();
+        release
+            .send(())
+            .map_err(|error| format!("launch registration owner was lost: {error}"))?;
+        let shutdown_result = match early_shutdown {
+            Ok(result) => result,
+            Err(_) => shutdown.await,
+        };
+        shutdown_result.map_err(|error| error.to_string())??;
+        let launched = launch.await.map_err(|error| error.to_string())?;
+        match launched {
+            Ok(receipt) => {
+                let terminal = service
+                    .inner
+                    .wait(&receipt.cell_id, 0, 0)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                assert!(terminal.snapshot.phase.is_terminal());
+                assert_eq!(terminal.snapshot.exit_code, None);
+            }
+            Err(CommandCellError::Shutdown | CommandCellError::Cancelled) => {}
+            Err(error) => return Err(format!("launch returned an unexpected failure: {error}")),
+        }
+        // 负控也先清理晚登记的原 producer，再对先前记录的关机结果作断言。
+        service.observers.wait().await;
+        assert!(service.observers.is_empty());
+        drop(held);
+        store.shutdown_operations().await?;
+        assert!(
+            !returned_before_registration,
+            "shutdown returned while an admitted launch had not registered its original producer"
+        );
         Ok(())
     }
 
@@ -4772,6 +5295,14 @@ mod tests {
                 .all(|cells| !cells.contains(&cell_id))
         );
         assert_eq!(store.active_operation_count(), 0);
+        assert_eq!(service.governor.shell_semaphore().available_permits(), 0);
+        let terminal = registry
+            .wait(&cell_id, 0, 0)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(terminal.snapshot.phase.is_terminal());
+        assert_eq!(terminal.snapshot.exit_code, Some(0));
+        assert!(service.shutdown().await.is_err());
         Ok(())
     }
 }

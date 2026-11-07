@@ -42,6 +42,9 @@ use echo_agent::runtime::{
     AgentTurnDriver, EventSink, SinkControl, TurnMode, TurnOutcome, TurnReceipt, TurnRequest,
 };
 use echo_agent::subagent::{ContextTransferPolicy, SubagentInvocation};
+use echo_agent::tools::cell::{
+    CommandCellError, CommandCellResourceAdmission, CommandCellResourceLease,
+};
 use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard, Semaphore};
 
 /// Process-wide EKO resource ceiling shared by every workspace and TaskRun.
@@ -79,8 +82,21 @@ pub(crate) fn process_execution_governor() -> Arc<ProcessExecutionGovernor> {
 }
 
 impl ProcessExecutionGovernor {
+    #[cfg(test)]
     pub(crate) fn shell_semaphore(&self) -> Arc<Semaphore> {
         self.shell.clone()
+    }
+
+    /// Product resource policy for background command cells.
+    ///
+    /// The framework's cell runner awaits this in the Queued phase, after the
+    /// launch call has already returned its receipt. That keeps the process-wide
+    /// `shell = 1` ceiling without making an admitted cell's receipt wait for a
+    /// slot that a long-running command may hold for an hour.
+    pub(crate) fn shell_admission(&self) -> Arc<dyn CommandCellResourceAdmission> {
+        Arc::new(ProcessShellResourceAdmission {
+            shell: self.shell.clone(),
+        })
     }
 
     fn snapshot(&self) -> ProcessExecutionResourceSnapshot {
@@ -110,6 +126,41 @@ use super::store::{
     TaskRuntimeStore,
 };
 use super::types::*;
+
+/// Product resource admission for one background command cell.
+///
+/// Eclip caps concurrent shells at one process-wide slot. The framework cell
+/// runner awaits this after the cell is accepted, so the launch receipt never
+/// waits for an unrelated long-running command, while the slot is still held
+/// until the admitted process drains.
+struct ProcessShellResourceAdmission {
+    shell: Arc<Semaphore>,
+}
+
+impl CommandCellResourceAdmission for ProcessShellResourceAdmission {
+    fn admit<'a>(
+        &'a self,
+        _cell_id: &'a str,
+        cancel: &'a CancellationToken,
+        deadline: std::time::Instant,
+    ) -> futures::future::BoxFuture<'a, Result<CommandCellResourceLease, CommandCellError>> {
+        Box::pin(async move {
+            let acquire = self.shell.clone().acquire_owned();
+            tokio::pin!(acquire);
+            let permit = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(CommandCellError::Cancelled),
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                    return Err(CommandCellError::CapacityDeadline);
+                }
+                result = &mut acquire => result.map_err(|_| CommandCellError::Shutdown)?,
+            };
+            // The lease owns the permit: dropping it is the single release of
+            // the process-wide shell slot, after the cell's terminal drain.
+            Ok(CommandCellResourceLease::new(move || drop(permit)))
+        })
+    }
+}
 
 /// EKO product-resource limits. Only the Subagent cap is passed to the
 /// framework DAG kernel; write, shell, and LLM limits stay in the application.

@@ -185,3 +185,9 @@ Trace 写入失败当前不会回滚 TaskRuntime 已提交事件，因此 Trace 
 - 普通 Chat Journal：`echo-agent-app-core/src/chat_event_log/journal.rs`
 - Observability projection：`echo-agent-app-core/src/observability/`
 - Workspace 文件布局：`echo-agent-app-core/src/workspace/layout.rs`
+
+## 后台回执与保存失败
+
+普通 Chat/TaskRun 的后台 shell 在原 cell 接纳后返回回执，产品全进程 shell=1 由原 Queued runner 获取。原 TaskTracker 保有启动到 terminal observer 的交接；完整调用身份可以重取原回执，新 call_id 才表示新的业务执行。Started/Finished 事实与 blocked/unknown 继续由原持久化路径维护，保存失败不触发命令重放。许可直到原观察 owner 结算后释放。详见 [ADR 0064](../adr/0064-background-cell-receipt-ownership.md)。
+
+启动登记与关机封口共用回执观察的原临界区；关机必须先等已通过关闭检查的调用登记 producer，再关闭原 TaskTracker 并等待结算。该临界区在 close 后立即释放，异步结算不持锁。
