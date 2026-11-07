@@ -23,6 +23,10 @@ export default defineConfig(({ mode }) => {
             terminal: ['@xterm/xterm', '@xterm/addon-fit'],
             icons: ['lucide-react'],
             state: ['zustand'],
+            // 图表按需载入；解释运行时和编译器各自成块，保留既有包体阈值。
+            'chart-runtime': ['vega', 'vega-interpreter'],
+            'chart-compiler': ['vega-lite'],
+            'chart-embed': ['vega-embed'],
           },
         },
       },

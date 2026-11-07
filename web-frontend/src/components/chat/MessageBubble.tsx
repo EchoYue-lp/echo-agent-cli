@@ -7,6 +7,7 @@ import { NativeMessageTimeline, nativeAssistantBlockText } from './NativeMessage
 import { ParallelExecutionBlock, visibleSubagentRuns } from './ParallelExecutionBlock';
 import { ToolExecutionGroup } from './ToolExecutionGroup';
 import { ExecutionProcessGroup } from './ExecutionProcessGroup';
+import { ChartCard } from './ChartCard';
 import { useSubagentRunStore } from '../../stores/subagentRunStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { useChatStore } from '../../stores/chatStore';
@@ -257,6 +258,7 @@ export const MessageBubble = memo(function MessageBubble({
     !showFailureReason &&
     images.length === 0 &&
     files.length === 0 &&
+    !message.chartSpecs?.length &&
     !hasExecutionProcess &&
     !message.internalAgent
   ) {
@@ -502,6 +504,9 @@ export const MessageBubble = memo(function MessageBubble({
                 )}
               </div>
             )}
+            {message.chartSpecs?.map((spec, index) => (
+              <ChartCard key={`${message.id}:chart:${index}`} spec={spec} />
+            ))}
           </div>
         )}
       </div>
