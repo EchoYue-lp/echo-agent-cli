@@ -881,12 +881,14 @@ impl ApplicationLifecycleOwner {
         #[cfg(feature = "channels")]
         let channels_uncertain = if let Some(channels) = self.channel_runtime.as_ref() {
             match channels.observe_shutdown().await {
-                Ok(failures) => {
+                Ok(Some(failures)) => {
                     for error in failures {
                         receipt.record_retained("IM channel completed failure", error);
                     }
                     false
                 }
+                // 原producer还在关闭；continuation保有原资源，这个观察不是失败事实。
+                Ok(None) => true,
                 Err(error) => {
                     receipt.record_retained("IM channel original owners", error);
                     true
@@ -1005,10 +1007,8 @@ impl ApplicationLifecycleOwner {
             }
         }
         if uncertain {
-            receipt.record_retained(
-                "application lifecycle",
-                "original execution ownership is not physically settled; resources retained",
-            );
+            // 保留原Owner/continuation即表达未完成；不能把‘仍在途’写成永久failure。
+            // 上方已保留真实错误，后续原物理final不会清删那些历史失败。
             // Keep the original Owner, AppState and dependency resources; the
             // publication is observation only, never a final drained receipt.
             return (true, receipt);
@@ -3666,6 +3666,57 @@ mod tests {
 
     #[cfg(feature = "channels")]
     #[tokio::test]
+    async fn channel_pending_observation_is_not_a_final_cleanup_failure() -> anyhow::Result<()> {
+        use crate::channel_runtime::test_support;
+        use std::sync::atomic::Ordering;
+        let (plugin, mut probe) = test_support::channel(true, false, false);
+        let channels = crate::channel_runtime::ChannelRuntime::with_original_test_plugin(
+            std::sync::Weak::new(),
+            plugin,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let mut owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        owner.bind_channel_runtime(channels);
+        let initial = owner.begin_shutdown(ApplicationLifecycleReason::Shutdown, None);
+        let settlement = owner.start_join(initial);
+        let first =
+            tokio::time::timeout(std::time::Duration::from_secs(2), settlement.wait()).await;
+        let entered =
+            tokio::time::timeout(std::time::Duration::from_secs(2), probe.started.notified()).await;
+        // 包括观察失败时也先释放真实producer；不通过额外kick或预join掩盖首次Pending。
+        probe
+            .release
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("original stop release missing"))?
+            .send(())
+            .map_err(|_| anyhow::anyhow!("original stop owner vanished"))?;
+        entered?;
+        let first = first?;
+        let was_pending =
+            first.continuation.is_some() && !first.physically_final && !first.is_clean();
+        let initial_failures = first.failures.clone();
+        // wait_final只订阅原进度，原stop postcommit负责唤醒同一个Root。
+        let final_receipt =
+            tokio::time::timeout(std::time::Duration::from_secs(2), first.wait_final()).await?;
+        assert!(
+            was_pending,
+            "pending cleanup escaped original resource retention"
+        );
+        assert!(
+            initial_failures.is_empty(),
+            "in-flight cleanup was recorded as a failure: {initial_failures:?}"
+        );
+        assert!(final_receipt.physically_final && final_receipt.continuation.is_none());
+        assert!(
+            final_receipt.is_clean(),
+            "normal original stop became a permanent failure: {final_receipt}"
+        );
+        assert_eq!(probe.stops.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
     async fn channel_postcommit_finalizes_original_root_without_an_external_wait_kick()
     -> anyhow::Result<()> {
         use crate::channel_runtime::test_support;
@@ -3840,6 +3891,19 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         })
         .await??;
+        let final_receipt = publications
+            .borrow()
+            .as_ref()
+            .map(|publication| publication.receipt.clone())
+            .ok_or_else(|| anyhow::anyhow!("original final publication missing"))?;
+        assert!(final_receipt.physically_final && !final_receipt.is_clean());
+        assert!(
+            final_receipt
+                .failures
+                .iter()
+                .any(|failure| failure.error.contains("mock_stop_error")),
+            "legal cleanup retry erased the original failed stop fact"
+        );
         assert_eq!(probe.stops.load(Ordering::SeqCst), 2);
         Ok(())
     }

@@ -212,6 +212,15 @@ impl<Identity> ChannelInputPumpSlot<Identity>
 where
     Identity: Clone + Eq + Hash,
 {
+    // 测试只观察原slot状态；不选举、不增加epoch，关闭后仍可核验已发生的唤醒。
+    #[cfg(test)]
+    pub(super) fn observed_wake_epoch_for_test(&self) -> Result<u64, ChannelInputPumpError> {
+        self.state
+            .lock()
+            .map(|state| state.wake_epoch)
+            .map_err(|_| ChannelInputPumpError::StateUnavailable)
+    }
+
     /// Keep the existing owner from treating a committed input as route-less
     /// between durable submit and publication into this same reply map.
     pub(super) fn begin_reply_admission(

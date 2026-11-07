@@ -788,6 +788,22 @@ impl ConversationInputService {
         self.log.cancel_conversation_input(identity).await
     }
 
+    /// 用户明确放弃一条待恢复（RecoveryRequired）的原渠道输入。
+    ///
+    /// 只追加原日志的 Cancelled 事实并保留原 attempt、reason、drained 与
+    /// 副作用/发送结论；当前 phase 与队列 revision 在原 authority 锁内复核，
+    /// 调用方观察到的版本不构成第二权威。
+    #[cfg(any(test, feature = "channels"))]
+    pub async fn cancel_pending_recovery(
+        &self,
+        identity: ConversationInputIdentity,
+        expected_queue_revision: u64,
+    ) -> Result<ConversationInputReceipt, ConversationInputError> {
+        self.log
+            .cancel_recovery_conversation_input(identity, expected_queue_revision)
+            .await
+    }
+
     pub async fn reorder(
         &self,
         address: &ConversationInputAddress,
@@ -1208,6 +1224,309 @@ mod tests {
                 )
             })
             .count())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn abandon_recovery_requires_exact_revision_and_blocks_late_uncertainty()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let log = Arc::new(ChatEventLog::open(
+            directory.path(),
+            ChatEventRetention::default(),
+        )?);
+        let service = ConversationInputService::new(Arc::clone(&log));
+        let blocked = service
+            .submit(
+                address(),
+                "channel-blocked".into(),
+                "旧的待恢复消息".into(),
+                Vec::new(),
+            )
+            .await?;
+        let started = service
+            .dispatch_selected(
+                blocked.identity.clone(),
+                blocked.queue_revision,
+                "turn-blocked".into(),
+            )
+            .await?;
+        service
+            .recovery_required(exact_attempt(&started)?, "原驱动中断，副作用未知".into())
+            .await?;
+        let blocked_frontier = service.list(&address()).await?;
+        assert_eq!(blocked_frontier.items.len(), 1);
+        assert_eq!(
+            blocked_frontier.items[0].receipt.phase,
+            ConversationInputPhase::RecoveryRequired
+        );
+        // 同地址后续消息仍被原 RecoveryRequired 阻塞。
+        let queued = service
+            .submit(
+                address(),
+                "channel-next".into(),
+                "下一条消息".into(),
+                Vec::new(),
+            )
+            .await?;
+        assert!(
+            service
+                .dispatch_next(&address(), "turn-next".into())
+                .await?
+                .is_none()
+        );
+        let latest = service.list(&address()).await?;
+        // 陈旧队列版本不能放弃。
+        let stale = service
+            .cancel_pending_recovery(blocked.identity.clone(), blocked.queue_revision)
+            .await;
+        assert!(matches!(
+            stale,
+            Err(ConversationInputError::StaleRevision { .. })
+        ));
+        // 只有 RecoveryRequired 项可用此用户动作；普通排队项仍走原取消入口。
+        let live = latest
+            .items
+            .iter()
+            .find(|item| item.receipt.identity == queued.identity)
+            .cloned()
+            .ok_or("next input is missing")?;
+        let wrong = service
+            .cancel_pending_recovery(live.receipt.identity, latest.queue_revision)
+            .await;
+        assert!(matches!(
+            wrong,
+            Err(ConversationInputError::NotDispatchable { .. })
+        ));
+        let receipt = service
+            .cancel_pending_recovery(blocked.identity.clone(), latest.queue_revision)
+            .await?;
+        assert_eq!(receipt.phase, ConversationInputPhase::Cancelled);
+        assert_eq!(receipt.attempt, Some(1));
+        assert_eq!(receipt.reason.as_deref(), Some("原驱动中断，副作用未知"));
+        assert!(!receipt.drained);
+        // 重复成功是幂等观察，不产生第二个终态。
+        let duplicate_frontier = service.list(&address()).await?;
+        let duplicate = service
+            .cancel_pending_recovery(blocked.identity.clone(), duplicate_frontier.queue_revision)
+            .await?;
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.phase, ConversationInputPhase::Cancelled);
+        // 解除阻塞后同一队列的下一项只产生一次 claim。
+        assert!(
+            service
+                .dispatch_next(&address(), "turn-next".into())
+                .await?
+                .is_some()
+        );
+        assert!(
+            service
+                .dispatch_next(&address(), "turn-next".into())
+                .await?
+                .is_none()
+        );
+        // 旧 owner 的迟到 RecoveryUncertain 不能复活已放弃项。
+        log.mark_channel_input_uncertain_checked(
+            blocked.identity.clone(),
+            None,
+            "迟到的不确定结果".into(),
+        )
+        .await?;
+        let settled = service.list(&address()).await?;
+        for item in &settled.items {
+            if item.receipt.identity == blocked.identity {
+                assert_ne!(
+                    item.receipt.phase,
+                    ConversationInputPhase::RecoveryRequired,
+                    "late uncertainty resurrected a cancelled input"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn recovery_abandon_and_live_claim_linearize_across_two_journal_handles()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let log_a = Arc::new(ChatEventLog::open(
+            directory.path(),
+            ChatEventRetention::default(),
+        )?);
+        let log_b = Arc::new(ChatEventLog::open(
+            directory.path(),
+            ChatEventRetention::default(),
+        )?);
+        let service_a = ConversationInputService::new(log_a.clone());
+        let service_b = ConversationInputService::new(log_b.clone());
+        let blocked = service_a
+            .submit(
+                address(),
+                "racing-blocked".into(),
+                "原失败输入".into(),
+                Vec::new(),
+            )
+            .await?;
+        let original = service_a
+            .dispatch_next(&address(), "original-racing-turn".into())
+            .await?
+            .ok_or("original attempt missing")?;
+        let attempt = exact_attempt(&original)?;
+        service_a.mailbox_accepted(attempt.clone()).await?;
+        let failed = service_a
+            .turn_settled(attempt, ConversationInputOutcome::Failed, false)
+            .await?;
+        log_a
+            .mark_channel_input_uncertain_checked(
+                blocked.identity.clone(),
+                Some(failed.queue_revision),
+                "原效果UNKNOWN".into(),
+            )
+            .await?;
+        let queued = service_a
+            .submit(
+                address(),
+                "racing-next".into(),
+                "后续输入".into(),
+                Vec::new(),
+            )
+            .await?;
+        let frontier = service_a.list(&address()).await?;
+        let original_events = log_a.replay(
+            &address().workspace_id,
+            Some(&address().conversation_id),
+            &blocked.identity.input_id,
+            0,
+        )?;
+        let start = tokio::sync::Barrier::new(3);
+        // 测试屏障只负责同时起跑；三条操作仍通过原spawn_blocking和同一日志authority串行化。
+        let abandon = async {
+            start.wait().await;
+            service_a
+                .cancel_pending_recovery(blocked.identity.clone(), frontier.queue_revision)
+                .await
+        };
+        let recovery = async {
+            start.wait().await;
+            log_b
+                .mark_channel_input_uncertain_checked(
+                    blocked.identity.clone(),
+                    Some(frontier.queue_revision),
+                    "并发原效果UNKNOWN".into(),
+                )
+                .await
+        };
+        let claim = async {
+            start.wait().await;
+            service_b
+                .dispatch_next(&address(), "racing-next-turn".into())
+                .await
+        };
+        let (abandon, recovery, claim) = tokio::join!(abandon, recovery, claim);
+        recovery?;
+        let claim = claim?;
+        let cancelled = match abandon {
+            Ok(receipt) => receipt,
+            Err(ConversationInputError::StaleRevision { .. }) => {
+                // 原恢复先提交时必须保留新版本，用户只可用新观察重试明确放弃。
+                let latest = service_a.list(&address()).await?;
+                assert!(
+                    latest
+                        .items
+                        .iter()
+                        .any(|input| input.receipt.identity == blocked.identity
+                            && input.receipt.phase == ConversationInputPhase::RecoveryRequired)
+                );
+                assert!(claim.is_none());
+                service_a
+                    .cancel_pending_recovery(blocked.identity.clone(), latest.queue_revision)
+                    .await?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        assert_eq!(cancelled.phase, ConversationInputPhase::Cancelled);
+        assert_eq!(cancelled.attempt, Some(1));
+        assert!(!cancelled.drained);
+        let claimed_next = match claim {
+            Some(input) => input,
+            None => service_b
+                .dispatch_next(&address(), "racing-next-turn".into())
+                .await?
+                .ok_or("next input did not become dispatchable")?,
+        };
+        assert_eq!(claimed_next.receipt.identity, queued.identity);
+        assert_eq!(claimed_next.receipt.attempt, Some(1));
+        assert!(
+            service_a
+                .dispatch_next(&address(), "duplicate-racing-turn".into())
+                .await?
+                .is_none()
+        );
+        // 保留确定顺序的None版本负控；不能靠本次竞态恰好先读旧snapshot掩盖复活缺陷。
+        log_b
+            .mark_channel_input_uncertain_checked(
+                blocked.identity.clone(),
+                None,
+                "取消后的迟到UNKNOWN".into(),
+            )
+            .await?;
+        let current = service_a.list(&address()).await?;
+        let duplicate = service_a
+            .cancel_pending_recovery(blocked.identity.clone(), current.queue_revision)
+            .await?;
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.phase, ConversationInputPhase::Cancelled);
+        let old_events = log_b.replay(
+            &address().workspace_id,
+            Some(&address().conversation_id),
+            &blocked.identity.input_id,
+            0,
+        )?;
+        for (before, after) in original_events.events.iter().zip(&old_events.events) {
+            assert_eq!(serde_json::to_value(before)?, serde_json::to_value(after)?);
+        }
+        assert!(old_events.events.len() > original_events.events.len());
+        let (cancelled_facts, old_claims, drained_facts) = old_events.events.iter().fold(
+            (0_usize, 0_usize, 0_usize),
+            |(cancelled, claimed, drained), event| match &event.payload {
+                crate::chat_driver::ChatDriverEvent::InputLifecycle(fact)
+                    if fact.identity() == &blocked.identity =>
+                {
+                    match fact.as_ref() {
+                        ConversationInputFact::Cancelled { .. } => {
+                            (cancelled.saturating_add(1), claimed, drained)
+                        }
+                        ConversationInputFact::AttemptStarted { .. } => {
+                            (cancelled, claimed.saturating_add(1), drained)
+                        }
+                        ConversationInputFact::Drained { .. } => {
+                            (cancelled, claimed, drained.saturating_add(1))
+                        }
+                        _ => (cancelled, claimed, drained),
+                    }
+                }
+                _ => (cancelled, claimed, drained),
+            },
+        );
+        assert_eq!((cancelled_facts, old_claims, drained_facts), (1, 1, 0));
+        let next_events = log_b.replay(
+            &address().workspace_id,
+            Some(&address().conversation_id),
+            &queued.identity.input_id,
+            0,
+        )?;
+        let claims = next_events
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(&event.payload,
+            crate::chat_driver::ChatDriverEvent::InputLifecycle(fact)
+            if fact.identity() == &queued.identity && matches!(fact.as_ref(), ConversationInputFact::AttemptStarted {..}))
+            })
+            .count();
+        assert_eq!(claims, 1);
+        Ok(())
     }
 
     #[tokio::test]

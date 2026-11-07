@@ -591,6 +591,10 @@ pub(crate) struct ChannelSessionCoordinator {
         >,
     >,
     input_pump_tasks: std::sync::Mutex<ChannelInputPumpTasks>,
+    // Wake handles retained from the original durable handler. They are only
+    // a capability to re-enter the handler's own slot; they own no queue,
+    // phase or settlement.
+    session_wakes: std::sync::Mutex<HashMap<ChannelSurfaceIdentity, Arc<ChannelSessionWake>>>,
     recovery_claims: Arc<std::sync::Mutex<ChannelRecoveryClaims>>,
     lifecycle_retention:
         std::sync::Mutex<std::sync::Weak<crate::runtime::ApplicationLifecycleRetention>>,
@@ -687,6 +691,47 @@ impl ChannelSessionCoordinator {
         )
     }
 
+    fn retain_session_wake(
+        &self,
+        surface_id: ChannelSurfaceIdentity,
+        wake: Arc<ChannelSessionWake>,
+    ) {
+        self.session_wakes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(surface_id, wake);
+    }
+
+    fn drop_session_wake(&self, surface_id: &ChannelSurfaceIdentity) {
+        self.session_wakes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(surface_id);
+    }
+
+    /// Find the original handler retained for the exact product conversation.
+    /// The conversation id is the same hash used by the journal address, so a
+    /// current GUI project or a different account cannot select another owner.
+    fn find_session_wake(
+        &self,
+        channel_id: &str,
+        conversation_id: &str,
+    ) -> Option<(ChannelSurfaceIdentity, Arc<ChannelSessionWake>)> {
+        let wakes = self
+            .session_wakes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        wakes.iter().find_map(|(surface, wake)| {
+            (surface.channel_id == channel_id
+                && AppChannelMessageHandler::conversation_id(
+                    &surface.channel_id,
+                    &surface.chat_id,
+                    &surface.sender_id,
+                ) == conversation_id)
+                .then(|| (surface.clone(), Arc::clone(wake)))
+        })
+    }
+
     pub(crate) fn record_session_end(&self, info: echo_agent::channels::SessionEndInfo) {
         let surface_id = ChannelSurfaceIdentity {
             channel_id: info.channel_id,
@@ -706,14 +751,16 @@ impl ChannelSessionCoordinator {
             record.pending_ended_incarnation_id = Some(info.incarnation_id);
         }
         drop(lifecycle);
-        if ended_current
-            && let Some(slot) = self
+        if ended_current {
+            self.drop_session_wake(&surface_id);
+            if let Some(slot) = self
                 .input_pumps
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&surface_id)
-        {
-            let _ = slot.begin_shutdown();
+            {
+                let _ = slot.begin_shutdown();
+            }
         }
     }
 
@@ -1185,6 +1232,10 @@ impl ChannelSessionCoordinator {
         self.input_pumps
             .lock()
             .map_err(|_| "Original pump registry unavailable".to_string())?
+            .clear();
+        self.session_wakes
+            .lock()
+            .map_err(|_| "Original session wake registry unavailable".to_string())?
             .clear();
         *tasks = ChannelInputPumpTasks::default();
         Ok(())
@@ -1996,6 +2047,151 @@ struct ChannelInputPumpAdapter {
     cache_id: String,
     hitl: Arc<ChannelHumanLoopProvider>,
     human_loop_provider: Arc<dyn echo_agent::human_loop::HumanLoopProvider>,
+}
+
+/// Everything the original handler needs to re-enter its own pump slot.
+/// Cloning these handles does not create an owner, queue or settlement path.
+#[cfg(feature = "channels")]
+#[derive(Clone)]
+struct ChannelPumpWiring {
+    retirement: Option<Arc<ChannelRuntimeRetirementContext>>,
+    weixin_identity: Option<(String, String)>,
+    session_instance: Option<echo_agent::channels::ChannelSessionInstance>,
+    reply_slot: Option<
+        Arc<input_pump::ChannelInputPumpSlot<crate::conversation_input::ConversationInputIdentity>>,
+    >,
+    service_cancel: tokio_util::sync::CancellationToken,
+    weixin_delivery: Option<echo_agent::channels::weixin::WeixinDeliveryHandle>,
+    bound_control_runtime: Option<crate::state::ScopedChatRuntime>,
+    active_turns: ChannelActiveTurnMap,
+    surface_id: ChannelSurfaceIdentity,
+    // Weak: the coordinator retains this wake, so a strong handle would make
+    // the registry's own type recursive.
+    coordinator: std::sync::Weak<ChannelSessionCoordinator>,
+    // Weak for the same reason: AppState reaches this registry through the
+    // channel runtime, so a strong handle would recurse its Sync evaluation.
+    app_state: std::sync::Weak<crate::state::AppState>,
+    foreground_turns: ForegroundTurnControl,
+    hitl: Arc<ChannelHumanLoopProvider>,
+    human_loop_provider: Arc<dyn echo_agent::human_loop::HumanLoopProvider>,
+}
+
+#[cfg(feature = "channels")]
+impl ChannelPumpWiring {
+    fn adapter(
+        &self,
+        address: crate::conversation_input::ConversationInputAddress,
+        agent_conversation_id: String,
+        cache_id: String,
+    ) -> Result<ChannelInputPumpAdapter, String> {
+        let app_state = self
+            .app_state
+            .upgrade()
+            .ok_or_else(|| "original channel app state unavailable".to_string())?;
+        Ok(ChannelInputPumpAdapter {
+            retirement: self.retirement.clone(),
+            weixin_identity: self.weixin_identity.clone(),
+            session_instance: self.session_instance.clone(),
+            reply_slot: self.reply_slot.clone(),
+            service_cancel: self.service_cancel.clone(),
+            weixin_delivery: self.weixin_delivery.clone(),
+            bound_control_runtime: self.bound_control_runtime.clone(),
+            active_turns: Arc::clone(&self.active_turns),
+            surface_id: self.surface_id.clone(),
+            app_state,
+            foreground_turns: self.foreground_turns.clone(),
+            address,
+            agent_conversation_id,
+            cache_id,
+            hitl: Arc::clone(&self.hitl),
+            human_loop_provider: Arc::clone(&self.human_loop_provider),
+        })
+    }
+}
+
+/// The original durable handler's retained wake capability. It lets a user
+/// action re-enter the same slot after the queue stops being blocked; it does
+/// not own scheduling, retry or recovery state.
+#[cfg(feature = "channels")]
+struct ChannelSessionWake {
+    wiring: ChannelPumpWiring,
+}
+
+#[cfg(feature = "channels")]
+impl ChannelSessionWake {
+    /// Wake the original pump after an operator abandoned one pending input.
+    /// Deriving the address from the retained instance keeps this action on
+    /// the original conversation instead of the current GUI selection.
+    async fn start_after_abandon(&self) -> Result<&'static str, String> {
+        let instance = self
+            .wiring
+            .session_instance
+            .as_ref()
+            .ok_or_else(|| "original channel session instance unavailable".to_string())?;
+        let slot = self
+            .wiring
+            .reply_slot
+            .clone()
+            .ok_or_else(|| "original channel pump slot unavailable".to_string())?;
+        let workspace_id = self
+            .wiring
+            .bound_control_runtime
+            .as_ref()
+            .map(|runtime| runtime.execution_scope().workspace_id().to_string())
+            .ok_or_else(|| "original channel workspace is unavailable".to_string())?;
+        let conversation = AppChannelMessageHandler::conversation_id(
+            instance.channel_id(),
+            instance.conversation_id(),
+            instance.sender_id(),
+        );
+        let agent_conversation = AppChannelMessageHandler::agent_conversation_id(
+            &conversation,
+            &instance.incarnation_id(),
+        );
+        let cache_id =
+            AppChannelMessageHandler::cache_user_id(&conversation, &instance.incarnation_id());
+        let coordinator = self
+            .wiring
+            .coordinator
+            .upgrade()
+            .ok_or_else(|| "original channel session coordinator unavailable".to_string())?;
+        start_channel_input_pump_with(
+            &coordinator,
+            slot,
+            &self.wiring,
+            crate::conversation_input::ConversationInputAddress {
+                workspace_id,
+                conversation_id: conversation,
+            },
+            agent_conversation,
+            cache_id,
+        )
+        .await
+    }
+}
+
+#[cfg(feature = "channels")]
+async fn start_channel_input_pump_with(
+    coordinator: &Arc<ChannelSessionCoordinator>,
+    slot: Arc<
+        input_pump::ChannelInputPumpSlot<crate::conversation_input::ConversationInputIdentity>,
+    >,
+    wiring: &ChannelPumpWiring,
+    address: crate::conversation_input::ConversationInputAddress,
+    agent_conversation_id: String,
+    cache_id: String,
+) -> Result<&'static str, String> {
+    match slot.kick().map_err(|error| error.to_string())? {
+        input_pump::ChannelInputPumpKick::Notified => Ok("notified"),
+        input_pump::ChannelInputPumpKick::Started(owner) => {
+            coordinator.start_input_pump_task(
+                slot,
+                owner,
+                Arc::new(wiring.adapter(address, agent_conversation_id, cache_id)?),
+            )?;
+            Ok("started")
+        }
+    }
 }
 
 #[cfg(feature = "channels")]
@@ -3107,39 +3303,41 @@ impl AppChannelMessageHandler {
         agent_conversation_id: String,
         cache_id: String,
     ) -> Result<(), String> {
-        match self.input_pump.kick().map_err(|error| error.to_string())? {
-            input_pump::ChannelInputPumpKick::Notified => Ok(()),
-            input_pump::ChannelInputPumpKick::Started(owner) => {
-                let adapter = Arc::new(ChannelInputPumpAdapter {
-                    retirement: Some(self.runtime_retirement_context()),
-                    weixin_identity: self.weixin_identity.clone(),
-                    session_instance: Some(self.session_instance.clone()),
-                    reply_slot: Some(self.input_pump.clone()),
-                    service_cancel: self
-                        .service_cancel
-                        .lock()
-                        .map_err(|_| "channel service owner unavailable".to_string())?
-                        .clone()
-                        .unwrap_or_default(),
-                    weixin_delivery: self.weixin_delivery.clone(),
-                    bound_control_runtime: self.bound_control_runtime.clone(),
-                    active_turns: self.active_turns.clone(),
-                    surface_id: ChannelSessionCoordinator::surface_id(&self.session_instance),
-                    app_state: Arc::clone(&self.app_state),
-                    foreground_turns: self.foreground_turns.clone(),
-                    address,
-                    agent_conversation_id,
-                    cache_id,
-                    hitl: Arc::clone(&self.hitl),
-                    human_loop_provider: self.human_loop_provider.clone(),
-                });
-                self.session_coordinator.start_input_pump_task(
-                    Arc::clone(&self.input_pump),
-                    owner,
-                    adapter,
-                )
-            }
-        }
+        let wiring = self.pump_wiring()?;
+        start_channel_input_pump_with(
+            &self.session_coordinator,
+            Arc::clone(&self.input_pump),
+            &wiring,
+            address,
+            agent_conversation_id,
+            cache_id,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    fn pump_wiring(&self) -> Result<ChannelPumpWiring, String> {
+        Ok(ChannelPumpWiring {
+            retirement: Some(self.runtime_retirement_context()),
+            weixin_identity: self.weixin_identity.clone(),
+            session_instance: Some(self.session_instance.clone()),
+            reply_slot: Some(Arc::clone(&self.input_pump)),
+            service_cancel: self
+                .service_cancel
+                .lock()
+                .map_err(|_| "channel service owner unavailable".to_string())?
+                .clone()
+                .unwrap_or_default(),
+            weixin_delivery: self.weixin_delivery.clone(),
+            bound_control_runtime: self.bound_control_runtime.clone(),
+            active_turns: Arc::clone(&self.active_turns),
+            surface_id: ChannelSessionCoordinator::surface_id(&self.session_instance),
+            coordinator: Arc::downgrade(&self.session_coordinator),
+            app_state: Arc::downgrade(&self.app_state),
+            foreground_turns: self.foreground_turns.clone(),
+            hitl: Arc::clone(&self.hitl),
+            human_loop_provider: Arc::clone(&self.human_loop_provider),
+        })
     }
 
     pub(crate) fn new(
@@ -5900,7 +6098,15 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 "channel service is already bound or closed".to_string(),
             ));
         }
-        *owner = Some(service_cancel);
+        *owner = Some(service_cancel.clone());
+        drop(owner);
+        // The retained wake belongs to this exact bound handler; it becomes
+        // reachable only after the original service token exists.
+        if let Ok(wiring) = self.pump_wiring() {
+            let surface = ChannelSessionCoordinator::surface_id(&self.session_instance);
+            self.session_coordinator
+                .retain_session_wake(surface, Arc::new(ChannelSessionWake { wiring }));
+        }
         Ok(())
     }
 
@@ -11975,6 +12181,146 @@ mod tests {
             || record.pending_ended_incarnation_id.is_some()
         {
             return Err("late end callback cleared the replacement incarnation".to_string());
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    type SessionRegistrations =
+        std::sync::Arc<std::sync::Mutex<Vec<(String, Result<Option<String>, String>)>>>;
+
+    #[cfg(feature = "channels")]
+    fn coordinator_session_handler(
+        coordinator: &std::sync::Arc<super::ChannelSessionCoordinator>,
+        registrations: &SessionRegistrations,
+    ) -> echo_agent::channels::SessionHandler {
+        use echo_agent::channels::{MessageHandler, SessionConfig, SessionHandler};
+
+        let factory_coordinator = std::sync::Arc::clone(coordinator);
+        let end_coordinator = std::sync::Arc::clone(coordinator);
+        let factory_registrations = std::sync::Arc::clone(registrations);
+        SessionHandler::new(
+            SessionConfig::default(),
+            move |instance: &echo_agent::channels::ChannelSessionInstance| {
+                let registration = factory_coordinator
+                    .register(instance)
+                    .map(|(previous, _gate)| previous);
+                match factory_registrations.lock() {
+                    Ok(mut entries) => entries.push((instance.incarnation_id(), registration)),
+                    Err(poisoned) => poisoned
+                        .into_inner()
+                        .push((instance.incarnation_id(), registration)),
+                }
+                Box::new(SessionIdentityProbe) as Box<dyn MessageHandler>
+            },
+        )
+        .with_on_session_end(move |info| end_coordinator.record_session_end(info))
+    }
+
+    #[cfg(feature = "channels")]
+    fn registered_previous(
+        registrations: &SessionRegistrations,
+        index: usize,
+    ) -> Result<(String, Result<Option<String>, String>), String> {
+        let entries = registrations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries
+            .get(index)
+            .cloned()
+            .ok_or_else(|| format!("session registration {index} is missing"))
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn shutdown_end_releases_the_coordinator_for_the_same_surface() -> Result<(), String> {
+        use echo_agent::channels::{ChatType, InboundMessage, MessageHandler};
+
+        let coordinator = std::sync::Arc::new(super::ChannelSessionCoordinator::new());
+        let registrations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let surface = super::ChannelSurfaceIdentity {
+            channel_id: "channel".to_string(),
+            chat_id: "conversation".to_string(),
+            sender_id: "sender".to_string(),
+        };
+        let message = |text: &str, id: &str| {
+            InboundMessage::new(
+                "channel",
+                "sender",
+                "conversation",
+                ChatType::Direct,
+                text,
+                id,
+            )
+        };
+
+        let first = coordinator_session_handler(&coordinator, &registrations);
+        first
+            .handle(message("first", "m1"))
+            .await
+            .map_err(|error| error.to_string())?;
+        let (first_incarnation, first_registration) = registered_previous(&registrations, 0)?;
+        let first_previous = first_registration.clone()?;
+        if first_previous.is_some() {
+            return Err(format!(
+                "first admission did not register a fresh incarnation: {first_previous:?}"
+            ));
+        }
+
+        // Replacing a live incarnation without an exact predecessor stays refused.
+        let premature = coordinator_session_handler(&coordinator, &registrations);
+        premature
+            .handle(message("early", "m2"))
+            .await
+            .map_err(|error| error.to_string())?;
+        let (_, premature_registration) = registered_previous(&registrations, 1)?;
+        if premature_registration.is_ok() {
+            return Err("a live incarnation was replaced without a predecessor".to_string());
+        }
+
+        first.close().await.map_err(|error| error.to_string())?;
+        {
+            let lifecycle = coordinator
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let record = lifecycle
+                .get(&surface)
+                .ok_or_else(|| "closed session lifecycle record is missing".to_string())?;
+            if record.current_incarnation_id.is_some()
+                || record.pending_ended_incarnation_id.as_deref()
+                    != Some(first_incarnation.as_str())
+            {
+                return Err(
+                    "a successful shutdown did not release the exact incarnation".to_string(),
+                );
+            }
+        }
+
+        let reopened = coordinator_session_handler(&coordinator, &registrations);
+        reopened
+            .handle(message("second", "m3"))
+            .await
+            .map_err(|error| error.to_string())?;
+        let (reopened_incarnation, reopened_registration) = registered_previous(&registrations, 2)?;
+        let reopened_previous = reopened_registration.clone()?;
+        if reopened_previous.as_deref() != Some(first_incarnation.as_str()) {
+            return Err(format!(
+                "reopened admission did not carry the closed predecessor: {reopened_previous:?}"
+            ));
+        }
+        if reopened_incarnation == first_incarnation {
+            return Err("reopened admission reused the closed incarnation".to_string());
+        }
+        let lifecycle = coordinator
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let record = lifecycle
+            .get(&surface)
+            .ok_or_else(|| "reopened lifecycle record is missing".to_string())?;
+        if record.current_incarnation_id.as_deref() != Some(reopened_incarnation.as_str()) {
+            return Err("reopened session did not become the current incarnation".to_string());
         }
         Ok(())
     }

@@ -927,7 +927,12 @@ impl RetentionPins {
             ConversationInputFact::RecoveryUncertain {
                 identity, reason, ..
             } => {
-                if let Some(entry) = self.conversation_inputs.get_mut(&identity.input_id) {
+                if let Some(entry) = self.conversation_inputs.get_mut(&identity.input_id)
+                    // A terminal cancellation is authoritative: a delayed
+                    // uncertainty fact from an older owner cannot turn it back
+                    // into a blocking recovery item.
+                    && entry.projection.receipt.phase != ConversationInputPhase::Cancelled
+                {
                     entry.projection.receipt.phase = ConversationInputPhase::RecoveryRequired;
                     entry.projection.receipt.reason = Some(reason.clone());
                     entry.projection.receipt.duplicate = false;

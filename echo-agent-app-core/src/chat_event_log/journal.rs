@@ -761,6 +761,12 @@ impl ChatEventLog {
                             input_id: identity.input_id.clone(),
                         });
                     }
+                    if current.projection.receipt.phase == ConversationInputPhase::Cancelled {
+                        // A late recovery observation belongs to an older
+                        // owner; it must never resurrect a user-abandoned
+                        // input, even when it carries no expected revision.
+                        return Ok(());
+                    }
                     log.append_conversation_input_event_locked(
                         authority,
                         stream_id,
@@ -1707,6 +1713,34 @@ impl ChatEventLog {
         self: &Arc<Self>,
         identity: ConversationInputIdentity,
     ) -> Result<ConversationInputReceipt, ConversationInputError> {
+        self.cancel_conversation_input_checked(identity, None, None)
+            .await
+    }
+
+    /// 用户明确放弃一条待恢复的原渠道输入。
+    ///
+    /// 队列 revision、身份与当前 phase 只能在同一 authority 锁内判定；调用方
+    /// 事先观察到的版本只用于拒绝陈旧界面动作，不能替代这里的事实检查。
+    #[cfg(any(test, feature = "channels"))]
+    pub(crate) async fn cancel_recovery_conversation_input(
+        self: &Arc<Self>,
+        identity: ConversationInputIdentity,
+        expected_queue_revision: u64,
+    ) -> Result<ConversationInputReceipt, ConversationInputError> {
+        self.cancel_conversation_input_checked(
+            identity,
+            Some(expected_queue_revision),
+            Some(ConversationInputPhase::RecoveryRequired),
+        )
+        .await
+    }
+
+    async fn cancel_conversation_input_checked(
+        self: &Arc<Self>,
+        identity: ConversationInputIdentity,
+        expected_queue_revision: Option<u64>,
+        required_phase: Option<ConversationInputPhase>,
+    ) -> Result<ConversationInputReceipt, ConversationInputError> {
         let permit = PROCESS_CHAT_EVENT_IO
             .clone()
             .acquire_owned()
@@ -1737,10 +1771,26 @@ impl ChatEventLog {
                             input_id: identity.input_id.clone(),
                         });
                     }
+                    if expected_queue_revision
+                        .is_some_and(|expected| authority.pins.queue_revision != expected)
+                    {
+                        // The queue advanced since the operator looked at it;
+                        // refuse instead of cancelling a different frontier.
+                        return Err(ConversationInputError::StaleRevision {
+                            input_id: identity.input_id.clone(),
+                        });
+                    }
                     if current.receipt.phase == ConversationInputPhase::Cancelled {
+                        // A repeated operator action with the current revision
+                        // is idempotent; the original terminal fact stands.
                         let mut receipt = current.receipt;
                         receipt.duplicate = true;
                         return Ok(receipt);
+                    }
+                    if required_phase.is_some_and(|required| current.receipt.phase != required) {
+                        return Err(ConversationInputError::NotDispatchable {
+                            input_id: identity.input_id.clone(),
+                        });
                     }
                     if !current.receipt.is_dispatchable()
                         && current.receipt.phase != ConversationInputPhase::RecoveryRequired

@@ -63,6 +63,7 @@ pub fn build_tauri_app(
             commands::channels::save_channel_configuration,
             commands::channels::list_channel_status,
             commands::channels::control_channel,
+            commands::channels::abandon_channel_recovery_input,
             commands::channels::begin_weixin_login,
             commands::channels::get_weixin_login_status,
             commands::channels::verify_weixin_login,

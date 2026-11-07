@@ -71,6 +71,26 @@ send 前核对原已提交账号/generation、enabled 与冻结 context；不读
 
 ## 影响
 
+### 待恢复输入的显式放弃与启动诊断
+
+GUI 原 IM 对话的队列对 `RecoveryRequired` 项提供“放弃这条待恢复消息”。原
+`ChannelRuntime` 核对原输入身份、payload digest、队列版本及原账户/工作空间代次；
+历史输入按其原 workspace/generation 解析并保持原 publication 租约；传输默认工作空间改变不替换原绑定。
+当前对话仍有任何 surface 的前台 owner 时拒绝修改。身份锁与 idle suspension 复用
+原对话准入，防止本地新轮次或删除操作越过正在处理的显式放弃。
+
+原日志只追加该输入的 `Cancelled` 事实，保留原 attempt、reason 与 `drained`；
+原 TaskRun、执行失败及副作用/发送的 Unknown 保持各自事实。“队列项已放弃”不表示远端
+效果被撤销。重复动作读取已保留的准确终态并返回 duplicate，不追加第二个取消事实。
+
+取消、保护释放及原 pump 唤醒由已有 `ProductDataIoFlow` supervisor 保有至物理完成；
+界面或调用者丢弃等待不释放已接纳操作的保护，也不丢掉提交后的唤醒。仅在原日志写入结束
+后释放对话准入并唤醒既有 slot，不新增恢复执行器、消息 store 或替代任务结果。
+
+configured transport 的启动失败与完成通知恢复的 pending 分别报告。通知 ledger 的原
+恢复报告保持独立；例如未准备的 SSH 工作空间只产生通知恢复待处理诊断，不能因此把已启动
+的整个 IM 渠道报告为未启动。实际消息发送与手机收件继续分别验收。
+
 GUI 渠道页增加扫码卡片，定时任务页按原 definition 设置通知，历史只查询已解析原 run 的独立通知回执。
 “已接受”不等于实际收件或已读；未验证无 context、重启、发送窗口或额度的服务行为，不承诺主动发送必达。
 新依赖、锁和风险合同由中央作者按准确身份另行处理，不沿用旧接受证明新输入；不扩大 SDK accepted inventory 或修改其 build pin。

@@ -120,6 +120,21 @@ pub async fn control_channel(
         .map_err(IpcError::Internal)
 }
 
+/// 用户明确放弃一条待恢复的原微信消息。身份/代次与队列版本由 app-core
+/// 的原 journal authority 复核；这里只做参数透传与错误分类。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn abandon_channel_recovery_input(
+    state: tauri::State<'_, TauriState>,
+    identity: echo_agent_app_core::api::conversation_input::ConversationInputIdentity,
+    expected_queue_revision: u64,
+) -> Result<serde_json::Value, IpcError> {
+    state
+        .channel_runtime
+        .abandon_recovery_input(identity, expected_queue_revision)
+        .await
+        .map_err(IpcError::Validation)
+}
+
 /// Notification configuration belongs to EKO, not the framework CronTask.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn get_weixin_notification_configuration(

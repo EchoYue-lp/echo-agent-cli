@@ -194,6 +194,12 @@ cleanup degraded 的 generation 留在 registry 中保持 sealed，后续 contro
 不能重新开放它或吞掉原始 debt。framework command shutdown 是可重复 await 的 shared result，
 并发 caller 不会覆盖 owner。
 
+原 channel cleanup watch 仍开放但尚未发布收据时，只表示已知的在途关闭。应用根继续以同一
+continuation 保有 owner 和资源，不把 Pending 本身写成失败；它仍不满足 `is_clean()`。
+只有原 producer 的物理 final 才结束等待。真实 stop 错误、观察关闭、未确认结算及原
+primary error 继续保留；合法重试也先报告原失败事实，不能按字符串清删最终回执。
+Desktop 仍先 `wait_final()` 再 `into_result()`；失败数组为空不能单独证明已经结算。
+
 ChatEventLog 的 async safe point 通过 bounded product-data adapter，并让 blocking closure 捕获
 exact workspace I/O receipt。manual compression、GUI cancel 和 HITL orphan projection 在 caller
 drop 后仍持有 generation；workspace delete 不能先删文件再被迟到 append 复活。

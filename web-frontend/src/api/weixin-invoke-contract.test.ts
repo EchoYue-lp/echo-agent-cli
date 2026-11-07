@@ -56,9 +56,43 @@ afterEach(() => {
 
 describe('real Weixin endpoints through the native invoke boundary', () => {
   it('keeps every channel command explicitly bound to the snake_case frontend contract', () => {
-    expect(commands.size).toBe(12);
+    expect([...commands.keys()].sort()).toEqual([
+      'abandon_channel_recovery_input',
+      'begin_weixin_login',
+      'cancel_weixin_login',
+      'configure_weixin_notification',
+      'control_channel',
+      'forget_weixin_login',
+      'get_channel_configuration',
+      'get_weixin_login_status',
+      'get_weixin_notification_configuration',
+      'get_weixin_notification_result',
+      'list_channel_status',
+      'save_channel_configuration',
+      'verify_weixin_login',
+    ]);
     for (const producer of commands.values())
       expect(producer.annotation.replace(/\s/g, '')).toBe('rename_all="snake_case"');
+  });
+
+  it('passes the exact recovery identity and snake_case revision to the native producer', async () => {
+    const { apiInvoke } = await import('../lib/tauri-bridge');
+    const identity = {
+      address: { workspace_id: 'original-workspace', conversation_id: 'original-conversation' },
+      input_id: 'original-input',
+      revision: 2,
+      payload_sha256: 'original-payload-digest',
+    };
+    await apiInvoke('abandon_channel_recovery_input', { identity, expected_queue_revision: 9 });
+    expect(native.invoke).toHaveBeenCalledExactlyOnceWith('abandon_channel_recovery_input', {
+      identity,
+      expected_queue_revision: 9,
+    });
+    // 直接对照 Rust 生产签名，不能接受旧 camelCase 或漏掉必填的版本。
+    await expect(
+      apiInvoke('abandon_channel_recovery_input', { identity, expectedQueueRevision: 9 })
+    ).rejects.toThrow();
+    await expect(apiInvoke('abandon_channel_recovery_input', { identity })).rejects.toThrow();
   });
 
   it('passes authorization revision, exact challenge and unmodified numeric code to Rust', async () => {

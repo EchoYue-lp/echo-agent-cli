@@ -1,4 +1,4 @@
-//! EKO controls around the original ChannelManager and session/pump owners.
+//! Eclip 对原 ChannelManager 与会话/消息泵 owner 的应用控制。
 //! Configuration publication remains ConfigState-owned. Transport observations
 //! are projections; neither a closed watch nor a discarded waiter settles work.
 
@@ -6,6 +6,7 @@ use super::ChannelSessionCoordinator;
 #[path = "management/weixin_auth.rs"]
 mod weixin_auth;
 use crate::state::AppState;
+use crate::tasks::task_runtime::weixin_delivery::WeixinNotificationRecoveryReport;
 use echo_agent::channels::{
     ChannelHandle, ChannelManager, ChannelPlugin, ChannelTransportEvidence, ChannelTransportPhase,
     FeishuChannel, FeishuConfig, MessageHandler, QqChannel, QqConfig, SessionHandler,
@@ -146,6 +147,9 @@ pub struct ChannelRuntime {
     weixin_auth: Arc<weixin_auth::AuthOwner>,
     weixin_auth_action: tokio::sync::Mutex<()>,
     weixin_workspace: Arc<Mutex<Option<String>>>,
+    // 仅测试依赖绑定：仍由原构造入口创建真实 poll/sender，不模拟准入或执行。
+    #[cfg(test)]
+    weixin_fixture_address: Option<std::net::SocketAddr>,
     weixin_delivery: Mutex<
         Option<(
             crate::config::WeixinAccountConfig,
@@ -174,6 +178,8 @@ impl ChannelRuntime {
             weixin_auth: Arc::default(),
             weixin_auth_action: tokio::sync::Mutex::new(()),
             weixin_workspace: Arc::default(),
+            #[cfg(test)]
+            weixin_fixture_address: None,
             weixin_delivery: Mutex::default(),
         }
     }
@@ -403,6 +409,169 @@ impl ChannelRuntime {
         }
         Ok(json!({"configuration_revision":revision,"channels":channels}))
     }
+    /// 用户明确放弃一条阻塞原微信会话的待恢复输入。
+    ///
+    /// 这是产品策略上的薄适配：输入身份、账户/凭据代次与工作空间代次全部
+    /// 来自原日志中不可变的 binding；当前 phase 与队列 revision 由原 journal
+    /// authority 在同一锁内复核，界面观察到的版本不能替代它。成功后只追加
+    /// Cancelled 并唤醒原 slot 的既有处理循环，不重写原失败、UNKNOWN 或
+    /// TaskRun 结论，也不创建第二个 owner。
+    pub async fn abandon_recovery_input(
+        &self,
+        identity: crate::conversation_input::ConversationInputIdentity,
+        expected_queue_revision: u64,
+    ) -> Result<Value, String> {
+        use crate::conversation_input::ConversationInputPhase;
+        let operation = Arc::clone(&self.operation).lock_owned().await;
+        let state = self
+            .state
+            .upgrade()
+            .ok_or_else(|| "Channel runtime owner unavailable".to_string())?;
+        let service = state.conversation_inputs();
+        let snapshot = service
+            .list(&identity.address)
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(item) = snapshot
+            .items
+            .iter()
+            .find(|entry| entry.receipt.identity == identity)
+        else {
+            // frontier 不包含已取消项；重复动作只观察原日志的准确终态，
+            // 不因其它队列项变化再次取消，也不借当前账户改写原绑定。
+            let (inputs, _) = state
+                .storage
+                .chat_events
+                .channel_input_bindings()
+                .await
+                .map_err(|error| error.to_string())?;
+            if let Some(mut previous) = inputs.into_iter().find(|entry| {
+                entry.receipt.identity == identity
+                    && entry.receipt.phase == ConversationInputPhase::Cancelled
+            }) {
+                previous
+                    .payload
+                    .validate_channel_digest(&identity.address)
+                    .map_err(|error| error.to_string())?;
+                previous.receipt.duplicate = true;
+                return Ok(json!({
+                    "queue_revision": previous.receipt.queue_revision,
+                    "receipt": previous.receipt,
+                    "pump": {"observation": "already_abandoned"},
+                }));
+            }
+            return Err("待恢复消息已不在原队列；请重新查看".to_string());
+        };
+        if item.receipt.phase != ConversationInputPhase::RecoveryRequired {
+            return Err("只有待恢复（RecoveryRequired）的原渠道消息可以放弃".to_string());
+        }
+        if snapshot.queue_revision != expected_queue_revision {
+            return Err("原队列已变化；请重新查看后再放弃".to_string());
+        }
+        let binding = item
+            .payload
+            .channel_binding
+            .as_ref()
+            .ok_or_else(|| "该消息不属于原渠道会话".to_string())?;
+        binding.validate_data().map_err(|error| error.to_string())?;
+        item.payload
+            .validate_channel_digest(&identity.address)
+            .map_err(|error| error.to_string())?;
+        let coordinators = self
+            .coordinators
+            .lock()
+            .map_err(|_| "Original channel sessions unavailable".to_string())?
+            .get(&binding.channel_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut owner = None;
+        for coordinator in coordinators.iter().rev() {
+            if let Some(found) = coordinator
+                .find_session_wake(&binding.channel_id, &identity.address.conversation_id)
+            {
+                owner = Some(found.1);
+                break;
+            }
+        }
+        let wake = owner.ok_or_else(|| {
+            "原渠道会话运行实例不可用；请重连该渠道后再处理待恢复消息".to_string()
+        })?;
+        let Some((account_id, credential_generation)) = wake.wiring.weixin_identity.as_ref() else {
+            return Err("原渠道凭据代次不可用；未执行放弃".to_string());
+        };
+        if account_id != &binding.account_id
+            || credential_generation != &binding.credential_generation
+        {
+            return Err("原账户或凭据代次已变化；保留原输入，未执行放弃".to_string());
+        }
+        // 历史输入的scope来自原DATA；wake的默认scope只路由新消息，不能替换它。
+        // 原publication租约和control保有到同一owned IO结束，防止校验后被删除/重建。
+        let original_scope: futures::future::BoxFuture<'_, _> =
+            Box::pin(state.channel_control_for_generation(
+                &identity.address.workspace_id,
+                &binding.workspace_generation,
+            ));
+        let (publication, original_control) = original_scope
+            .await
+            .map_err(|_| "原工作空间代次已变化或不可用；保留原输入，未执行放弃".to_string())?;
+        // 本地仍需防止显式放弃与原对话删除/新轮次并发，避免误取消刚获准入
+        // 的输入；复用原身份锁与所有 surface 的原子 idle suspension。
+        let admission = original_control
+            .runtime()
+            .begin_managed_replacement(
+                &state.session.foreground_turns,
+                &identity.address.conversation_id,
+            )
+            .await
+            .map_err(|error| format!("原对话仍有运行或恢复义务；未执行放弃：{error}"))?;
+        let flow = state
+            .session
+            .product_data_io
+            .begin_owned_flow("abandon channel recovery input")
+            .map_err(|error| error.to_string())?;
+        let settlement = flow.clone();
+        let observed = flow
+            .run_async("commit abandoned channel recovery input", async move {
+                let _operation = operation;
+                let _publication = publication;
+                let _original_control = original_control;
+                // 原 supervisor 持有整个物理流程，调用者丢弃观察不能释放保护，
+                // 也不能丢掉已提交取消之后对原 pump 的唤醒。
+                let result = async move {
+                    let receipt = service
+                        .cancel_pending_recovery(identity.clone(), expected_queue_revision)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    drop(admission);
+                    let pump = wake.start_after_abandon().await;
+                    let frontier = service
+                        .list(&identity.address)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    Ok(json!({
+                        "receipt": receipt,
+                        "queue_revision": frontier.queue_revision,
+                        "pump": match pump {
+                            Ok(started) => json!({"observation": started}),
+                            Err(error) => json!({"observation": "unavailable", "error": error}),
+                        },
+                    }))
+                }
+                .await;
+                // 这里结算原物理流程；业务结果仍通过原 Result/输入日志表达。
+                settlement.settle(None);
+                result
+            })
+            .await;
+        match observed {
+            Ok(result) => result,
+            Err(error) => {
+                flow.settle(Some(error.to_string()));
+                Err(error.to_string())
+            }
+        }
+    }
+
     async fn handler(
         &self,
         state: Arc<AppState>,
@@ -708,13 +877,20 @@ impl ChannelRuntime {
         self.status().await
     }
     pub async fn start_configured(&self) -> Vec<String> {
-        self.start_configured_with_receipt().await.1
+        let (_, failures, recovery) = self.start_configured_with_receipt().await;
+        for reason in recovery.pending {
+            tracing::warn!(%reason, "Weixin completion notification recovery remains pending");
+        }
+        failures
     }
-    pub(crate) async fn start_configured_with_receipt(&self) -> (usize, Vec<String>) {
+    pub(crate) async fn start_configured_with_receipt(
+        &self,
+    ) -> (usize, Vec<String>, WeixinNotificationRecoveryReport) {
         let Ok(state) = self.state() else {
             return (
                 0,
                 vec!["Original channel application owner unavailable".to_string()],
+                WeixinNotificationRecoveryReport::default(),
             );
         };
         let mut failures = Vec::new();
@@ -774,13 +950,8 @@ impl ChannelRuntime {
         let recovery = state
             .recover_weixin_notifications_after_channel_start(sender, &state.scheduler.cancel_token)
             .await;
-        failures.extend(
-            recovery
-                .pending
-                .into_iter()
-                .map(|reason| format!("Weixin completion recovery remains pending: {reason}")),
-        );
-        (started, failures)
+        // 原通知恢复报告保留自己的 ledger/结算语义，不伪装成 transport 启动失败。
+        (started, failures, recovery)
     }
     async fn watch_original_transport(&self, handle: &ChannelHandle) -> Result<(), String> {
         let observation = handle.transport_status().await;
@@ -865,10 +1036,10 @@ impl ChannelRuntime {
     /// Outside normal_drained: return completed failure facts separately from
     /// unknown ownership. Never repoll a Ready/Err producer or treat wait() as
     /// physical progress; compare only original manager/session facts.
-    pub(crate) async fn observe_shutdown(&self) -> Result<Vec<String>, String> {
+    pub(crate) async fn observe_shutdown(&self) -> Result<Option<Vec<String>>, String> {
         self.begin_shutdown()?;
         if self.no_registered_owners()? {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         }
         let (receipt, closed) = {
             let slot = self
@@ -878,24 +1049,32 @@ impl ChannelRuntime {
             let observation = slot
                 .as_ref()
                 .ok_or_else(|| "Original cleanup not started".to_string())?;
-            (
-                observation.receiver.borrow().clone(),
-                observation.receiver.has_changed().is_err(),
-            )
+            // 同步读取原watch快照；持原读guard时检查closed，避免None与稍后已发布Some混时。
+            let current = observation.receiver.borrow();
+            let closed = observation.receiver.has_changed().is_err();
+            (current.clone(), closed)
         };
         let Some(receipt) = receipt else {
-            return Err(if closed {
-                "Channel cleanup observation closed without a receipt"
+            return if closed {
+                Err("Channel cleanup observation closed without a receipt".to_string())
             } else {
-                "Original channel cleanup is still pending"
-            }
-            .to_string());
+                // 原watch开放且没有回执就是在途；根继续保留owner，不能制造错误事实。
+                Ok(None)
+            };
         };
         if receipt.physically_settled {
-            return Ok(receipt.result.err().into_iter().collect());
+            return Ok(Some(receipt.result.err().into_iter().collect()));
         }
+        let original_error = receipt
+            .result
+            .as_ref()
+            .err()
+            .cloned()
+            .unwrap_or_else(|| "Original channel cleanup remains unconfirmed".to_string());
         if receipt.retry_cleanup {
-            let facts = original_shutdown_facts(&self.manager, &self.coordinators).await?;
+            let facts = original_shutdown_facts(&self.manager, &self.coordinators)
+                .await
+                .map_err(|error| format!("{original_error}; cleanup facts observation: {error}"))?;
             if receipt
                 .failed_facts
                 .as_ref()
@@ -904,15 +1083,15 @@ impl ChannelRuntime {
                 let mut slot = self
                     .shutdown
                     .lock()
-                    .map_err(|_| "Original cleanup slot unavailable".to_string())?;
-                self.start_original_cleanup(&mut slot)?;
-                return Err("Original channel cleanup retry is still pending".to_string());
+                    .map_err(|_| format!("{original_error}; original cleanup slot unavailable"))?;
+                self.start_original_cleanup(&mut slot).map_err(|error| {
+                    format!("{original_error}; cleanup retry admission: {error}")
+                })?;
+                // 即使这是根第一次观察该旧收据，也不能把真实failed stop改为新Pending。
+                return Err(original_error);
             }
         }
-        Err(receipt
-            .result
-            .err()
-            .unwrap_or_else(|| "Original channel cleanup remains unconfirmed".to_string()))
+        Err(original_error)
     }
     fn start_original_cleanup(
         &self,
@@ -1353,6 +1532,573 @@ mod tests {
         ))
     }
 
+    struct RecoveryInputFixture {
+        state: Arc<AppState>,
+        channels: Arc<ChannelRuntime>,
+        handler: Arc<dyn MessageHandler>,
+        cancel: echo_agent::agent::CancellationToken,
+        input: crate::conversation_input::ConversationInputReceipt,
+        _channel: echo_agent::channels::weixin::WeixinChannel,
+        _temporary: tempfile::TempDir,
+    }
+
+    async fn bootstrap_recovery_handler(
+        handler: &Arc<dyn MessageHandler>,
+        target: &str,
+        cancel: &echo_agent::agent::CancellationToken,
+    ) -> anyhow::Result<()> {
+        let (receipt, observed) = echo_agent::channels::channel_ingress_receipt();
+        handler
+            .admit_with_ingress(
+                echo_agent::channels::InboundMessage::new(
+                    "weixin",
+                    target,
+                    target,
+                    echo_agent::channels::ChatType::Direct,
+                    "",
+                    "bootstrap-empty",
+                ),
+                cancel.child_token(),
+                receipt,
+            )
+            .await?;
+        let bootstrap = tokio::time::timeout(std::time::Duration::from_secs(2), observed).await??;
+        anyhow::ensure!(
+            bootstrap == echo_agent::channels::ChannelIngressDisposition::TerminalRejected,
+            "empty bootstrap unexpectedly entered execution"
+        );
+        Ok(())
+    }
+
+    impl RecoveryInputFixture {
+        async fn new(binding_generation: &str) -> anyhow::Result<Self> {
+            Self::new_with_binding(binding_generation, "global").await
+        }
+
+        async fn new_with_binding(
+            binding_generation: &str,
+            workspace_generation: &str,
+        ) -> anyhow::Result<Self> {
+            use crate::conversation_input::{
+                ChannelExecutionIntent, ChannelInputBinding, ConversationInputAddress,
+                ConversationInputSource, FrozenChannelContext, stable_scoped_input_id,
+            };
+
+            let temporary = tempfile::tempdir()?;
+            let mut state = Arc::try_unwrap(state(temporary.path()).await?)
+                .map_err(|_| anyhow::anyhow!("fixture AppState already has another owner"))?;
+            state.storage.chat_events = Arc::new(crate::chat_event_log::ChatEventLog::open(
+                temporary.path().join("events"),
+                Default::default(),
+            )?);
+            state.workspace.global_execution_root = temporary.path().join("product-data");
+            std::fs::create_dir_all(&state.workspace.global_execution_root)?;
+            state.tasks.runtime = Some(Arc::new(
+                crate::tasks::task_runtime::TaskRuntimeStore::open_for_workspace(
+                    temporary.path().join("tasks"),
+                    "global",
+                )?,
+            ));
+            let state = Arc::new(state);
+            let suffix = temporary
+                .path()
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("fixture");
+            let account = crate::config::WeixinAccountConfig {
+                account_id: format!("offline-account-{suffix}"),
+                bot_token: "offline-fixture".to_string(),
+                base_url: "https://example.invalid".to_string(),
+                user_id: "peer".to_string(),
+                generation: "original-generation".to_string(),
+            };
+            // 原 producer 仅提供本机 handle，不 start/poll/send，也不读取真实凭据。
+            let channel = echo_agent::channels::weixin::WeixinChannel::new(
+                echo_agent::channels::weixin::WeixinConfig {
+                    credentials: weixin_auth::credentials(&account),
+                    store: Arc::new(echo_agent::memory::InMemoryStore::new()),
+                },
+            )?;
+            let delivery = channel
+                .delivery_handle()
+                .ok_or_else(|| anyhow::anyhow!("original delivery handle missing"))?;
+            let channels = Arc::new(ChannelRuntime::new(&state));
+            *channels
+                .weixin_delivery
+                .lock()
+                .map_err(|_| anyhow::anyhow!("original delivery slot unavailable"))? =
+                Some((account.clone(), delivery));
+            let (handler, _) = channels
+                .handler(state.clone(), "weixin", 30)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let cancel = echo_agent::agent::CancellationToken::new();
+            handler.bind_durable_ingress(cancel.clone())?;
+            let target =
+                echo_agent::channels::weixin::encode_target(&account.account_id, &account.user_id)?;
+            bootstrap_recovery_handler(&handler, &target, &cancel).await?;
+            let address = ConversationInputAddress {
+                workspace_id: "global".to_string(),
+                conversation_id: crate::channel_runtime::AppChannelMessageHandler::conversation_id(
+                    "weixin", &target, &target,
+                ),
+            };
+            let provider_message = "original-provider-input";
+            let source = serde_json::to_string(&(
+                "weixin",
+                &account.account_id,
+                binding_generation,
+                &account.user_id,
+                provider_message,
+            ))?;
+            let input_id =
+                stable_scoped_input_id(&address, ConversationInputSource::Channel, &source)?;
+            let service = state.conversation_inputs();
+            let saved = service
+                .submit_channel(
+                    address.clone(),
+                    input_id,
+                    "原待恢复消息".to_string(),
+                    Vec::new(),
+                    None,
+                    ChannelInputBinding {
+                        version: 1,
+                        channel_id: "weixin".to_string(),
+                        account_id: account.account_id,
+                        credential_generation: binding_generation.to_string(),
+                        peer_id: account.user_id,
+                        provider_message_id: provider_message.to_string(),
+                        workspace_generation: workspace_generation.to_string(),
+                        context: FrozenChannelContext::Absent,
+                        execution: ChannelExecutionIntent::Chat,
+                    },
+                )
+                .await?;
+            service
+                .dispatch_selected(
+                    saved.identity.clone(),
+                    saved.queue_revision,
+                    "original-input-turn".to_string(),
+                )
+                .await?;
+            let attempt = service
+                .list(&address)
+                .await?
+                .items
+                .into_iter()
+                .find(|item| item.receipt.identity == saved.identity)
+                .and_then(|item| item.active_attempt)
+                .ok_or_else(|| anyhow::anyhow!("original attempt missing"))?;
+            service
+                .recovery_required(attempt, "原 owner 丢失，副作用未知".to_string())
+                .await?;
+            let input = service
+                .list(&address)
+                .await?
+                .items
+                .into_iter()
+                .find(|item| item.receipt.identity == saved.identity)
+                .map(|item| item.receipt)
+                .ok_or_else(|| anyhow::anyhow!("recovery input missing"))?;
+            Ok(Self {
+                state,
+                channels,
+                handler,
+                cancel,
+                input,
+                _channel: channel,
+                _temporary: temporary,
+            })
+        }
+
+        async fn close(self) -> anyhow::Result<()> {
+            self.cancel.cancel();
+            self.handler.close().await?;
+            self.channels
+                .shutdown_and_wait()
+                .await
+                .map_err(anyhow::Error::msg)
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_handler_reconnect_reuses_the_original_coordinator_and_input()
+    -> anyhow::Result<()> {
+        let fixture = RecoveryInputFixture::new("original-generation").await?;
+        let identity = fixture.input.identity.clone();
+        let coordinator = fixture
+            .channels
+            .coordinators
+            .lock()
+            .map_err(|_| anyhow::anyhow!("coordinator registry unavailable"))?
+            .get("weixin")
+            .and_then(|entries| entries.last())
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("original coordinator missing"))?;
+        let (surface, old_wake) = coordinator
+            .find_session_wake("weixin", &identity.address.conversation_id)
+            .ok_or_else(|| anyhow::anyhow!("original session wake missing"))?;
+        let old_incarnation = old_wake
+            .wiring
+            .session_instance
+            .as_ref()
+            .map(echo_agent::channels::ChannelSessionInstance::incarnation_id)
+            .ok_or_else(|| anyhow::anyhow!("original incarnation missing"))?;
+        drop(old_wake);
+        fixture.handler.close().await?;
+        let (reopened, _) = fixture
+            .channels
+            .handler(fixture.state.clone(), "weixin", 30)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let reopened_cancel = echo_agent::agent::CancellationToken::new();
+        reopened.bind_durable_ingress(reopened_cancel.clone())?;
+        bootstrap_recovery_handler(&reopened, &surface.chat_id, &reopened_cancel).await?;
+        let new_incarnation = coordinator
+            .find_session_wake("weixin", &identity.address.conversation_id)
+            .and_then(|(_, wake)| {
+                wake.wiring
+                    .session_instance
+                    .as_ref()
+                    .map(echo_agent::channels::ChannelSessionInstance::incarnation_id)
+            });
+        drop(coordinator);
+        let result = fixture
+            .channels
+            .abandon_recovery_input(identity, fixture.input.queue_revision)
+            .await;
+        reopened_cancel.cancel();
+        reopened.close().await?;
+        drop(reopened);
+        fixture.close().await?;
+        result.map_err(anyhow::Error::msg)?;
+        assert!(new_incarnation.is_some_and(|current| current != old_incarnation));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn abandon_recovery_high_level_is_idempotent_for_the_exact_terminal_fact()
+    -> anyhow::Result<()> {
+        use crate::conversation_input::{ConversationInputFact, ConversationInputPhase};
+        let fixture = RecoveryInputFixture::new("original-generation").await?;
+        let identity = fixture.input.identity.clone();
+        let revision = fixture.input.queue_revision;
+        let first = fixture
+            .channels
+            .abandon_recovery_input(identity.clone(), revision)
+            .await;
+        let duplicate = fixture
+            .channels
+            .abandon_recovery_input(identity.clone(), revision)
+            .await;
+        let replay = fixture.state.storage.chat_events.replay(
+            &identity.address.workspace_id,
+            Some(&identity.address.conversation_id),
+            &identity.input_id,
+            0,
+        );
+        fixture.close().await?;
+        let replay = replay?;
+        let first = first.map_err(anyhow::Error::msg)?;
+        let duplicate = duplicate.map_err(anyhow::Error::msg)?;
+        let decode =
+            |value: &Value| -> anyhow::Result<crate::conversation_input::ConversationInputReceipt> {
+                Ok(serde_json::from_value(
+                    value
+                        .get("receipt")
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("receipt missing"))?,
+                )?)
+            };
+        let first = decode(&first)?;
+        let duplicate = decode(&duplicate)?;
+        assert_eq!(first.phase, ConversationInputPhase::Cancelled);
+        assert!(!first.drained);
+        assert_eq!(first.reason.as_deref(), Some("原 owner 丢失，副作用未知"));
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.identity, identity);
+        let cancellations = replay.events.iter().filter(|event| {
+            matches!(&event.payload, crate::chat_driver::ChatDriverEvent::InputLifecycle(fact)
+                if matches!(fact.as_ref(), ConversationInputFact::Cancelled { identity: cancelled, .. } if cancelled == &identity))
+        }).count();
+        assert_eq!(cancellations, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn abandon_recovery_high_level_retains_owned_io_after_caller_drop() -> anyhow::Result<()>
+    {
+        use crate::conversation_input::{ConversationInputFact, ConversationInputPhase};
+        use crate::foreground_turn::{ForegroundTurnError, ForegroundTurnSurface};
+        let fixture = RecoveryInputFixture::new("original-generation").await?;
+        let identity = fixture.input.identity.clone();
+        let coordinator = fixture
+            .channels
+            .coordinators
+            .lock()
+            .map_err(|_| anyhow::anyhow!("coordinator registry unavailable"))?
+            .get("weixin")
+            .and_then(|entries| entries.last())
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("original coordinator missing"))?;
+        let (_, wake) = coordinator
+            .find_session_wake("weixin", &identity.address.conversation_id)
+            .ok_or_else(|| anyhow::anyhow!("original session wake missing"))?;
+        let slot = wake
+            .wiring
+            .reply_slot
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("original reply slot missing"))?;
+        drop(wake);
+        drop(coordinator);
+        let wake_before = slot.observed_wake_epoch_for_test()?;
+        let io = fixture.state.session.product_data_io.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        io.install_test_barrier(
+            "commit abandoned channel recovery input",
+            entered_tx,
+            release_rx,
+        );
+        let channels = fixture.channels.clone();
+        let action_identity = identity.clone();
+        let revision = fixture.input.queue_revision;
+        let caller = tokio::spawn(async move {
+            channels
+                .abandon_recovery_input(action_identity, revision)
+                .await
+        });
+        let entered = tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx).await;
+        caller.abort();
+        let caller_exit = caller.await;
+        let blocked_turn = fixture.state.session.foreground_turns.begin_scoped(
+            "global",
+            ForegroundTurnSurface::Gui,
+            &identity.address.conversation_id,
+            "must-wait-for-original-io",
+        );
+        let suspended = match blocked_turn {
+            Err(ForegroundTurnError::ConversationAdmissionSuspended { .. }) => true,
+            Err(_) => false,
+            Ok(lease) => {
+                lease
+                    .settle_after_observers(crate::chat_driver::TurnOutcome::Cancelled)
+                    .await?;
+                false
+            }
+        };
+        let (_, revision) = fixture.state.config.configuration_snapshot().await;
+        let stop = fixture.channels.control(
+            ManagedChannel::Weixin,
+            revision,
+            None,
+            None,
+            ChannelControlAction::Stop,
+        );
+        let (stop_waited, released, stop_result) = {
+            tokio::pin!(stop);
+            match tokio::time::timeout(std::time::Duration::from_millis(25), stop.as_mut()).await {
+                Err(_) => {
+                    let released = release_tx.send(()).is_ok();
+                    (true, released, stop.await)
+                }
+                Ok(result) => {
+                    let released = release_tx.send(()).is_ok();
+                    (false, released, result)
+                }
+            }
+        };
+        let input = fixture
+            .state
+            .storage
+            .chat_events
+            .channel_input_bindings()
+            .await?
+            .0
+            .into_iter()
+            .find(|item| item.receipt.identity == identity)
+            .ok_or_else(|| anyhow::anyhow!("original input fact disappeared"))?;
+        let wake_after = slot.observed_wake_epoch_for_test()?;
+        let replay = fixture.state.storage.chat_events.replay(
+            "global",
+            Some(&identity.address.conversation_id),
+            &identity.input_id,
+            0,
+        );
+        fixture.close().await?;
+        let io_settled = io.join_shutdown().await;
+        entered.map_err(|_| anyhow::anyhow!("original IO was never admitted"))??;
+        stop_result.map_err(anyhow::Error::msg)?;
+        io_settled.map_err(anyhow::Error::msg)?;
+        assert!(caller_exit.is_err_and(|error| error.is_cancelled()));
+        assert!(suspended);
+        assert!(stop_waited);
+        assert!(released);
+        assert_eq!(input.receipt.phase, ConversationInputPhase::Cancelled);
+        assert!(!input.receipt.drained);
+        assert_eq!(
+            wake_after,
+            wake_before
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("wake counter exhausted"))?
+        );
+        let cancellations = replay?
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(&event.payload, crate::chat_driver::ChatDriverEvent::InputLifecycle(fact)
+                    if matches!(fact.as_ref(), ConversationInputFact::Cancelled { identity: cancelled, .. } if cancelled == &identity))
+            })
+            .count();
+        assert_eq!(cancellations, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn abandon_recovery_high_level_refuses_a_live_original_foreground() -> anyhow::Result<()>
+    {
+        use crate::conversation_input::ConversationInputPhase;
+        let fixture = RecoveryInputFixture::new("original-generation").await?;
+        let identity = fixture.input.identity.clone();
+        let revision = fixture.input.queue_revision;
+        let original_turn = fixture
+            .input
+            .turn_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("original input turn missing"))?;
+        let lease = fixture.state.session.foreground_turns.begin_scoped(
+            "global",
+            crate::foreground_turn::ForegroundTurnSurface::Channel,
+            &identity.address.conversation_id,
+            original_turn,
+        )?;
+        let result = fixture
+            .channels
+            .abandon_recovery_input(identity.clone(), fixture.input.queue_revision)
+            .await;
+        let after = fixture
+            .state
+            .conversation_inputs()
+            .list(&identity.address)
+            .await;
+        let still_active = fixture
+            .state
+            .session
+            .foreground_turns
+            .snapshot_scoped(
+                "global",
+                crate::foreground_turn::ForegroundTurnSurface::Channel,
+                &identity.address.conversation_id,
+            )
+            .is_some();
+        lease
+            .settle_after_observers(crate::chat_driver::TurnOutcome::Cancelled)
+            .await?;
+        fixture.close().await?;
+        let after = after?;
+        assert!(matches!(result, Err(error) if error.contains("active foreground turn")));
+        assert!(still_active);
+        assert_eq!(after.queue_revision, revision);
+        assert!(
+            after
+                .items
+                .iter()
+                .any(|item| item.receipt.identity == identity
+                    && item.receipt.phase == ConversationInputPhase::RecoveryRequired)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn abandon_recovery_high_level_refuses_stale_revision_and_credential_generation()
+    -> anyhow::Result<()> {
+        let fixture = RecoveryInputFixture::new("original-generation").await?;
+        let stale = fixture
+            .channels
+            .abandon_recovery_input(
+                fixture.input.identity.clone(),
+                fixture.input.queue_revision.saturating_sub(1),
+            )
+            .await;
+        let after = fixture
+            .state
+            .conversation_inputs()
+            .list(&fixture.input.identity.address)
+            .await;
+        let revision = fixture.input.queue_revision;
+        fixture.close().await?;
+        let after = after?;
+        assert!(matches!(stale, Err(error) if error.contains("原队列已变化")));
+        assert_eq!(after.queue_revision, revision);
+        let fixture = RecoveryInputFixture::new("old-credential-generation").await?;
+        let wrong_generation = fixture
+            .channels
+            .abandon_recovery_input(fixture.input.identity.clone(), fixture.input.queue_revision)
+            .await;
+        let after = fixture
+            .state
+            .conversation_inputs()
+            .list(&fixture.input.identity.address)
+            .await;
+        let revision = fixture.input.queue_revision;
+        fixture.close().await?;
+        let after = after?;
+        assert!(matches!(wrong_generation, Err(error) if error.contains("原账户或凭据代次已变化")));
+        assert_eq!(after.queue_revision, revision);
+        let fixture = RecoveryInputFixture::new_with_binding(
+            "original-generation",
+            "stale-workspace-generation",
+        )
+        .await?;
+        let wrong_workspace = fixture
+            .channels
+            .abandon_recovery_input(fixture.input.identity.clone(), fixture.input.queue_revision)
+            .await;
+        let after = fixture
+            .state
+            .conversation_inputs()
+            .list(&fixture.input.identity.address)
+            .await;
+        let revision = fixture.input.queue_revision;
+        fixture.close().await?;
+        let after = after?;
+        assert!(matches!(wrong_workspace, Err(error) if error.contains("原工作空间代次已变化")));
+        assert_eq!(after.queue_revision, revision);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_notification_recovery_pending_is_not_a_channel_start_failure()
+    -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut state = Arc::try_unwrap(state(temporary.path()).await?)
+            .map_err(|_| anyhow::anyhow!("fixture AppState already shared"))?;
+        let registry_root = temporary.path().join("workspaces");
+        state.workspace.registry = Arc::new(
+            crate::workspace::registry::WorkspaceRegistry::with_base_dir(registry_root.clone())?,
+        );
+        std::fs::write(
+            registry_root.join("registry.json"),
+            b"invalid registry fixture",
+        )?;
+        let state = Arc::new(state);
+        let channels = ChannelRuntime::new(&state);
+        let (started, failures, recovery) = channels.start_configured_with_receipt().await;
+        channels
+            .shutdown_and_wait()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(started, 0);
+        assert!(failures.is_empty());
+        assert!(
+            recovery
+                .pending
+                .iter()
+                .any(|reason| reason.starts_with("workspace registry:"))
+        );
+        Ok(())
+    }
+
     #[test]
     fn management_snapshot_serializes_weixin_authenticated_poll_evidence() {
         let evidence = serde_json::json!({
@@ -1369,6 +2115,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_retry_reports_original_failure_before_a_fresh_pending_observation()
+    -> anyhow::Result<()> {
+        let (plugin, probe) = test_support::channel(false, true, false);
+        let channels = ChannelRuntime::with_original_test_plugin(Weak::new(), plugin)
+            .map_err(anyhow::Error::msg)?;
+        channels.begin_shutdown().map_err(anyhow::Error::msg)?;
+        let mut first = {
+            let slot = channels
+                .shutdown
+                .lock()
+                .map_err(|_| anyhow::anyhow!("original channel observation unavailable"))?;
+            slot.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("original cleanup not started"))?
+                .receiver
+                .clone()
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if first.borrow().is_some() {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                first.changed().await?;
+            }
+        })
+        .await??;
+        // 修改fixture回复本身不是完成证据；先真实等待同一原handle的第二次stop。
+        probe.fail.store(false, Ordering::SeqCst);
+        channels
+            .retry_original_stop_for_test()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        // 根尚未观察过旧failure。合法retry必须仍返回那个实际error，不能只报新Pending。
+        let observed = channels.observe_shutdown().await;
+        let joined = channels.shutdown_and_wait().await;
+        assert!(
+            joined.is_ok(),
+            "original cleanup retry did not physically finish: {joined:?}"
+        );
+        assert!(
+            matches!(observed, Err(error) if error.contains("mock_stop_error")),
+            "first observer lost the original failed stop fact when retry became legal"
+        );
+        assert_eq!(probe.stops.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn gui_all_start_failures_return_original_start_receipt() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let state = state(temp.path()).await?;
@@ -1380,7 +2173,7 @@ mod tests {
             })
             .await?;
         let channels = Arc::new(ChannelRuntime::new(&state));
-        let (started, failures) = tokio::time::timeout(
+        let (started, failures, _) = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             channels.start_configured_with_receipt(),
         )
@@ -1400,7 +2193,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let state = state(temp.path()).await?;
         let empty = ChannelRuntime::new(&state);
-        let (started, failures) = empty.start_configured_with_receipt().await;
+        let (started, failures, _) = empty.start_configured_with_receipt().await;
         assert_eq!(started, 0);
         assert!(failures.is_empty());
         let revision = state.config.configuration_snapshot().await.1;
@@ -1420,7 +2213,7 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("original handle absent"))?
             .start(Arc::new(test_support::Handler))
             .await?;
-        let (started, failures) = channels.start_configured_with_receipt().await;
+        let (started, failures, _) = channels.start_configured_with_receipt().await;
         assert_eq!(started, 1);
         assert_eq!(failures.len(), 1);
         assert!(

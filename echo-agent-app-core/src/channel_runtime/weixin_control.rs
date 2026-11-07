@@ -57,11 +57,13 @@ impl WeixinControlReply {
         if self.service_cancel.is_cancelled() {
             return;
         }
-        let (_publication, _control) = match self
-            .state
-            .channel_control_for_generation(&self.workspace_id, &self.workspace_generation)
-            .await
-        {
+        // 在原回复边界擦除scope初始化future的具体类型，避免向渠道的Send/Sync
+        // 证明展开整条工作空间/生命周期链；仍由同一owner原位等待，不新增任务。
+        let control: futures::future::BoxFuture<'_, _> = Box::pin(
+            self.state
+                .channel_control_for_generation(&self.workspace_id, &self.workspace_generation),
+        );
+        let (_publication, _control) = match control.await {
             Ok(scope) => scope,
             Err(_) => {
                 tracing::warn!("Control reply workspace generation is unavailable");

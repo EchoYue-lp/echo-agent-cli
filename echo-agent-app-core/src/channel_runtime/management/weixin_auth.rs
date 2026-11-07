@@ -278,12 +278,22 @@ impl ChannelRuntime {
             ))
             .map_err(|_| "Weixin protocol state could not be opened".to_string())?,
         );
-        let plugin = WeixinChannel::new(WeixinConfig {
+        let config = WeixinConfig {
             credentials: credentials(&account),
             store,
-        })
-        .and_then(|plugin| plugin.with_bot_agent(&format!("EKO/{}", env!("CARGO_PKG_VERSION"))))
-        .map_err(|_| "Weixin channel could not be initialized".to_string())?;
+        };
+        #[cfg(test)]
+        let plugin = match self.weixin_fixture_address {
+            Some(address) => WeixinChannel::for_local_fixture(config, address),
+            None => WeixinChannel::new(config),
+        };
+        #[cfg(not(test))]
+        let plugin = WeixinChannel::new(config);
+        let plugin = plugin
+            .and_then(|plugin| {
+                plugin.with_bot_agent(&format!("Eclip/{}", env!("CARGO_PKG_VERSION")))
+            })
+            .map_err(|_| "Weixin channel could not be initialized".to_string())?;
         let handle = plugin
             .delivery_handle()
             .ok_or_else(|| "Weixin original sender unavailable".to_string())?;
@@ -569,7 +579,7 @@ impl ChannelRuntime {
         let api = match api {
             Some(api) => api,
             None => WeixinApi::new()
-                .and_then(|api| api.with_bot_agent(&format!("EKO/{}", env!("CARGO_PKG_VERSION"))))
+                .and_then(|api| api.with_bot_agent(&format!("Eclip/{}", env!("CARGO_PKG_VERSION"))))
                 .map_err(|_| "Weixin HTTPS client unavailable".to_string())?,
         };
         // This host never imports another application's saved local_token_list.
