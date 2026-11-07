@@ -131,6 +131,19 @@ describe('原生消息时间线', () => {
         }}
       />
     );
+    expect(screen.getByRole('alert').textContent).toContain('首请求失败');
+    rerender(
+      <MessageBubble
+        message={{
+          ...failed,
+          content: '',
+          failureNotice: undefined,
+          assistantBlocks: [
+            { block: block('candidate', 'final_answer', '未通过', 0), content: '未通过' },
+          ],
+        }}
+      />
+    );
     expect(container.childElementCount).toBe(0);
   });
 
@@ -190,7 +203,8 @@ describe('原生消息时间线', () => {
     expect(screen.queryByText('原签名推理🙂')).toBeNull();
     expect(screen.queryByText('native-copy-summary')).toBeNull();
     const foldButtons = screen.getAllByRole('button', { name: /^展开思考/ });
-    expect(foldButtons.length).toBeGreaterThanOrEqual(2);
+    // 连续Reasoning共用一个过程入口，全部公开内容仍须原序保留。
+    expect(foldButtons).toHaveLength(1);
     for (const button of foldButtons) fireEvent.click(button);
     expect(screen.getByText('原签名推理🙂')).toBeTruthy();
     expect(screen.getByText('native-copy-summary')).toBeTruthy();

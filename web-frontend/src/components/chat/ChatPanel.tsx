@@ -6,7 +6,7 @@ import {
 import { useAgentCommunicationInputs } from '../../hooks/useAgentCommunicationInputs';
 import { useRef, useEffect, useCallback, useState } from 'react';
 import { useChatStore } from '../../stores/chatStore';
-import { MessageBubble } from './MessageBubble';
+import { ConversationTimeline } from './ConversationTimeline';
 import { nativeAssistantBlockText } from './NativeMessageTimeline';
 import { ReplyForkDialog, type ReplyForkSource } from './ReplyForkDialog';
 import { ExecutionStatus } from './ExecutionStatus';
@@ -15,6 +15,7 @@ import { ChatInput } from './ChatInput';
 import { WelcomeScreen } from './WelcomeScreen';
 import { useTauriChat, type ChatSendSubmission } from '../../hooks/useTauriChat';
 import { productDataScope, sameProductDataScope } from '../../lib/productDataScope';
+import { configuredModelPresentation, modelLabel } from '../../lib/modelPresentation';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { useConversationStore } from '../../stores/conversationStore';
 import { useToastStore } from '../../stores/toastStore';
@@ -37,7 +38,7 @@ import {
   Workflow,
   X,
 } from 'lucide-react';
-import { providerApi, type ProductDataScope } from '../../api/endpoints';
+import { type ProductDataScope } from '../../api/endpoints';
 import type { Attachment, ChatMessage } from '../../types/api';
 import type { QueuedChatInput } from '../../hooks/useTauriChat';
 import { useContextPaneStore } from '../../stores/contextPaneStore';
@@ -47,7 +48,7 @@ import { useToolExecutionStore } from '../../stores/toolExecutionStore';
 import { dispatchGuiSlashCommand } from '../../lib/slashCommands';
 import { AgentPane } from './AgentPane';
 import { workspaceLocationLabel } from '../../lib/workspacePresentation';
-import type { ConfiguredModel, TaskRun } from '../../generated';
+import type { ConfiguredModel, ModelProviderView, TaskRun } from '../../generated';
 
 // Tauri IPC is the only live transport. The WebSocket transport
 // (hooks/useWebSocket.ts) was removed after the chat path migrated to Tauri
@@ -101,6 +102,7 @@ export function ChatPanel() {
   const [failureToastDismissed, setFailureToastDismissed] = useState(false);
   const [forkSource, setForkSource] = useState<ReplyForkSource | null>(null);
   const [configuredModels, setConfiguredModels] = useState<ConfiguredModel[]>([]);
+  const [modelProviders, setModelProviders] = useState<ModelProviderView[]>([]);
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
   const workspaceMenuRef = useRef<HTMLDivElement>(null);
 
@@ -134,10 +136,12 @@ export function ChatPanel() {
       return;
     }
     let current = true;
-    providerApi
-      .listConfigured()
+    configuredModelPresentation()
       .then((response) => {
-        if (current) setConfiguredModels(response.models.filter((model) => model.enabled));
+        if (current) {
+          setConfiguredModels(response.models.filter((model) => model.enabled));
+          setModelProviders(response.providers);
+        }
       })
       .catch(() => {
         if (current) setConfiguredModels([]);
@@ -178,8 +182,10 @@ export function ChatPanel() {
     sendSelection,
     cancel,
     queuedInputs,
+    isSubmitting,
     clearQueuedMessages,
     removeQueuedMessage,
+    abandonChannelRecoveryInput,
     replaceQueuedMessage,
     reorderQueuedMessage,
     steerQueuedMessage,
@@ -444,7 +450,7 @@ export function ChatPanel() {
                     <option value="">继承主对话</option>
                     {configuredModels.map((model) => (
                       <option key={model.id} value={model.id}>
-                        {model.display_name || model.model}
+                        {modelLabel(model, modelProviders)}
                       </option>
                     ))}
                   </select>
@@ -452,7 +458,7 @@ export function ChatPanel() {
               )}
               <div className="hidden items-center gap-2 sm:flex">
                 <span className="h-2 w-2 rounded-full bg-[var(--accent)]" />
-                <span>{runStatusLabel(runStatus, isStreaming)}</span>
+                <span>{isSubmitting ? '正在提交' : runStatusLabel(runStatus, isStreaming)}</span>
               </div>
               <div ref={workspaceMenuRef} className="relative">
                 <button
@@ -512,21 +518,6 @@ export function ChatPanel() {
                 }
               />
             </div>
-            {isStreaming && messages.length > 0 && (
-              <div className="flex justify-center pb-2">
-                <button
-                  onClick={cancel}
-                  aria-label="停止生成"
-                  className="flex items-center gap-2 rounded-md border border-[var(--border-primary)] bg-[var(--bg-primary)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-                >
-                  <div
-                    className="h-3 w-3 rounded-[3px]"
-                    style={{ background: 'var(--text-secondary)' }}
-                  />
-                  停止生成
-                </button>
-              </div>
-            )}
             {queuedInputs.length > 0 && (
               <QueuedInputList
                 key={JSON.stringify([
@@ -540,6 +531,7 @@ export function ChatPanel() {
                     item.conversationId === activeConversationId
                 )}
                 onRemove={removeQueuedMessage}
+                onAbandonChannelInput={abandonChannelRecoveryInput}
                 onReplace={replaceQueuedMessage}
                 onReorder={reorderQueuedMessage}
                 onSteer={steerQueuedMessage}
@@ -586,44 +578,22 @@ export function ChatPanel() {
         ) : (
           <div className="mx-auto w-full max-w-[980px] px-4 sm:px-6 lg:px-8">
             <div className="space-y-1 pb-6 pt-5">
-              {timelineMessages.map((msg, idx) => {
-                const prevMsg = idx > 0 ? timelineMessages[idx - 1] : null;
-                const showSeparator =
-                  idx === 0 ||
-                  (prevMsg &&
-                    msg.timestamp &&
-                    prevMsg.timestamp &&
-                    msg.timestamp - prevMsg.timestamp > 300000);
-
-                return (
-                  <div key={msg.id}>
-                    {showSeparator && idx > 0 && (
-                      <div className="flex items-center gap-3 py-4">
-                        <div className="h-px flex-1 bg-[var(--border-secondary)]" />
-                        <span
-                          className="text-xs text-[var(--text-tertiary)]"
-                          style={{ fontVariantNumeric: 'tabular-nums' }}
-                        >
-                          {new Date(msg.timestamp).toLocaleTimeString([], {
-                            hour: '2-digit',
-                            minute: '2-digit',
-                          })}
-                        </span>
-                        <div className="h-px flex-1 bg-[var(--border-secondary)]" />
-                      </div>
-                    )}
-                    <MessageBubble
-                      message={msg}
-                      onRegenerate={handleRegenerate}
-                      onEditAndResend={handleEditAndResend}
-                      onFork={
-                        activeConversationId && forkReplies.has(msg.id) ? handleFork : undefined
-                      }
-                      forkDisabled={isStreaming || !!forkSource}
-                    />
-                  </div>
-                );
-              })}
+              <ConversationTimeline
+                messages={timelineMessages}
+                targetScope={{
+                  workspaceId: productDataScope(currentWorkspace).workspaceId,
+                  conversationId: activeConversationId,
+                }}
+                containerKey={JSON.stringify([
+                  productDataScope(currentWorkspace),
+                  activeConversationId,
+                ])}
+                onRegenerate={handleRegenerate}
+                onEditAndResend={handleEditAndResend}
+                onFork={activeConversationId ? handleFork : undefined}
+                forkReplies={forkReplies}
+                forkDisabled={isStreaming || !!forkSource}
+              />
 
               <ExecutionStatus />
 
@@ -1043,12 +1013,14 @@ function queuedInputVersion(item: QueuedChatInput): string {
 function QueuedInputList({
   items,
   onRemove,
+  onAbandonChannelInput,
   onReplace,
   onReorder,
   onSteer,
 }: {
   items: QueuedChatInput[];
   onRemove: (id: string) => void;
+  onAbandonChannelInput: (id: string) => void;
   onReplace: (id: string, text: string) => Promise<boolean>;
   onReorder: (sourceId: string, targetId: string) => void;
   onSteer: (id: string) => Promise<boolean>;
@@ -1316,6 +1288,18 @@ function QueuedInputList({
               >
                 <CornerUpLeft size={14} />
               </button>
+              {item.channelOwned && item.phase === 'recovery_required' && (
+                <button
+                  type="button"
+                  onClick={() => onAbandonChannelInput(item.id)}
+                  disabled={!!busyId}
+                  className="shrink-0 rounded border border-[var(--border-primary)] px-2 py-0.5 text-[11px] text-[var(--text-secondary)] hover:text-[var(--color-error)]"
+                  title="仅解除队列阻塞；不撤销已发生的执行、发送或 UNKNOWN 结论"
+                  aria-label="放弃这条待恢复消息"
+                >
+                  放弃这条待恢复消息
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => onRemove(item.id)}

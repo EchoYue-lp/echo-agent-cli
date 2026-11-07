@@ -2931,6 +2931,8 @@ mod tests {
                 &JournalIdentity::new(),
                 &NativePublicationCoverage {
                     first_observed_sequence: 1,
+                    usage: None,
+                    presentation: None,
                 },
                 0,
             )

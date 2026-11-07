@@ -1,0 +1,128 @@
+{
+  "messages": [
+    {
+      "assistant_blocks": [
+        {
+          "block": {
+            "block_id": "progress",
+            "complete": true,
+            "delta": "各自已核验的原进度",
+            "phase": "commentary",
+            "provider": "controlled",
+            "reasoning": null,
+            "request_id": "request-progress",
+            "sequence": 0
+          },
+          "content": "各自已核验的原进度",
+          "execution_id": "same-execution",
+          "journal_source": {
+            "sequence": 1,
+            "stream_id": "[\"same-workspace\",\"same-conversation\"]"
+          },
+          "publication_event_id": "evt_1d81b3a27a32ae317f7ef698498a56c5bbdcb5ebd9a5a6d2eb63f4eb61fb24da"
+        }
+      ],
+      "content": null,
+      "created_at": "2026-11-07T00:00:00Z",
+      "execution_steps": [
+        {
+          "index": 0,
+          "type": "assistant"
+        }
+      ],
+      "presentation_unavailable": true,
+      "role": "assistant",
+      "tool_calls": null,
+      "turn_source": {
+        "conversation_id": "same-conversation",
+        "execution_id": "same-execution",
+        "root_turn_id": "same-root",
+        "turn_id": "same-root",
+        "workspace_id": "same-workspace"
+      }
+    },
+    {
+      "assistant_blocks": [
+        {
+          "block": {
+            "block_id": "progress",
+            "complete": true,
+            "delta": "各自已核验的原进度",
+            "phase": "commentary",
+            "provider": "controlled",
+            "reasoning": null,
+            "request_id": "request-progress",
+            "sequence": 0
+          },
+          "content": "各自已核验的原进度",
+          "execution_id": "same-execution",
+          "journal_source": {
+            "sequence": 1,
+            "stream_id": "[\"same-workspace\",\"same-conversation\"]"
+          },
+          "publication_event_id": "evt_1d81b3a27a32ae317f7ef698498a56c5bbdcb5ebd9a5a6d2eb63f4eb61fb24da"
+        }
+      ],
+      "content": null,
+      "created_at": "2026-11-07T00:00:00Z",
+      "execution_steps": [
+        {
+          "index": 0,
+          "type": "assistant"
+        }
+      ],
+      "presentation_unavailable": true,
+      "role": "assistant",
+      "tool_calls": null,
+      "turn_source": {
+        "conversation_id": "same-conversation",
+        "execution_id": "same-execution",
+        "root_turn_id": "same-root",
+        "turn_id": "same-root",
+        "workspace_id": "same-workspace"
+      }
+    },
+    {
+      "assistant_blocks": [
+        {
+          "block": {
+            "block_id": "progress",
+            "complete": true,
+            "delta": "各自已核验的原进度",
+            "phase": "commentary",
+            "provider": "controlled",
+            "reasoning": null,
+            "request_id": "request-progress",
+            "sequence": 0
+          },
+          "content": "各自已核验的原进度",
+          "execution_id": "same-execution",
+          "journal_source": {
+            "sequence": 1,
+            "stream_id": "[\"same-workspace\",\"same-conversation\"]"
+          },
+          "publication_event_id": "evt_1d81b3a27a32ae317f7ef698498a56c5bbdcb5ebd9a5a6d2eb63f4eb61fb24da"
+        }
+      ],
+      "content": null,
+      "created_at": "2026-11-07T00:00:00Z",
+      "execution_steps": [
+        {
+          "index": 0,
+          "type": "assistant"
+        }
+      ],
+      "presentation_unavailable": true,
+      "role": "assistant",
+      "tool_calls": null,
+      "turn_source": {
+        "conversation_id": "same-conversation",
+        "execution_id": "same-execution",
+        "root_turn_id": "same-root",
+        "turn_id": "same-root",
+        "workspace_id": "same-workspace"
+      }
+    }
+  ],
+  "verification": "two controlled original journals -> real imported history transport; not native App"
+}

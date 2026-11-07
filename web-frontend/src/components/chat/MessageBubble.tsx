@@ -3,7 +3,7 @@ import { useMemo, useState, memo } from 'react';
 import { transcriptToolExecution, type ChatMessage } from '../../types/api';
 import { Copy, Check, RefreshCw, GitFork, Pencil, X, ArrowUp, File, Download } from 'lucide-react';
 import MarkdownContent from '../common/MarkdownContent';
-import { NativeMessageTimeline, nativeAssistantBlockText } from './NativeMessageTimeline';
+import { NativeMessageTimeline, nativeTimelineItems } from './NativeMessageTimeline';
 import { ParallelExecutionBlock, visibleSubagentRuns } from './ParallelExecutionBlock';
 import { ToolExecutionGroup } from './ToolExecutionGroup';
 import { ExecutionProcessGroup } from './ExecutionProcessGroup';
@@ -19,6 +19,10 @@ interface MessageBubbleProps {
   onEditAndResend?: (messageId: string, newContent: string) => void;
   onFork?: (messageId: string) => void;
   forkDisabled?: boolean;
+  /** 轮次容器已呈现原过程时，复用本组件的最终正文/产物/操作。 */
+  hideProcess?: boolean;
+  hideBody?: boolean;
+  hideParallel?: boolean;
 }
 
 function formatFileSize(bytes: number): string {
@@ -121,6 +125,9 @@ export const MessageBubble = memo(function MessageBubble({
   onEditAndResend,
   onFork,
   forkDisabled,
+  hideProcess = false,
+  hideBody = false,
+  hideParallel = false,
 }: MessageBubbleProps) {
   const isUser = message.role === 'user' && !message.internalAgent;
   const [editing, setEditing] = useState(false);
@@ -149,10 +156,8 @@ export const MessageBubble = memo(function MessageBubble({
 
   const { steps } = flattenSteps(message);
   const executionItems = groupExecutionSteps(steps);
-  const hasNativeTimeline = Boolean(message.assistantBlocks?.length);
-  const hasVisibleNativeContent = message.assistantBlocks?.some(
-    (view) => view.block.phase !== 'final_answer' && Boolean(nativeAssistantBlockText(view).trim())
-  );
+  const hasNativeTimeline = !hideProcess && Boolean(message.assistantBlocks?.length);
+  const hasVisibleNativeContent = hasNativeTimeline && nativeTimelineItems(message).length > 0;
   const activeRun = useTaskRuntimeStore((state) => state.activeRun);
   const subagentRuns = useSubagentRunStore((state) => state.runs);
   const chatMessages = useChatStore((state) => state.messages);
@@ -166,7 +171,7 @@ export const MessageBubble = memo(function MessageBubble({
   const messageIds = useMemo(() => new Set(chatMessages.map((item) => item.id)), [chatMessages]);
   const visibleRuns = useMemo(
     () =>
-      message.role === 'tool'
+      hideParallel || message.role === 'tool'
         ? []
         : visibleSubagentRuns(
             Object.values(subagentRuns),
@@ -175,7 +180,15 @@ export const MessageBubble = memo(function MessageBubble({
             lastAssistantMessageId,
             messageIds
           ),
-    [activeRun, lastAssistantMessageId, message.id, message.role, messageIds, subagentRuns]
+    [
+      activeRun,
+      hideParallel,
+      lastAssistantMessageId,
+      message.id,
+      message.role,
+      messageIds,
+      subagentRuns,
+    ]
   );
   const activeRunBelongsToMessage = Boolean(
     activeRun &&
@@ -206,7 +219,7 @@ export const MessageBubble = memo(function MessageBubble({
     visibleRuns.map((run) => run.status),
     hasRunningTools
   );
-  const hasExecutionProcess = executionItems.length > 0 || visibleRuns.length > 0;
+  const hasExecutionProcess = !hideProcess && (executionItems.length > 0 || visibleRuns.length > 0);
   const hasUnrestoredTranscript = useToolExecutionStore(
     (state) =>
       (message.transcriptTools?.some((record) => !transcriptToolExecution(record, state.tools)) ??
@@ -215,13 +228,16 @@ export const MessageBubble = memo(function MessageBubble({
         (status) => status == null || status === 'unknown' || status === 'interrupted'
       )
   );
-  const hasBody = Boolean(message.content.trim());
+  const hasBody = !hideBody && Boolean(message.content.trim());
   // 历史恢复沿原运行态保留失败原因；失败不是助手最终答案，也不能被空行过滤隐藏。
   const failureReason =
-    message.executionStatus?.status === 'failed' && message.executionStatus.reason?.trim()
+    message.failureNotice ??
+    (message.executionStatus?.status === 'failed' && message.executionStatus.reason?.trim()
       ? message.executionStatus.reason
-      : null;
-  const showFailureReason = Boolean(failureReason && !message.content.includes(failureReason));
+      : null);
+  const showFailureReason = Boolean(
+    failureReason && (hideBody || !message.content.includes(failureReason))
+  );
 
   if (message.role === 'user' && message.agentInput) return <AgentInputMessage message={message} />;
 
@@ -405,33 +421,43 @@ export const MessageBubble = memo(function MessageBubble({
                 Agent 内部消息
               </span>
             )}
-            {hasNativeTimeline && <NativeMessageTimeline message={message} />}
-            {!hasNativeTimeline && hasExecutionProcess ? (
-              <ExecutionProcessGroup
-                completed={processCompleted}
-                unrestored={hasUnrestoredTranscript}
-                toolFailureCount={toolFailureCount}
-              >
-                {/* canonical工具引用 */}
-                <div className="space-y-1">
-                  {executionItems.map((item, i) => {
-                    return (
-                      <ToolExecutionGroup
-                        key={`tools-${i}`}
-                        toolIds={item.toolIds}
-                        transcriptTools={message.transcriptTools}
-                      />
-                    );
-                  })}
-                </div>
+            {!hideProcess &&
+              (hasNativeTimeline && (hasVisibleNativeContent || visibleRuns.length > 0) ? (
+                <ExecutionProcessGroup
+                  completed={Boolean(message.finalAnswerConfirmed && hasBody)}
+                  statusLabel="最终结果已发布"
+                  unrestored={hasUnrestoredTranscript}
+                  toolFailureCount={toolFailureCount}
+                >
+                  <NativeMessageTimeline message={message} includeSubagents={false} />
+                  {!hideParallel && <ParallelExecutionBlock messageId={message.id} />}
+                </ExecutionProcessGroup>
+              ) : !hasNativeTimeline && hasExecutionProcess ? (
+                <ExecutionProcessGroup
+                  completed={processCompleted}
+                  unrestored={hasUnrestoredTranscript}
+                  toolFailureCount={toolFailureCount}
+                >
+                  {/* canonical工具引用 */}
+                  <div className="space-y-1">
+                    {executionItems.map((item, i) => {
+                      return (
+                        <ToolExecutionGroup
+                          key={`tools-${i}`}
+                          toolIds={item.toolIds}
+                          transcriptTools={message.transcriptTools}
+                        />
+                      );
+                    })}
+                  </div>
 
-                {/* Run-level Subagents remain independent rows inside the process. */}
-                <ParallelExecutionBlock messageId={message.id} />
-              </ExecutionProcessGroup>
-            ) : (
-              // No execution history exists for this assistant response.
-              <ParallelExecutionBlock messageId={message.id} />
-            )}
+                  {/* Run-level Subagents remain independent rows inside the process. */}
+                  {!hideParallel && <ParallelExecutionBlock messageId={message.id} />}
+                </ExecutionProcessGroup>
+              ) : (
+                // No execution history exists for this assistant response.
+                !hideParallel && <ParallelExecutionBlock messageId={message.id} />
+              ))}
 
             {/* Final text — no left border, plain markdown flow */}
             {hasBody && (

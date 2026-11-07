@@ -633,6 +633,12 @@
       "translationStatus": "not_required"
     },
     {
+      "targetPath": "adr/0066-turn-presentation-and-usage-projection.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
       "targetPath": "adr/0067-local-chart-rendering.md",
       "kind": "adr",
       "sourceLanguage": "zh",

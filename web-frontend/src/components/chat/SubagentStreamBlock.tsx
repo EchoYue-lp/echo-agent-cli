@@ -21,6 +21,8 @@ import { subagentOutcomePresentation } from '../../utils/subagentOutcome';
 interface SubagentStreamBlockProps {
   run: SubagentRunState;
   taskTitle?: string;
+  /** 继承来源只读呈现，不把源run当作目标会话的操作owner。 */
+  readOnlySource?: boolean;
 }
 
 /**
@@ -34,6 +36,7 @@ interface SubagentStreamBlockProps {
 export const SubagentStreamBlock = memo(function SubagentStreamBlock({
   run,
   taskTitle,
+  readOnlySource = false,
 }: SubagentStreamBlockProps) {
   const [expanded, setExpanded] = useState(false);
   const ownerKey = toolExecutionOwnerKey(
@@ -77,9 +80,13 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
         </button>
         <button
           type="button"
-          onClick={openDetail}
+          onClick={readOnlySource ? () => setExpanded((value) => !value) : openDetail}
           className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 py-0.5 text-left hover:bg-[var(--bg-hover)]"
-          title="在右侧边栏查看完整执行过程"
+          title={
+            readOnlySource
+              ? '查看来源结果摘要；完整日志请打开来源会话'
+              : '在右侧边栏查看完整执行过程'
+          }
         >
           {statusIcon}
           <span className="shrink-0 font-medium text-[var(--text-primary)]">Subagent</span>

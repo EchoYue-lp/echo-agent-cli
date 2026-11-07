@@ -207,6 +207,7 @@ pub fn build_tauri_app(
             commands::conversations::create_conversation,
             commands::conversations::set_conversation_archived,
             commands::conversations::get_conversation,
+            commands::conversations::get_conversation_usage,
             commands::conversations::get_agent_communication_inputs,
             commands::conversations::update_conversation,
             commands::conversations::prepare_conversation_fork,

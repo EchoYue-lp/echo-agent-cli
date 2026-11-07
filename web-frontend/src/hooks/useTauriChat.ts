@@ -1,7 +1,7 @@
 import { useRef, useCallback, useEffect, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { useChatStore } from '../stores/chatStore';
-import { useConversationStore } from '../stores/conversationStore';
+import { captureConversationView, useConversationStore } from '../stores/conversationStore';
 import { useTaskRuntimeStore, type TaskRuntimeState } from '../stores/taskRuntimeStore';
 import { useToastStore } from '../stores/toastStore';
 import { useToolExecutionStore } from '../stores/toolExecutionStore';
@@ -151,6 +151,9 @@ export function useTauriChat() {
   const frontierAppliedOrdinalRef = useRef(0);
   const dispatchingInputIdRef = useRef<string | null>(null);
   const pendingAdmissionRef = useRef<PendingChatAdmission | null>(null);
+  // 只投影原提交正在等待启动回执，不代表后端已经运行。
+  const [submittingAdmission, setSubmittingAdmission] = useState<PendingChatAdmission | null>(null);
+  const activeInputIdRef = useRef<string | null>(null);
   const pendingSteersRef = useRef(new Map<string, Promise<boolean>>());
   const steerProjectionOwnersRef = useRef(new Map<string, symbol>());
   const dispatchMessageRef = useRef<
@@ -190,6 +193,13 @@ export function useTauriChat() {
     };
   }, []);
 
+  // 只读补件允许原轮次自然结束，但卸载/视图代次变化必须退役请求。
+  const capturePresentationProjection = useCallback(() => {
+    const generation = identityGenerationRef.current;
+    const ownsView = captureConversationView();
+    return () => identityGenerationRef.current === generation && ownsView();
+  }, []);
+
   const getActiveTurnSnapshot = useCallback(async () => {
     // Every dispatched GUI turn receives a durable conversation id before it
     // reaches Rust. An unscoped lookup from a blank new-chat view can only
@@ -210,6 +220,7 @@ export function useTauriChat() {
     ) {
       currentWorkspaceIdRef.current = snapshot.workspace_id;
       currentConversationIdRef.current = snapshot.conversation_id;
+      if (currentMessageKeyRef.current !== snapshot.root_turn_id) activeInputIdRef.current = null;
       activeTurnIdRef.current = snapshot.active_turn_id;
       const chat = useChatStore.getState();
       if (!chat.messages.some((message) => message.id === snapshot.root_turn_id)) {
@@ -292,11 +303,13 @@ export function useTauriChat() {
     }
 
     activeTurnIdRef.current = null;
+    activeInputIdRef.current = null;
     currentMessageKeyRef.current = null;
     assistantIdRef.current = null;
     thinkingIdRef.current = null;
     isCancelledRef.current = false;
     pendingAdmissionRef.current = null;
+    setSubmittingAdmission(null);
   }, [activeConversationId, currentWorkspaceId, currentWorkspaceGeneration, newConversationEpoch]);
 
   useEffect(
@@ -314,6 +327,14 @@ export function useTauriChat() {
     ) {
       return;
     }
+    // 新会话切到持久ID后会重新挂载观察；原send仍可能只提交了输入、尚未
+    // 返回started。恢复观察不能抢占它，再以另一messageKey派发同一个输入。
+    const admission = pendingAdmissionRef.current;
+    if (
+      activeTurnIdRef.current ||
+      (admission?.workspaceId === workspaceId && admission.conversationId === conversationId)
+    )
+      return;
     const snapshot = frontierRef.current;
     const next = snapshot.items[0];
     if (!next || channelOwnsInput(next)) return;
@@ -321,6 +342,16 @@ export function useTauriChat() {
     if (dispatchingInputIdRef.current === inputId) return;
     dispatchingInputIdRef.current = inputId;
     queueMicrotask(() => {
+      const admission = pendingAdmissionRef.current;
+      if (
+        currentWorkspaceIdRef.current !== workspaceId ||
+        useConversationStore.getState().activeId !== conversationId ||
+        activeTurnIdRef.current ||
+        (admission?.workspaceId === workspaceId && admission.conversationId === conversationId)
+      ) {
+        if (dispatchingInputIdRef.current === inputId) dispatchingInputIdRef.current = null;
+        return;
+      }
       const dispatch = dispatchMessageRef.current;
       if (!dispatch) {
         dispatchingInputIdRef.current = null;
@@ -382,6 +413,7 @@ export function useTauriChat() {
           currentMessageKeyRef,
           currentMessageIdRef: currentMessageKeyRef,
           isCancelledRef,
+          captureProjection: capturePresentationProjection,
           currentThinkingIdRef: thinkingIdRef,
           onInputLifecycle: (workspaceId, conversationId) => {
             void refreshFrontier(workspaceId, conversationId);
@@ -400,6 +432,7 @@ export function useTauriChat() {
           currentMessageKeyRef,
           currentMessageIdRef: currentMessageKeyRef,
           isCancelledRef,
+          captureProjection: capturePresentationProjection,
           currentThinkingIdRef: thinkingIdRef,
         });
         return;
@@ -411,6 +444,7 @@ export function useTauriChat() {
         currentMessageKeyRef,
         currentMessageIdRef: currentMessageKeyRef,
         isCancelledRef,
+        captureProjection: capturePresentationProjection,
         currentThinkingIdRef: thinkingIdRef,
         onInputLifecycle: (workspaceId, conversationId) => {
           void refreshFrontier(workspaceId, conversationId);
@@ -434,7 +468,14 @@ export function useTauriChat() {
         }
       }
     },
-    [dispatchNextQueued, isCurrentRunEvent, isCurrentStreamEvent, rebindEventRefs, refreshFrontier]
+    [
+      capturePresentationProjection,
+      dispatchNextQueued,
+      isCurrentRunEvent,
+      isCurrentStreamEvent,
+      rebindEventRefs,
+      refreshFrontier,
+    ]
   );
 
   const handleEvent = useCallback(
@@ -542,14 +583,22 @@ export function useTauriChat() {
       pendingCleanup.push(unlistenExec);
       try {
         const recoveryTerminalRevision = terminalProjectionRevisionRef.current;
+        const submissionAtSnapshot = pendingAdmissionRef.current;
         const snapshot = await getActiveTurnSnapshot();
         if (
           !aborted &&
           setupIdentityGeneration === identityGenerationRef.current &&
           recoveryTerminalRevision === terminalProjectionRevisionRef.current
         ) {
-          restoreActiveTurnRefs(snapshot);
           const activeConversation = useConversationStore.getState().activeId;
+          const pending = pendingAdmissionRef.current;
+          const snapshotIsOriginalSubmission =
+            pending?.workspaceId === currentWorkspaceId &&
+            pending.conversationId === activeConversation &&
+            pending.messageKey === snapshot?.root_turn_id;
+          // 同一原提交的界面由启动回执建立；恢复仍重放原journal，但不能
+          // 提前插入一个assistant，再由原回执重复建立同一条消息。
+          if (!snapshotIsOriginalSubmission) restoreActiveTurnRefs(snapshot);
           const snapshotIsMessageScope = snapshot?.conversation_id.startsWith('message:') ?? false;
           const conversationId = snapshotIsMessageScope
             ? undefined
@@ -584,7 +633,16 @@ export function useTauriChat() {
                   }
                 }
               }
-              if (!snapshot && useChatStore.getState().isStreaming) {
+              const pending = pendingAdmissionRef.current;
+              if (
+                !snapshot &&
+                !submissionAtSnapshot &&
+                !(
+                  pending?.workspaceId === currentWorkspaceId &&
+                  pending.conversationId === activeConversation
+                ) &&
+                useChatStore.getState().isStreaming
+              ) {
                 useChatStore.getState().clearInactiveTurnProjection();
               }
             }
@@ -704,7 +762,10 @@ export function useTauriChat() {
           identityGeneration: identityGenerationRef.current,
           events: [],
         };
-        if (isOriginalView()) pendingAdmissionRef.current = admission;
+        if (isOriginalView()) {
+          pendingAdmissionRef.current = admission;
+          setSubmittingAdmission(admission);
+        }
 
         // TaskRuntime runs are keyed by conversation_id. On the first turn there
         // is no active conversation yet, so create it before routing; otherwise
@@ -862,6 +923,7 @@ export function useTauriChat() {
         store.addUserMessage(text || '(附件)', displayAttachments);
         currentMessageKeyRef.current = chatResult.root_turn_id ?? messageKey;
         activeTurnIdRef.current = chatResult.active_turn_id ?? messageKey;
+        activeInputIdRef.current = chatResult.input_id ?? null;
         assistantIdRef.current = store.startAssistantMessage(currentMessageKeyRef.current);
         notifyDirectAccepted(captureInputProjection());
         for (const event of pendingEvents) applyEvent(event);
@@ -894,6 +956,9 @@ export function useTauriChat() {
           }
         }
         return false;
+      } finally {
+        const settledAdmission = admission;
+        setSubmittingAdmission((current) => (current === settledAdmission ? null : current));
       }
     },
     [applyEvent, captureInputProjection, refreshFrontier]
@@ -916,6 +981,10 @@ export function useTauriChat() {
         return false;
       }
       const activeTurnId = activeTurnIdRef.current;
+      if (!activeTurnId) {
+        useToastStore.getState().addToast('info', '当前没有正在执行的对话，消息仍保留在排队队列中');
+        return false;
+      }
       const ownsTarget = captureInputProjection();
       // Enter自动投递与队列按钮可同时观察同一输入。复用准确版本/原turn的
       // 在途回执，避免第二次CAS拒绝覆盖第一次仍待drain的真实状态。
@@ -1330,7 +1399,25 @@ export function useTauriChat() {
     }
   }, [getActiveTurnSnapshot, handleEvent, restoreActiveTurnRefs]);
 
-  const queuedInputs: QueuedChatInput[] = frontier.items.map((item) => ({
+  const isSubmitting = Boolean(
+    submittingAdmission &&
+    pendingAdmissionRef.current === submittingAdmission &&
+    submittingAdmission.identityGeneration === identityGenerationRef.current &&
+    submittingAdmission.workspaceId === currentWorkspaceId &&
+    submittingAdmission.conversationId === activeConversationId
+  );
+  const queuedInputs: QueuedChatInput[] = (
+    isSubmitting
+      ? []
+      : frontier.items.filter((item) => {
+          const isActiveInput =
+            item.receipt.identity.input_id === activeInputIdRef.current ||
+            (item.receipt.turn_id != null &&
+              (item.receipt.turn_id === activeTurnIdRef.current ||
+                item.receipt.turn_id === currentMessageKeyRef.current));
+          return !activeTurnIdRef.current || !isActiveInput;
+        })
+  ).map((item) => ({
     id: item.receipt.identity.input_id,
     text: item.payload.text,
     attachments: item.payload.attachments,
@@ -1375,6 +1462,34 @@ export function useTauriChat() {
         )
         .catch((error) => {
           useToastStore.getState().addToast('error', `删除排队消息失败：${errorMessage(error)}`);
+        });
+    },
+    [refreshFrontier]
+  );
+
+  /**
+   * 用户明确放弃一条待恢复的原渠道消息。队列项本身不能被编辑/执行/移除；
+   * 只有 RecoveryRequired 才出现此动作，且只解除队列阻塞，不撤销已发生的
+   * 执行或发送结论。phase 与队列版本仍由后端原 authority 复核。
+   */
+  const abandonChannelRecoveryInput = useCallback(
+    (id: string) => {
+      const snapshot = frontierRef.current;
+      const item = snapshot.items.find((candidate) => candidate.receipt.identity.input_id === id);
+      if (!item || !channelOwnsInput(item) || item.receipt.phase !== 'recovery_required') return;
+      void apiInvoke('abandon_channel_recovery_input', {
+        identity: item.receipt.identity,
+        expected_queue_revision: snapshot.queue_revision,
+      })
+        .then(async () => {
+          useToastStore.getState().addToast('info', '队列项已放弃；原执行状态与副作用结论保持不变');
+          await refreshFrontier(
+            item.receipt.identity.address.workspace_id,
+            item.receipt.identity.address.conversation_id
+          );
+        })
+        .catch((error) => {
+          useToastStore.getState().addToast('error', `放弃待恢复消息失败：${errorMessage(error)}`);
         });
     },
     [refreshFrontier]
@@ -1463,6 +1578,7 @@ export function useTauriChat() {
   );
 
   return {
+    isSubmitting,
     sendMessage,
     sendApproval,
     sendInput,
@@ -1471,6 +1587,7 @@ export function useTauriChat() {
     queuedInputs,
     clearQueuedMessages,
     removeQueuedMessage,
+    abandonChannelRecoveryInput,
     replaceQueuedMessage,
     reorderQueuedMessage,
     steerQueuedMessage,

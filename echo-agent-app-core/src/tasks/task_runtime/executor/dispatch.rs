@@ -991,7 +991,8 @@ impl RunTurnPersistence {
 struct EkoAgentTurnState {
     closed: bool,
     output: String,
-    native_event_ids: HashMap<String, String>,
+    // 同一原事件索引也去重用量，但用量不能解锁native正文/终态发布门槛。
+    native_event_ids: HashMap<String, (String, bool)>,
     pending_verification: HashMap<String, String>,
     pending_file_access: HashMap<String, (String, serde_json::Value)>,
     observed_evidence: Vec<echo_agent::subagent::SubagentEvidence>,
@@ -1126,13 +1127,25 @@ impl EventSink for EkoAgentTurnSink {
             ));
         }
         let source_event_id = envelope.event_id.to_string();
-        let native_started = !self
+        let native_started = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .native_event_ids
-            .is_empty();
-        if matches!(
+            .values()
+            .any(|(_, publication)| *publication);
+        let usage_event = matches!(&envelope.payload, AgentEvent::LlmUsage { .. });
+        let mut confirmed_usage_hash = None;
+        let usage_source = serde_json::json!({
+            "workspace_id": self.context.workspace_id,
+            "conversation_id": envelope.conversation_id.as_ref().map(ToString::to_string),
+            "root_turn_id": self.run_turn.as_ref().map(|owner| owner.turn_id.as_str()),
+            "turn_id": envelope.turn_id.as_str(),
+            "execution_id": envelope.execution_id.as_ref().map(ToString::to_string),
+            "message_id": envelope.message_id.as_ref().map(ToString::to_string),
+            "event_id": source_event_id,
+        });
+        let native_publication = matches!(
             &envelope.payload,
             AgentEvent::AssistantMessage { .. } | AgentEvent::ExecutionStatus(_)
         ) || (native_started
@@ -1143,8 +1156,8 @@ impl EventSink for EkoAgentTurnSink {
                     | AgentEvent::Error { .. }
                     // 保存事实沿同一个owner的journal发布；不能用它补造执行头。
                     | AgentEvent::TranscriptProjectionSettlement(_)
-            ))
-        {
+            ));
+        if native_publication || usage_event {
             if envelope
                 .run_id
                 .as_ref()
@@ -1186,7 +1199,7 @@ impl EventSink for EkoAgentTurnSink {
                 .native_event_ids
                 .get(&source_event_id)
             {
-                if previous == &source_hash {
+                if previous.0 == source_hash {
                     return Ok(SinkControl::Continue);
                 }
                 return Err(echo_agent::error::ReactError::Other(
@@ -1206,7 +1219,7 @@ impl EventSink for EkoAgentTurnSink {
                 .as_ref()
                 .map(|owner| &owner.blocking)
                 .or_else(|| self.run_turn.as_ref().map(|owner| &owner.blocking));
-            if let Some(blocking) = persistence {
+            if native_publication && let Some(blocking) = persistence {
                 let run_id = self.context.run_id.clone();
                 let task_id = self.context.task_id.clone();
                 let execution_id = source_execution_id.clone();
@@ -1225,22 +1238,41 @@ impl EventSink for EkoAgentTurnSink {
                         Self::persistence_error("native Agent envelope persistence failed", error)
                     })?;
             }
+            let mut journal_confirmed = true;
             if let Some(owner) = self.run_turn.as_ref() {
-                // 缺失头仍保未确认，绝不从 Started 文本/Final/EOF 在 sink 后补 owner。
-                if source_execution_id.is_some() {
-                    owner
+                // 用量只是观察，可以保留缺execution的未知；不能借它补造执行头。
+                if source_execution_id.is_some() || usage_event {
+                    let result = owner
                         .publish(crate::chat_driver::ChatDriverEvent::Agent(Box::new(
                             envelope.clone(),
                         )))
-                        .await?;
+                        .await;
+                    if usage_event {
+                        // 观测写入失败只留下覆盖缺口，不能替换原provider错误或改变运行结果。
+                        if result.is_err() {
+                            tracing::warn!(event_id=%source_event_id,"Owned Run用量原日志尚未确认，原执行路径保持");
+                            journal_confirmed = false;
+                        }
+                    } else {
+                        result?;
+                    }
                 }
             }
-            self.emit(RuntimeEventKind::Note, payload);
-            self.state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .native_event_ids
-                .insert(source_event_id.clone(), source_hash);
+            if native_publication {
+                self.emit(RuntimeEventKind::Note, payload);
+            }
+            if journal_confirmed {
+                if usage_event {
+                    // 原费用Store还可能失败；整个处理成功前不能让同event重试早退。
+                    confirmed_usage_hash = Some(source_hash);
+                } else {
+                    self.state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .native_event_ids
+                        .insert(source_event_id.clone(), (source_hash, native_publication));
+                }
+            }
         }
         match envelope.payload {
             AgentEvent::LlmUsage {
@@ -1251,6 +1283,7 @@ impl EventSink for EkoAgentTurnSink {
                 cached_prompt_tokens,
                 cache_creation_prompt_tokens,
                 usage_reported,
+                observation,
             } => {
                 if usage_reported && let Some(primary_task) = self.primary_task.as_ref() {
                     let run_id = self.context.run_id.clone();
@@ -1319,9 +1352,18 @@ impl EventSink for EkoAgentTurnSink {
                         "cached_prompt_tokens": cached_prompt_tokens,
                         "cache_creation_prompt_tokens": cache_creation_prompt_tokens,
                         "usage_reported": usage_reported,
+                        "observation": observation,
                         "usage_event_id": source_event_id,
+                        "usage_source": usage_source,
                     }),
                 );
+                if let Some(source_hash) = confirmed_usage_hash {
+                    self.state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .native_event_ids
+                        .insert(source_event_id.clone(), (source_hash, false));
+                }
             }
             AgentEvent::ToolCall {
                 call_id,

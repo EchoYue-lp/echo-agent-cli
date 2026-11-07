@@ -10,7 +10,7 @@ use echo_agent::memory::{NewConversation, StoredMessage};
 use echo_agent_app_core::api::chat_driver::ChatDriverEvent;
 use echo_agent_app_core::api::chat_event_log::ChatEventEnvelope;
 use echo_agent_app_core::api::conversation_projection::{
-    AttachmentsPayload, NativeHistoryImport, SavedMessage,
+    AttachmentsPayload, NativeHistoryImport, NativeTurnSource, SavedMessage,
 };
 use echo_agent_app_core::api::state::ScopedChatRuntime;
 #[cfg(test)]
@@ -242,6 +242,7 @@ fn pack_ui_projection(message: &mut SavedMessage) -> Option<String> {
         display_content: message.content.clone(),
         execution_steps: message.execution_steps.take().unwrap_or_default(),
         native_history_import: None,
+        native_presentation_import: None,
         attachments: message.attachments.take().unwrap_or_default(),
     })
     .ok()
@@ -583,6 +584,9 @@ fn project_stored_message_with_publications(
         || echo_agent_app_core::api::side_conversation::is_internal_agent_message(
             message.attachments_json.as_deref(),
         );
+    let presentation_import = attachment_payload
+        .as_ref()
+        .and_then(|payload| payload.native_presentation_import.clone());
     let (message_id, display_content, mut execution_steps, attachments) = attachment_payload
         .map(|payload| {
             let execution_steps =
@@ -625,8 +629,18 @@ fn project_stored_message_with_publications(
             false,
         )
     };
+    let turn_source = native_publication
+        .as_ref()
+        .and_then(Option::as_ref)
+        .and_then(|view| view.turn_source.clone());
+    let had_presentation_import = presentation_import.is_some();
+    let native_presentation =
+        presentation_import.filter(|value| turn_source.as_ref() == Some(&value.source));
+    let presentation_unavailable = had_presentation_import && native_presentation.is_none();
     Ok(SavedMessage {
         message_id,
+        native_presentation,
+        presentation_unavailable,
         role: message.role,
         created_at: message.created_at,
         content: agent_input
@@ -644,6 +658,7 @@ fn project_stored_message_with_publications(
             .as_ref()
             .and_then(Option::as_ref)
             .and_then(|view| view.final_answer_source.clone()),
+        turn_source,
         internal_agent,
         tool_calls,
         tool_result: message.tool_result_json,
@@ -686,12 +701,74 @@ async fn project_conversation_messages_with_native_history(
     if cancel.is_cancelled() {
         return Err(IpcError::Validation("会话历史读取已取消".into()));
     }
-    project_conversation_messages(
+    let mut projected = project_conversation_messages(
         stored,
         side_initial_identity,
         internal_message_ids,
         Some((workspace_id, conversation_id, &publications)),
-    )
+    )?;
+    let mut supplements = std::collections::HashMap::new();
+    for message in &projected {
+        if let Some(value) = message.native_presentation.as_ref() {
+            match supplements.entry(value.source.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(value.clone()));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if let Some(previous) = entry.get_mut() {
+                        if previous.journal_identity != value.journal_identity {
+                            // 同source不同原generation是粘性冲突，不能挑第一份或回填新日志。
+                            entry.insert(None);
+                        } else {
+                            for record in &value.records {
+                                if !previous.records.iter().any(|known| {
+                                    known.event_id == record.event_id
+                                        && known.content_hash == record.content_hash
+                                }) {
+                                    previous.records.push(record.clone());
+                                }
+                            }
+                            previous.through_sequence =
+                                previous.through_sequence.max(value.through_sequence);
+                            previous.first_observed_sequence = previous
+                                .first_observed_sequence
+                                .min(value.first_observed_sequence);
+                            previous.prefix_complete &= value.prefix_complete;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut emitted = std::collections::HashSet::new();
+    for message in &mut projected {
+        let Some(source) = message.turn_source.as_ref() else {
+            continue;
+        };
+        if let std::collections::hash_map::Entry::Vacant(entry) = supplements.entry(source.clone())
+        {
+            let value = match log.native_presentation_async(source, cancel).await {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    if cancel.is_cancelled() {
+                        return Err(IpcError::Validation("会话历史读取已取消".into()));
+                    }
+                    tracing::warn!(error=%error,"原展示补充未恢复，正文资格不变");
+                    None
+                }
+            };
+            entry.insert(value);
+        }
+        let value = supplements.get(source).and_then(Option::as_ref);
+        message.presentation_unavailable |= value.is_none_or(|value| !value.prefix_complete);
+        // 一个响应只传一份同root补充；前端按原source共享引用，分页不依赖消息位置。
+        message.native_presentation = if emitted.insert(source.clone()) {
+            value.cloned()
+        } else {
+            None
+        };
+    }
+    Ok(projected)
 }
 
 fn project_conversation_messages(
@@ -758,6 +835,233 @@ mod tests {
         Ok(stored)
     }
 
+    #[tokio::test]
+    async fn imported_presentation_generation_conflict_survives_real_history_transport()
+    -> anyhow::Result<()> {
+        use echo_agent::agent::{
+            AgentEvent, AssistantMessageBlock, AssistantPhase, EventEnvelope, EventIdentity,
+        };
+        use echo_agent_app_core::api::chat_event_log::{ChatEventLog, ChatEventRetention};
+        use sha2::{Digest, Sha256};
+        let directory = tempfile::tempdir()?;
+        let block = AssistantMessageBlock {
+            provider_source: None,
+            block_id: "progress".into(),
+            request_id: "request-progress".into(),
+            sequence: 0,
+            phase: AssistantPhase::Commentary,
+            delta: "各自已核验的原进度".into(),
+            complete: true,
+            provider: Some("controlled".into()),
+            reasoning: None,
+        };
+        let mut canonical = Message::assistant(block.delta.clone());
+        canonical.assistant_blocks = Some(vec![block.clone()]);
+        canonical.approved_assistant_blocks = Some(vec![block.clone()]);
+        let mut stored = Vec::new();
+        let mut sources = Vec::new();
+        for label in ["A", "B"] {
+            let log = Arc::new(ChatEventLog::open(
+                directory.path().join(label),
+                ChatEventRetention::default(),
+            )?);
+            let identity = EventIdentity::new("same-native-stream", "same-root")?
+                .with_conversation_id("same-conversation")?
+                .with_message_id("same-root")?
+                .with_execution_id("same-execution")?;
+            log.append(
+                "same-workspace",
+                Some("same-conversation"),
+                "same-root",
+                ChatDriverEvent::Agent(Box::new(EventEnvelope::new(
+                    &identity,
+                    1,
+                    None,
+                    AgentEvent::AssistantMessage {
+                        block: block.clone(),
+                    },
+                )?)),
+            )?;
+            log.append(
+                "same-workspace",
+                Some("same-conversation"),
+                "same-root",
+                ChatDriverEvent::Agent(Box::new(EventEnvelope::new(
+                    &identity,
+                    2,
+                    None,
+                    AgentEvent::Chart {
+                        spec: serde_json::json!({"mark":"bar","source":label}),
+                    },
+                )?)),
+            )?;
+            // 源费用是源日志的事实，不能随Fork的只读历史导入目标账目。
+            log.append(
+                "same-workspace",
+                Some("same-conversation"),
+                "same-root",
+                ChatDriverEvent::Agent(Box::new(EventEnvelope::new(
+                    &identity,
+                    3,
+                    None,
+                    AgentEvent::LlmUsage {
+                        model: "source-model".into(),
+                        prompt_tokens: 100,
+                        completion_tokens: 20,
+                        total_tokens: 120,
+                        cached_prompt_tokens: 50,
+                        cache_creation_prompt_tokens: 0,
+                        usage_reported: true,
+                        observation: None,
+                    },
+                )?)),
+            )?;
+            let publications = log
+                .native_history_publications_async(
+                    "same-workspace",
+                    "same-conversation",
+                    &canonical,
+                    &echo_agent::agent::CancellationToken::new(),
+                )
+                .await?;
+            let view=echo_agent_app_core::api::conversation_projection::project_native_history_publication(&canonical,"same-workspace","same-conversation",&publications)
+                .map_err(anyhow::Error::msg)?.ok_or_else(||anyhow::anyhow!("source view missing"))?;
+            let source = view
+                .turn_source
+                .ok_or_else(|| anyhow::anyhow!("source identity missing"))?;
+            let presentation = log
+                .native_presentation_async(&source, &echo_agent::agent::CancellationToken::new())
+                .await?;
+            let source_usage = log.conversation_usage("same-workspace", "same-conversation")?;
+            assert_eq!(
+                (
+                    source_usage.main.input_tokens,
+                    source_usage.main.output_tokens
+                ),
+                (100, 20),
+                "实际源费用必须先由原Filejournal累计"
+            );
+            sources.push(presentation.clone());
+            let mut row = canonical_fixture(
+                None,
+                "target-conversation",
+                canonical.clone(),
+                "2026-11-07T00:00:00Z",
+            )?;
+            attach_native_history_import(
+                &mut row,
+                NativeHistoryImport {
+                    source_workspace_id: source.workspace_id,
+                    source_conversation_id: source.conversation_id,
+                    source_root_turn_id: source.root_turn_id.clone(),
+                    source_turn_id: source.turn_id,
+                    source_message_id: source.root_turn_id,
+                    execution_id: source.execution_id,
+                    message_content_sha256: hex::encode(Sha256::digest(serde_json::to_vec(
+                        &canonical,
+                    )?)),
+                    events: publications,
+                },
+            )
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            attach_native_product_import(&mut row, "native_presentation_import", &presentation)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            stored.push(row);
+        }
+        assert_eq!(
+            sources.first().map(|value| &value.source),
+            sources.last().map(|value| &value.source)
+        );
+        assert_ne!(
+            sources.first().map(|value| &value.journal_identity),
+            sources.last().map(|value| &value.journal_identity)
+        );
+        stored.push(
+            stored
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("first source missing"))?,
+        );
+        let target = Arc::new(ChatEventLog::open(
+            directory.path().join("target"),
+            ChatEventRetention::default(),
+        )?);
+        let projected = project_conversation_messages_with_native_history(
+            stored,
+            None,
+            &std::collections::HashSet::new(),
+            "target-workspace",
+            "target-conversation",
+            &target,
+            &echo_agent::agent::CancellationToken::new(),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        assert_eq!(projected.len(), 3);
+        assert!(projected.iter().all(
+            |message| message.native_presentation.is_none() && message.presentation_unavailable
+        ));
+        assert!(
+            projected
+                .iter()
+                .all(|message| message.turn_source.is_some() && !message.final_answer_confirmed),
+            "辅助冲突不改变原正文/最终许可"
+        );
+        let inherited_target_usage =
+            target.conversation_usage("target-workspace", "target-conversation")?;
+        assert_eq!(
+            (
+                inherited_target_usage.main.input_tokens,
+                inherited_target_usage.main.output_tokens
+            ),
+            (0, 0),
+            "只读Fork源前缀及冲突补充不向目标账目搬运原费用"
+        );
+        let target_identity = EventIdentity::new("target-native-stream", "target-root")?
+            .with_conversation_id("target-conversation")?
+            .with_message_id("target-root")?
+            .with_execution_id("target-execution")?;
+        target.append(
+            "target-workspace",
+            Some("target-conversation"),
+            "target-root",
+            ChatDriverEvent::Agent(Box::new(EventEnvelope::new(
+                &target_identity,
+                1,
+                None,
+                AgentEvent::LlmUsage {
+                    model: "target-model".into(),
+                    prompt_tokens: 40,
+                    completion_tokens: 2,
+                    total_tokens: 42,
+                    cached_prompt_tokens: 10,
+                    cache_creation_prompt_tokens: 0,
+                    usage_reported: true,
+                    observation: None,
+                },
+            )?)),
+        )?;
+        let own_target_usage =
+            target.conversation_usage("target-workspace", "target-conversation")?;
+        assert_eq!(
+            (
+                own_target_usage.main.input_tokens,
+                own_target_usage.main.output_tokens
+            ),
+            (40, 2),
+            "目标原请求正常累计，不能因继承前缀就忽略目标费用"
+        );
+        if let Some(output) = std::env::var_os("ECLIP_UI_CONFLICT_FIXTURE_OUT") {
+            std::fs::write(
+                output,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "verification":"two controlled original journals -> real imported history transport; not native App", "messages":projected,
+                }))?,
+            )?;
+        }
+        Ok(())
+    }
+
     fn fixture_tool_call(name: &str) -> echo_agent::llm::types::ToolCall {
         echo_agent::llm::types::ToolCall {
             provider_source: None,
@@ -776,12 +1080,15 @@ mod tests {
         SavedMessage {
             message_id: Some(id.to_string()),
             role: role.to_string(),
+            native_presentation: None,
+            presentation_unavailable: false,
             created_at: chrono::Utc::now().to_rfc3339(),
             content: Some(content.to_string()),
             assistant_blocks: None,
             final_answer_confirmed: false,
             execution_status: None,
             final_answer_source: None,
+            turn_source: None,
             internal_agent: false,
             agent_input: None,
             tool_calls: None,
@@ -1804,6 +2111,16 @@ pub async fn get_conversation(
         &read_cancel,
     )
     .await?;
+    let (usage, usage_error) = match state
+        .app_state
+        .storage
+        .chat_events
+        .conversation_usage_async(&workspace_id, &id, &read_cancel)
+        .await
+    {
+        Ok(usage) => (Some(usage), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
     // 原workspace/control和conversation创建身份fence；前端loadGeneration/canProject继续挡旧视图。
     let _same_workspace = state
         .app_state
@@ -1826,7 +2143,54 @@ pub async fn get_conversation(
         "messages": messages,
         "created_at": conv.created_at,
         "updated_at": conv.updated_at,
+        "usage": usage,
+        "usage_error": usage_error,
     }))
+}
+
+/// 只读统计查询复用原 control/conversation 身份栅栏；不恢复上下文或改变当前视图。
+#[tauri::command]
+pub async fn get_conversation_usage(
+    state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    id: String,
+) -> Result<echo_agent_app_core::api::chat_event_log::ConversationUsageSnapshot, IpcError> {
+    let control = state
+        .app_state
+        .workspace_control_for_scope(&workspace_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let generation = control.generation();
+    let store = control
+        .runtime()
+        .conversation_store()
+        .ok_or_else(|| IpcError::Internal("Conversation store not available".into()))?;
+    let original = store
+        .get_conversation(&id)
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?
+        .ok_or_else(|| IpcError::NotFound("会话不存在".into()))?;
+    let result = state
+        .app_state
+        .storage
+        .chat_events
+        .conversation_usage_async(&workspace_id, &id, &state.app_state.tasks.cancel_token)
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    let _same_workspace = state
+        .app_state
+        .workspace_control_for_generation(&workspace_id, &generation)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let current = store
+        .get_conversation(&id)
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?
+        .ok_or_else(|| IpcError::NotFound("统计读取期间会话已删除".into()))?;
+    if current.created_at != original.created_at || current.id != original.id {
+        return Err(IpcError::Validation("统计读取期间会话身份已变更".into()));
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -2059,6 +2423,14 @@ fn attach_native_history_import(
     message: &mut StoredMessage,
     import: NativeHistoryImport,
 ) -> Result<(), IpcError> {
+    attach_native_product_import(message, "native_history_import", &import)
+}
+
+fn attach_native_product_import<T: serde::Serialize>(
+    message: &mut StoredMessage,
+    key: &str,
+    import: &T,
+) -> Result<(), IpcError> {
     let raw = message
         .attachments_json
         .as_deref()
@@ -2070,11 +2442,51 @@ fn attach_native_history_import(
         IpcError::Internal("native history metadata must preserve an object payload".into())
     })?;
     object.insert(
-        "native_history_import".to_string(),
+        key.to_string(),
         serde_json::to_value(import).map_err(|error| IpcError::Internal(error.to_string()))?,
     );
     message.attachments_json =
         Some(serde_json::to_string(&value).map_err(|error| IpcError::Internal(error.to_string()))?);
+    Ok(())
+}
+
+async fn capture_native_presentation_import(
+    app_state: &echo_agent_app_core::api::AppState,
+    message: &mut StoredMessage,
+    source: NativeTurnSource,
+    seen: &mut std::collections::HashSet<NativeTurnSource>,
+) -> Result<(), IpcError> {
+    if !seen.insert(source.clone()) {
+        return Ok(());
+    }
+    let imported = message
+        .attachments_json
+        .as_deref()
+        .and_then(AttachmentsPayload::parse)
+        .and_then(|payload| payload.native_presentation_import)
+        .filter(|value| value.source == source);
+    let presentation = if let Some(value) = imported {
+        Some(value)
+    } else {
+        match app_state
+            .storage
+            .chat_events
+            .native_presentation_async(&source, &app_state.tasks.cancel_token)
+            .await
+        {
+            Ok(value) => Some(value),
+            Err(error) => {
+                if app_state.tasks.cancel_token.is_cancelled() {
+                    return Err(IpcError::Validation("分叉历史读取已取消".into()));
+                }
+                tracing::warn!(error=%error,"分叉展示补充未恢复，保留原publication和缺口");
+                None
+            }
+        }
+    };
+    if let Some(presentation) = presentation {
+        attach_native_product_import(message, "native_presentation_import", &presentation)?;
+    }
     Ok(())
 }
 
@@ -2172,6 +2584,7 @@ async fn attach_reply_fork_native_history_imports(
     prefix: &mut [StoredMessage],
 ) -> Result<(), IpcError> {
     let workspace_id = runtime.execution_scope().workspace_id().to_string();
+    let mut presentation_seen = std::collections::HashSet::new();
     let last_assistant = prefix
         .iter()
         .rposition(|message| message.role == "assistant");
@@ -2249,6 +2662,13 @@ async fn attach_reply_fork_native_history_imports(
                     serde_json::to_vec(&restored)
                         .map_err(|error| IpcError::Internal(error.to_string()))?,
                 ));
+                let presentation_source = NativeTurnSource {
+                    workspace_id: source_workspace_id.clone(),
+                    conversation_id: source_conversation_id.clone(),
+                    root_turn_id: source_root_turn_id.clone(),
+                    turn_id: source_turn_id.clone(),
+                    execution_id: execution_id.clone(),
+                };
                 attach_native_history_import(
                     message,
                     NativeHistoryImport {
@@ -2262,6 +2682,13 @@ async fn attach_reply_fork_native_history_imports(
                         events: progress,
                     },
                 )?;
+                capture_native_presentation_import(
+                    app_state,
+                    message,
+                    presentation_source,
+                    &mut presentation_seen,
+                )
+                .await?;
             }
             continue;
         };
@@ -2358,6 +2785,13 @@ async fn attach_reply_fork_native_history_imports(
                     .map_err(|error| IpcError::Internal(error.to_string()))?,
             ))
         };
+        let presentation_source = NativeTurnSource {
+            workspace_id: first.workspace_id.clone(),
+            conversation_id: first.conversation_id.clone().unwrap_or_default(),
+            root_turn_id: first.root_turn_id.clone(),
+            turn_id: first.turn_id.clone(),
+            execution_id: status.execution_id.clone(),
+        };
         attach_native_history_import(
             message,
             NativeHistoryImport {
@@ -2371,6 +2805,13 @@ async fn attach_reply_fork_native_history_imports(
                 events: matching_events,
             },
         )?;
+        capture_native_presentation_import(
+            app_state,
+            message,
+            presentation_source,
+            &mut presentation_seen,
+        )
+        .await?;
     }
     Ok(())
 }

@@ -4453,3 +4453,6 @@ async fn native_import_full_message_digest_preserves_annotation_boundary_and_rej
     );
     Ok(())
 }
+
+#[path = "native_chart_producer_tests.rs"]
+mod native_chart_producer_tests;

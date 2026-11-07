@@ -49,7 +49,7 @@ describe('EKO subagent depth configuration', () => {
     expect(screen.getByText(/对新任务生效/)).toBeTruthy();
   });
 
-  it('基础页不再重复编辑QQ和飞书，导航至原IM渠道入口', async () => {
+  it('基础页不重复渠道配置，也不再放置IM渠道入口', async () => {
     const { useUiStore } = await import('../../stores/uiStore');
     useUiStore.setState({ settingsOpen: true, activeSettingsTab: 'config' });
     render(<ConfigPanel />);
@@ -58,8 +58,9 @@ describe('EKO subagent depth configuration', () => {
     expect(screen.queryByRole('heading', { name: '飞书' })).toBeNull();
     expect(screen.queryByText('客户端密钥')).toBeNull();
     expect(screen.queryByText('应用密钥')).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: '前往IM渠道' }));
-    expect(useUiStore.getState().activeSettingsTab).toBe('channels');
+    expect(screen.queryByRole('heading', { name: 'IM 渠道' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '前往IM渠道' })).toBeNull();
+    expect(useUiStore.getState().activeSettingsTab).toBe('config');
     expect(useUiStore.getState().settingsOpen).toBe(true);
     expect(api.updateFull).not.toHaveBeenCalled();
     useUiStore.setState({ settingsOpen: false, activeSettingsTab: 'providers' });

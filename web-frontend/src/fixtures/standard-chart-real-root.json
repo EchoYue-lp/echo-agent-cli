@@ -1,0 +1,1230 @@
+{
+  "actual_spec": {
+    "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+    "data": {
+      "values": [
+        {
+          "值": 7,
+          "类": "甲🙂"
+        }
+      ]
+    },
+    "encoding": {
+      "x": {
+        "field": "类",
+        "type": "nominal"
+      },
+      "y": {
+        "field": "值",
+        "type": "quantitative"
+      }
+    },
+    "height": 120,
+    "mark": "bar",
+    "title": "原标准工具公开图表",
+    "width": 240
+  },
+  "after_batch_messages": [
+    {
+      "content": "运行标准图表工具受控链",
+      "created_at": "2026-11-08T06:03:51.200711+08:00",
+      "role": "user",
+      "tool_calls": null
+    },
+    {
+      "assistant_blocks": [
+        {
+          "block": {
+            "block_id": "chart-progress",
+            "complete": true,
+            "delta": "我会用原工具生成公开图表",
+            "phase": "commentary",
+            "provider": "controlled-model",
+            "reasoning": null,
+            "request_id": "chart-request",
+            "sequence": 0
+          },
+          "content": "我会用原工具生成公开图表",
+          "execution_id": "native-history-execution",
+          "journal_source": {
+            "sequence": 4,
+            "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]"
+          },
+          "publication_event_id": "evt_d7f2c3171b6900165a65f8c2997a4c34fcd6400d76219d51fc5c99dcf03bd46e"
+        }
+      ],
+      "content": null,
+      "created_at": "2026-11-08T06:03:51.338021+08:00",
+      "execution_steps": [
+        {
+          "index": 0,
+          "type": "assistant"
+        }
+      ],
+      "native_presentation": {
+        "first_observed_sequence": 1,
+        "journal_identity": "3cb02005-2311-4db5-9f0e-a5e28d3bf0bb",
+        "prefix_complete": true,
+        "records": [
+          {
+            "content_hash": "sha256_37516eb68436df6b57266ccf6834a5f7213d06b3b8c2ee2d28a375102fedb537",
+            "cursor": {
+              "sequence": 8,
+              "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]"
+            },
+            "event_id": "chat_evt_32ffe110e85d303677924b1693e4da5e71852869526d51c1d68c54d8a1e23875",
+            "payload": {
+              "data": {
+                "call_id": "actual-chart-call",
+                "execution_id": "native-history-execution",
+                "name": "generate_chart",
+                "publication_event_id": "evt_7f5c384d2c3610308a0d75d24e318794dca4ef68ae7a2a5a984b3eca74758b6f"
+              },
+              "kind": "tool_call"
+            },
+            "scope": {
+              "conversation_id": "native-history-conversation",
+              "message_id": "native-history-root",
+              "root_turn_id": "native-history-root",
+              "turn_id": "native-history-root",
+              "workspace_id": "native-history-workspace"
+            },
+            "timestamp": "2026-11-07T22:03:51.679814Z"
+          },
+          {
+            "content_hash": "sha256_10901363fee8cda2c7ef814f7d9e842e2833afc2d1d92275867c6783143607bd",
+            "cursor": {
+              "sequence": 9,
+              "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]"
+            },
+            "event_id": "chat_evt_2eeb2745387c29c3b60b28928e9bf25aa3116d4825c36ace38c2492c5df80427",
+            "payload": {
+              "data": {
+                "execution_id": "native-history-execution",
+                "publication_event_id": "evt_9061c6057164e8dcf3b20e26ad7b2ebf0035729f296cca570d5561467f3cd569",
+                "spec": {
+                  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+                  "data": {
+                    "values": [
+                      {
+                        "值": 7,
+                        "类": "甲🙂"
+                      }
+                    ]
+                  },
+                  "encoding": {
+                    "x": {
+                      "field": "类",
+                      "type": "nominal"
+                    },
+                    "y": {
+                      "field": "值",
+                      "type": "quantitative"
+                    }
+                  },
+                  "height": 120,
+                  "mark": "bar",
+                  "title": "原标准工具公开图表",
+                  "width": 240
+                }
+              },
+              "kind": "chart"
+            },
+            "scope": {
+              "conversation_id": "native-history-conversation",
+              "message_id": "native-history-root",
+              "root_turn_id": "native-history-root",
+              "turn_id": "native-history-root",
+              "workspace_id": "native-history-workspace"
+            },
+            "timestamp": "2026-11-07T22:03:51.809133Z"
+          }
+        ],
+        "source": {
+          "conversation_id": "native-history-conversation",
+          "execution_id": "native-history-execution",
+          "root_turn_id": "native-history-root",
+          "turn_id": "native-history-root",
+          "workspace_id": "native-history-workspace"
+        },
+        "through_sequence": 10
+      },
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{\"chart_type\":\"bar\",\"data\":[{\"值\":7,\"类\":\"甲🙂\"}],\"height\":120,\"output_format\":\"json\",\"title\":\"原标准工具公开图表\",\"width\":240,\"x_field\":\"类\",\"y_field\":\"值\"}",
+            "name": "generate_chart"
+          },
+          "id": "actual-chart-call",
+          "type": "function"
+        }
+      ],
+      "turn_source": {
+        "conversation_id": "native-history-conversation",
+        "execution_id": "native-history-execution",
+        "root_turn_id": "native-history-root",
+        "turn_id": "native-history-root",
+        "workspace_id": "native-history-workspace"
+      }
+    },
+    {
+      "content": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"values\": [\n      {\n        \"值\": 7,\n        \"类\": \"甲🙂\"\n      }\n    ]\n  },\n  \"encoding\": {\n    \"x\": {\n      \"field\": \"类\",\n      \"type\": \"nominal\"\n    },\n    \"y\": {\n      \"field\": \"值\",\n      \"type\": \"quantitative\"\n    }\n  },\n  \"height\": 120,\n  \"mark\": \"bar\",\n  \"title\": \"原标准工具公开图表\",\n  \"width\": 240\n}",
+      "created_at": "2026-11-08T06:03:51.338034+08:00",
+      "role": "tool",
+      "tool_calls": null,
+      "tool_result": "{\"name\":\"generate_chart\",\"tool_call_id\":\"actual-chart-call\"}"
+    },
+    {
+      "assistant_blocks": [],
+      "content": null,
+      "created_at": "2026-11-08T06:03:51.637914+08:00",
+      "execution_steps": [],
+      "role": "assistant",
+      "tool_calls": null,
+      "turn_source": {
+        "conversation_id": "native-history-conversation",
+        "execution_id": "native-history-execution",
+        "root_turn_id": "native-history-root",
+        "turn_id": "native-history-root",
+        "workspace_id": "native-history-workspace"
+      }
+    }
+  ],
+  "batch_sequence": 10,
+  "cold_messages": [
+    {
+      "content": "运行标准图表工具受控链",
+      "created_at": "2026-11-08T06:03:51.200711+08:00",
+      "role": "user",
+      "tool_calls": null
+    },
+    {
+      "assistant_blocks": [
+        {
+          "block": {
+            "block_id": "chart-progress",
+            "complete": true,
+            "delta": "我会用原工具生成公开图表",
+            "phase": "commentary",
+            "provider": "controlled-model",
+            "reasoning": null,
+            "request_id": "chart-request",
+            "sequence": 0
+          },
+          "content": "我会用原工具生成公开图表",
+          "execution_id": "native-history-execution",
+          "journal_source": {
+            "sequence": 4,
+            "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]"
+          },
+          "publication_event_id": "evt_d7f2c3171b6900165a65f8c2997a4c34fcd6400d76219d51fc5c99dcf03bd46e"
+        }
+      ],
+      "content": null,
+      "created_at": "2026-11-08T06:03:51.338021+08:00",
+      "execution_steps": [
+        {
+          "index": 0,
+          "type": "assistant"
+        }
+      ],
+      "native_presentation": {
+        "first_observed_sequence": 1,
+        "journal_identity": "3cb02005-2311-4db5-9f0e-a5e28d3bf0bb",
+        "prefix_complete": true,
+        "records": [
+          {
+            "content_hash": "sha256_37516eb68436df6b57266ccf6834a5f7213d06b3b8c2ee2d28a375102fedb537",
+            "cursor": {
+              "sequence": 8,
+              "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]"
+            },
+            "event_id": "chat_evt_32ffe110e85d303677924b1693e4da5e71852869526d51c1d68c54d8a1e23875",
+            "payload": {
+              "data": {
+                "call_id": "actual-chart-call",
+                "execution_id": "native-history-execution",
+                "name": "generate_chart",
+                "publication_event_id": "evt_7f5c384d2c3610308a0d75d24e318794dca4ef68ae7a2a5a984b3eca74758b6f"
+              },
+              "kind": "tool_call"
+            },
+            "scope": {
+              "conversation_id": "native-history-conversation",
+              "message_id": "native-history-root",
+              "root_turn_id": "native-history-root",
+              "turn_id": "native-history-root",
+              "workspace_id": "native-history-workspace"
+            },
+            "timestamp": "2026-11-07T22:03:51.679814Z"
+          },
+          {
+            "content_hash": "sha256_10901363fee8cda2c7ef814f7d9e842e2833afc2d1d92275867c6783143607bd",
+            "cursor": {
+              "sequence": 9,
+              "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]"
+            },
+            "event_id": "chat_evt_2eeb2745387c29c3b60b28928e9bf25aa3116d4825c36ace38c2492c5df80427",
+            "payload": {
+              "data": {
+                "execution_id": "native-history-execution",
+                "publication_event_id": "evt_9061c6057164e8dcf3b20e26ad7b2ebf0035729f296cca570d5561467f3cd569",
+                "spec": {
+                  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+                  "data": {
+                    "values": [
+                      {
+                        "值": 7,
+                        "类": "甲🙂"
+                      }
+                    ]
+                  },
+                  "encoding": {
+                    "x": {
+                      "field": "类",
+                      "type": "nominal"
+                    },
+                    "y": {
+                      "field": "值",
+                      "type": "quantitative"
+                    }
+                  },
+                  "height": 120,
+                  "mark": "bar",
+                  "title": "原标准工具公开图表",
+                  "width": 240
+                }
+              },
+              "kind": "chart"
+            },
+            "scope": {
+              "conversation_id": "native-history-conversation",
+              "message_id": "native-history-root",
+              "root_turn_id": "native-history-root",
+              "turn_id": "native-history-root",
+              "workspace_id": "native-history-workspace"
+            },
+            "timestamp": "2026-11-07T22:03:51.809133Z"
+          }
+        ],
+        "source": {
+          "conversation_id": "native-history-conversation",
+          "execution_id": "native-history-execution",
+          "root_turn_id": "native-history-root",
+          "turn_id": "native-history-root",
+          "workspace_id": "native-history-workspace"
+        },
+        "through_sequence": 30
+      },
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{\"chart_type\":\"bar\",\"data\":[{\"值\":7,\"类\":\"甲🙂\"}],\"height\":120,\"output_format\":\"json\",\"title\":\"原标准工具公开图表\",\"width\":240,\"x_field\":\"类\",\"y_field\":\"值\"}",
+            "name": "generate_chart"
+          },
+          "id": "actual-chart-call",
+          "type": "function"
+        }
+      ],
+      "turn_source": {
+        "conversation_id": "native-history-conversation",
+        "execution_id": "native-history-execution",
+        "root_turn_id": "native-history-root",
+        "turn_id": "native-history-root",
+        "workspace_id": "native-history-workspace"
+      }
+    },
+    {
+      "content": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"values\": [\n      {\n        \"值\": 7,\n        \"类\": \"甲🙂\"\n      }\n    ]\n  },\n  \"encoding\": {\n    \"x\": {\n      \"field\": \"类\",\n      \"type\": \"nominal\"\n    },\n    \"y\": {\n      \"field\": \"值\",\n      \"type\": \"quantitative\"\n    }\n  },\n  \"height\": 120,\n  \"mark\": \"bar\",\n  \"title\": \"原标准工具公开图表\",\n  \"width\": 240\n}",
+      "created_at": "2026-11-08T06:03:51.338034+08:00",
+      "role": "tool",
+      "tool_calls": null,
+      "tool_result": "{\"name\":\"generate_chart\",\"tool_call_id\":\"actual-chart-call\"}"
+    },
+    {
+      "assistant_blocks": [
+        {
+          "block": {
+            "block_id": "e2072b3d-89cf-41fc-a835-b35fe87cdd46:assistant",
+            "complete": true,
+            "delta": "原标准图表工具已结束",
+            "phase": "unknown",
+            "provider": "",
+            "reasoning": null,
+            "request_id": "e2072b3d-89cf-41fc-a835-b35fe87cdd46",
+            "sequence": 0
+          },
+          "content": "原标准图表工具已结束",
+          "execution_id": "native-history-execution",
+          "journal_source": {
+            "sequence": 16,
+            "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]"
+          },
+          "publication_event_id": "evt_118efe8a3bc903b6cc3ca1894f6780de2a9dad8f2444bc6d91588dda01968c47"
+        }
+      ],
+      "content": "原标准图表工具已结束",
+      "created_at": "2026-11-08T06:03:51.637914+08:00",
+      "execution_status": {
+        "execution_id": "native-history-execution",
+        "phase": "Terminal",
+        "reason": null,
+        "request_id": "e2072b3d-89cf-41fc-a835-b35fe87cdd46",
+        "sequence": 4,
+        "status": "settled"
+      },
+      "execution_steps": [
+        {
+          "index": 0,
+          "type": "assistant"
+        }
+      ],
+      "final_answer_confirmed": true,
+      "final_answer_source": {
+        "blocks": [
+          {
+            "block_id": "e2072b3d-89cf-41fc-a835-b35fe87cdd46:assistant",
+            "publication_event_id": "evt_118efe8a3bc903b6cc3ca1894f6780de2a9dad8f2444bc6d91588dda01968c47",
+            "request_id": "e2072b3d-89cf-41fc-a835-b35fe87cdd46",
+            "sequence": 0
+          }
+        ],
+        "execution_id": "native-history-execution",
+        "request_id": "e2072b3d-89cf-41fc-a835-b35fe87cdd46",
+        "sequence": 4
+      },
+      "role": "assistant",
+      "tool_calls": null,
+      "turn_source": {
+        "conversation_id": "native-history-conversation",
+        "execution_id": "native-history-execution",
+        "root_turn_id": "native-history-root",
+        "turn_id": "native-history-root",
+        "workspace_id": "native-history-workspace"
+      }
+    }
+  ],
+  "events": [
+    {
+      "content_hash": "sha256_2adc7f25c11e74024e62cd227a279bda45543aba80c9f55443294c6d5f6cc5fe",
+      "conversation_id": "native-history-conversation",
+      "event_id": "chat_evt_75fc59b23bd71f08e93a4f5a8dff939010855e4542a9977c0fe5776ae41fecfd",
+      "message_id": "native-history-root",
+      "payload": {
+        "event": {
+          "content_hash": "sha256:3be24cbcbce3b5aa4b95d7bdeef827bafcf6b303d57b3aaaf6d0bf508ad6f99e",
+          "conversation_id": "native-history-conversation",
+          "event_id": "evt_17a100150e246fb386c015f94df91a239e957aaaa6a27ba24aed4b1a9a81b7a6",
+          "execution_id": "native-history-execution",
+          "message_id": "native-history-root",
+          "parent_event_id": null,
+          "payload": {
+            "data": {
+              "execution_id": "native-history-execution",
+              "phase": "Thinking",
+              "reason": null,
+              "request_id": null,
+              "sequence": 0,
+              "status": "started"
+            },
+            "type": "execution_status"
+          },
+          "run_id": null,
+          "schema_version": 5,
+          "sequence": 1,
+          "stream_id": "a7d2ad51-44cd-48d6-a0bb-271197e1942e",
+          "timestamp": "2026-11-07T22:03:51.159014Z",
+          "turn_id": "native-history-root"
+        },
+        "source": "agent"
+      },
+      "root_turn_id": "native-history-root",
+      "schema_version": 2,
+      "sequence": 1,
+      "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]",
+      "timestamp": "2026-11-07T22:03:51.197599Z",
+      "turn_id": "native-history-root",
+      "workspace_id": "native-history-workspace"
+    },
+    {
+      "content_hash": "sha256_128fb31f5c37cd9217c8636e11bf2453bddcbd37fc2db8c3da37d8f7965c0c69",
+      "conversation_id": "native-history-conversation",
+      "event_id": "chat_evt_82ee0a68542b2b44fe9ecdc0b950b4a3678626ebe06c26758aa845ddfe63e43b",
+      "message_id": "native-history-root",
+      "payload": {
+        "event": {
+          "content_hash": "sha256:69829db1bb4a388e464c049b8dfaa77d8e83da9faf1945393a911ca064d4e829",
+          "conversation_id": "native-history-conversation",
+          "event_id": "evt_eb4538676a28f66b41f60396b592337a3c7ca27bad60d69eecb1094a67f09c42",
+          "execution_id": "native-history-execution",
+          "message_id": "native-history-root",
+          "parent_event_id": null,
+          "payload": {
+            "data": {
+              "attempt": 1,
+              "conversation_id": "native-history-conversation",
+              "detail": null,
+              "error_class": null,
+              "generation_id": "native-history-conversation",
+              "operation_id": "transcript-projection-v1:45587b5557374b3dd2cc16cb71033ed9269724d72fc07ddab1829c97f555ebde",
+              "status": "settled"
+            },
+            "type": "transcript_projection_settlement"
+          },
+          "run_id": null,
+          "schema_version": 5,
+          "sequence": 2,
+          "stream_id": "a7d2ad51-44cd-48d6-a0bb-271197e1942e",
+          "timestamp": "2026-11-07T22:03:51.337370Z",
+          "turn_id": "native-history-root"
+        },
+        "source": "agent"
+      },
+      "root_turn_id": "native-history-root",
+      "schema_version": 2,
+      "sequence": 2,
+      "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]",
+      "timestamp": "2026-11-07T22:03:51.339185Z",
+      "turn_id": "native-history-root",
+      "workspace_id": "native-history-workspace"
+    },
+    {
+      "content_hash": "sha256_9f33bde57d79d5a5d3579e9d413188429863a9846ea546b4848a34503b5a4442",
+      "conversation_id": "native-history-conversation",
+      "event_id": "chat_evt_bdf32cb37fd758e2cf7b6bf5577abac441e7433992d840096ab018cf27acc0ec",
+      "message_id": "native-history-root",
+      "payload": {
+        "event": {
+          "content_hash": "sha256:f4449338dbdfa423f9ddeda22157d2a1d17dd0f0e98310c6c2e7280d978bfcd9",
+          "conversation_id": "native-history-conversation",
+          "event_id": "evt_e47c3a8423d93252ec4ba2e18cc6bf3b6bcba1f4fbfb5df277ad531d0efe51e2",
+          "execution_id": "native-history-execution",
+          "message_id": "native-history-root",
+          "parent_event_id": null,
+          "payload": {
+            "data": {
+              "execution_id": "native-history-execution",
+              "phase": "Thinking",
+              "reason": null,
+              "request_id": "67fac922-e8d1-4794-ae7c-d7def2b7a31a",
+              "sequence": 1,
+              "status": "waiting"
+            },
+            "type": "execution_status"
+          },
+          "run_id": null,
+          "schema_version": 5,
+          "sequence": 3,
+          "stream_id": "a7d2ad51-44cd-48d6-a0bb-271197e1942e",
+          "timestamp": "2026-11-07T22:03:51.358092Z",
+          "turn_id": "native-history-root"
+        },
+        "source": "agent"
+      },
+      "root_turn_id": "native-history-root",
+      "schema_version": 2,
+      "sequence": 3,
+      "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]",
+      "timestamp": "2026-11-07T22:03:51.358515Z",
+      "turn_id": "native-history-root",
+      "workspace_id": "native-history-workspace"
+    },
+    {
+      "content_hash": "sha256_b5797d185a72f568299a73e546840d7832b82001f0558c946e95f5b3baaadc9c",
+      "conversation_id": "native-history-conversation",
+      "event_id": "chat_evt_64b463c0fbea17de043951b65c1b7557422de374b8a29cfe2020fdde4aa0edf8",
+      "message_id": "native-history-root",
+      "payload": {
+        "event": {
+          "content_hash": "sha256:b554099616d96b54a0c6e554ef9789217013878a0a88e16f9349aec384b793ab",
+          "conversation_id": "native-history-conversation",
+          "event_id": "evt_d7f2c3171b6900165a65f8c2997a4c34fcd6400d76219d51fc5c99dcf03bd46e",
+          "execution_id": "native-history-execution",
+          "message_id": "native-history-root",
+          "parent_event_id": null,
+          "payload": {
+            "data": {
+              "block": {
+                "block_id": "chart-progress",
+                "complete": true,
+                "delta": "我会用原工具生成公开图表",
+                "phase": "commentary",
+                "provider": "controlled-model",
+                "reasoning": null,
+                "request_id": "chart-request",
+                "sequence": 0
+              }
+            },
+            "type": "assistant_message"
+          },
+          "run_id": null,
+          "schema_version": 5,
+          "sequence": 4,
+          "stream_id": "a7d2ad51-44cd-48d6-a0bb-271197e1942e",
+          "timestamp": "2026-11-07T22:03:51.372745Z",
+          "turn_id": "native-history-root"
+        },
+        "source": "agent"
+      },
+      "root_turn_id": "native-history-root",
+      "schema_version": 2,
+      "sequence": 4,
+      "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]",
+      "timestamp": "2026-11-07T22:03:51.373183Z",
+      "turn_id": "native-history-root",
+      "workspace_id": "native-history-workspace"
+    },
+    {
+      "content_hash": "sha256_2bd670e16dc07755a995f0136eed5f7f8b65b7c827cbebcc4b92d1039721329f",
+      "conversation_id": "native-history-conversation",
+      "event_id": "chat_evt_c9f6a7ebac152f390876f68dc81249e1edb0a068c4ac4ea685ea0b22df581e24",
+      "message_id": "native-history-root",
+      "payload": {
+        "event": {
+          "content_hash": "sha256:b4527193197a7a7bddad1abcd02b0be23881ca5f42d8bef0272b8c4947006432",
+          "conversation_id": "native-history-conversation",
+          "event_id": "evt_0e84a0a2d68fb7b0a5f7d92f1d0f3aeaf97e4e1394a20991a998d09970d277fa",
+          "execution_id": "native-history-execution",
+          "message_id": "native-history-root",
+          "parent_event_id": null,
+          "payload": {
+            "data": {
+              "cache_creation_prompt_tokens": 0,
+              "cached_prompt_tokens": 0,
+              "completion_tokens": 0,
+              "model": "controlled-chart-producer",
+              "observation": {
+                "attempt_id": "6a84f475-7836-4c56-b1d5-c097348e3606",
+                "call_id": "67fac922-e8d1-4794-ae7c-d7def2b7a31a",
+                "first_output_ms": 0,
+                "last_output_ms": 0,
+                "outcome": "completed",
+                "output_samples": 1,
+                "request_duration_ms": 0,
+                "timing_comparable": false
+              },
+              "prompt_tokens": 0,
+              "total_tokens": 0,
+              "usage_reported": false
+            },
+            "type": "llm_usage"
+          },
+          "run_id": null,
+          "schema_version": 5,
+          "sequence": 5,
+          "stream_id": "a7d2ad51-44cd-48d6-a0bb-271197e1942e",
+          "timestamp": "2026-11-07T22:03:51.391261Z",
+          "turn_id": "native-history-root"
+        },
+        "source": "agent"
+      },
+      "root_turn_id": "native-history-root",
+      "schema_version": 2,
+      "sequence": 5,
+      "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]",
+      "timestamp": "2026-11-07T22:03:51.391798Z",
+      "turn_id": "native-history-root",
+      "workspace_id": "native-history-workspace"
+    },
+    {
+      "content_hash": "sha256_93682b6b157b6728e52e49b9c7bc3c88e2be695c99763cdbf5368c5494483908",
+      "conversation_id": "native-history-conversation",
+      "event_id": "chat_evt_7b8715e4c3b79582be0a7fe64437d8bbcf0899c33688968e93736baf89ea18ec",
+      "message_id": "native-history-root",
+      "payload": {
+        "event": {
+          "content_hash": "sha256:d205ecf43405f32f3df5763906b45a39b5fbb24ded34491879cffe11da125161",
+          "conversation_id": "native-history-conversation",
+          "event_id": "evt_56138d6f7f0956cfb34a6082319109e26a0ad21f25e3aebefb97f23308b4cad0",
+          "execution_id": "native-history-execution",
+          "message_id": "native-history-root",
+          "parent_event_id": null,
+          "payload": {
+            "data": {
+              "execution_id": "native-history-execution",
+              "phase": "Acting",
+              "reason": null,
+              "request_id": "chart-request",
+              "sequence": 2,
+              "status": "tool_pending"
+            },
+            "type": "execution_status"
+          },
+          "run_id": null,
+          "schema_version": 5,
+          "sequence": 6,
+          "stream_id": "a7d2ad51-44cd-48d6-a0bb-271197e1942e",
+          "timestamp": "2026-11-07T22:03:51.649095Z",
+          "turn_id": "native-history-root"
+        },
+        "source": "agent"
+      },
+      "root_turn_id": "native-history-root",
+      "schema_version": 2,
+      "sequence": 6,
+      "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]",
+      "timestamp": "2026-11-07T22:03:51.649811Z",
+      "turn_id": "native-history-root",
+      "workspace_id": "native-history-workspace"
+    },
+    {
+      "content_hash": "sha256_6c55e94fa8b3ab03d62b0c596cdd00eba6739a6d436bef26ce7985dd72c58b44",
+      "conversation_id": "native-history-conversation",
+      "event_id": "chat_evt_aba15750f825179fdec3a03fb2f84a40bcd4685e12bf74db1ada091817e145bc",
+      "message_id": "native-history-root",
+      "payload": {
+        "event": {
+          "content_hash": "sha256:760577a9fba3699fdecf78d2b8db5066da5614d0623a8553c35b832600f8ca4e",
+          "conversation_id": "native-history-conversation",
+          "event_id": "evt_dd5edcf4c058f11fdc3ba85b31bee3c919d26e48f4464c66af6dcc86cc685820",
+          "execution_id": "native-history-execution",
+          "message_id": "native-history-root",
+          "parent_event_id": null,
+          "payload": {
+            "data": {
+              "tool_count": 1
+            },
+            "type": "tool_batch_start"
+          },
+          "run_id": null,
+          "schema_version": 5,
+          "sequence": 7,
+          "stream_id": "a7d2ad51-44cd-48d6-a0bb-271197e1942e",
+          "timestamp": "2026-11-07T22:03:51.662361Z",
+          "turn_id": "native-history-root"
+        },
+        "source": "agent"
+      },
+      "root_turn_id": "native-history-root",
+      "schema_version": 2,
+      "sequence": 7,
+      "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]",
+      "timestamp": "2026-11-07T22:03:51.662931Z",
+      "turn_id": "native-history-root",
+      "workspace_id": "native-history-workspace"
+    },
+    {
+      "content_hash": "sha256_37516eb68436df6b57266ccf6834a5f7213d06b3b8c2ee2d28a375102fedb537",
+      "conversation_id": "native-history-conversation",
+      "event_id": "chat_evt_32ffe110e85d303677924b1693e4da5e71852869526d51c1d68c54d8a1e23875",
+      "message_id": "native-history-root",
+      "payload": {
+        "event": {
+          "content_hash": "sha256:0376baaa3f7482a60ff54747f5184c20d802a4eec2fc3c4ade56af037093ff18",
+          "conversation_id": "native-history-conversation",
+          "event_id": "evt_7f5c384d2c3610308a0d75d24e318794dca4ef68ae7a2a5a984b3eca74758b6f",
+          "execution_id": "native-history-execution",
+          "message_id": "native-history-root",
+          "parent_event_id": null,
+          "payload": {
+            "data": {
+              "call_id": "actual-chart-call",
+              "invocation": {
+                "args": {
+                  "chart_type": "bar",
+                  "data": [
+                    {
+                      "值": 7,
+                      "类": "甲🙂"
+                    }
+                  ],
+                  "height": 120,
+                  "output_format": "json",
+                  "title": "原标准工具公开图表",
+                  "width": 240,
+                  "x_field": "类",
+                  "y_field": "值"
+                },
+                "name": "generate_chart",
+                "requested_args": {
+                  "chart_type": "bar",
+                  "data": [
+                    {
+                      "值": 7,
+                      "类": "甲🙂"
+                    }
+                  ],
+                  "height": 120,
+                  "output_format": "json",
+                  "title": "原标准工具公开图表",
+                  "width": 240,
+                  "x_field": "类",
+                  "y_field": "值"
+                },
+                "requested_name": "generate_chart"
+              }
+            },
+            "type": "tool_call"
+          },
+          "run_id": null,
+          "schema_version": 5,
+          "sequence": 8,
+          "stream_id": "a7d2ad51-44cd-48d6-a0bb-271197e1942e",
+          "timestamp": "2026-11-07T22:03:51.679258Z",
+          "turn_id": "native-history-root"
+        },
+        "source": "agent"
+      },
+      "root_turn_id": "native-history-root",
+      "schema_version": 2,
+      "sequence": 8,
+      "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]",
+      "timestamp": "2026-11-07T22:03:51.679814Z",
+      "turn_id": "native-history-root",
+      "workspace_id": "native-history-workspace"
+    },
+    {
+      "content_hash": "sha256_10901363fee8cda2c7ef814f7d9e842e2833afc2d1d92275867c6783143607bd",
+      "conversation_id": "native-history-conversation",
+      "event_id": "chat_evt_2eeb2745387c29c3b60b28928e9bf25aa3116d4825c36ace38c2492c5df80427",
+      "message_id": "native-history-root",
+      "payload": {
+        "event": {
+          "content_hash": "sha256:f50584076920f466c17fb3862b4f9ab0016df082bf3505c0726b2bf6b290524c",
+          "conversation_id": "native-history-conversation",
+          "event_id": "evt_9061c6057164e8dcf3b20e26ad7b2ebf0035729f296cca570d5561467f3cd569",
+          "execution_id": "native-history-execution",
+          "message_id": "native-history-root",
+          "parent_event_id": "evt_7f5c384d2c3610308a0d75d24e318794dca4ef68ae7a2a5a984b3eca74758b6f",
+          "payload": {
+            "data": {
+              "call_id": "actual-chart-call",
+              "name": "generate_chart",
+              "result": {
+                "data": {
+                  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+                  "data": {
+                    "values": [
+                      {
+                        "值": 7,
+                        "类": "甲🙂"
+                      }
+                    ]
+                  },
+                  "encoding": {
+                    "x": {
+                      "field": "类",
+                      "type": "nominal"
+                    },
+                    "y": {
+                      "field": "值",
+                      "type": "quantitative"
+                    }
+                  },
+                  "height": 120,
+                  "mark": "bar",
+                  "title": "原标准工具公开图表",
+                  "width": 240
+                },
+                "error": null,
+                "kind": {
+                  "kind_type": "text"
+                },
+                "metadata": {
+                  "estimated_tokens": "98",
+                  "original_bytes": "409",
+                  "output_handling": "inline",
+                  "returned_bytes": "409"
+                },
+                "mime_type": "application/vnd.vegalite.v5+json",
+                "output": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"values\": [\n      {\n        \"值\": 7,\n        \"类\": \"甲🙂\"\n      }\n    ]\n  },\n  \"encoding\": {\n    \"x\": {\n      \"field\": \"类\",\n      \"type\": \"nominal\"\n    },\n    \"y\": {\n      \"field\": \"值\",\n      \"type\": \"quantitative\"\n    }\n  },\n  \"height\": 120,\n  \"mark\": \"bar\",\n  \"title\": \"原标准工具公开图表\",\n  \"width\": 240\n}",
+                "success": true,
+                "truncated": false
+              }
+            },
+            "type": "tool_result"
+          },
+          "run_id": null,
+          "schema_version": 5,
+          "sequence": 9,
+          "stream_id": "a7d2ad51-44cd-48d6-a0bb-271197e1942e",
+          "timestamp": "2026-11-07T22:03:51.808312Z",
+          "turn_id": "native-history-root"
+        },
+        "source": "agent"
+      },
+      "root_turn_id": "native-history-root",
+      "schema_version": 2,
+      "sequence": 9,
+      "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]",
+      "timestamp": "2026-11-07T22:03:51.809133Z",
+      "turn_id": "native-history-root",
+      "workspace_id": "native-history-workspace"
+    },
+    {
+      "content_hash": "sha256_72a77fd1e961a85b4c5bc1847433814ae9a886846cfc0626210cd42d025d245e",
+      "conversation_id": "native-history-conversation",
+      "event_id": "chat_evt_f8db843c35c97970d11e0176e41e757c76aa103f2a2dc79fa26e66fa7ffd1e69",
+      "message_id": "native-history-root",
+      "payload": {
+        "event": {
+          "content_hash": "sha256:a57aa91a8023d2484edfb9b657f9c965399642dcf54a16d238a8b4f0757edc19",
+          "conversation_id": "native-history-conversation",
+          "event_id": "evt_19e7d5ed795c614824d9fcc7f40356e3d83e4054cbb72c657ed876637ec5d2fe",
+          "execution_id": "native-history-execution",
+          "message_id": "native-history-root",
+          "parent_event_id": null,
+          "payload": {
+            "data": {
+              "attempt": 1,
+              "conversation_id": "native-history-conversation",
+              "detail": null,
+              "error_class": null,
+              "generation_id": "native-history-conversation",
+              "operation_id": "transcript-projection-v1:19ea5cd24d0f760eb206b439904eba5758e0ca067bbe4fdc2611fa5a353dea27",
+              "status": "settled"
+            },
+            "type": "transcript_projection_settlement"
+          },
+          "run_id": null,
+          "schema_version": 5,
+          "sequence": 10,
+          "stream_id": "a7d2ad51-44cd-48d6-a0bb-271197e1942e",
+          "timestamp": "2026-11-07T22:03:51.912097Z",
+          "turn_id": "native-history-root"
+        },
+        "source": "agent"
+      },
+      "root_turn_id": "native-history-root",
+      "schema_version": 2,
+      "sequence": 10,
+      "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]",
+      "timestamp": "2026-11-07T22:03:51.913273Z",
+      "turn_id": "native-history-root",
+      "workspace_id": "native-history-workspace"
+    },
+    {
+      "content_hash": "sha256_a4b817f8f6220612642385ea74c2b749730bc1590f5fb0ee6ab5bad1f1d0e25e",
+      "conversation_id": "native-history-conversation",
+      "event_id": "chat_evt_03e6db234e995aa5f191b4e4fbe5c1331762e447908b43d32ca1ffeb3fc8f1ac",
+      "message_id": "native-history-root",
+      "payload": {
+        "event": {
+          "content_hash": "sha256:e9f11920fdcdac14e3989f494ede9500cce8acba522bf94a11977143143d2b05",
+          "conversation_id": "native-history-conversation",
+          "event_id": "evt_5003a5e91fd8e05bb3b1f380dd8db7517ae9cb70ecf71ce02e7bd883626bf298",
+          "execution_id": "native-history-execution",
+          "message_id": "native-history-root",
+          "parent_event_id": null,
+          "payload": {
+            "type": "tool_batch_end"
+          },
+          "run_id": null,
+          "schema_version": 5,
+          "sequence": 11,
+          "stream_id": "a7d2ad51-44cd-48d6-a0bb-271197e1942e",
+          "timestamp": "2026-11-07T22:03:52.004721Z",
+          "turn_id": "native-history-root"
+        },
+        "source": "agent"
+      },
+      "root_turn_id": "native-history-root",
+      "schema_version": 2,
+      "sequence": 11,
+      "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]",
+      "timestamp": "2026-11-07T22:03:52.005929Z",
+      "turn_id": "native-history-root",
+      "workspace_id": "native-history-workspace"
+    },
+    {
+      "content_hash": "sha256_1eeea806877c2df001fa873e075a8cd89bbdef8d7654aa8c7b10b67625ef3b03",
+      "conversation_id": "native-history-conversation",
+      "event_id": "chat_evt_ce60bbb17dfcd7c8f42bcadefc280826875010ead30804e3e0f90828ff1fc276",
+      "message_id": "native-history-root",
+      "payload": {
+        "event": {
+          "content_hash": "sha256:eddf1e8d85367e2e3cdcc1ec84b695927daeb1515eb0a6b6f4e0d00e76fa091d",
+          "conversation_id": "native-history-conversation",
+          "event_id": "evt_6854a2cfa0d94d6fb16ae5b671b95465ec48da7fb4d2837406040b47e1001652",
+          "execution_id": "native-history-execution",
+          "message_id": "native-history-root",
+          "parent_event_id": null,
+          "payload": {
+            "data": {
+              "attempt": 0,
+              "conversation_id": "native-history-conversation",
+              "detail": null,
+              "error_class": null,
+              "generation_id": "native-history-conversation",
+              "operation_id": null,
+              "status": "settled"
+            },
+            "type": "transcript_projection_settlement"
+          },
+          "run_id": null,
+          "schema_version": 5,
+          "sequence": 12,
+          "stream_id": "a7d2ad51-44cd-48d6-a0bb-271197e1942e",
+          "timestamp": "2026-11-07T22:03:52.016455Z",
+          "turn_id": "native-history-root"
+        },
+        "source": "agent"
+      },
+      "root_turn_id": "native-history-root",
+      "schema_version": 2,
+      "sequence": 12,
+      "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]",
+      "timestamp": "2026-11-07T22:03:52.017588Z",
+      "turn_id": "native-history-root",
+      "workspace_id": "native-history-workspace"
+    },
+    {
+      "content_hash": "sha256_2d07c9df8f2261ad15bc3acff74bedca05b7e5fa5b60f622dbdb9980e6d90b9c",
+      "conversation_id": "native-history-conversation",
+      "event_id": "chat_evt_10ad88583e38d4e2d021b33600e8c24709cf7a065ace36c4dd18075d44ef0c83",
+      "message_id": "native-history-root",
+      "payload": {
+        "event": {
+          "content_hash": "sha256:1ed0f86bb9ef49b2f06f5ff7367af0327d5aa711d24291c9a433e89180a9fee6",
+          "conversation_id": "native-history-conversation",
+          "event_id": "evt_395b526fc0a7faac60ba2280881a79905d2b7770072d4acb35c2ee8afeadb8d4",
+          "execution_id": "native-history-execution",
+          "message_id": "native-history-root",
+          "parent_event_id": null,
+          "payload": {
+            "data": {
+              "execution_id": "native-history-execution",
+              "phase": "Thinking",
+              "reason": null,
+              "request_id": "e2072b3d-89cf-41fc-a835-b35fe87cdd46",
+              "sequence": 3,
+              "status": "waiting"
+            },
+            "type": "execution_status"
+          },
+          "run_id": null,
+          "schema_version": 5,
+          "sequence": 13,
+          "stream_id": "a7d2ad51-44cd-48d6-a0bb-271197e1942e",
+          "timestamp": "2026-11-07T22:03:52.026594Z",
+          "turn_id": "native-history-root"
+        },
+        "source": "agent"
+      },
+      "root_turn_id": "native-history-root",
+      "schema_version": 2,
+      "sequence": 13,
+      "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]",
+      "timestamp": "2026-11-07T22:03:52.027623Z",
+      "turn_id": "native-history-root",
+      "workspace_id": "native-history-workspace"
+    },
+    {
+      "content_hash": "sha256_b2ebaeaa2567dbb9a47c0db788d53a94c53db9a85a0fb8a83fcedc6df6409def",
+      "conversation_id": "native-history-conversation",
+      "event_id": "chat_evt_5f2865d9775bf4d40276aaaa80cb345dee074948bd913e3dea1b18dc3ac974c0",
+      "message_id": "native-history-root",
+      "payload": {
+        "event": {
+          "content_hash": "sha256:576abd9076f2116697a77d52085b1bb5c8748654192490142ea00d6c6e5e1e26",
+          "conversation_id": "native-history-conversation",
+          "event_id": "evt_0178a8c6996dda4d912b978dd5b98b97407f75f2e32273274ba2b02d189196de",
+          "execution_id": "native-history-execution",
+          "message_id": "native-history-root",
+          "parent_event_id": null,
+          "payload": {
+            "data": {
+              "cache_creation_prompt_tokens": 0,
+              "cached_prompt_tokens": 0,
+              "completion_tokens": 0,
+              "model": "controlled-chart-producer",
+              "observation": {
+                "attempt_id": "933aa3c6-63f9-4659-b329-c3d723349ab7",
+                "call_id": "e2072b3d-89cf-41fc-a835-b35fe87cdd46",
+                "first_output_ms": 0,
+                "last_output_ms": 0,
+                "outcome": "completed",
+                "output_samples": 1,
+                "request_duration_ms": 0,
+                "timing_comparable": false
+              },
+              "prompt_tokens": 0,
+              "total_tokens": 0,
+              "usage_reported": false
+            },
+            "type": "llm_usage"
+          },
+          "run_id": null,
+          "schema_version": 5,
+          "sequence": 14,
+          "stream_id": "a7d2ad51-44cd-48d6-a0bb-271197e1942e",
+          "timestamp": "2026-11-07T22:03:52.045139Z",
+          "turn_id": "native-history-root"
+        },
+        "source": "agent"
+      },
+      "root_turn_id": "native-history-root",
+      "schema_version": 2,
+      "sequence": 14,
+      "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]",
+      "timestamp": "2026-11-07T22:03:52.046352Z",
+      "turn_id": "native-history-root",
+      "workspace_id": "native-history-workspace"
+    },
+    {
+      "content_hash": "sha256_da94d02f0c7b1a641d2f31d6d68e37f5bb8391f9663a1b1cb254311bd4319877",
+      "conversation_id": "native-history-conversation",
+      "event_id": "chat_evt_4be32000c8f34ac79a36d8b6ba176be578f4b0c244f73b497987afe29b7d952d",
+      "message_id": "native-history-root",
+      "payload": {
+        "event": {
+          "content_hash": "sha256:d64fb4dd6431ff84af28f599e4beb1c0dc5c6a586bfc9c12a891bec053097e6f",
+          "conversation_id": "native-history-conversation",
+          "event_id": "evt_a120b52274937fd3b1165551f489edcd3aab6f6eb503b8af4c70ea89510de17d",
+          "execution_id": "native-history-execution",
+          "message_id": "native-history-root",
+          "parent_event_id": null,
+          "payload": {
+            "data": {
+              "attempt": 1,
+              "conversation_id": "native-history-conversation",
+              "detail": null,
+              "error_class": null,
+              "generation_id": "native-history-conversation",
+              "operation_id": "transcript-projection-v1:7728b83ad8c43008238c76d5355f4ab0bc751dd3169d18eaa9e94adb4fc78057",
+              "status": "settled"
+            },
+            "type": "transcript_projection_settlement"
+          },
+          "run_id": null,
+          "schema_version": 5,
+          "sequence": 15,
+          "stream_id": "a7d2ad51-44cd-48d6-a0bb-271197e1942e",
+          "timestamp": "2026-11-07T22:03:52.155193Z",
+          "turn_id": "native-history-root"
+        },
+        "source": "agent"
+      },
+      "root_turn_id": "native-history-root",
+      "schema_version": 2,
+      "sequence": 15,
+      "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]",
+      "timestamp": "2026-11-07T22:03:52.156449Z",
+      "turn_id": "native-history-root",
+      "workspace_id": "native-history-workspace"
+    },
+    {
+      "content_hash": "sha256_e29a895e7ca0290191a90ce6fc298821255955bcbe0b59aa2dee43708e6678a2",
+      "conversation_id": "native-history-conversation",
+      "event_id": "chat_evt_28753468d9c4aeb340f668d428bbc88adc9b1455048665daa5c30dd1d63b064e",
+      "message_id": "native-history-root",
+      "payload": {
+        "event": {
+          "content_hash": "sha256:99c6c46de400bf41cd5210929841bd10a0c70a6e334e22d8fd521e54a74af03e",
+          "conversation_id": "native-history-conversation",
+          "event_id": "evt_118efe8a3bc903b6cc3ca1894f6780de2a9dad8f2444bc6d91588dda01968c47",
+          "execution_id": "native-history-execution",
+          "message_id": "native-history-root",
+          "parent_event_id": null,
+          "payload": {
+            "data": {
+              "block": {
+                "block_id": "e2072b3d-89cf-41fc-a835-b35fe87cdd46:assistant",
+                "complete": true,
+                "delta": "原标准图表工具已结束",
+                "phase": "unknown",
+                "provider": "",
+                "reasoning": null,
+                "request_id": "e2072b3d-89cf-41fc-a835-b35fe87cdd46",
+                "sequence": 0
+              }
+            },
+            "type": "assistant_message"
+          },
+          "run_id": null,
+          "schema_version": 5,
+          "sequence": 16,
+          "stream_id": "a7d2ad51-44cd-48d6-a0bb-271197e1942e",
+          "timestamp": "2026-11-07T22:03:52.170424Z",
+          "turn_id": "native-history-root"
+        },
+        "source": "agent"
+      },
+      "root_turn_id": "native-history-root",
+      "schema_version": 2,
+      "sequence": 16,
+      "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]",
+      "timestamp": "2026-11-07T22:03:52.171547Z",
+      "turn_id": "native-history-root",
+      "workspace_id": "native-history-workspace"
+    },
+    {
+      "content_hash": "sha256_a1d15f6321bf42cb6b05c5e88c0c1f4a19b4b50dd44885c215b1ff8ae42148cc",
+      "conversation_id": "native-history-conversation",
+      "event_id": "chat_evt_c808b205c933b7ac8c25097382356f273054102b684a66cb77c23ffb3c6f4730",
+      "message_id": "native-history-root",
+      "payload": {
+        "event": {
+          "content_hash": "sha256:295437068713d0aa184e2561160f26424dbb42188280a81e9cc434675ea0a39c",
+          "conversation_id": "native-history-conversation",
+          "event_id": "evt_98af7d65c888a1981e2b1e1122d6cd3275390226c2df17afb97a2983f393dab7",
+          "execution_id": "native-history-execution",
+          "message_id": "native-history-root",
+          "parent_event_id": null,
+          "payload": {
+            "data": "原标准图表工具已结束",
+            "type": "final_answer"
+          },
+          "run_id": null,
+          "schema_version": 5,
+          "sequence": 17,
+          "stream_id": "a7d2ad51-44cd-48d6-a0bb-271197e1942e",
+          "timestamp": "2026-11-07T22:03:52.187896Z",
+          "turn_id": "native-history-root"
+        },
+        "source": "agent"
+      },
+      "root_turn_id": "native-history-root",
+      "schema_version": 2,
+      "sequence": 17,
+      "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]",
+      "timestamp": "2026-11-07T22:03:52.190208Z",
+      "turn_id": "native-history-root",
+      "workspace_id": "native-history-workspace"
+    },
+    {
+      "content_hash": "sha256_c32555ecd15c397f519d7ac699b1e168cf0d94cd5c363d26e967a51bd8b79eec",
+      "conversation_id": "native-history-conversation",
+      "event_id": "chat_evt_8bb7cac4a7684e1225fd85e3e8cae8a6cc1c8f85cc9e3dc4f6597d4819abb10c",
+      "message_id": "native-history-root",
+      "payload": {
+        "event": {
+          "content_hash": "sha256:abc256297c5bf1aea3eaa5386919e7611069b6d1a466e320b80b1fafc56616c6",
+          "conversation_id": "native-history-conversation",
+          "event_id": "evt_b1643f8d298b1218bcb00610183ad133d95abb3816dcaebf03444f393ac6d369",
+          "execution_id": "native-history-execution",
+          "message_id": "native-history-root",
+          "parent_event_id": null,
+          "payload": {
+            "data": {
+              "execution_id": "native-history-execution",
+              "phase": "Terminal",
+              "reason": null,
+              "request_id": "e2072b3d-89cf-41fc-a835-b35fe87cdd46",
+              "sequence": 4,
+              "status": "settled"
+            },
+            "type": "execution_status"
+          },
+          "run_id": null,
+          "schema_version": 5,
+          "sequence": 18,
+          "stream_id": "a7d2ad51-44cd-48d6-a0bb-271197e1942e",
+          "timestamp": "2026-11-07T22:03:52.285667Z",
+          "turn_id": "native-history-root"
+        },
+        "source": "agent"
+      },
+      "root_turn_id": "native-history-root",
+      "schema_version": 2,
+      "sequence": 18,
+      "stream_id": "[\"native-history-workspace\",\"native-history-conversation\"]",
+      "timestamp": "2026-11-07T22:03:52.287993Z",
+      "turn_id": "native-history-root",
+      "workspace_id": "native-history-workspace"
+    }
+  ],
+  "verification": "actual ReactAgent->real GenerateChartTool->original ToolResult/Driver/FileStore/journal/checkpoint->actual saved/cold history wrapper; controlled model, not native App"
+}

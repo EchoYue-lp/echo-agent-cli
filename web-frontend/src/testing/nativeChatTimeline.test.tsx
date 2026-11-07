@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 // 合成回归控制，只证明JS消费/真实组件/边界行为；不写性能样本或宣称backend捕获。
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+import { fireEvent, waitFor } from '@testing-library/react';
 vi.hoisted(() => localStorage.setItem('echo-theme', 'light'));
 import {
   createTimelineMeasurement,
@@ -254,7 +255,7 @@ function fixture(): TimelineFixture {
           tools: [{ id: 'tool-1', status: 'succeeded' }],
           visible: [
             { text: '最终正文', count: 1 },
-            { text: '检查文件', count: 1 },
+            { text: '检查文件', count: 0 },
           ],
           absent: ['状态未恢复'],
         },
@@ -304,8 +305,21 @@ describe('现有native probe的真实聊天组件producer', () => {
       expect(proof.boundaries.transaction_ack).toBe('native probe only');
       if (operation === 'batch')
         expect(useChatStore.getState().messages.at(0)?.finalAnswerConfirmed).toBe(false);
-      if (operation === 'run-state')
+      if (operation === 'run-state') {
         expect(document.body.textContent?.split('最终正文').length).toBe(2);
+        // 默认折叠是产品新合同；计时边界之外仍完整核对原进度、正文和反复展开。
+        const open = document.querySelector<HTMLButtonElement>('[aria-label="展开执行过程"]');
+        if (!open) throw new Error('整轮过程入口缺失');
+        fireEvent.click(open);
+        await waitFor(() => expect(document.body.textContent?.split('检查文件').length).toBe(2));
+        expect(document.body.textContent?.split('最终正文').length).toBe(2);
+        expect(document.body.textContent).toContain('已执行 1 个工具');
+        const close = document.querySelector<HTMLButtonElement>('[aria-label="折叠执行过程"]');
+        if (!close) throw new Error('整轮过程无法收起');
+        fireEvent.click(close);
+        await waitFor(() => expect(document.body.textContent?.split('检查文件').length).toBe(1));
+        api.snapshot();
+      }
       await api.cleanup();
     }
     api.finish();

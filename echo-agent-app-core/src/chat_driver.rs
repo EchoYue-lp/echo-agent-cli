@@ -4166,6 +4166,7 @@ mod tests {
                 cached_prompt_tokens: 0,
                 cache_creation_prompt_tokens: 0,
                 usage_reported: false,
+                observation: None,
             },
             AgentEvent::LlmUsage {
                 model: "test-model".to_string(),
@@ -4175,6 +4176,7 @@ mod tests {
                 cached_prompt_tokens: 0,
                 cache_creation_prompt_tokens: 0,
                 usage_reported: true,
+                observation: None,
             },
             AgentEvent::ContextCompressed {
                 before_count: 10,

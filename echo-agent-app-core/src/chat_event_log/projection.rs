@@ -124,7 +124,10 @@ fn validate_native_anchor(
         if event.stream_id != authority.expected_stream_id
             || event.sequence > frame.sequence
             || (native_publication_fact_key(event)?.as_deref() != Some(expected_key)
-                && native_execution_scope_key(event)?.as_deref() != Some(expected_key))
+                && native_execution_scope_key(event)?.as_deref() != Some(expected_key)
+                && !usage_anchor_keys(event)?
+                    .iter()
+                    .any(|key| key == expected_key))
         {
             return Err(corrupt(
                 path,
@@ -198,7 +201,25 @@ fn preserve_native_publication_key(
         .as_ref()
         .filter(|frame| &frame.journal_identity == authority.journal.journal_identity())
         .map_or(event.sequence, |frame| frame.sequence.max(event.sequence));
-    let identical = if key.starts_with("scope-") {
+    let identical = if key.starts_with("usage-") {
+        // usage 锚只用于首次身份/冲突见证，重复运输不扩张锚或重复收费。
+        state.records.iter().any(|previous| {
+            if key.starts_with("usage-turn-")
+                || key.starts_with("usage-call-")
+                || key.starts_with("usage-start-")
+            {
+                true
+            } else {
+                usage_fact(previous)
+                    .ok()
+                    .flatten()
+                    .zip(usage_fact(event).ok().flatten())
+                    .is_some_and(|(a, b)| {
+                        serde_json::to_value(a.usage).ok() == serde_json::to_value(b.usage).ok()
+                    })
+            }
+        })
+    } else if key.starts_with("scope-") {
         state
             .records
             .iter()
@@ -302,7 +323,7 @@ fn advance_native_publication_projection_through(
         },
     );
     let loaded = load_result.map_err(|error| journal_error(path, error))?;
-    let (mut through, coverage) = if let Some(frame) = loaded {
+    let (mut through, mut coverage) = if let Some(frame) = loaded {
         if &frame.journal_identity != authority.journal.journal_identity() {
             return Err(corrupt(
                 path,
@@ -330,6 +351,8 @@ fn advance_native_publication_projection_through(
             floor.saturating_sub(1),
             NativePublicationCoverage {
                 first_observed_sequence: floor,
+                usage: None,
+                presentation: None,
             },
         )
     };
@@ -341,32 +364,87 @@ fn advance_native_publication_projection_through(
             key: "original-prefix-uncovered".into(),
         });
     }
-    if through < head {
-        let batch = authority
-            .journal
-            .replay_after(through, NATIVE_HISTORY_PROJECTION_BATCH)
-            .map_err(|error| journal_error(path, error))?;
-        if batch.is_empty() {
-            return Err(corrupt(
-                path,
-                "native publication bounded replay did not reach original head",
-            ));
-        }
-        for record in batch {
-            if record.sequence > head {
-                break;
-            }
-            if record.sequence != through.saturating_add(1) {
+    let (usage_through, presentation_through) = {
+        let usage = coverage
+            .usage
+            .get_or_insert_with(|| ConversationUsageProjection {
+                first_observed_sequence: floor,
+                through_sequence: floor.saturating_sub(1),
+                turns_known: floor == 1,
+                ..ConversationUsageProjection::default()
+            });
+        let presentation =
+            coverage
+                .presentation
+                .get_or_insert_with(|| NativePresentationCoverage {
+                    first_observed_sequence: floor,
+                    through_sequence: floor.saturating_sub(1),
+                });
+        for (first, cursor) in [
+            (usage.first_observed_sequence, usage.through_sequence),
+            (
+                presentation.first_observed_sequence,
+                presentation.through_sequence,
+            ),
+        ] {
+            if first == 0
+                || first > cursor.saturating_add(1)
+                || cursor > actual_head
+                || cursor < floor.saturating_sub(1)
+            {
                 return Err(corrupt(
                     path,
-                    "native publication bounded replay skipped original sequence",
+                    "derived coverage exceeds its original journal",
                 ));
             }
-            let event = envelope_from_record(record, path, &authority.expected_stream_id)?;
-            preserve_native_publication(authority, &event, through)?;
-            through = event.sequence;
         }
-    }
+        if through > head || usage.through_sequence > head || presentation.through_sequence > head {
+            return Err(ChatEventLogError::NativeHistorySnapshotAdvanced {
+                frozen_head: head,
+                latest_sequence: actual_head,
+            });
+        }
+        let mut replayed = through
+            .min(usage.through_sequence)
+            .min(presentation.through_sequence);
+        if replayed < head {
+            // 一个固定原batch服务发布、费用和展示，避免每项派生投影另扫4096条。
+            let batch = authority
+                .journal
+                .replay_after(replayed, NATIVE_HISTORY_PROJECTION_BATCH)
+                .map_err(|error| journal_error(path, error))?;
+            if batch.is_empty() {
+                return Err(corrupt(
+                    path,
+                    "native bounded replay did not reach original head",
+                ));
+            }
+            for record in batch {
+                if record.sequence > head {
+                    break;
+                }
+                if record.sequence != replayed.saturating_add(1) {
+                    return Err(corrupt(
+                        path,
+                        "native bounded replay skipped original sequence",
+                    ));
+                }
+                let event = envelope_from_record(record, path, &authority.expected_stream_id)?;
+                if event.sequence > through {
+                    preserve_native_publication(authority, &event, through)?;
+                    through = event.sequence;
+                }
+                if event.sequence > usage.through_sequence {
+                    fold_usage_event(authority, usage, &event)?;
+                }
+                if event.sequence > presentation.through_sequence {
+                    fold_presentation_event(authority, presentation, &event)?;
+                }
+                replayed = event.sequence;
+            }
+        }
+        (usage.through_sequence, presentation.through_sequence)
+    };
     // 所有原pub原子落盘以后才提交coverage；任何barrier错误都阻止后续prune。
     // 即使load已见rename，也重新save以确认本次父目录barrier，不把degraded当成功。
     #[cfg(feature = "test-utils")]
@@ -383,7 +461,7 @@ fn advance_native_publication_projection_through(
         },
     );
     save_result.map_err(|error| journal_error(path, error))?;
-    Ok((through, head))
+    Ok((through.min(usage_through).min(presentation_through), head))
 }
 
 fn read_native_publication_anchor(
@@ -1377,7 +1455,8 @@ fn should_mark_barrier_pending(
 fn append_durability(event: &ChatDriverEvent) -> FileDurability {
     match event {
         ChatDriverEvent::Agent(envelope) => match &envelope.payload {
-            echo_agent::agent::AgentEvent::ToolCall { .. }
+            echo_agent::agent::AgentEvent::LlmUsage { .. }
+            | echo_agent::agent::AgentEvent::ToolCall { .. }
             | echo_agent::agent::AgentEvent::ToolResult { .. }
             | echo_agent::agent::AgentEvent::FinalAnswer(_)
             | echo_agent::agent::AgentEvent::Cancelled

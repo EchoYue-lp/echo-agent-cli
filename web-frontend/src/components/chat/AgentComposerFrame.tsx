@@ -18,7 +18,7 @@ export function AgentComposerFrame({
       {...props}
     >
       <div
-        className={`flex items-end ${variant === 'primary' ? 'min-h-[138px] gap-2 px-6 py-4' : 'min-h-11 px-2.5 py-1.5'}`}
+        className={`flex ${variant === 'primary' ? 'min-h-[108px] flex-col items-stretch gap-1 px-4 py-2.5' : 'min-h-11 items-end px-2.5 py-1.5'}`}
       >
         {children}
       </div>

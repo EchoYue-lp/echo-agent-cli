@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo, useId } from 'react';
 import {
   ArrowUp,
   Square,
@@ -26,11 +26,14 @@ import { productDataScope } from '../../lib/productDataScope';
 import type { ChatSendSubmission } from '../../hooks/useTauriChat';
 import type { ConversationInputReceipt } from '../../generated';
 import { workspaceIdForView } from '../../lib/viewAddress';
+import { configuredModelPresentation, modelLabel } from '../../lib/modelPresentation';
 import { useUiStore } from '../../stores/uiStore';
 import { useToastStore } from '../../stores/toastStore';
-import { useChatStore, cacheHitRate } from '../../stores/chatStore';
+import { useChatStore } from '../../stores/chatStore';
+import { useConversationUsage } from '../../hooks/useConversationUsage';
+import { ConversationStatistics } from './ConversationStatistics';
 import type { Attachment } from '../../types/api';
-import type { ConfiguredModel } from '../../generated';
+import type { ConfiguredModel, ModelProviderView } from '../../generated';
 import { CONTEXT_RING_CIRCUMFERENCE, ringDashOffset } from './contextRing';
 import { computeContextUsage, estimateDraftTokens, type ContextUsageSource } from './contextUsage';
 import { isKnownThinkingLevel, thinkingLevelOptions } from './thinkingLevels';
@@ -292,6 +295,9 @@ function ContextRingIndicator({
   source: ContextUsageSource;
 }) {
   const [hover, setHover] = useState(false);
+  const [pinned, setPinned] = useState(false);
+  const tooltipId = useId();
+  const showDetails = hover || pinned;
   const color =
     tier === 'critical'
       ? 'var(--color-error)'
@@ -320,57 +326,80 @@ function ContextRingIndicator({
 
   return (
     <span
-      className="relative inline-flex h-7 w-7 items-center justify-center"
+      className="relative inline-flex h-7 w-7 shrink-0 items-center justify-center"
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
     >
-      <svg width="28" height="28" viewBox="0 0 28 28" aria-hidden="true">
-        <circle
-          cx="14"
-          cy="14"
-          r="10"
-          fill="none"
-          stroke={
-            source === 'unknown'
-              ? 'var(--border-primary)'
-              : `color-mix(in srgb, ${color} 22%, var(--border-primary))`
+      <button
+        type="button"
+        aria-label={`${capacityLine}；来源：${sourceLabel}`}
+        aria-expanded={showDetails}
+        aria-describedby={showDetails ? tooltipId : undefined}
+        className="inline-flex h-7 w-7 items-center justify-center rounded-full focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
+        onClick={() => {
+          setHover(false);
+          setPinned((value) => !value);
+        }}
+        onBlur={() => {
+          setHover(false);
+          setPinned(false);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === 'Escape') {
+            setHover(false);
+            setPinned(false);
           }
-          strokeWidth="3"
-        />
-        <circle
-          cx="14"
-          cy="14"
-          r="10"
-          fill="none"
-          stroke={color}
-          strokeWidth="3.4"
-          strokeLinecap="round"
-          strokeDasharray={CONTEXT_RING_CIRCUMFERENCE}
-          strokeDashoffset={offset}
-          transform="rotate(-90 14 14)"
-          style={{
-            filter:
+        }}
+      >
+        <svg width="28" height="28" viewBox="0 0 28 28" aria-hidden="true">
+          <circle
+            cx="14"
+            cy="14"
+            r="10"
+            fill="none"
+            stroke={
               source === 'unknown'
-                ? undefined
-                : `drop-shadow(0 0 2px color-mix(in srgb, ${color} 70%, transparent))`,
-          }}
-        />
-        <text
-          x="14"
-          y="14"
-          textAnchor="middle"
-          dominantBaseline="central"
-          fill={color}
-          fontSize="7.2"
-          fontWeight="700"
-          fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
-        >
-          {centerLabel}
-        </text>
-      </svg>
-      {hover && (
+                ? 'var(--border-primary)'
+                : `color-mix(in srgb, ${color} 22%, var(--border-primary))`
+            }
+            strokeWidth="3"
+          />
+          <circle
+            cx="14"
+            cy="14"
+            r="10"
+            fill="none"
+            stroke={color}
+            strokeWidth="3.4"
+            strokeLinecap="round"
+            strokeDasharray={CONTEXT_RING_CIRCUMFERENCE}
+            strokeDashoffset={offset}
+            transform="rotate(-90 14 14)"
+            style={{
+              filter:
+                source === 'unknown'
+                  ? undefined
+                  : `drop-shadow(0 0 2px color-mix(in srgb, ${color} 70%, transparent))`,
+            }}
+          />
+          <text
+            x="14"
+            y="14"
+            textAnchor="middle"
+            dominantBaseline="central"
+            fill={color}
+            fontSize="7.2"
+            fontWeight="700"
+            fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
+          >
+            {centerLabel}
+          </text>
+        </svg>
+      </button>
+      {showDetails && (
         <span
-          className="absolute bottom-full left-1/2 z-50 mb-2 -translate-x-1/2 whitespace-nowrap rounded-md border border-[var(--border-primary)] bg-[var(--bg-primary)] px-2.5 py-1.5 text-[11px] leading-relaxed text-[var(--text-secondary)] shadow-[var(--shadow-md)]"
+          id={tooltipId}
+          className="absolute bottom-full right-0 z-50 mb-2 w-max max-w-[calc(100vw-2rem)] whitespace-normal rounded-md border border-[var(--border-primary)] bg-[var(--bg-primary)] px-2.5 py-1.5 text-left text-[11px] leading-relaxed text-[var(--text-secondary)] shadow-[var(--shadow-md)]"
           role="tooltip"
         >
           <span className="block">{capacityLine}</span>
@@ -430,6 +459,7 @@ export function ChatInput({
   }, []);
   const [paletteSelectedIndex, setPaletteSelectedIndex] = useState(0);
   const [configuredModels, setConfiguredModels] = useState<ConfiguredModel[]>([]);
+  const [modelProviders, setModelProviders] = useState<ModelProviderView[]>([]);
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [switchingModelId, setSwitchingModelId] = useState<string | null>(null);
@@ -443,6 +473,7 @@ export function ChatInput({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const thinkingPublicationRef = useRef<string | null>(null);
   const controlsRef = useRef<HTMLDivElement>(null);
+  const controlLabelId = useId();
   useEffect(() => {
     if (!modelMenuOpen && !permissionMenuOpen && !thinkingMenuOpen) return;
     const close = () => {
@@ -476,7 +507,8 @@ export function ChatInput({
   const thinkingLevels = thinkingLevelOptions(displayModel?.thinking_levels ?? []);
   // 上下文窗口占用（来自 llm_usage 事件 → chatStore）。
   const contextWindow = useChatStore((s) => s.contextWindow);
-  const usageAccumulator = useChatStore((s) => s.usageAccumulator);
+  const statistics = useConversationUsage();
+  const contextInvalidated = useChatStore((s) => s.contextInvalidated);
   // 后端返回显式配置或模型推断后的有效窗口；无默认标记时与展示模型保持一致。
   const contextWindowSize = displayModel?.context_window ?? null;
   const activePermissionMode =
@@ -484,8 +516,9 @@ export function ChatInput({
 
   const loadConfiguredModels = useCallback(async () => {
     try {
-      const res = await providerApi.listConfigured();
+      const res = await configuredModelPresentation();
       setConfiguredModels(res.models);
+      setModelProviders(res.providers);
     } catch (e) {
       console.error('[ChatInput] Failed to load configured models:', e);
     } finally {
@@ -987,14 +1020,18 @@ export function ChatInput({
       sameDraftTarget(submissionRef.current.target, readDraftTarget()));
   const draftTokens = useMemo(() => estimateDraftTokens(text, pendingFiles), [text, pendingFiles]);
   const contextUsage = computeContextUsage(
-    contextWindow?.inputTokens ?? null,
+    contextWindow?.inputTokens ??
+      (!contextInvalidated ? (statistics.value?.main.latest_input_tokens ?? null) : null),
     draftTokens,
     contextWindowSize
   );
   const ctxUsage = {
     ...contextUsage,
     win: contextWindowSize,
-    cacheRate: cacheHitRate(usageAccumulator),
+    cacheRate:
+      statistics.value && statistics.value.main.input_tokens > 0 && !statistics.value.main.conflicts
+        ? statistics.value.main.cached_tokens / statistics.value.main.input_tokens
+        : null,
   };
 
   return (
@@ -1101,7 +1138,7 @@ export function ChatInput({
                     : '继续对话，或补充当前任务…'
                   : '请先配置模型'
               }
-              className="max-h-[240px] min-h-[104px] min-w-0 flex-1 resize-none pb-10 bg-transparent text-sm leading-relaxed text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
+              className="max-h-[240px] min-h-[64px] w-full min-w-0 flex-1 resize-none bg-transparent text-sm leading-relaxed text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
             />
             {isStreaming ? (
               <button
@@ -1123,193 +1160,215 @@ export function ChatInput({
                 <ArrowUp size={16} strokeWidth={2.5} />
               </button>
             )}
+            <div
+              ref={controlsRef}
+              className="relative flex min-w-0 items-center justify-between gap-x-1 pl-8 pr-9 text-xs text-[var(--text-tertiary)]"
+            >
+              <div className="flex min-w-0 shrink-0 items-center gap-0.5 sm:gap-1">
+                <WorkspaceMenuControl
+                  onOpen={() => {
+                    setPermissionMenuOpen(false);
+                    setModelMenuOpen(false);
+                    setThinkingMenuOpen(false);
+                  }}
+                />
+                <div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPermissionMenuOpen((open) => !open);
+                      setModelMenuOpen(false);
+                      setThinkingMenuOpen(false);
+                    }}
+                    className="flex max-w-[180px] items-center gap-1 rounded-full px-1 py-1 sm:gap-1.5 sm:px-2 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                    title="权限配置"
+                    aria-label="权限配置"
+                    aria-describedby={`${controlLabelId}-permission`}
+                    aria-expanded={permissionMenuOpen}
+                  >
+                    <span id={`${controlLabelId}-permission`} className="sr-only">
+                      当前权限：
+                      {permissionMode === 'default' ? '默认权限' : activePermissionMode.label}
+                    </span>
+                    <ShieldCheck size={13} />
+                    <span className="hidden truncate sm:inline">
+                      {permissionMode === 'default' ? '默认权限' : activePermissionMode.label}
+                    </span>
+                    <ChevronDown size={12} />
+                  </button>
+                  {permissionMenuOpen && (
+                    <MenuOverlay title="审批模式" width="w-64">
+                      <div className="p-1">
+                        {PERMISSION_MODES.map((mode) => (
+                          <button
+                            key={mode.id}
+                            type="button"
+                            onClick={() => switchPermissionMode(mode.id)}
+                            disabled={switchingPermissionMode === mode.id}
+                            className="flex w-full items-start gap-2 rounded-md px-2 py-2 text-left transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-wait disabled:opacity-70"
+                          >
+                            <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center text-[var(--accent)]">
+                              {mode.id === permissionMode && <Check size={13} />}
+                            </span>
+                            <span className="min-w-0 flex-1">
+                              <span className="block text-xs text-[var(--text-primary)]">
+                                {switchingPermissionMode === mode.id ? '切换中...' : mode.label}
+                              </span>
+                              <span className="block text-[10px] text-[var(--text-tertiary)]">
+                                {mode.description}
+                              </span>
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    </MenuOverlay>
+                  )}
+                </div>
+                <div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPermissionMenuOpen(false);
+                      setModelMenuOpen(false);
+                      setThinkingMenuOpen((open) => !open);
+                    }}
+                    disabled={!displayModel || switchingThinking}
+                    className="flex max-w-[140px] items-center gap-1 rounded-full px-1 py-1 sm:gap-1.5 sm:px-2 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-[var(--text-tertiary)]"
+                    title={displayModel ? '切换思考深度' : '配置模型后可用'}
+                    aria-label="思考深度"
+                    aria-describedby={`${controlLabelId}-thinking`}
+                    aria-expanded={thinkingMenuOpen}
+                  >
+                    <span id={`${controlLabelId}-thinking`} className="sr-only">
+                      当前思考深度：
+                      {thinkingLevels.find((level) => level.id === thinkingLevel)?.label ?? '自动'}
+                    </span>
+                    <Brain size={13} />
+                    <span className="hidden truncate sm:inline">
+                      {thinkingLevels.find((level) => level.id === thinkingLevel)?.label ?? '自动'}
+                    </span>
+                    {displayModel && <ChevronDown size={12} />}
+                  </button>
+                  {thinkingMenuOpen && displayModel && (
+                    <MenuOverlay title="思考深度" width="w-56">
+                      <div className="p-1">
+                        {thinkingLevels.map((lvl) => (
+                          <button
+                            key={lvl.id}
+                            type="button"
+                            onClick={() => switchThinkingLevel(lvl.id)}
+                            disabled={switchingThinking}
+                            className="flex w-full items-start gap-2 rounded-md px-2 py-2 text-left transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-wait disabled:opacity-70"
+                          >
+                            <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center text-[var(--accent)]">
+                              {lvl.id === thinkingLevel && <Check size={13} />}
+                            </span>
+                            <span className="min-w-0 flex-1">
+                              <span className="block text-xs text-[var(--text-primary)]">
+                                {switchingThinking && lvl.id === thinkingLevel
+                                  ? '切换中...'
+                                  : lvl.label}
+                              </span>
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    </MenuOverlay>
+                  )}
+                </div>
+              </div>
+              <div className="ml-auto flex min-w-0 flex-1 items-center justify-end gap-1">
+                {receiptNotice?.target === currentDraftTargetKey && (
+                  <span
+                    role="status"
+                    title="输入已保存，后续处理状态由原任务回执呈现"
+                    className="px-1 text-[var(--text-secondary)]"
+                    data-input-id={receiptNotice.receipt.identity.input_id}
+                  >
+                    已收到
+                  </span>
+                )}
+                <div className="min-w-0 max-w-full">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPermissionMenuOpen(false);
+                      setThinkingMenuOpen(false);
+                      if (visibleModels.length === 0) {
+                        openModelSettings();
+                      } else {
+                        setModelMenuOpen((open) => !open);
+                      }
+                    }}
+                    className="flex max-w-full min-w-0 sm:max-w-[min(32vw,300px)] items-center gap-1 rounded-full px-1 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] sm:px-2"
+                    title={
+                      displayModel ? `${displayModel.provider} / ${displayModel.model}` : '选择模型'
+                    }
+                    aria-label="选择模型"
+                    aria-expanded={modelMenuOpen}
+                  >
+                    <Cpu size={13} />
+                    <span className="truncate">
+                      {displayModel ? modelLabel(displayModel, modelProviders) : '选择模型'}
+                    </span>
+                    {visibleModels.length > 0 && <ChevronDown size={12} />}
+                  </button>
+                  {modelMenuOpen && visibleModels.length > 0 && (
+                    <MenuOverlay title="默认模型" width="w-64" align="right">
+                      <div className="max-h-64 overflow-y-auto p-1">
+                        {visibleModels.map((model) => (
+                          <button
+                            key={model.id}
+                            type="button"
+                            onClick={() => switchModel(model)}
+                            disabled={switchingModelId !== null}
+                            className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-xs text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            <span className="flex h-4 w-4 shrink-0 items-center justify-center text-[var(--accent)]">
+                              {model.is_default && <Check size={13} />}
+                            </span>
+                            <span className="min-w-0 flex-1 break-words">
+                              {modelLabel(model, modelProviders)}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={openModelSettings}
+                        className="w-full border-t border-[var(--border-secondary)] px-3 py-2 text-left text-xs text-[var(--accent)] transition-colors hover:bg-[var(--bg-hover)]"
+                      >
+                        管理模型
+                      </button>
+                    </MenuOverlay>
+                  )}
+                </div>
+                {queuedCount > 0 && (
+                  <span className="hidden lg:inline">已排队 {queuedCount} 条</span>
+                )}
+              </div>
+            </div>
           </AgentComposerFrame>
           <div
-            ref={controlsRef}
-            className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 px-2 py-2 text-xs text-[var(--text-tertiary)]"
+            className="flex min-h-7 items-center justify-center gap-x-1 px-2 pt-1 text-[10px] text-[var(--text-tertiary)] sm:gap-x-3 sm:text-xs"
+            aria-label="运行统计"
           >
-            <div className="flex min-w-0 flex-wrap items-center gap-1.5 sm:gap-2">
-              <WorkspaceMenuControl
-                onOpen={() => {
-                  setPermissionMenuOpen(false);
-                  setModelMenuOpen(false);
-                  setThinkingMenuOpen(false);
-                }}
+            <ConversationStatistics
+              streaming={isStreaming === true}
+              value={statistics.value}
+              error={statistics.error}
+            />
+            {ctxUsage.source !== 'unknown' && (
+              <ContextRingIndicator
+                pct={ctxUsage.pct}
+                used={ctxUsage.used}
+                win={ctxUsage.win}
+                tier={ctxUsage.tier}
+                cacheRate={ctxUsage.cacheRate}
+                source={ctxUsage.source}
               />
-              <div className="relative">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setPermissionMenuOpen((open) => !open);
-                    setModelMenuOpen(false);
-                    setThinkingMenuOpen(false);
-                  }}
-                  className="flex max-w-[180px] items-center gap-1.5 rounded-full px-2 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-                  title="权限配置"
-                  aria-label="权限配置"
-                  aria-expanded={permissionMenuOpen}
-                >
-                  <ShieldCheck size={13} />
-                  <span className="truncate">
-                    {permissionMode === 'default' ? '默认权限' : activePermissionMode.label}
-                  </span>
-                  <ChevronDown size={12} />
-                </button>
-                {permissionMenuOpen && (
-                  <MenuOverlay title="审批模式" width="w-64">
-                    <div className="p-1">
-                      {PERMISSION_MODES.map((mode) => (
-                        <button
-                          key={mode.id}
-                          type="button"
-                          onClick={() => switchPermissionMode(mode.id)}
-                          disabled={switchingPermissionMode === mode.id}
-                          className="flex w-full items-start gap-2 rounded-md px-2 py-2 text-left transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-wait disabled:opacity-70"
-                        >
-                          <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center text-[var(--accent)]">
-                            {mode.id === permissionMode && <Check size={13} />}
-                          </span>
-                          <span className="min-w-0 flex-1">
-                            <span className="block text-xs text-[var(--text-primary)]">
-                              {switchingPermissionMode === mode.id ? '切换中...' : mode.label}
-                            </span>
-                            <span className="block text-[10px] text-[var(--text-tertiary)]">
-                              {mode.description}
-                            </span>
-                          </span>
-                        </button>
-                      ))}
-                    </div>
-                  </MenuOverlay>
-                )}
-              </div>
-              <div className="relative">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setPermissionMenuOpen(false);
-                    setModelMenuOpen(false);
-                    setThinkingMenuOpen((open) => !open);
-                  }}
-                  disabled={!displayModel || switchingThinking}
-                  className="flex max-w-[140px] items-center gap-1.5 rounded-full px-2 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-[var(--text-tertiary)]"
-                  title={displayModel ? '切换思考深度' : '配置模型后可用'}
-                  aria-label="思考深度"
-                  aria-expanded={thinkingMenuOpen}
-                >
-                  <Brain size={13} />
-                  <span className="truncate">
-                    {thinkingLevels.find((level) => level.id === thinkingLevel)?.label ?? '自动'}
-                  </span>
-                  {displayModel && <ChevronDown size={12} />}
-                </button>
-                {thinkingMenuOpen && displayModel && (
-                  <MenuOverlay title="思考深度" width="w-56">
-                    <div className="p-1">
-                      {thinkingLevels.map((lvl) => (
-                        <button
-                          key={lvl.id}
-                          type="button"
-                          onClick={() => switchThinkingLevel(lvl.id)}
-                          disabled={switchingThinking}
-                          className="flex w-full items-start gap-2 rounded-md px-2 py-2 text-left transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-wait disabled:opacity-70"
-                        >
-                          <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center text-[var(--accent)]">
-                            {lvl.id === thinkingLevel && <Check size={13} />}
-                          </span>
-                          <span className="min-w-0 flex-1">
-                            <span className="block text-xs text-[var(--text-primary)]">
-                              {switchingThinking && lvl.id === thinkingLevel
-                                ? '切换中...'
-                                : lvl.label}
-                            </span>
-                          </span>
-                        </button>
-                      ))}
-                    </div>
-                  </MenuOverlay>
-                )}
-              </div>
-            </div>
-            <div className="ml-auto flex min-w-0 items-center gap-1">
-              {receiptNotice?.target === currentDraftTargetKey && (
-                <span
-                  role="status"
-                  title="输入已保存，后续处理状态由原任务回执呈现"
-                  className="px-1 text-[var(--text-secondary)]"
-                  data-input-id={receiptNotice.receipt.identity.input_id}
-                >
-                  已收到
-                </span>
-              )}
-              <div className="relative min-w-0">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setPermissionMenuOpen(false);
-                    setThinkingMenuOpen(false);
-                    if (visibleModels.length === 0) {
-                      openModelSettings();
-                    } else {
-                      setModelMenuOpen((open) => !open);
-                    }
-                  }}
-                  className="flex max-w-[180px] items-center gap-1.5 rounded-full px-2 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-                  title={
-                    displayModel ? `${displayModel.provider} / ${displayModel.model}` : '选择模型'
-                  }
-                  aria-label="选择模型"
-                  aria-expanded={modelMenuOpen}
-                >
-                  <Cpu size={13} />
-                  <span className="truncate">
-                    {displayModel?.display_name || displayModel?.model || '选择模型'}
-                  </span>
-                  {visibleModels.length > 0 && <ChevronDown size={12} />}
-                </button>
-                {modelMenuOpen && visibleModels.length > 0 && (
-                  <MenuOverlay title="默认模型" width="w-64" align="right">
-                    <div className="max-h-64 overflow-y-auto p-1">
-                      {visibleModels.map((model) => (
-                        <button
-                          key={model.id}
-                          type="button"
-                          onClick={() => switchModel(model)}
-                          disabled={switchingModelId !== null}
-                          className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-xs text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                          <span className="flex h-4 w-4 shrink-0 items-center justify-center text-[var(--accent)]">
-                            {model.is_default && <Check size={13} />}
-                          </span>
-                          <span className="min-w-0 flex-1 truncate">
-                            {model.display_name || model.model}
-                          </span>
-                        </button>
-                      ))}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={openModelSettings}
-                      className="w-full border-t border-[var(--border-secondary)] px-3 py-2 text-left text-xs text-[var(--accent)] transition-colors hover:bg-[var(--bg-hover)]"
-                    >
-                      管理模型
-                    </button>
-                  </MenuOverlay>
-                )}
-              </div>
-              {queuedCount > 0 && <span className="hidden lg:inline">已排队 {queuedCount} 条</span>}
-              {ctxUsage.source !== 'unknown' && (
-                <ContextRingIndicator
-                  pct={ctxUsage.pct}
-                  used={ctxUsage.used}
-                  win={ctxUsage.win}
-                  tier={ctxUsage.tier}
-                  cacheRate={ctxUsage.cacheRate}
-                  source={ctxUsage.source}
-                />
-              )}
-              {text.length > 0 && <span>{text.length} 字</span>}
-            </div>
+            )}
+            {text.length > 0 && <span className="hidden shrink-0 sm:inline">{text.length} 字</span>}
           </div>
         </div>
       </div>
@@ -1338,7 +1397,7 @@ function MenuOverlay({
   return (
     <Card
       variant="overlay"
-      className={`absolute bottom-full z-50 mb-2 max-w-[calc(100vw-2rem)] overflow-hidden ${align === 'right' ? 'right-0' : 'left-0'} ${width}`}
+      className={`absolute bottom-full z-50 mb-2 max-w-full overflow-hidden ${align === 'right' ? 'right-0' : 'left-0'} ${width}`}
     >
       <div className="border-b border-[var(--border-secondary)] px-3 py-2 text-[10px] font-medium text-[var(--text-tertiary)]">
         {title}
@@ -1407,7 +1466,7 @@ function WorkspaceMenuControl({ onOpen }: { onOpen: () => void }) {
       .includes(query.trim().toLowerCase())
   );
   return (
-    <div ref={container} className="relative min-w-0">
+    <div ref={container} className="min-w-0 shrink-0">
       <button
         ref={trigger}
         type="button"
@@ -1419,7 +1478,7 @@ function WorkspaceMenuControl({ onOpen }: { onOpen: () => void }) {
           setError('');
         }}
         title={current ? workspaceLocationLabel(current) : '选择工作空间'}
-        className="flex max-w-[190px] items-center gap-1.5 rounded-lg px-2 py-1.5 text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+        className="flex max-w-[min(18vw,160px)] min-w-0 items-center gap-1 rounded-lg px-1 py-1.5 text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] sm:px-2"
       >
         {current && workspaceIsRemote(current) ? <Server size={14} /> : <FolderOpen size={14} />}
         <span className="truncate">{current?.name || '选择工作空间'}</span>
@@ -1430,7 +1489,7 @@ function WorkspaceMenuControl({ onOpen }: { onOpen: () => void }) {
           variant="overlay"
           role="dialog"
           aria-label="工作空间选择"
-          className="absolute bottom-full left-0 z-50 mb-3 w-[330px] max-w-[calc(100vw-2rem)] overflow-hidden rounded-2xl"
+          className="absolute bottom-full left-0 z-50 mb-3 w-[330px] max-w-full overflow-hidden rounded-2xl"
         >
           <label className="eko-workspace-search m-2 flex items-center gap-2 rounded-xl bg-[var(--bg-secondary)] px-3 py-2.5">
             <Search size={15} className="shrink-0" />

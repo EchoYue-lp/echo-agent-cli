@@ -19,6 +19,7 @@ vi.mock('../../api/endpoints', async (original) => {
     ...actual,
     providerApi: {
       ...actual.providerApi,
+      listProviders: vi.fn().mockResolvedValue({ providers: [] }),
       listConfigured: mocks.models,
       setThinking: vi.fn().mockResolvedValue({ success: true, applied: true, spec: 'auto' }),
     },

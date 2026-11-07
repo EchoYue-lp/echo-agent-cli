@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react';
 import { configApi } from '../../api/endpoints';
-import { useUiStore } from '../../stores/uiStore';
 import type { AgentConfigResponse, FullConfigResponse } from '../../generated';
 import type { FullConfigUpdateRequest } from '../../types/api';
 
@@ -181,19 +180,6 @@ export function ConfigPanel() {
           value={edit.mcp?.config_path ?? fullConfig.mcp.config_path ?? ''}
           onChange={(v) => markDirty({ mcp: { config_path: v } })}
         />
-      </Section>
-
-      <Section title="IM 渠道">
-        <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
-          QQ、飞书和个人微信的配置与连接统一在 IM 渠道管理。
-        </p>
-        <button
-          type="button"
-          onClick={() => useUiStore.getState().setActiveSettingsTab('channels')}
-          className="inline-flex min-h-9 items-center text-sm font-medium text-[var(--accent)] underline-offset-4 hover:underline"
-        >
-          前往IM渠道
-        </button>
       </Section>
 
       {/* Session */}

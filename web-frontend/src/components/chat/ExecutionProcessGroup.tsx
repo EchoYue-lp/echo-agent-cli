@@ -7,6 +7,8 @@ interface ExecutionProcessGroupProps {
   unrestored?: boolean;
   /** Known failed tool executions remain visible when the process is collapsed. */
   toolFailureCount?: number;
+  /** 展示事实，不把最终正文发布等同于整个 TaskRun 完成。 */
+  statusLabel?: string;
   children: ReactNode;
 }
 
@@ -15,6 +17,7 @@ export const ExecutionProcessGroup = memo(function ExecutionProcessGroup({
   completed,
   unrestored = false,
   toolFailureCount = 0,
+  statusLabel = '已完成',
   children,
 }: ExecutionProcessGroupProps) {
   const [completedExpanded, setCompletedExpanded] = useState(false);
@@ -45,7 +48,7 @@ export const ExecutionProcessGroup = memo(function ExecutionProcessGroup({
         )}
         <ListTree size={12} className="shrink-0" />
         <span>{unrestored ? '历史执行状态未恢复' : '执行过程'}</span>
-        {!unrestored && <span className="text-[10px]">已完成</span>}
+        {!unrestored && <span className="text-[10px]">{statusLabel}</span>}
         {toolFailureCount > 0 && (
           <span className="text-[10px] text-[var(--color-error)]">
             {toolFailureCount} 个工具失败

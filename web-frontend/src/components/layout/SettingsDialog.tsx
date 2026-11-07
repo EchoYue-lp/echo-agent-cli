@@ -128,6 +128,7 @@ const settingsGroups: SettingsGroup[] = [
         maturity: 'core',
         description: '智能体与常用应用配置',
       },
+      channelsItem,
       {
         id: 'tools',
         label: '工具',
@@ -311,80 +312,78 @@ export function SettingsDialog() {
       }
     >
       {/* Left sidebar — settings nav */}
-      {!independentChannels && (
-        <div className="settings-navigation flex w-[196px] shrink-0 max-sm:w-[144px] flex-col border-r border-[var(--border-secondary)] bg-[var(--settings-sidebar-bg)]">
-          <div className="flex h-18 shrink-0 items-center px-5">
-            <h2
-              id="settings-dialog-title"
-              className="text-base font-semibold text-[var(--text-primary)]"
-            >
-              设置
-            </h2>
-          </div>
-          <nav aria-label="设置分类" className="flex-1 space-y-4 overflow-y-auto px-3 pb-4">
-            {settingsGroups.map((group) => (
-              <div key={group.label} role="group" aria-label={group.label}>
-                {group.tier === 'advanced' ? (
+      <div className="settings-navigation flex w-[196px] shrink-0 max-sm:w-[144px] flex-col border-r border-[var(--border-secondary)] bg-[var(--settings-sidebar-bg)]">
+        <div className="flex h-18 shrink-0 items-center px-5">
+          <h2
+            id="settings-dialog-title"
+            className="text-base font-semibold text-[var(--text-primary)]"
+          >
+            设置
+          </h2>
+        </div>
+        <nav aria-label="设置分类" className="flex-1 space-y-4 overflow-y-auto px-3 pb-4">
+          {settingsGroups.map((group) => (
+            <div key={group.label} role="group" aria-label={group.label}>
+              {group.tier === 'advanced' ? (
+                <button
+                  type="button"
+                  aria-expanded={Boolean(
+                    expandedAdvanced[group.label] || activeGroup?.label === group.label
+                  )}
+                  onClick={() =>
+                    setExpandedAdvanced((prev) => ({
+                      ...prev,
+                      [group.label]: !prev[group.label],
+                    }))
+                  }
+                  className="mb-1 flex w-full items-center justify-between px-2 py-1 text-xs font-medium text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
+                >
+                  {group.label}
+                  {expandedAdvanced[group.label] || activeGroup?.label === group.label ? (
+                    <ChevronDown size={12} />
+                  ) : (
+                    <ChevronRight size={12} />
+                  )}
+                </button>
+              ) : (
+                <div className="mb-1 px-2 py-1 text-xs font-medium text-[var(--text-tertiary)]">
+                  {group.label}
+                </div>
+              )}
+              {(group.tier === 'core' ||
+                expandedAdvanced[group.label] ||
+                activeGroup?.label === group.label) &&
+                group.items.map(({ id, label, icon: Icon, maturity, description }) => (
                   <button
+                    key={id}
                     type="button"
-                    aria-expanded={Boolean(
-                      expandedAdvanced[group.label] || activeGroup?.label === group.label
-                    )}
-                    onClick={() =>
-                      setExpandedAdvanced((prev) => ({
-                        ...prev,
-                        [group.label]: !prev[group.label],
-                      }))
-                    }
-                    className="mb-1 flex w-full items-center justify-between px-2 py-1 text-xs font-medium text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
-                  >
-                    {group.label}
-                    {expandedAdvanced[group.label] || activeGroup?.label === group.label ? (
-                      <ChevronDown size={12} />
-                    ) : (
-                      <ChevronRight size={12} />
-                    )}
-                  </button>
-                ) : (
-                  <div className="mb-1 px-2 py-1 text-xs font-medium text-[var(--text-tertiary)]">
-                    {group.label}
-                  </div>
-                )}
-                {(group.tier === 'core' ||
-                  expandedAdvanced[group.label] ||
-                  activeGroup?.label === group.label) &&
-                  group.items.map(({ id, label, icon: Icon, maturity, description }) => (
-                    <button
-                      key={id}
-                      type="button"
-                      title={description}
-                      aria-current={effectiveSettingsTab === id ? 'page' : undefined}
-                      onClick={() => setActiveSettingsTab(id)}
-                      className={`flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left transition-all duration-150
+                    title={description}
+                    aria-current={effectiveSettingsTab === id ? 'page' : undefined}
+                    onClick={() => setActiveSettingsTab(id)}
+                    className={`flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left transition-all duration-150
                     ${
                       effectiveSettingsTab === id
                         ? 'bg-[var(--settings-active-bg)] text-[var(--text-primary)]'
                         : 'text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]'
                     }`}
-                    >
-                      <Icon size={15} className="shrink-0" />
-                      <span className="min-w-0 flex-1">
-                        <span className="flex min-w-0 items-center gap-2">
-                          <span className="truncate text-sm font-medium">{label}</span>
-                          {maturity === 'lab' && (
-                            <span className="shrink-0 rounded-md bg-[var(--bg-hover)] px-2 py-0.5 text-[11px] text-[var(--text-secondary)]">
-                              实验
-                            </span>
-                          )}
-                        </span>
+                  >
+                    <Icon size={15} className="shrink-0" />
+                    <span className="min-w-0 flex-1">
+                      <span className="flex min-w-0 items-center gap-2">
+                        <span className="truncate text-sm font-medium">{label}</span>
+                        {maturity === 'lab' && (
+                          <span className="shrink-0 rounded-md bg-[var(--bg-hover)] px-2 py-0.5 text-[11px] text-[var(--text-secondary)]">
+                            实验
+                          </span>
+                        )}
                       </span>
-                    </button>
-                  ))}
-              </div>
-            ))}
-          </nav>
-        </div>
-      )}
+                    </span>
+                  </button>
+                ))}
+            </div>
+          ))}
+        </nav>
+      </div>
 
       {/* Content area */}
       <div className="flex flex-1 flex-col min-w-0 bg-[var(--settings-content-bg)]">

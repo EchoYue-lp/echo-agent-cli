@@ -1,3 +1,7 @@
 dist
 node_modules
 *.local
+
+# Rust 原始 DTO 导出按 SHA 保留字节。
+src/fixtures/native-presentation-conflict.json
+src/fixtures/standard-chart-real-root.json

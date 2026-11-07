@@ -14,13 +14,25 @@ import { productDataScope, sameProductDataScope } from '../lib/productDataScope'
 import { conversationApi } from '../api/endpoints';
 import { isHitlRequestIdentity } from '../types/api';
 import {
+  nativeSourceKey,
+  recordBelongsToTurn,
+  savedPresentationBySource,
+  presentationRecordFromEnvelope,
+} from '../lib/nativePresentation';
+import {
   ingestSubagentExecEvent,
   subagentRunStoreKey,
   useSubagentRunStore,
 } from '../stores/subagentRunStore';
 import { useToastStore } from '../stores/toastStore';
 import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
-import type { AgentEvent, ChatEvent, ChatEventEnvelope } from '../types/api';
+import type {
+  AgentEvent,
+  ChatEvent,
+  ChatEventEnvelope,
+  NativeTurnSource,
+  SavedMessage,
+} from '../types/api';
 import type { ExecEvent } from '../generated';
 
 interface EventContext {
@@ -30,6 +42,7 @@ interface EventContext {
   isCancelledRef: React.MutableRefObject<boolean>;
   currentThinkingIdRef: React.MutableRefObject<string | null>;
   onInputLifecycle?: (workspaceId: string, conversationId: string) => void;
+  captureProjection?: () => () => boolean;
 }
 
 export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventContext): void {
@@ -52,6 +65,27 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
   }
   switch (payload.source) {
     case 'agent': {
+      const agent = payload.event;
+      const messageId = ctx.assistantIdRef.current;
+      if (
+        messageId &&
+        !ctx.isCancelledRef.current &&
+        ctx.currentMessageKeyRef.current === envelope.root_turn_id &&
+        agent.execution_id &&
+        agent.conversation_id === envelope.conversation_id &&
+        agent.turn_id === envelope.turn_id &&
+        agent.message_id === envelope.message_id &&
+        envelope.root_turn_id === envelope.message_id &&
+        envelope.conversation_id
+      ) {
+        useChatStore.getState().observeTurnSource(messageId, {
+          workspace_id: envelope.workspace_id,
+          conversation_id: envelope.conversation_id,
+          root_turn_id: envelope.root_turn_id,
+          turn_id: envelope.turn_id,
+          execution_id: agent.execution_id,
+        });
+      }
       const scope = JSON.stringify([
         envelope.workspace_id,
         envelope.conversation_id,
@@ -67,6 +101,16 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
         Number.isFinite(at);
       // 重放保留原事件时刻；其它会话的frontier通知不推进当前操作时钟。
       if (ownsOperation) useChatStore.getState().noteActivityEvent(at);
+      const presentation = presentationRecordFromEnvelope(envelope);
+      if (presentation) useChatStore.getState().recordNativePresentation(presentation);
+      const saveScope = JSON.stringify([
+        envelope.workspace_id,
+        envelope.conversation_id ?? envelope.root_turn_id,
+      ]);
+      const saveAlreadyObserved =
+        useChatStore
+          .getState()
+          .transcriptSaves[saveScope]?.some((entry) => entry.eventId === agent.event_id) === true;
       handleAgentEvent(
         payload.event.payload,
         ctx,
@@ -77,19 +121,50 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
           rootTurnId: envelope.root_turn_id,
           timestamp: at,
           sequence: envelope.sequence,
+          journalSource: { stream_id: envelope.stream_id, sequence: envelope.sequence },
           saveScope: JSON.stringify([
             envelope.workspace_id,
             envelope.conversation_id ?? envelope.root_turn_id,
           ]),
         }
       );
+      if (
+        messageId &&
+        ownsOperation &&
+        !saveAlreadyObserved &&
+        agent.payload.type === 'transcript_projection_settlement'
+      ) {
+        const receipt = agent.payload.data;
+        const admitted = useChatStore
+          .getState()
+          .transcriptSaves[saveScope]?.some((entry) => entry.eventId === agent.event_id);
+        if (
+          admitted &&
+          receipt.status === 'settled' &&
+          receipt.operation_id &&
+          receipt.generation_id &&
+          receipt.attempt > 0 &&
+          receipt.error_class === null &&
+          receipt.conversation_id === envelope.conversation_id
+        ) {
+          void refreshNativeChartsAfterSave(
+            envelope,
+            messageId,
+            ctx.captureProjection?.() ?? captureConversationView()
+          );
+        }
+      }
       break;
     }
     case 'turn_status': {
       const messageId = ctx.assistantIdRef.current;
       handleChatEvent({ type: 'run_status', status: payload.event.status }, ctx);
       if (messageId && payload.event.status === 'completed')
-        void refreshNativeFinalPresentation(envelope, messageId);
+        void refreshNativeFinalPresentation(
+          envelope,
+          messageId,
+          ctx.captureProjection?.() ?? captureConversationView()
+        );
       break;
     }
     case 'execution_path':
@@ -158,9 +233,12 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
     case 'command_cell_watch_delivery_started':
     case 'command_cell_watch_acknowledged':
       break;
-    case 'execution':
+    case 'execution': {
       applyExecutionEvent(payload.event, envelope);
+      const presentation = presentationRecordFromEnvelope(envelope);
+      if (presentation) useChatStore.getState().recordNativePresentation(presentation);
       break;
+    }
     default:
       assertNever(payload, 'chat driver event');
   }
@@ -199,7 +277,13 @@ function handleAgentEvent(
   observation?: { at: number; scope: string; eventId: string },
   executionId?: string | null,
   publicationEventId?: string,
-  journal?: { rootTurnId: string; timestamp: number; sequence: number; saveScope: string }
+  journal?: {
+    rootTurnId: string;
+    timestamp: number;
+    sequence: number;
+    saveScope: string;
+    journalSource?: import('../types/api').NativeJournalCursor;
+  }
 ): void {
   switch (event.type) {
     case 'execution_status': {
@@ -228,7 +312,13 @@ function handleAgentEvent(
       if (id && !ctx.isCancelledRef.current) {
         useChatStore
           .getState()
-          .appendAssistantBlock(id, event.data.block, executionId, publicationEventId);
+          .appendAssistantBlock(
+            id,
+            event.data.block,
+            executionId,
+            publicationEventId,
+            journal?.journalSource
+          );
         if (
           observation &&
           useChatStore.getState().activity?.key !== `request:${event.data.block.request_id}`
@@ -282,7 +372,9 @@ function handleAgentEvent(
       handleChatEvent({ type: 'tool_batch_end' }, ctx);
       break;
     case 'chart':
-      handleChatEvent({ type: 'chart', spec: event.data.spec }, ctx);
+      // 原envelope的图表已按只读引用保存；不再另添一个无身份副本。
+      if (!publicationEventId || !journal?.journalSource || !executionId)
+        handleChatEvent({ type: 'chart', spec: event.data.spec }, ctx);
       break;
     case 'final_answer':
       handleChatEvent({ type: 'final_answer', data: event.data, execution_id: executionId }, ctx);
@@ -375,7 +467,7 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
     }
     case 'chart': {
       if (ctx.isCancelledRef.current) break;
-      if (event.spec) store.addChartMessage(event.spec);
+      if (event.spec) store.addChartMessage(event.spec, ctx.assistantIdRef.current);
       break;
     }
     case 'final_answer': {
@@ -513,7 +605,11 @@ function settleTurnProjection(store: ReturnType<typeof useChatStore.getState>, c
 }
 
 /** 复用既有 conversation.get 的 publication 视图，不新建 transcript 或执行状态。 */
-async function refreshNativeFinalPresentation(envelope: ChatEventEnvelope, messageId: string) {
+async function refreshNativeFinalPresentation(
+  envelope: ChatEventEnvelope,
+  messageId: string,
+  canProject: () => boolean
+) {
   const address = useConversationStore.getState();
   const ownsView = captureConversationView();
   const scope = productDataScope(useWorkspaceStore.getState().current);
@@ -533,12 +629,15 @@ async function refreshNativeFinalPresentation(envelope: ChatEventEnvelope, messa
     const record = await conversationApi.get(envelope.workspace_id, envelope.conversation_id);
     const currentAddress = useConversationStore.getState();
     if (
+      !canProject() ||
       !ownsView() ||
       currentAddress.workspaceId !== envelope.workspace_id ||
       currentAddress.activeId !== envelope.conversation_id ||
       !sameProductDataScope(scope, productDataScope(useWorkspaceStore.getState().current))
     )
       return;
+    if (message?.turnSource)
+      applyReadOnlyChartSupplement(record.messages, messageId, message.turnSource);
     const matches = record.messages.filter((entry) => {
       const source = entry.final_answer_source;
       return (
@@ -553,5 +652,86 @@ async function refreshNativeFinalPresentation(envelope: ChatEventEnvelope, messa
     if (source) useChatStore.getState().applyFinalAnswerSource(messageId, source);
   } catch {
     // 来源缺失时保留普通消息；不能用同文或末块位置补造 candidate identity。
+  }
+}
+
+/** 只消费Rust原journal/checkpoint的公开产物；不在前端解析ToolResult或重造Chart事件。 */
+function applyReadOnlyChartSupplement(
+  saved: SavedMessage[],
+  messageId: string,
+  source: NativeTurnSource
+): void {
+  const current = useChatStore.getState().messages.find((message) => message.id === messageId);
+  if (!current?.turnSource || nativeSourceKey(current.turnSource) !== nativeSourceKey(source))
+    return;
+  const calls = (current.presentationRecords ?? []).filter(
+    (record) =>
+      recordBelongsToTurn(record, source) &&
+      record.payload.kind === 'tool_call' &&
+      record.payload.data.name === 'generate_chart'
+  );
+  if (calls.length === 0) return;
+  const supplement = savedPresentationBySource(saved).get(nativeSourceKey(source));
+  if (
+    !supplement ||
+    !calls.some((call) =>
+      supplement.records.some(
+        (record) =>
+          record.payload.kind === 'tool_call' &&
+          record.event_id === call.event_id &&
+          record.content_hash === call.content_hash &&
+          record.cursor.stream_id === call.cursor.stream_id &&
+          record.cursor.sequence === call.cursor.sequence &&
+          recordBelongsToTurn(record, source)
+      )
+    )
+  )
+    return;
+  for (const record of supplement.records) {
+    if (record.payload.kind === 'chart' && recordBelongsToTurn(record, source))
+      useChatStore.getState().recordNativePresentation(record);
+  }
+}
+
+async function refreshNativeChartsAfterSave(
+  envelope: ChatEventEnvelope,
+  messageId: string,
+  canProject: () => boolean
+): Promise<void> {
+  const message = useChatStore.getState().messages.find((entry) => entry.id === messageId);
+  const source = message?.turnSource;
+  const address = useConversationStore.getState();
+  const scope = productDataScope(useWorkspaceStore.getState().current);
+  const ownsView = captureConversationView();
+  if (
+    !canProject() ||
+    !source ||
+    !envelope.conversation_id ||
+    source.workspace_id !== envelope.workspace_id ||
+    source.conversation_id !== envelope.conversation_id ||
+    source.root_turn_id !== envelope.root_turn_id ||
+    source.turn_id !== envelope.turn_id ||
+    address.workspaceId !== envelope.workspace_id ||
+    address.activeId !== envelope.conversation_id ||
+    scope.workspaceId !== envelope.workspace_id ||
+    !(message.presentationRecords ?? []).some(
+      (record) =>
+        recordBelongsToTurn(record, source) &&
+        record.payload.kind === 'tool_call' &&
+        record.payload.data.name === 'generate_chart'
+    )
+  )
+    return;
+  try {
+    const record = await conversationApi.get(envelope.workspace_id, envelope.conversation_id);
+    if (
+      !canProject() ||
+      !ownsView() ||
+      !sameProductDataScope(scope, productDataScope(useWorkspaceStore.getState().current))
+    )
+      return;
+    applyReadOnlyChartSupplement(record.messages, messageId, source);
+  } catch {
+    // 读取失败只保留原未恢复状态；后续原保存/最终确认可再次取同一原Supplement。
   }
 }

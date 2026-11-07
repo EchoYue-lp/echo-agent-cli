@@ -180,6 +180,336 @@ mod tests {
         .map_err(|error| error.to_string())
     }
 
+    #[tokio::test]
+    async fn owned_run_usage_is_durable_without_trace_and_trace_projection_never_rebills()
+    -> anyhow::Result<()> {
+        use echo_agent::agent::{
+            EventEnvelope, EventIdentity, ModelCallObservation, ModelCallOutcome,
+        };
+        for with_trace in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let (workspace, conversation, original_owner, journal_identity) = {
+                let (store, _agent, log, _runtime) =
+                    publication_run_fixture(directory.path()).await?;
+                let _resources = store.test_resource_scope();
+                let run_id = seed_run(&store, vec![solo_readonly_task("usage-source")])
+                    .map_err(anyhow::Error::msg)?;
+                let run = store
+                    .get_run(&run_id)?
+                    .ok_or_else(|| anyhow::anyhow!("run missing"))?;
+                let turn = "actual-owned-usage-turn";
+                // 原公开配置/claim必须真实进入Started；Ok也可能是NotSubmitted。
+                store.configure_run_continuation(&run_id, true, false, None, None)?;
+                let claim = store.claim_run_turn(
+                    &run_id,
+                    turn,
+                    RunTurnOrigin::User,
+                    TurnVisibility::Visible,
+                )?;
+                anyhow::ensure!(
+                    matches!(&claim, super::super::store::RunTurnClaimOutcome::Started(started) if started.turn_id == turn),
+                    "usage fixture original claim was not Started: {claim:?}"
+                );
+                let errors = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+                let trace: Option<ExecSink> = if with_trace {
+                    let log = log.clone();
+                    let errors = errors.clone();
+                    Some(Arc::new(move |event| {
+                        if event.event == RuntimeEventKind::Usage {
+                            // 原Exec trace可投到Run根；费用必须按显式native source去重，不能猜Run ID。
+                            for _ in 0..2 {
+                                if let Err(error) = log.append(
+                                    &event.workspace_id,
+                                    Some(&event.conversation_id),
+                                    "trace-original-run-root",
+                                    crate::chat_driver::ChatDriverEvent::Execution(Box::new(
+                                        event.clone(),
+                                    )),
+                                ) {
+                                    errors
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner())
+                                        .push(error.to_string());
+                                }
+                            }
+                        }
+                    }))
+                } else {
+                    None
+                };
+                let sink = EkoAgentTurnSink::for_run(
+                    &run,
+                    turn,
+                    TaskRuntimeOperation::new(store.clone()),
+                    HashSet::new(),
+                    trace,
+                );
+                let identity = EventIdentity::for_chat(
+                    Some(run.conversation_id.clone()),
+                    turn,
+                    turn,
+                    Some(run_id.clone()),
+                )?
+                .with_execution_id("original-native-execution-distinct-from-run")?;
+                let started = AgentEvent::ExecutionStatus(echo_agent::agent::ExecutionStatus {
+                    adapter_generated: false,
+                    execution_id: "original-native-execution-distinct-from-run".into(),
+                    request_id: None,
+                    sequence: 1,
+                    phase: echo_agent::agent::AgentPhase::Thinking,
+                    status: echo_agent::agent::ExecutionStatusKind::Started,
+                    reason: None,
+                });
+                let waiting = AgentEvent::ExecutionStatus(echo_agent::agent::ExecutionStatus {
+                    adapter_generated: false,
+                    execution_id: "original-native-execution-distinct-from-run".into(),
+                    request_id: Some("owned-logical-call".into()),
+                    sequence: 2,
+                    phase: echo_agent::agent::AgentPhase::Thinking,
+                    status: echo_agent::agent::ExecutionStatusKind::Waiting,
+                    reason: None,
+                });
+                let usage = AgentEvent::LlmUsage {
+                    model: "source-model".into(),
+                    prompt_tokens: 100,
+                    completion_tokens: 20,
+                    total_tokens: 120,
+                    cached_prompt_tokens: 50,
+                    cache_creation_prompt_tokens: 5,
+                    usage_reported: true,
+                    observation: Some(ModelCallObservation {
+                        call_id: "owned-logical-call".into(),
+                        attempt_id: "actual-attempt".into(),
+                        outcome: ModelCallOutcome::Completed,
+                        request_duration_ms: 1200,
+                        first_output_ms: Some(100),
+                        last_output_ms: Some(1100),
+                        output_samples: 2,
+                        timing_comparable: true,
+                    }),
+                };
+                for (index, payload) in [started, waiting, usage].into_iter().enumerate() {
+                    let event = EventEnvelope::new(
+                        &identity,
+                        u64::try_from(index)?.saturating_add(1),
+                        None,
+                        payload,
+                    )?;
+                    EventSink::on_event(&sink, event.clone()).await?;
+                    if matches!(event.payload, AgentEvent::LlmUsage { .. }) {
+                        EventSink::on_event(&sink, event).await?;
+                    }
+                }
+                assert!(
+                    errors
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .is_empty()
+                );
+                let snapshot = log.conversation_usage(&run.workspace_id, &run.conversation_id)?;
+                assert_eq!(
+                    (
+                        snapshot.main.steps,
+                        snapshot.main.attempts,
+                        snapshot.main.pending_calls
+                    ),
+                    (1, 1, 0)
+                );
+                assert_eq!(
+                    (
+                        snapshot.main.input_tokens,
+                        snapshot.main.output_tokens,
+                        snapshot.main.cached_tokens
+                    ),
+                    (100, 20, 50)
+                );
+                assert_eq!(snapshot.turns, 1);
+                assert!(snapshot.turns_known);
+                let events = log.replay(&run.workspace_id, Some(&run.conversation_id), turn, 0)?;
+                assert_eq!(events.events.iter().filter(|event|matches!(&event.payload,
+                    crate::chat_driver::ChatDriverEvent::Agent(agent) if matches!(agent.payload,AgentEvent::LlmUsage {..}))).count(),1);
+                (
+                    run.workspace_id,
+                    run.conversation_id,
+                    Arc::downgrade(&log),
+                    snapshot.journal_identity,
+                )
+            };
+            assert!(
+                original_owner.upgrade().is_none(),
+                "释放原log owner后才叫cold reopen"
+            );
+            let cold = crate::chat_event_log::ChatEventLog::open(
+                directory.path().join("chat-events"),
+                crate::chat_event_log::ChatEventRetention::default(),
+            )?;
+            let restored = cold.conversation_usage(&workspace, &conversation)?;
+            assert_eq!(restored.journal_identity, journal_identity);
+            assert_eq!(
+                (
+                    restored.main.steps,
+                    restored.main.attempts,
+                    restored.main.pending_calls
+                ),
+                (1, 1, 0)
+            );
+            assert_eq!(
+                (
+                    restored.main.input_tokens,
+                    restored.main.output_tokens,
+                    restored.main.cached_tokens
+                ),
+                (100, 20, 50)
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owned_run_usage_never_unlocks_native_publication_without_a_source_witness()
+    -> anyhow::Result<()> {
+        use echo_agent::agent::{EventEnvelope, EventIdentity};
+        let directory = tempfile::tempdir()?;
+        let (store, _agent, log, _runtime) = publication_run_fixture(directory.path()).await?;
+        let _resources = store.test_resource_scope();
+        let run_id = seed_run(&store, vec![solo_readonly_task("usage-not-header")])
+            .map_err(anyhow::Error::msg)?;
+        let run = store
+            .get_run(&run_id)?
+            .ok_or_else(|| anyhow::anyhow!("run missing"))?;
+        let turn = "usage-observation-is-not-started";
+        store.configure_run_continuation(&run_id, true, false, None, None)?;
+        let claim =
+            store.claim_run_turn(&run_id, turn, RunTurnOrigin::User, TurnVisibility::Visible)?;
+        anyhow::ensure!(
+            matches!(&claim, super::super::store::RunTurnClaimOutcome::Started(started) if started.turn_id == turn),
+            "usage fixture original claim was not Started: {claim:?}"
+        );
+        let sink = EkoAgentTurnSink::for_run(
+            &run,
+            turn,
+            TaskRuntimeOperation::new(store),
+            HashSet::new(),
+            None,
+        );
+        let identity =
+            EventIdentity::for_chat(Some(run.conversation_id.clone()), turn, turn, Some(run_id))?
+                .with_execution_id("usage-only-execution")?;
+        for (index, payload) in [
+            AgentEvent::LlmUsage {
+                model: "observed".into(),
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                total_tokens: 12,
+                cached_prompt_tokens: 0,
+                cache_creation_prompt_tokens: 0,
+                usage_reported: true,
+                observation: None,
+            },
+            AgentEvent::FinalAnswer("没有原发布见证，不能给正文补资格".into()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            EventSink::on_event(
+                &sink,
+                EventEnvelope::new(
+                    &identity,
+                    u64::try_from(index)?.saturating_add(1),
+                    None,
+                    payload,
+                )?,
+            )
+            .await?;
+        }
+        let replay = log.replay(&run.workspace_id, Some(&run.conversation_id), turn, 0)?;
+        assert_eq!(replay.events.iter().filter(|event|matches!(&event.payload,
+            crate::chat_driver::ChatDriverEvent::Agent(agent) if matches!(agent.payload,AgentEvent::LlmUsage {..}))).count(),1);
+        assert!(!replay.events.iter().any(|event|matches!(&event.payload,
+            crate::chat_driver::ChatDriverEvent::Agent(agent) if matches!(agent.payload,AgentEvent::FinalAnswer(_)|AgentEvent::ExecutionStatus(_)))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owned_run_usage_retries_original_accounting_after_journal_success()
+    -> anyhow::Result<()> {
+        use echo_agent::agent::{EventEnvelope, EventIdentity};
+        let directory = tempfile::tempdir()?;
+        let (store, _agent, log, _runtime) = publication_run_fixture(directory.path()).await?;
+        let _resources = store.test_resource_scope();
+        let run_id = seed_run(
+            &store,
+            vec![solo_readonly_task("retry-original-accounting")],
+        )
+        .map_err(anyhow::Error::msg)?;
+        let run = store
+            .get_run(&run_id)?
+            .ok_or_else(|| anyhow::anyhow!("run missing"))?;
+        let turn = "restore-original-accounting-after-error";
+        let sink = EkoAgentTurnSink::for_run(
+            &run,
+            turn,
+            TaskRuntimeOperation::new(store.clone()),
+            HashSet::new(),
+            None,
+        );
+        let identity = EventIdentity::for_chat(
+            Some(run.conversation_id.clone()),
+            turn,
+            turn,
+            Some(run_id.clone()),
+        )?
+        .with_execution_id("actual-usage-execution")?;
+        let usage = EventEnvelope::new(
+            &identity,
+            1,
+            None,
+            AgentEvent::LlmUsage {
+                model: "source-model".into(),
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                total_tokens: 12,
+                cached_prompt_tokens: 0,
+                cache_creation_prompt_tokens: 0,
+                usage_reported: true,
+                observation: None,
+            },
+        )?;
+        // 有意缺原active RunTurn，只制造原Store一次真实拒绝，不模拟合法准入或执行。
+        let first = EventSink::on_event(&sink, usage.clone()).await;
+        assert!(first.is_err(), "原accounting失败必须保留");
+        assert!(log.replay(&run.workspace_id,Some(&run.conversation_id),turn,0)?.events.iter().any(|event|
+            matches!(&event.payload,crate::chat_driver::ChatDriverEvent::Agent(agent) if matches!(agent.payload,AgentEvent::LlmUsage {..}))),
+            "此次故障发生在原LU已journal之后");
+        store.configure_run_continuation(&run_id, true, false, None, None)?;
+        let claim =
+            store.claim_run_turn(&run_id, turn, RunTurnOrigin::User, TurnVisibility::Visible)?;
+        anyhow::ensure!(
+            matches!(&claim, super::super::store::RunTurnClaimOutcome::Started(started) if started.turn_id == turn),
+            "usage fixture original claim was not Started: {claim:?}"
+        );
+        EventSink::on_event(&sink, usage.clone()).await?;
+        EventSink::on_event(&sink, usage).await?;
+        let continuation = store
+            .get_run_state(&run_id)?
+            .and_then(|state| state.continuation)
+            .ok_or_else(|| anyhow::anyhow!("continuation missing"))?;
+        assert_eq!(
+            continuation.tokens_used, 12,
+            "同envelope重试须完成原费用且不得重复加账"
+        );
+        let stats = log.conversation_usage(&run.workspace_id, &run.conversation_id)?;
+        assert_eq!(
+            (
+                stats.main.input_tokens,
+                stats.main.output_tokens,
+                stats.main.attempts
+            ),
+            (10, 2, 1)
+        );
+        Ok(())
+    }
+
     async fn drive_scripted_run_turn(
         store: Arc<TaskRuntimeStore>,
         run: &TaskRun,
@@ -606,6 +936,7 @@ mod tests {
                     cached_prompt_tokens: 0,
                     cache_creation_prompt_tokens: 0,
                     usage_reported: false,
+                    observation: None,
                 },
                 AgentEvent::LlmUsage {
                     model: "reported-usage".to_string(),
@@ -615,6 +946,7 @@ mod tests {
                     cached_prompt_tokens: 1,
                     cache_creation_prompt_tokens: 0,
                     usage_reported: true,
+                    observation: None,
                 },
                 AgentEvent::FinalAnswer("done".to_string()),
                 scripted_execution_status(

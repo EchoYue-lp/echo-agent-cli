@@ -8,7 +8,10 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('../../api/endpoints', () => ({
-  providerApi: { listConfigured: mocks.listConfigured },
+  providerApi: {
+    listConfigured: mocks.listConfigured,
+    listProviders: vi.fn().mockResolvedValue({ providers: [] }),
+  },
 }));
 
 vi.mock('../../stores/conversationStore', () => ({

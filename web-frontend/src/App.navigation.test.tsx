@@ -57,6 +57,7 @@ vi.mock('./api/endpoints', async (original) => {
     },
     providerApi: {
       ...actual.providerApi,
+      listProviders: vi.fn().mockResolvedValue({ providers: [] }),
       listConfigured: vi.fn().mockResolvedValue({
         models: [
           {
@@ -71,7 +72,6 @@ vi.mock('./api/endpoints', async (original) => {
             has_auth_token: true,
             auth_source: 'config',
             base_url: 'https://example.test/v1',
-            temperature: null,
             max_tokens: null,
             context_window: 32_000,
             thinking_levels: [],

@@ -14,6 +14,8 @@ import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { useToolExecutionStore } from '../../stores/toolExecutionStore';
 import type { ChatMessage, ToolExecution } from '../../types/api';
 import { MessageBubble, isExecutionProcessCompleted } from './MessageBubble';
+vi.mock('vega-embed', () => ({ default: vi.fn(async () => ({ finalize: vi.fn() })) }));
+vi.mock('vega-interpreter', () => ({ expressionInterpreter: {} }));
 
 const emptyReply: ChatMessage = {
   id: 'empty-assistant',
@@ -32,6 +34,31 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe('聊天正文与空消息投影', () => {
+  it('图表专用消息、正文与最终发布后的图表都保留原spec且不进入过程折叠', () => {
+    const spec = {
+      $schema: 'https://vega.github.io/schema/vega-lite/v5.json',
+      mark: 'bar',
+      data: { values: [{ name: '原图表数据🙂', value: 7 }] },
+    };
+    for (const message of [
+      { ...emptyReply, chartSpecs: [spec] },
+      { ...emptyReply, id: 'body-chart', content: '公开正文', chartSpecs: [spec] },
+      {
+        ...emptyReply,
+        id: 'final-chart',
+        content: '最终正文',
+        finalAnswerConfirmed: true,
+        chartSpecs: [spec],
+      },
+    ]) {
+      const { unmount } = render(<MessageBubble message={message} hideProcess />);
+      expect(screen.getByRole('group', { name: '图表' })).not.toBeNull();
+      fireEvent.click(screen.getByText('查看图表数据'));
+      expect(screen.getByText(/原图表数据🙂/)).not.toBeNull();
+      if (message.content) expect(screen.getByText(message.content)).not.toBeNull();
+      unmount();
+    }
+  });
   it('恢复无正文的失败消息时显示原运行态原因，取消与重复错误不另生成失败说明', () => {
     const reason = 'LLM Error: API error (status 403): 不支持当前工具。';
     const message: ChatMessage = {

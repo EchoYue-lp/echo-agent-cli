@@ -795,6 +795,71 @@ describe('useTauriChat foreground turn recovery', () => {
     hook.unmount();
   });
 
+  it('abandons only an exact recovery-required channel input', async () => {
+    const conversationId = 'conversation-channel-recovery';
+    useConversationStore.setState({ activeId: conversationId });
+    const binding = {
+      version: 1,
+      channel_id: 'weixin',
+      account_id: 'account-a',
+      credential_generation: 'generation-a',
+      peer_id: 'peer-a',
+      provider_message_id: 'provider-a',
+      workspace_generation: 'global',
+      context: { kind: 'absent' as const },
+      execution: { kind: 'chat' as const },
+    };
+    const base = inputProjection('channel-recovery', conversationId, '旧的待恢复消息');
+    const recovery: ConversationInputProjection = {
+      ...base,
+      receipt: {
+        ...base.receipt,
+        phase: 'recovery_required',
+        reason: '原驱动中断，副作用未知',
+        attempt: 1,
+      },
+      payload: { ...base.payload, channel_binding: binding },
+    };
+    const ordinaryBase = inputProjection('channel-ordinary', conversationId, '普通渠道消息');
+    const ordinary: ConversationInputProjection = {
+      ...ordinaryBase,
+      payload: { ...ordinaryBase.payload, channel_binding: binding },
+    };
+    mocks.apiInvoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === 'get_active_chat_turn')
+        return { ...activeSnapshot, conversation_id: conversationId };
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs')
+        return { queue_revision: 9, items: [recovery, ordinary] };
+      if (command === 'abandon_channel_recovery_input') {
+        // 原生命令使用 rename_all = "snake_case"，缺少该键时尚未进入恢复逻辑。
+        if (typeof args?.expected_queue_revision !== 'number') {
+          throw new Error('missing required key expected_queue_revision');
+        }
+        return { receipt: { ...recovery.receipt, phase: 'cancelled' }, queue_revision: 10 };
+      }
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => expect(hook.result.current.queuedInputs).toHaveLength(2));
+    // 非恢复中的渠道项不提供该动作，也不发出 IPC。
+    await act(async () => {
+      hook.result.current.abandonChannelRecoveryInput('channel-ordinary');
+    });
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith(
+      'abandon_channel_recovery_input',
+      expect.anything()
+    );
+    await act(async () => {
+      hook.result.current.abandonChannelRecoveryInput('channel-recovery');
+    });
+    expect(mocks.apiInvoke).toHaveBeenCalledWith('abandon_channel_recovery_input', {
+      identity: recovery.receipt.identity,
+      expected_queue_revision: 9,
+    });
+    hook.unmount();
+  });
+
   it.each(['another conversation', 'another new draft'] as const)(
     'keeps a deferred first input on its original saved conversation after %s is selected',
     async (selection) => {
@@ -1059,6 +1124,140 @@ describe('useTauriChat foreground turn recovery', () => {
       expect(onDirectAccepted).toHaveBeenCalledExactlyOnceWith(expect.any(Function));
       expect(onDirectAccepted.mock.calls[0]?.[0]()).toBe(false);
       expect(onPersisted).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(
+    (['before', 'after'] as const).flatMap((failureTiming) =>
+      (['idle', 'already-starting'] as const).map(
+        (snapshotKind) => [failureTiming, snapshotKind] as const
+      )
+    )
+  )(
+    '新会话首条启动回执未返回时，恢复队列不会抢占原提交或隐藏失败（错误在回执%s，快照%s）',
+    async (failureTiming, snapshotKind) => {
+      useConversationStore.setState({ activeId: null, workspaceId: 'global' });
+      useChatStore.getState().clearMessages();
+      const startup = deferred<{
+        kind: string;
+        root_turn_id: string;
+        active_turn_id: string;
+        input_id: string;
+      }>();
+      const recoverySnapshot = deferred<typeof activeSnapshot | null>();
+      let conversationId = '';
+      let rootTurnId = '';
+      let sendCalls = 0;
+      let recoveryReadPendingInput = false;
+      const onDirectAccepted = vi.fn((canProject: () => boolean) =>
+        expect(canProject()).toBe(true)
+      );
+      mocks.apiInvoke.mockImplementation(
+        async (command: string, args?: Record<string, unknown>) => {
+          if (command === 'create_conversation') {
+            conversationId = String((args?.request as { id: string }).id);
+            return { kind: 'primary', id: conversationId };
+          }
+          if (command === 'list_conversations') return [];
+          if (command === 'get_active_chat_turn') return recoverySnapshot.promise;
+          if (command === 'replay_chat_events') return emptyReplay();
+          if (command === 'list_queued_chat_inputs') {
+            if (rootTurnId) recoveryReadPendingInput = true;
+            return queuedFrontier;
+          }
+          if (command === 'send_chat_message') {
+            sendCalls += 1;
+            const request = args?.request as { messageKey: string };
+            if (sendCalls > 1) return { kind: 'queued', input_id: 'original-first-input' };
+            rootTurnId = request.messageKey;
+            queuedFrontier = {
+              queue_revision: 1,
+              items: [inputProjection('original-first-input', conversationId, '首条输入')],
+            };
+            return startup.promise;
+          }
+          return { success: true };
+        }
+      );
+      const hook = renderHook(() => useTauriChat());
+      await waitFor(() => expect(mocks.listeners.has('chat://event')).toBe(true));
+      let sending: Promise<boolean> | undefined;
+      act(() => {
+        sending = hook.result.current.sendMessage('首条输入', undefined, undefined, {
+          ...draftSubmission('首条输入'),
+          onDirectAccepted,
+        });
+      });
+      await waitFor(() => expect(rootTurnId).not.toBe(''));
+      await act(async () =>
+        recoverySnapshot.resolve(
+          snapshotKind === 'idle'
+            ? null
+            : {
+                ...activeSnapshot,
+                conversation_id: conversationId,
+                root_turn_id: rootTurnId,
+                active_turn_id: rootTurnId,
+              }
+        )
+      );
+      await waitFor(() => expect(recoveryReadPendingInput).toBe(true));
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(sendCalls).toBe(1);
+      expect(hook.result.current.isSubmitting).toBe(true);
+      expect(hook.result.current.queuedInputs).toEqual([]);
+      const fail = () => {
+        mocks.listeners.get('chat://event')?.({
+          payload: agentEnvelope(
+            rootTurnId,
+            1,
+            {
+              type: 'error',
+              data: {
+                source: 'react_loop',
+                message: '实际模型错误',
+                failure: {
+                  category: 'llm',
+                  terminal_kind: 'failed',
+                  retryable: false,
+                  code: 'llm_invalid_response',
+                  http_status: null,
+                  message: '实际模型错误',
+                },
+              },
+            },
+            conversationId,
+            rootTurnId
+          ),
+        });
+        queuedFrontier = { queue_revision: 2, items: [] };
+        mocks.listeners.get('chat://event')?.({
+          payload: turnStatusEnvelope(rootTurnId, rootTurnId, 2, 'failed', conversationId),
+        });
+      };
+      if (failureTiming === 'before') await act(async () => fail());
+      await act(async () => {
+        startup.resolve({
+          kind: 'started',
+          root_turn_id: rootTurnId,
+          active_turn_id: rootTurnId,
+          input_id: 'original-first-input',
+        });
+        expect(await sending).toBe(true);
+      });
+      expect(onDirectAccepted).toHaveBeenCalledTimes(1);
+      expect(useChatStore.getState().messages.filter((m) => m.role === 'assistant')).toHaveLength(
+        1
+      );
+      expect(hook.result.current.isSubmitting).toBe(false);
+      expect(hook.result.current.queuedInputs).toEqual([]);
+      if (failureTiming === 'after') await act(async () => fail());
+      expect(useChatStore.getState().messages.filter((m) => m.role === 'user')).toHaveLength(1);
+      expect(useChatStore.getState().messages.at(-1)?.content).toContain('实际模型错误');
+      expect(useChatStore.getState().runStatus).toBe('failed');
+      hook.unmount();
     }
   );
 
@@ -2046,6 +2245,31 @@ describe('useTauriChat foreground turn recovery', () => {
       hook.unmount();
     }
   );
+
+  it('没有活跃turn时保留排队输入，不向Steer接口传null', async () => {
+    const conversationId = 'conversation-without-active-turn';
+    useConversationStore.setState({ activeId: conversationId });
+    const pending = inputProjection('retained-input', conversationId, '尚未发送的输入');
+    queuedFrontier = { queue_revision: 11, items: [pending] };
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn') return null;
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs') return queuedFrontier;
+      if (command === 'send_chat_message') throw new Error('对话尚未获准启动');
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => expect(hook.result.current.queuedInputs.at(0)?.id).toBe('retained-input'));
+    await waitFor(() => expect(useChatStore.getState().isStreaming).toBe(false));
+    await act(async () => {
+      expect(await hook.result.current.steerQueuedMessage('retained-input')).toBe(false);
+    });
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('steer_chat_message', expect.anything());
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('remove_queued_chat_input', expect.anything());
+    expect(hook.result.current.queuedInputs.at(0)?.identity).toEqual(pending.receipt.identity);
+    expect(useToastStore.getState().toasts.at(-1)?.message).toContain('当前没有正在执行的对话');
+    hook.unmount();
+  });
 
   it('steers an exact selected identity and refreshes instead of removing locally', async () => {
     const conversationId = 'conversation-steer-accepted';

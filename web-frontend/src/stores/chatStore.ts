@@ -1,16 +1,24 @@
 import type { AgentCommunicationInput } from '../lib/agentCommunication';
 import { create } from 'zustand';
-import { isHitlRequestIdentity, sameHitlIdentity } from '../types/api';
+import { isHitlRequestIdentity, isNativeTurnSource, sameHitlIdentity } from '../types/api';
 import type { HitlRequestIdentity } from '../types/api';
 import type {
   AssistantMessageBlock,
   NativeExecutionStatus,
   NativeFinalAnswerSource,
+  NativeTurnSource,
+  NativeJournalCursor,
+  NativePresentationRecord,
   ChatMessage,
   ApprovalRequest,
   ChatRunStatus,
   TranscriptProjectionSettlement,
 } from '../types/api';
+import {
+  earliestNativeJournalCursor,
+  recordBelongsToTurn,
+  uniquePresentationRecords,
+} from '../lib/nativePresentation';
 import { useConversationStore } from './conversationStore';
 
 export interface ChatActivity {
@@ -99,6 +107,7 @@ interface ChatState {
   isHistoryView: boolean;
   /** 当前上下文窗口占用（来自最近一次 llm_usage 事件的真实 prompt_tokens）。null = 首次响应前 / 刚压缩后。 */
   contextWindow: ContextWindowUsage | null;
+  contextInvalidated: boolean;
   /** 会话级缓存命中率累加器（压缩保留，clear/replace 清零）。 */
   usageAccumulator: ContextUsageAccumulator;
 
@@ -115,9 +124,12 @@ interface ChatState {
     id: string,
     block: AssistantMessageBlock,
     executionId?: string | null,
-    publicationEventId?: string | null
+    publicationEventId?: string | null,
+    journalSource?: NativeJournalCursor
   ) => void;
   observeExecutionStatus: (id: string, status: NativeExecutionStatus) => void;
+  observeTurnSource: (id: string, source: NativeTurnSource) => void;
+  recordNativePresentation: (record: NativePresentationRecord) => void;
   recordToolStart: (messageId: string, toolExecutionId: string) => void;
   applyFinalAnswer: (id: string, content: string, executionId?: string | null) => void;
   applyFinalAnswerSource: (id: string, source: NativeFinalAnswerSource) => void;
@@ -133,7 +145,7 @@ interface ChatState {
   enqueueHitlRequest: (request: PendingHitlRequest) => void;
   removeHitlRequest: (identity: HitlRequestIdentity) => void;
   clearHitlRequests: () => void;
-  addChartMessage: (spec: unknown) => void;
+  addChartMessage: (spec: unknown, messageId?: string | null) => void;
   clearMessages: () => void;
   replaceMessages: (messages: ChatMessage[]) => void;
   setHistoryView: (v: boolean) => void;
@@ -233,6 +245,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   pendingHitlRequests: [],
   isHistoryView: false,
   contextWindow: null,
+  contextInvalidated: false,
   usageAccumulator: { totalInput: 0, totalCached: 0 },
 
   observeTranscriptSave: (scope, observation) =>
@@ -391,7 +404,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     });
   },
 
-  appendAssistantBlock: (id, block, executionId, publicationEventId) => {
+  appendAssistantBlock: (id, block, executionId, publicationEventId, journalSource) => {
     set((state) => ({
       messages: state.messages.map((message) => {
         if (message.id !== id || !message.isStreaming) return message;
@@ -404,8 +417,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
         );
         if (index >= 0) {
           const previous = blocks[index];
-          if (!previous || previous.block.complete || block.sequence < previous.block.sequence)
-            return message;
+          if (!previous) return message;
+          const firstCursor = earliestNativeJournalCursor(previous.journal_source, journalSource);
+          if (previous.block.complete || block.sequence < previous.block.sequence) {
+            if (firstCursor === previous.journal_source) return message;
+            blocks[index] = { ...previous, journal_source: firstCursor };
+            return { ...message, assistantBlocks: blocks };
+          }
           if (previous.block.phase !== 'unknown' && previous.block.phase !== block.phase)
             return message;
           blocks[index] = {
@@ -413,6 +431,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             content: previous.content + block.delta,
             execution_id: executionId ?? previous.execution_id,
             publication_event_id: publicationEventId ?? previous.publication_event_id,
+            journal_source: firstCursor,
           };
           return { ...message, assistantBlocks: blocks };
         }
@@ -421,6 +440,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           content: block.delta,
           execution_id: executionId,
           publication_event_id: publicationEventId,
+          journal_source: journalSource,
         });
         return {
           ...message,
@@ -435,6 +455,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   setThinking: (v) => set({ isThinking: v, runStatus: v ? 'thinking' : get().runStatus }),
+
+  recordNativePresentation: (record) =>
+    set((state) => {
+      const owns = (message: ChatMessage) =>
+        isNativeTurnSource(message.turnSource) && recordBelongsToTurn(record, message.turnSource);
+      const owners = state.messages.filter(owns);
+      if (owners.length === 0) return state;
+      const records = uniquePresentationRecords([
+        ...owners.flatMap((message) => message.presentationRecords ?? []),
+        record,
+      ]);
+      return {
+        messages: state.messages.map((message) =>
+          owns(message) ? { ...message, presentationRecords: records } : message
+        ),
+      };
+    }),
 
   recordToolStart: (messageId, toolExecutionId) => {
     set((s) => {
@@ -454,6 +491,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return { messages, runStatus: 'using_tool' };
     });
     scheduleAutoSave();
+  },
+
+  // 原生终态仅提供消息来源坐标，不更新 TaskRun/TurnStatus 或最终发布标记。
+  observeTurnSource: (id, source) => {
+    if (!isNativeTurnSource(source)) return;
+    set((state) => ({
+      messages: state.messages.map((message) => {
+        if (message.id !== id || message.turnSource === null) return message;
+        const previous = message.turnSource;
+        if (!previous) return { ...message, turnSource: source };
+        const matches = (Object.keys(source) as (keyof NativeTurnSource)[]).every(
+          (key) => previous[key] === source[key]
+        );
+        return matches ? message : { ...message, turnSource: null };
+      }),
+    }));
   },
 
   // 原生终态仅提供消息来源坐标，不更新 TaskRun/TurnStatus 或最终发布标记。
@@ -518,6 +571,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         const errorNote = `[Error] ${error}`;
         return {
           ...message,
+          failureNotice: error,
           content: message.content ? `${message.content}\n\n${errorNote}` : errorNote,
         };
       }),
@@ -629,13 +683,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }),
   clearHitlRequests: () => set({ pendingHitlRequests: [] }),
 
-  addChartMessage: (spec) => {
-    set((s) => ({
-      messages: s.messages.map((m) =>
-        m.isStreaming ? { ...m, chartSpecs: [...(m.chartSpecs || []), spec] } : m
-      ),
-    }));
-  },
+  addChartMessage: (spec, messageId) =>
+    set((state) => {
+      const streaming = state.messages.filter((message) => message.isStreaming);
+      const target = messageId ?? (streaming.length === 1 ? streaming.at(0)?.id : undefined);
+      if (!target) return state;
+      return {
+        messages: state.messages.map((message) =>
+          message.id === target
+            ? { ...message, chartSpecs: [...(message.chartSpecs ?? []), spec] }
+            : message
+        ),
+      };
+    }),
 
   clearMessages: () =>
     set({
@@ -650,6 +710,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isHistoryView: false,
       pendingHitlRequests: [],
       contextWindow: null,
+      contextInvalidated: false,
       usageAccumulator: { totalInput: 0, totalCached: 0 },
       runStatus: 'idle',
       activity: null,
@@ -665,6 +726,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       pendingHitlRequests: [],
       // 加载历史会话时清空实时上下文占用（历史视图无 live llm_usage，显示旧值会误导）。
       contextWindow: null,
+      contextInvalidated: false,
       usageAccumulator: { totalInput: 0, totalCached: 0 },
       runStatus: 'idle',
       activity: null,
@@ -672,9 +734,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   setHistoryView: (v) => set({ isHistoryView: v }),
 
-  setContextWindow: (usage) => set({ contextWindow: usage }),
+  setContextWindow: (usage) => set({ contextWindow: usage, contextInvalidated: false }),
 
-  clearContextWindow: () => set({ contextWindow: null }),
+  clearContextWindow: () => set({ contextWindow: null, contextInvalidated: true }),
 
   recordUsage: (input, cached) =>
     set((s) => ({

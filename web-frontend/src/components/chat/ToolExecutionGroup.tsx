@@ -17,6 +17,8 @@ interface ToolExecutionGroupProps {
   toolIds: string[];
   transcriptTools?: readonly TranscriptToolRecord[];
   grouped?: boolean;
+  /** 外层已提供折叠摘要时，直接显示原工具行，避免重复的摘要层。 */
+  detailsOnly?: boolean;
 }
 
 export function toolExecutionGroupPresentation(
@@ -60,6 +62,7 @@ export const ToolExecutionGroup = memo(function ToolExecutionGroup({
   toolIds,
   transcriptTools = [],
   grouped = false,
+  detailsOnly = false,
 }: ToolExecutionGroupProps) {
   const [expanded, setExpanded] = useState(false);
   const toolsById = useToolExecutionStore((state) => state.tools);
@@ -106,12 +109,28 @@ export const ToolExecutionGroup = memo(function ToolExecutionGroup({
                 toolIds={[id]}
                 transcriptTools={transcriptTools}
                 grouped
+                detailsOnly={detailsOnly}
               />
             );
           })}
         </>
       );
   }
+  const details = toolIds.map((toolId, index) => {
+    const transcript = transcriptTools.find((record) => record.id === toolId);
+    if (!toolsById[toolId] && !transcript)
+      return (
+        <div
+          key={toolId}
+          role="status"
+          className="break-all py-1 text-xs text-[var(--text-tertiary)]"
+        >
+          工具记录 {toolId} · 详情未恢复
+        </div>
+      );
+    return <InlineToolCall key={toolId} toolId={toolId} index={index} transcript={transcript} />;
+  });
+  if (detailsOnly) return <div className="min-w-0">{details}</div>;
   return (
     <div className="my-1 min-w-0 pl-2">
       <button
@@ -129,16 +148,7 @@ export const ToolExecutionGroup = memo(function ToolExecutionGroup({
       </button>
 
       {expanded && (
-        <div className="ml-3 border-l border-[var(--border-primary)] pl-2">
-          {toolIds.map((toolId, index) => (
-            <InlineToolCall
-              key={toolId}
-              toolId={toolId}
-              index={index}
-              transcript={transcriptTools.find((record) => record.id === toolId)}
-            />
-          ))}
-        </div>
+        <div className="ml-3 border-l border-[var(--border-primary)] pl-2">{details}</div>
       )}
     </div>
   );

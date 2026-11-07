@@ -12,8 +12,9 @@ import { useWorkspaceStore } from './workspaceStore';
 import { productDataScope, sameProductDataScope } from '../lib/productDataScope';
 import { useToastStore } from './toastStore';
 import { useToolExecutionStore } from './toolExecutionStore';
-import { useSubagentRunStore } from './subagentRunStore';
+import { ingestSubagentExecEvent, useSubagentRunStore } from './subagentRunStore';
 import { useTaskRuntimeStore } from './taskRuntimeStore';
+import { nativeSourceKey, savedPresentationBySource } from '../lib/nativePresentation';
 import { transcriptToolExecution } from '../types/api';
 import { GLOBAL_WORKSPACE_ID, viewAddress, type ViewAddress } from '../lib/viewAddress';
 import type {
@@ -225,6 +226,7 @@ export function chatMessagesToSaved(messages: ChatMessage[]): SavedMessage[] {
       final_answer_confirmed: m.finalAnswerConfirmed,
       execution_status: m.executionStatus,
       final_answer_source: m.finalAnswerSource,
+      turn_source: m.turnSource,
     };
 
     // Save execution steps (chronological order of thinking/tool interleaving)
@@ -643,6 +645,18 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       set({ activeId: null });
       useToolExecutionStore.getState().hydrateConversation(workspaceId, id, tools);
 
+      const presentations = savedPresentationBySource(record.messages);
+      for (const value of presentations.values()) {
+        for (const entry of value?.records ?? []) {
+          if (entry.payload.kind === 'subagent')
+            ingestSubagentExecEvent(entry.payload.data.event, {
+              event_id: entry.event_id,
+              stream_id: entry.cursor.stream_id,
+              sequence: entry.cursor.sequence,
+              timestamp: entry.timestamp,
+            });
+        }
+      }
       // Convert user/assistant messages for display. Tool-role payloads stay in
       // the agent context; the GUI renders tools from lightweight summaries.
       const chatMessages: ChatMessage[] = record.messages
@@ -656,10 +670,18 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
             role: m.role as 'user' | 'assistant',
             content: m.content || '',
             internalAgent: m.internal_agent ?? false,
+            presentationRecords: m.turn_source
+              ? presentations.get(nativeSourceKey(m.turn_source))?.records
+              : undefined,
+            presentationUnavailable:
+              m.presentation_unavailable ||
+              (m.turn_source && presentations.get(nativeSourceKey(m.turn_source)) === null) ||
+              false,
             assistantBlocks: m.assistant_blocks,
             finalAnswerConfirmed: m.final_answer_confirmed,
             executionStatus: m.execution_status,
             finalAnswerSource: m.final_answer_source,
+            turnSource: m.turn_source,
             finalAnswerExecutionId: m.final_answer_confirmed
               ? m.execution_status?.execution_id
               : undefined,

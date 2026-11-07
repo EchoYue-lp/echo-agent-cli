@@ -148,6 +148,11 @@ struct NativePublicationAnchor {
 struct NativePublicationCoverage {
     // 兼容已有被裁日志：缺失的旧前缀不能因新增投影被误称已恢复。
     first_observed_sequence: u64,
+    /// 与原发布投影共享 journal owner/barrier；旧覆盖不证明旧 usage 已聚合。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usage: Option<ConversationUsageProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    presentation: Option<NativePresentationCoverage>,
 }
 
 type StartedCommandCellWatchDelivery = (

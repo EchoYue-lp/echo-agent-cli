@@ -68,7 +68,7 @@ describe('optional settings screens', () => {
     for (const name of ['定时任务', 'Hooks']) {
       expect(automation.getByRole('button', { name })).toBeTruthy();
     }
-    expect(screen.queryByRole('button', { name: 'IM 渠道' })).toBeNull();
+    expect(basic.getByRole('button', { name: 'IM 渠道' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Worktree' })).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: '高级' }));
     expect(screen.getByRole('button', { name: '高级' }).getAttribute('aria-expanded')).toBe('true');
@@ -117,7 +117,10 @@ describe('optional settings screens', () => {
     opener.focus();
     fireEvent.click(opener);
     const dialog = screen.getByRole('dialog', { name: 'IM 渠道' });
-    expect(within(dialog).queryByRole('navigation', { name: '设置分类' })).toBeNull();
+    expect(within(dialog).getByRole('navigation', { name: '设置分类' })).toBeTruthy();
+    expect(
+      within(dialog).getByRole('button', { name: 'IM 渠道' }).getAttribute('aria-current')
+    ).toBe('page');
     expect(dialog.querySelectorAll('#channels-dialog-title')).toHaveLength(1);
     expect(within(dialog).getByRole('status').textContent).toContain('正在加载');
     fireEvent.click(within(dialog).getByRole('button', { name: '关闭IM渠道' }));
@@ -170,7 +173,7 @@ describe('optional settings screens', () => {
       'textContent',
       expect.stringContaining('IM渠道页面加载失败')
     );
-    expect(screen.queryByRole('navigation', { name: '设置分类' })).toBeNull();
+    expect(screen.getByRole('navigation', { name: '设置分类' })).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: '关闭IM渠道' }));
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(document.activeElement).toBe(opener);

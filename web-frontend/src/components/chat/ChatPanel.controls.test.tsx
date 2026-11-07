@@ -13,10 +13,12 @@ const mocks = vi.hoisted(() => {
   });
   return {
     queue: [] as QueuedChatInput[],
+    submitting: false,
     renderRealBubble: false,
     send: vi.fn(),
     replace: vi.fn(),
     remove: vi.fn(),
+    abandon: vi.fn(),
     reorder: vi.fn(),
     steer: vi.fn(),
     update: vi.fn(),
@@ -28,6 +30,7 @@ const mocks = vi.hoisted(() => {
 vi.mock('../../hooks/useTauriChat', () => ({
   useTauriChat: () => ({
     queuedInputs: mocks.queue,
+    isSubmitting: mocks.submitting,
     sendMessage: mocks.send,
     sendApproval: vi.fn(),
     sendInput: vi.fn(),
@@ -36,6 +39,7 @@ vi.mock('../../hooks/useTauriChat', () => ({
     clearQueuedMessages: vi.fn(),
     replaceQueuedMessage: mocks.replace,
     removeQueuedMessage: mocks.remove,
+    abandonChannelRecoveryInput: mocks.abandon,
     reorderQueuedMessage: mocks.reorder,
     steerQueuedMessage: mocks.steer,
   }),
@@ -155,6 +159,7 @@ function cell(phase: BackgroundCellState['phase']): BackgroundCellState {
 
 beforeEach(() => {
   vi.resetAllMocks();
+  mocks.submitting = false;
   vi.spyOn(conversationApi, 'agentInputs').mockResolvedValue([]);
   mocks.queue = [];
   mocks.renderRealBubble = false;
@@ -797,6 +802,34 @@ describe('composer Steer controls', () => {
     expect(screen.queryByText('已保留在队列，等待可用安全点')).toBeNull();
   });
 
+  it('offers an explicit abandon action only for a recovery-required channel input', () => {
+    mocks.queue = [
+      { ...queueItem('channel'), channelOwned: true, phase: 'recovery_required' },
+      queueItem('gui'),
+    ];
+    render(<ChatPanel />);
+    const owned = screen.getByRole('group', { name: 'Steer 1' });
+    const abandon = within(owned).getByRole('button', { name: '放弃这条待恢复消息' });
+    expect((abandon as HTMLButtonElement).disabled).toBe(false);
+    // 停止排队不等于撤销已发生操作：移除入口对渠道项仍然禁用。
+    expect(
+      (within(owned).getByRole('button', { name: '移出队列' }) as HTMLButtonElement).disabled
+    ).toBe(true);
+    fireEvent.click(abandon);
+    expect(mocks.abandon).toHaveBeenCalledWith('channel');
+    expect(mocks.remove).not.toHaveBeenCalled();
+    expect(mocks.steer).not.toHaveBeenCalled();
+  });
+
+  it('does not offer abandon for channel input that is not blocked by recovery', () => {
+    mocks.queue = [{ ...queueItem('channel'), channelOwned: true }];
+    render(<ChatPanel />);
+    const owned = screen.getByRole('group', { name: 'Steer 1' });
+    expect(within(owned).queryByRole('button', { name: '放弃这条待恢复消息' })).toBeNull();
+    for (const button of within(owned).getAllByRole('button'))
+      expect((button as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it('does not let a channel-owned input be dragged, edited, executed or removed', () => {
     mocks.queue = [{ ...queueItem('channel'), channelOwned: true }, queueItem('gui')];
     render(<ChatPanel />);
@@ -933,3 +966,10 @@ it.each([
     expect(useChatStore.getState().messages).toEqual([]);
   }
 );
+
+it('等待首条启动回执只显示正在提交，不冒充后端运行状态', () => {
+  mocks.submitting = true;
+  render(<ChatPanel />);
+  expect(screen.getByText('正在提交')).toBeTruthy();
+  expect(useChatStore.getState().runStatus).toBe('idle');
+});

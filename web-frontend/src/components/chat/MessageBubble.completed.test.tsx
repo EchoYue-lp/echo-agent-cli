@@ -51,7 +51,8 @@ describe('MessageBubble completed execution', () => {
 
     const markup = renderToStaticMarkup(<MessageBubble message={message} />);
 
-    expect(markup).toContain('aria-label="展开思考"');
+    expect(markup).toContain('aria-label="展开中间过程"');
+    expect(markup).not.toContain('aria-label="展开思考"');
     expect(markup).toContain('最终结果正文');
     expect(markup).not.toContain('不应默认展开的思考');
     expect(markup).not.toContain('不应默认展开的 Subagent 结果');

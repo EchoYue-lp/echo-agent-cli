@@ -31,6 +31,7 @@ import type {
   CompressionStats,
   ConversationListItem,
   ConversationRecord,
+  ConversationUsageSnapshot,
   SavedMessage,
   FullConfigUpdateRequest,
   CuratorStatus,
@@ -832,6 +833,10 @@ export const conversationApi = {
     isTauri()
       ? apiInvoke<ConversationRecord>('get_conversation', { workspaceId, id })
       : get<ConversationRecord>(`/conversations/${id}`),
+  usage: (workspaceId: string, id: string) =>
+    isTauri()
+      ? apiInvoke<ConversationUsageSnapshot>('get_conversation_usage', { workspaceId, id })
+      : get<ConversationUsageSnapshot>(`/conversations/${id}/usage`),
   update: (workspaceId: string, id: string, data: { title: string }) =>
     isTauri()
       ? apiInvoke<{ success: boolean }>('update_conversation', {

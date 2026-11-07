@@ -264,6 +264,7 @@ export type ChatEvent = {
       cached_prompt_tokens: number;
       cache_creation_prompt_tokens: number;
       usage_reported: boolean;
+      observation?: ModelCallObservation | null;
     }
   | {
       type: 'context_compressed';
@@ -400,6 +401,7 @@ export interface AssistantBlockView {
   /** 原已发布 Agent envelope 的执行身份；缺失时不推断最终候选。 */
   execution_id?: string | null;
   publication_event_id?: string | null;
+  journal_source?: NativeJournalCursor | null;
   block: AssistantMessageBlock;
   content: string;
 }
@@ -434,6 +436,7 @@ export type AgentEvent =
         cached_prompt_tokens: number;
         cache_creation_prompt_tokens: number;
         usage_reported: boolean;
+        observation?: ModelCallObservation | null;
       };
     }
   | { type: 'budget_decision'; data: Record<string, unknown> }
@@ -801,6 +804,66 @@ export function transcriptToolExecution(
 }
 
 // Chat store types
+/** 原已核验 publication 的只读来源；Fork 继承仍保源 owner，不授予目标执行资格。 */
+export interface NativeTurnSource {
+  workspace_id: string;
+  conversation_id: string;
+  root_turn_id: string;
+  turn_id: string;
+  execution_id: string;
+}
+
+export interface NativeJournalCursor {
+  stream_id: string;
+  sequence: number;
+}
+
+export interface NativePresentationRecord {
+  cursor: NativeJournalCursor;
+  event_id: string;
+  content_hash: string;
+  timestamp: string;
+  scope: {
+    workspace_id: string;
+    conversation_id: string | null;
+    root_turn_id: string;
+    turn_id: string;
+    message_id: string;
+  };
+  payload:
+    | {
+        kind: 'tool_call';
+        data: {
+          execution_id: string | null;
+          publication_event_id: string;
+          call_id: string;
+          name: string;
+        };
+      }
+    | {
+        kind: 'chart';
+        data: { execution_id: string | null; publication_event_id: string; spec: unknown };
+      }
+    | { kind: 'subagent'; data: { event: ExecEvent } };
+}
+
+export interface NativePresentationSupplement {
+  source: NativeTurnSource;
+  journal_identity: unknown;
+  through_sequence: number;
+  first_observed_sequence: number;
+  prefix_complete: boolean;
+  records: NativePresentationRecord[];
+}
+
+export function isNativeTurnSource(value: unknown): value is NativeTurnSource {
+  if (!value || typeof value !== 'object') return false;
+  const source = value as Record<string, unknown>;
+  return ['workspace_id', 'conversation_id', 'root_turn_id', 'turn_id', 'execution_id'].every(
+    (key) => typeof source[key] === 'string' && source[key].trim().length > 0
+  );
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'tool';
@@ -812,6 +875,10 @@ export interface ChatMessage {
   finalAnswerExecutionId?: string | null;
   executionStatus?: NativeExecutionStatus;
   finalAnswerSource?: NativeFinalAnswerSource;
+  /** 显式错误事件的只读提示；不依据正文措辞猜测失败。 */
+  failureNotice?: string;
+  /** null 表示已观察到来源冲突，不能再由后续单个事件覆盖成已关联。 */
+  turnSource?: NativeTurnSource | null;
   /** AgentRouter coordination retained only in a Side Conversation view. */
   internalAgent?: boolean;
   /** Typed observation only: never user authorship, canonical input or edit authority. */
@@ -824,6 +891,9 @@ export interface ChatMessage {
     source?: Attachment['source'];
   }[];
   chartSpecs?: unknown[];
+  /** 原journal只读引用；不作为消息发布、执行或计费权威。 */
+  presentationRecords?: NativePresentationRecord[];
+  presentationUnavailable?: boolean;
   isStreaming?: boolean;
   timestamp: number;
   /** assistant块与工具引用的实际呈现顺序；Reasoning使用原生assistant块。 */
@@ -882,6 +952,8 @@ export interface SavedMessage {
   role: string;
   created_at: string;
   content: string | null;
+  native_presentation?: NativePresentationSupplement | null;
+  presentation_unavailable?: boolean;
   internal_agent?: boolean;
   agent_input?: AgentCommunicationInput['payload'];
   assistant_blocks?: AssistantBlockView[];
@@ -889,6 +961,7 @@ export interface SavedMessage {
   /** 后端既有 publication 校验得到的原 Settled 坐标与精确候选块。 */
   execution_status?: NativeExecutionStatus;
   final_answer_source?: NativeFinalAnswerSource;
+  turn_source?: NativeTurnSource | null;
   tool_calls?: {
     provider_source?: ProviderOutputSource | null;
     id: string;
@@ -915,6 +988,52 @@ export interface ConversationRecord {
   messages: SavedMessage[];
   created_at: string;
   updated_at: string;
+  usage?: ConversationUsageSnapshot | null;
+  usage_error?: string | null;
+}
+
+export interface ModelCallObservation {
+  call_id: string;
+  attempt_id: string;
+  outcome: 'completed' | 'failed' | 'cancelled';
+  request_duration_ms: number;
+  first_output_ms: number | null;
+  last_output_ms: number | null;
+  output_samples: number;
+  timing_comparable: boolean;
+}
+
+export interface UsageTotals {
+  attempts: number;
+  steps: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number;
+  cache_write_tokens: number;
+  missing_usage: number;
+  unidentified_steps: number;
+  conflicts: number;
+  pending_calls: number;
+  timed_output_tokens: number;
+  output_duration_ms: number;
+  latest_speed: number | null;
+  latest_input_tokens: number | null;
+}
+
+export interface ConversationUsageSnapshot {
+  workspace_id: string;
+  conversation_id: string;
+  journal_identity: unknown | null;
+  through_sequence: number;
+  latest_sequence: number;
+  first_observed_sequence: number | null;
+  prefix_complete: boolean;
+  turns: number;
+  turns_known: boolean;
+  main: UsageTotals;
+  subagent: UsageTotals;
+  models: Record<string, UsageTotals>;
+  auxiliary_coverage: 'unobserved';
 }
 
 export interface ConversationListItem {

@@ -15,6 +15,10 @@ pub struct SavedMessage {
     /// Original canonical timestamp, never the GUI load time.
     pub created_at: String,
     pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_presentation: Option<crate::chat_event_log::NativePresentationSupplement>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub presentation_unavailable: bool,
     /// 原 Framework 消息的块投影；它不拥有执行完成权威。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant_blocks: Option<Vec<SavedAssistantBlock>>,
@@ -26,6 +30,9 @@ pub struct SavedMessage {
     pub execution_status: Option<echo_agent::agent::ExecutionStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_answer_source: Option<NativeFinalAnswerSource>,
+    /// 原已核验 publication 的轮次坐标；Fork 中仍是源坐标，不授予目标 owner。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_source: Option<NativeTurnSource>,
     /// True when this transcript segment came from AgentRouter coordination.
     /// Primary conversation views filter these messages before serialization;
     /// Side Conversation views retain and label them.
@@ -54,12 +61,24 @@ fn is_false(value: &bool) -> bool {
     !value
 }
 
+/// 应用只读呈现身份，与 canonical 消息及运行时状态保持独立。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NativeTurnSource {
+    pub workspace_id: String,
+    pub conversation_id: String,
+    pub root_turn_id: String,
+    pub turn_id: String,
+    pub execution_id: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SavedAssistantBlock {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publication_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_source: Option<crate::chat_event_log::NativeJournalCursor>,
     pub block: echo_agent::agent::AssistantMessageBlock,
     pub content: String,
 }
@@ -106,6 +125,7 @@ pub fn project_assistant_blocks(
             projected.push(SavedAssistantBlock {
                 execution_id: None,
                 publication_event_id: None,
+                journal_source: None,
                 content: block.delta.clone(),
                 block,
             });
@@ -122,6 +142,7 @@ pub struct NativeHistoryPresentation {
     pub final_answer_confirmed: bool,
     pub execution_status: Option<echo_agent::agent::ExecutionStatus>,
     pub final_answer_source: Option<NativeFinalAnswerSource>,
+    pub turn_source: Option<NativeTurnSource>,
     pub unavailable: bool,
 }
 
@@ -148,6 +169,24 @@ fn publication_agent(
     }
 }
 
+/// 原块的首个已核publication游标；不与block/status的内部sequence混用。
+fn publication_block_cursor<'a>(
+    events: impl Iterator<Item = &'a crate::chat_event_log::ChatEventEnvelope>,
+    block: &echo_agent::agent::AssistantMessageBlock,
+) -> Option<crate::chat_event_log::NativeJournalCursor> {
+    events
+        .filter(|event| {
+            matches!(publication_agent(event).map(|agent| &agent.payload),
+        Some(echo_agent::agent::AgentEvent::AssistantMessage {block:published})
+        if published.request_id == block.request_id && published.block_id == block.block_id)
+        })
+        .min_by_key(|event| event.sequence)
+        .map(|event| crate::chat_event_log::NativeJournalCursor {
+            stream_id: event.stream_id.clone(),
+            sequence: event.sequence,
+        })
+}
+
 fn publication_scope_matches(
     left: &crate::chat_event_log::ChatEventEnvelope,
     right: &crate::chat_event_log::ChatEventEnvelope,
@@ -157,6 +196,43 @@ fn publication_scope_matches(
         && left.root_turn_id == right.root_turn_id
         && left.turn_id == right.turn_id
         && left.message_id == right.message_id
+}
+
+fn publication_turn_source<'a>(
+    events: impl Iterator<Item = &'a crate::chat_event_log::ChatEventEnvelope>,
+) -> Option<NativeTurnSource> {
+    let mut source = None;
+    for event in events {
+        let Some(agent) = publication_agent(event) else {
+            continue;
+        };
+        let execution_id = agent.execution_id.as_ref()?.as_str();
+        let conversation_id = event.conversation_id.as_deref()?;
+        if event.workspace_id.trim().is_empty()
+            || conversation_id.trim().is_empty()
+            || event.root_turn_id.trim().is_empty()
+            || event.turn_id.trim().is_empty()
+            || execution_id.trim().is_empty()
+            || agent.conversation_id.as_ref().map(|id| id.as_str()) != Some(conversation_id)
+            || agent.turn_id.as_str() != event.turn_id
+            || agent.message_id.as_ref().map(|id| id.as_str()) != Some(event.message_id.as_str())
+            || event.root_turn_id != event.message_id
+        {
+            return None;
+        }
+        let next = NativeTurnSource {
+            workspace_id: event.workspace_id.clone(),
+            conversation_id: conversation_id.to_string(),
+            root_turn_id: event.root_turn_id.clone(),
+            turn_id: event.turn_id.clone(),
+            execution_id: execution_id.to_string(),
+        };
+        if source.as_ref().is_some_and(|previous| previous != &next) {
+            return None;
+        }
+        source = Some(next);
+    }
+    source
 }
 
 /// 无终态坐标的中间块只能依据同一原消息的批准块与实际发布记录呈现。
@@ -277,11 +353,13 @@ pub fn project_native_history_publication(
         final_answer_confirmed: false,
         execution_status: None,
         final_answer_source: None,
+        turn_source: None,
         unavailable: true,
     };
     let Some(expected) = message.execution_status.as_ref() else {
         let published =
             native_progress_publication_events(message, workspace_id, conversation_id, events)?;
+        view.turn_source = publication_turn_source(published.iter());
         let blocks = published
             .iter()
             .filter_map(|event| match &publication_agent(event)?.payload {
@@ -296,6 +374,7 @@ pub fn project_native_history_publication(
                 matches!(&agent.payload, AgentEvent::AssistantMessage { block } if block == &view.block)
                     .then(|| agent.event_id.to_string())
             });
+            view.journal_source = publication_block_cursor(published.iter(), &view.block);
             view.execution_id = published.iter().find_map(|event| {
                 let agent = publication_agent(event)?;
                 match &agent.payload {
@@ -338,6 +417,7 @@ pub fn project_native_history_publication(
     if scopes.len() != 1 {
         return Ok(Some(view));
     }
+    view.turn_source = publication_turn_source(owned.iter().copied());
 
     // approved 本身只给 payload 资格；实际呈现还须与原已发布事件逐字段一致。
     // Some(empty) 和 None 均不回退 provider raw assistant_blocks。
@@ -381,6 +461,7 @@ pub fn project_native_history_publication(
     // 上面每项均已逐字段匹配同一 owner 的实际原 publication；raw 回退不带本字段。
     for block in &mut view.blocks {
         block.execution_id = Some(expected.execution_id.clone());
+        block.journal_source = publication_block_cursor(owned.iter().copied(), &block.block);
         block.publication_event_id = owned.iter().find_map(|event| {
             let agent = publication_agent(event)?;
             matches!(&agent.payload, AgentEvent::AssistantMessage { block: published } if published == &block.block)
@@ -549,6 +630,9 @@ pub struct AttachmentsPayload {
     pub execution_steps: Vec<SavedExecutionStep>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_history_import: Option<NativeHistoryImport>,
+    /// Fork的只读展示补充；与原publication许可分开，不能用于核准正文或执行。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_presentation_import: Option<crate::chat_event_log::NativePresentationSupplement>,
     /// Real user-uploaded attachments (images/documents). Despite the column
     /// name `attachments_json` historically holding thinking segments, this key
     /// holds the actual attachment data URL so messages render on reload.
@@ -573,6 +657,71 @@ pub type SavedToolCall = echo_agent::llm::types::ToolCall;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_turn_source_survives_original_journal_reopen_without_final_inference()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::chat_driver::ChatDriverEvent;
+        use crate::chat_event_log::{ChatEventLog, ChatEventRetention};
+        use echo_agent::agent::{
+            AgentEvent, AssistantMessageBlock, AssistantPhase, EventEnvelope, EventIdentity,
+        };
+        let directory = tempfile::tempdir()?;
+        let block = AssistantMessageBlock {
+            provider_source: None,
+            block_id: "progress-block".into(),
+            request_id: "provider-request".into(),
+            sequence: 0,
+            phase: AssistantPhase::Commentary,
+            delta: "先核对原来源🙂".into(),
+            complete: true,
+            provider: None,
+            reasoning: None,
+        };
+        let mut message = echo_agent::llm::types::Message::assistant(block.delta.clone());
+        message.assistant_blocks = Some(vec![block.clone()]);
+        message.approved_assistant_blocks = Some(vec![block.clone()]);
+        {
+            let log = ChatEventLog::open(directory.path(), ChatEventRetention::default())?;
+            let identity = EventIdentity::new("stream", "turn")?
+                .with_conversation_id("conversation")?
+                .with_message_id("root")?
+                .with_execution_id("execution")?;
+            let event =
+                EventEnvelope::new(&identity, 1, None, AgentEvent::AssistantMessage { block })?;
+            log.append(
+                "workspace",
+                Some("conversation"),
+                "root",
+                ChatDriverEvent::Agent(Box::new(event)),
+            )?;
+        }
+        let reopened = ChatEventLog::open(directory.path(), ChatEventRetention::default())?;
+        let events = reopened.native_history_publications("workspace", "conversation", &message)?;
+        let view =
+            project_native_history_publication(&message, "workspace", "conversation", &events)?
+                .ok_or("native view missing")?;
+        let expected = NativeTurnSource {
+            workspace_id: "workspace".into(),
+            conversation_id: "conversation".into(),
+            root_turn_id: "root".into(),
+            turn_id: "turn".into(),
+            execution_id: "execution".into(),
+        };
+        assert_eq!(view.turn_source, Some(expected.clone()));
+        assert_eq!(
+            serde_json::from_value::<NativeTurnSource>(serde_json::to_value(&expected)?)?,
+            expected
+        );
+        assert!(!view.final_answer_confirmed);
+        assert_eq!(view.blocks.len(), 1);
+        let mut conflict = events.clone();
+        if let Some(event) = conflict.first_mut() {
+            event.turn_id = "foreign-turn".into();
+        }
+        assert!(publication_turn_source(conflict.iter()).is_none());
+        Ok(())
+    }
 
     #[test]
     fn native_message_projection_keeps_exact_identity_and_phase() -> Result<(), String> {
@@ -629,10 +778,13 @@ mod tests {
             role: "user".to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
             content: Some("hello".to_string()),
+            native_presentation: None,
+            presentation_unavailable: false,
             assistant_blocks: None,
             final_answer_confirmed: false,
             execution_status: None,
             final_answer_source: None,
+            turn_source: None,
             internal_agent: false,
             agent_input: None,
             tool_calls: None,
@@ -657,6 +809,7 @@ mod tests {
                 call_id: Some("call-1".to_string()),
             }],
             native_history_import: None,
+            native_presentation_import: None,
             attachments: Vec::new(),
         };
         let encoded = serde_json::to_string(&payload).map_err(|error| error.to_string())?;
