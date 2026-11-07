@@ -1265,10 +1265,10 @@ impl PreparedProjectContext {
     pub(crate) fn projections(&self) -> Vec<echo_agent::compression::ContextProjection> {
         vec![
             self.instructions.projection(),
-            echo_agent::compression::ContextProjection {
-                marker: crate::project::prompt::PROJECT_CONTEXT_PROJECTION.to_string(),
-                message: self.project.clone(),
-            },
+            echo_agent::compression::ContextProjection::replacing(
+                crate::project::prompt::PROJECT_CONTEXT_PROJECTION,
+                self.project.clone(),
+            ),
         ]
     }
 
