@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { ChannelsPanel } from './ChannelsPanel';
 const api = vi.hoisted(() => ({
   configuration: vi.fn(),
@@ -328,4 +328,54 @@ it('微信连接区呈现原传输错误、已结算清理失败和观察时间'
   expect(connection.getByText('微信鉴权轮询失败，请重新连接')).toBeTruthy();
   expect(connection.getByText('上次清理已结算，保留失败记录：原微信 reader 关闭失败')).toBeTruthy();
   expect(connection.getByText(`观察于 ${new Date(observedAt).toLocaleString()}`)).toBeTruthy();
+});
+
+it('Ready仍显示消息准入错误，并只通过原状态轮询清除', async () => {
+  const admissionError = '消息尚未接纳；请重试原消息';
+  const ready = {
+    ...instance,
+    id: 'weixin',
+    transport: {
+      ...instance.transport,
+      phase: 'ready',
+      evidence: 'weixin_authenticated_poll',
+      error: admissionError,
+    },
+  };
+  api.status
+    .mockResolvedValueOnce({ configuration_revision: 'desired-new', channels: [ready] })
+    .mockResolvedValueOnce({
+      configuration_revision: 'desired-new',
+      channels: [{ ...ready, transport: { ...ready.transport, error: null } }],
+    });
+
+  vi.useFakeTimers();
+  let unmount: (() => void) | undefined;
+  try {
+    await act(async () => {
+      ({ unmount } = render(<ChannelsPanel />));
+    });
+    const connection = within(screen.getByRole('region', { name: '微信连接状态' }));
+    expect(connection.getByText('微信连接：微信鉴权轮询已确认')).toBeTruthy();
+    expect(connection.getByRole('alert').textContent).toBe(admissionError);
+    expect(api.status).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+
+    expect(api.status).toHaveBeenCalledTimes(2);
+    expect(connection.getByText('微信连接：微信鉴权轮询已确认')).toBeTruthy();
+    expect(connection.queryByText(admissionError)).toBeNull();
+    expect(connection.queryByRole('alert')).toBeNull();
+    expect(api.control).not.toHaveBeenCalled();
+    expect(api.save).not.toHaveBeenCalled();
+    expect(qrApi.begin).not.toHaveBeenCalled();
+    expect(qrApi.verify).not.toHaveBeenCalled();
+    expect(qrApi.cancel).not.toHaveBeenCalled();
+    expect(qrApi.forget).not.toHaveBeenCalled();
+  } finally {
+    unmount?.();
+    vi.useRealTimers();
+  }
 });
