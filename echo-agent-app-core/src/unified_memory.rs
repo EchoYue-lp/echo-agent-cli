@@ -40,10 +40,11 @@ pub(crate) struct InstructionProjectionSnapshot {
 
 impl InstructionProjectionSnapshot {
     pub(crate) fn projection(&self) -> echo_agent::compression::ContextProjection {
-        echo_agent::compression::ContextProjection {
-            marker: INSTRUCTION_CONTEXT_PROJECTION.to_string(),
-            message: self.message.clone(),
-        }
+        // 规则正文是固定指令：它只在文件内容变化时更新 generation，属于 boundary。
+        echo_agent::compression::ContextProjection::replacing(
+            INSTRUCTION_CONTEXT_PROJECTION,
+            self.message.clone(),
+        )
     }
     pub(crate) fn revision(&self) -> &str {
         &self.revision
@@ -96,10 +97,13 @@ impl HotMemoryProjectionSource {
     }
 
     pub(crate) fn projection(&self) -> ContextProjection {
-        ContextProjection {
-            marker: HOT_MEMORY_CONTEXT_PROJECTION.to_string(),
-            message: self.snapshot().and_then(|snapshot| snapshot.message),
-        }
+        // hot-memory 是人工维护的 MEMORY.md（规则与事实混写，无法可靠自动分类）：
+        // 沿固定指令 generation 更新，内容变化时接受一次正常冷 miss，而不是把任意
+        // 记忆文本自动降权成历史内事实。
+        ContextProjection::replacing(
+            HOT_MEMORY_CONTEXT_PROJECTION,
+            self.snapshot().and_then(|snapshot| snapshot.message),
+        )
     }
 }
 

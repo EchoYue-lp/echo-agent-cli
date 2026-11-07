@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock, Weak};
 
 use echo_agent::agent::ReactAgent;
-use echo_agent::compression::{ContextProjection, PreModelContextProjector, ProjectionContext};
+use echo_agent::compression::{
+    ContextProjection, PreModelContextProjector, ProjectionContext, projection_content_version,
+};
 use echo_agent::error::Result as AgentResult;
 use echo_agent::llm::types::Message;
 use futures::future::BoxFuture;
@@ -26,6 +28,8 @@ const RAW_INPUT_HISTORY_MARKER: &str = "[eko_original_input_history]";
 const CANONICAL_GOAL_REFERENCE_MARKER: &str = "[eko_canonical_goal_reference]";
 /// Stable objective contract projected separately from volatile recovery state.
 pub const RUNTIME_GOAL_MARKER: &str = "[eko_run_goal_contract]";
+/// 有界预算的近似剩余量投影（追加式版本，按 5% 台阶变化）。
+pub const RUNTIME_BUDGET_MARKER: &str = "[eko_run_budget]";
 pub(crate) const DOMAIN_METHOD_MARKER: &str = "[eko_bound_domain_method]";
 
 /// 共用原 typed failure 的 machine code 分类，不能解析展示文字或改自动重试语义。
@@ -471,13 +475,13 @@ impl PreModelContextProjector for TaskRuntimeContextProjector {
             if self.domain_only {
                 // Actual invocation resources retain this same registration.
                 // General None still clears an earlier domain marker.
-                return Ok(vec![ContextProjection {
-                    marker: DOMAIN_METHOD_MARKER.to_string(),
-                    message: domain.map(Message::user),
-                }]);
+                return Ok(vec![ContextProjection::replacing(
+                    DOMAIN_METHOD_MARKER,
+                    domain.map(Message::user),
+                )]);
             }
             let store = run_id.and_then(|run_id| self.registry.store(run_id));
-            let (goal, recovery) = match (run_id, store) {
+            let (goal, recovery, budget, raw_history) = match (run_id, store) {
                 (Some(run_id), Some(store)) => {
                     let run_id = run_id.to_string();
                     super::executor::TaskRuntimeOperation::new(store)
@@ -490,39 +494,65 @@ impl PreModelContextProjector for TaskRuntimeContextProjector {
                                             super::store::StoreError::RunNotFound(run_id.clone())
                                         })?;
                                         format!(
-                                            "{RUNTIME_RECOVERY_MARKER}\nGoal: {}\n{}",
+                                            "{RUNTIME_RECOVERY_MARKER}\nGoal: {}\n",
                                             truncate_chars(&run.goal, MAX_GOAL_CHARS),
-                                            format_raw_history_reference(
-                                                &store
-                                                    .raw_input_history_reference(&run_id, None)?
-                                            )?
                                         )
                                     }
                                 };
                             Ok((
                                 build_runtime_goal_contract_checked(&store, &run_id)?,
                                 Some(recovery),
+                                build_runtime_budget_projection_checked(&store, &run_id)?,
+                                Some(store.raw_input_history_reference(&run_id, None)?),
                             ))
                         })
                         .await
                         .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?
                 }
-                _ => (None, None),
+                _ => (None, None, None, None),
             };
-            Ok(vec![
-                ContextProjection {
-                    marker: RUNTIME_GOAL_MARKER.to_string(),
-                    message: goal.map(Message::user),
-                },
-                ContextProjection {
-                    marker: RUNTIME_RECOVERY_MARKER.to_string(),
-                    message: recovery.map(Message::user),
-                },
-                ContextProjection {
-                    marker: DOMAIN_METHOD_MARKER.to_string(),
-                    message: domain.map(Message::user),
-                },
-            ])
+            // 固定指令留在 boundary；运行事实按语义版本追加在已见历史之后，使
+            // provider 前缀在同一 generation 内保持逐字节稳定。
+            let mut projections = Vec::with_capacity(5);
+            projections.push(ContextProjection::replacing(
+                RUNTIME_GOAL_MARKER,
+                goal.map(Message::user),
+            ));
+            for (marker, text) in [
+                (RUNTIME_RECOVERY_MARKER, recovery),
+                (RUNTIME_BUDGET_MARKER, budget),
+            ] {
+                projections.push(ContextProjection::versioned(
+                    marker,
+                    projection_content_version(&[
+                        run_id.unwrap_or_default(),
+                        if text.is_some() { "present" } else { "cleared" },
+                        text.as_deref().unwrap_or_default(),
+                    ]),
+                    text.map(Message::user),
+                ));
+            }
+            if let Some(reference) = raw_history {
+                let text = format_raw_history_reference(&reference)
+                    .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
+                projections.push(ContextProjection::versioned(
+                    RAW_INPUT_HISTORY_MARKER,
+                    raw_history_source_version(&reference)
+                        .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?,
+                    Some(Message::user(text)),
+                ));
+            } else {
+                projections.push(ContextProjection::versioned(
+                    RAW_INPUT_HISTORY_MARKER,
+                    projection_content_version(&[run_id.unwrap_or_default(), "cleared"]),
+                    None,
+                ));
+            }
+            projections.push(ContextProjection::replacing(
+                DOMAIN_METHOD_MARKER,
+                domain.map(Message::user),
+            ));
+            Ok(projections)
         })
     }
 }
@@ -549,6 +579,80 @@ fn format_raw_history_reference(
     }
     rendered.push_str("这是准确Run/原journal前缀的原始输入来源记录，包含接纳与投递事实；Accepted不等于已理解或已执行。用read_artifact分页读取必要早期原文，结合历史理解，不自动改Goal或计划。\n[eko_original_input_history_end]\n\n");
     Ok(rendered)
+}
+
+/// 原始输入历史引用的**来源身份**版本。
+///
+/// 只排除观察 frontier；其余完整来源、scope 与 locator 字段都属于语义身份。
+/// 同内容恢复到新 host 路径时，也必须让模型获得可重新资格校验的当前引用。
+fn raw_history_source_version(
+    reference: &super::store::RawInputHistoryReference,
+) -> Result<String, super::store::StoreError> {
+    let mut identity = serde_json::to_value(reference)?;
+    let fields = identity
+        .as_object_mut()
+        .ok_or_else(|| super::store::StoreError::InvalidPlan("原文来源引用不是对象".into()))?;
+    fields.remove("observed_through_sequence");
+    let canonical = echo_agent::utils::canonical_json::canonical_json_bytes(&identity)?;
+    Ok(format!("{:x}", Sha256::digest(canonical)))
+}
+
+/// 有界预算的近似剩余量，按 5% 台阶量化。
+///
+/// 精确的每步用量会持续改写此前已经送入模型的 capsule；按台阶量化把"可见变化"
+/// 限制在有限次数内，同时仍向模型传达还剩多少额度。无界预算不产生任何投影。
+fn build_runtime_budget_projection_checked(
+    store: &TaskRuntimeStore,
+    run_id: &str,
+) -> Result<Option<String>, super::store::StoreError> {
+    let Some(state) = store.get_run_state(run_id)? else {
+        return Ok(None);
+    };
+    let Some(continuation) = state.continuation.as_ref() else {
+        return Ok(None);
+    };
+    if !continuation.enabled {
+        return Ok(None);
+    }
+    if continuation.token_budget.is_none() && continuation.time_budget_seconds.is_none() {
+        return Ok(None);
+    }
+
+    let mut out = String::new();
+    out.push_str(RUNTIME_BUDGET_MARKER);
+    out.push('\n');
+    out.push_str(
+        "Approximate remaining allowance, coarsened to 5% steps on purpose: exact per-step \
+         numbers would invalidate the prompt cache on every iteration. Use it only to pace \
+         effort; completion is decided by TaskRuntime blockers, not by these numbers.\n",
+    );
+    if let Some(budget) = continuation.token_budget {
+        let percent = coarsened_remaining_percent(continuation.tokens_used, budget);
+        out.push_str(&format!(
+            "- tokens: about {percent}% remaining (limit: {} tokens)\n",
+            budget
+        ));
+    }
+    if let Some(budget) = continuation.time_budget_seconds {
+        let percent = coarsened_remaining_percent(continuation.time_used_seconds, budget);
+        out.push_str(&format!(
+            "- time: about {percent}% remaining (limit: {}s)\n",
+            budget
+        ));
+    }
+    out.push_str("[eko_run_budget_end]\n");
+    Ok(Some(out))
+}
+
+/// 剩余额度百分比，向下取整到 5% 台阶。
+fn coarsened_remaining_percent(used: u64, budget: u64) -> u64 {
+    if budget == 0 {
+        return 0;
+    }
+    let remaining = budget.saturating_sub(used);
+    // u128 中间值可容纳任意 u64 预算乘 100，避免饱和乘法错误显示剩余量。
+    let remaining_percent = ((u128::from(remaining) * 100) / u128::from(budget)) as u64;
+    (remaining_percent / 5) * 5
 }
 
 type ObservedArtifactRead = (Option<String>, String);
@@ -733,9 +837,7 @@ fn raw_history_reference_from_request(
         let Some(text) = message.content.as_text_ref() else {
             continue;
         };
-        if !text.contains(RUNTIME_RECOVERY_MARKER) {
-            continue;
-        }
+        // 引用现在是独立投影，不再要求它与 recovery capsule 同一条消息。
         let Some((_, block)) = text.split_once(RAW_INPUT_HISTORY_MARKER) else {
             continue;
         };
@@ -803,21 +905,9 @@ fn build_runtime_goal_contract_checked(
         .take(MAX_GOAL_CONTRACT_CHARS)
         .collect::<String>();
     let objective_truncated = run.goal.chars().count() > MAX_GOAL_CONTRACT_CHARS;
-    let plan_revision = store
-        .get_plan(run_id)
-        .ok()
-        .flatten()
-        .map(|plan| plan.revision);
-    let remaining_tokens = continuation
-        .token_budget
-        .map(|budget| budget.saturating_sub(continuation.tokens_used));
-    let remaining_time_seconds = continuation
-        .time_budget_seconds
-        .map(|budget| budget.saturating_sub(continuation.time_used_seconds));
-
     let mut contract = format!(
         "{RUNTIME_GOAL_MARKER}\n\
-         Run: id={}, status={}, objective_sha256={}, plan_revision={}\n\
+         Run: id={}, objective_sha256={}\n\
          Objective{}:\n{}\n\
          Continuation contract:\n\
          - This finite Turn ending is not evidence that the TaskRun Goal is complete.\n\
@@ -825,14 +915,9 @@ fn build_runtime_goal_contract_checked(
          - Before completion, audit the original objective, current plan, artifacts, and verification evidence.\n\
          - TaskRuntime completion blockers are authoritative; final wording never overrides them.\n\
          - On a recoverable blocker, record the concrete blocker and preserve resumable state.\n\
-         {round_review}\
-         Budget: tokens_used={}, token_budget={}, tokens_remaining={}; time_used_seconds={}, time_budget_seconds={}, time_remaining_seconds={}\n",
+         {round_review}\n",
         run.run_id,
-        run.status.as_str(),
         goal_hash,
-        plan_revision
-            .map(|revision| revision.to_string())
-            .unwrap_or_else(|| "none".to_string()),
         if objective_truncated {
             let artifact = goal_reference.as_ref().ok_or_else(|| {
                 super::store::StoreError::InvalidPlan("长Goal缺本机可读引用".to_string())
@@ -846,22 +931,6 @@ fn build_runtime_goal_contract_checked(
             String::new()
         },
         objective,
-        continuation.tokens_used,
-        continuation
-            .token_budget
-            .map(|budget| budget.to_string())
-            .unwrap_or_else(|| "none".to_string()),
-        remaining_tokens
-            .map(|tokens| tokens.to_string())
-            .unwrap_or_else(|| "unbounded".to_string()),
-        continuation.time_used_seconds,
-        continuation
-            .time_budget_seconds
-            .map(|budget| budget.to_string())
-            .unwrap_or_else(|| "none".to_string()),
-        remaining_time_seconds
-            .map(|seconds| seconds.to_string())
-            .unwrap_or_else(|| "unbounded".to_string()),
         round_review = GOAL_ROUND_REVIEW_RULES,
     );
     if let Some(reference) = goal_reference {
@@ -935,8 +1004,11 @@ fn build_runtime_recovery_capsule_checked(
         ));
     }
     if let Some(continuation) = continuation {
+        // 每步精确的 tokens_used/剩余时间不再写进这个已被模型看过的快照：它们
+        // 会随每一步变化，从而让整段 prompt 的早部前缀失效。有界预算的近似剩余量
+        // 由独立的 `RUNTIME_BUDGET_MARKER` 追加式投影承载。
         out.push_str(&format!(
-            "Continuation: active_turn={}, last_turn={}, turns_next={}, tokens_used={}, token_budget={}, tokens_remaining={}, time_used_seconds={}, time_budget_seconds={}, time_remaining_seconds={}, compactions={}, deferred={}, pause={}\n",
+            "Continuation: active_turn={}, last_turn={}, turns_next={}, compactions={}, deferred={}, pause={}\n",
             continuation
                 .active_turn
                 .as_ref()
@@ -948,28 +1020,6 @@ fn build_runtime_recovery_capsule_checked(
                 .map(|turn| format!("{}:{}", turn.turn_id, turn.status.as_str()))
                 .unwrap_or_else(|| "none".to_string()),
             continuation.next_turn_ordinal,
-            continuation.tokens_used,
-            continuation
-                .token_budget
-                .map(|budget| budget.to_string())
-                .unwrap_or_else(|| "none".to_string()),
-            continuation
-                .token_budget
-                .map(|budget| budget.saturating_sub(continuation.tokens_used).to_string())
-                .unwrap_or_else(|| "unbounded".to_string()),
-            continuation.time_used_seconds,
-            continuation
-                .time_budget_seconds
-                .map(|budget| budget.to_string())
-                .unwrap_or_else(|| "none".to_string()),
-            continuation
-                .time_budget_seconds
-                .map(|budget| {
-                    budget
-                        .saturating_sub(continuation.time_used_seconds)
-                        .to_string()
-                })
-                .unwrap_or_else(|| "unbounded".to_string()),
             continuation.compaction_count,
             continuation.deferred,
             continuation
@@ -982,8 +1032,9 @@ fn build_runtime_recovery_capsule_checked(
 
     if let Some(plan) = &plan {
         out.push_str(&format!(
-            "Plan: id={}, execution_mode={}, tasks={}\n",
+            "Plan: id={}, revision={}, execution_mode={}, tasks={}\n",
             plan.plan_id,
+            plan.revision,
             plan.execution_mode.as_str(),
             plan.tasks.len()
         ));
@@ -1020,7 +1071,6 @@ fn build_runtime_recovery_capsule_checked(
         out.push('\n');
     }
 
-    out.push_str(&format_raw_history_reference(&raw_history)?);
     if let Some(reference) = goal_reference {
         out.push_str(&format_goal_reference(&reference)?);
     }
@@ -1455,6 +1505,190 @@ mod tests {
     }
 
     #[test]
+    fn goal_contract_omits_per_step_budget_and_capsule_omits_usage() -> Result<(), String> {
+        let store = seed_store()?;
+        store
+            .configure_run_continuation("r1", true, false, Some(10_000), Some(600))
+            .map_err(|err| format!("configure continuation failed: {err}"))?;
+        let contract = build_runtime_goal_contract(&store, "r1")
+            .ok_or_else(|| "goal contract should be built".to_string())?;
+        if contract.contains("Budget:") || contract.contains("tokens_used=") {
+            return Err(format!(
+                "goal contract must not embed per-step budget numbers: {contract}"
+            ));
+        }
+        let capsule = build_runtime_recovery_capsule(&store, "r1")
+            .ok_or_else(|| "capsule should be built".to_string())?;
+        if capsule.contains("tokens_used=") || capsule.contains("time_used_seconds=") {
+            return Err(format!(
+                "recovery capsule must not embed per-step usage numbers: {capsule}"
+            ));
+        }
+        if capsule.contains(RAW_INPUT_HISTORY_MARKER) {
+            return Err("original-input reference must be its own projection".to_string());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn budget_projection_is_bounded_only_and_coarsened() -> Result<(), String> {
+        let store = seed_store()?;
+        // 无界预算：不发送任何预算投影。
+        store
+            .configure_run_continuation("r1", true, false, None, None)
+            .map_err(|err| format!("configure continuation failed: {err}"))?;
+        if build_runtime_budget_projection_checked(&store, "r1")
+            .map_err(|err| format!("budget projection failed: {err}"))?
+            .is_some()
+        {
+            return Err("unbounded budget must not be projected".to_string());
+        }
+        // 有界预算：只在剩余额度跨 5% 台阶时产生新版本。
+        store
+            .configure_run_continuation("r1", true, false, Some(10_000), Some(600))
+            .map_err(|err| format!("configure continuation failed: {err}"))?;
+        let budget = build_runtime_budget_projection_checked(&store, "r1")
+            .map_err(|err| format!("budget projection failed: {err}"))?
+            .ok_or_else(|| "bounded budget should be projected".to_string())?;
+        if !budget.contains(RUNTIME_BUDGET_MARKER) || !budget.contains("about 100% remaining") {
+            return Err(format!("unexpected bounded budget text: {budget}"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn remaining_percent_is_coarsened_to_five_percent_steps() {
+        assert_eq!(coarsened_remaining_percent(0, 1000), 100);
+        assert_eq!(coarsened_remaining_percent(10, 1000), 95);
+        assert_eq!(coarsened_remaining_percent(24, 1000), 95);
+        assert_eq!(coarsened_remaining_percent(240, 1000), 75);
+        assert_eq!(coarsened_remaining_percent(u64::MAX, u64::MAX), 0);
+        assert_eq!(coarsened_remaining_percent(999, 1000), 0);
+        assert_eq!(coarsened_remaining_percent(1, 0), 0);
+    }
+
+    #[tokio::test]
+    async fn growing_runtime_requests_preserve_prefix_and_coarsened_budget() -> Result<(), String> {
+        use super::super::types::{RunTurnOrigin, TurnVisibility};
+        let store = seed_projection_store("cache-run", "original objective")?;
+        store
+            .configure_run_continuation("cache-run", true, false, Some(10_000), None)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("cache-run", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        let claim = store
+            .claim_run_turn(
+                "cache-run",
+                "cache-turn",
+                RunTurnOrigin::User,
+                TurnVisibility::Visible,
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(
+            matches!(claim, super::super::store::RunTurnClaimOutcome::Started(_)),
+            "记账前必须通过原RunTurn实际启动路径"
+        );
+        let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
+        let _registration = registry.register("cache-run", Arc::clone(&store));
+        let projector = TaskRuntimeContextProjector::new(registry);
+        let mut context = ContextManager::builder(16_000).build();
+        context.push(Message::user("original request".into()));
+        let mut previous = Vec::new();
+        let mut budget = None;
+        for iteration in 1..=3 {
+            store
+                .account_run_turn_usage(
+                    "cache-run",
+                    "cache-turn",
+                    &format!("usage-{iteration}"),
+                    1,
+                    0,
+                )
+                .map_err(|error| error.to_string())?;
+            let projections = projector
+                .project(&projection_context(Some("cache-run")))
+                .await
+                .map_err(|error| error.to_string())?;
+            let current_budget = projections
+                .iter()
+                .find(|projection| projection.marker == RUNTIME_BUDGET_MARKER)
+                .and_then(|projection| projection.message.as_ref())
+                .and_then(|message| message.content.as_text());
+            if let Some(expected) = &budget {
+                assert_eq!(&current_budget, expected);
+            }
+            budget = Some(current_budget);
+            context.apply_projection_scope("pre-model", &projections);
+            for (index, message) in previous.iter().enumerate() {
+                assert_eq!(
+                    serde_json::to_value(context.messages().get(index))
+                        .map_err(|error| error.to_string())?,
+                    serde_json::to_value(Some(message)).map_err(|error| error.to_string())?
+                );
+            }
+            previous = context.messages().to_vec();
+            context.push(Message::assistant(format!("output-{iteration}")));
+        }
+        assert!(context.protected_message_count() <= 4);
+        Ok(())
+    }
+
+    #[test]
+    fn raw_history_source_version_ignores_observed_frontier() -> Result<(), String> {
+        let store = seed_store()?;
+        store
+            .record_run_steer("r1", "turn-1", "保留原始输入历史")
+            .map_err(|err| format!("record steer failed: {err}"))?;
+        let first = store
+            .raw_input_history_reference("r1", None)
+            .map_err(|err| format!("reference failed: {err}"))?;
+        let version_first =
+            raw_history_source_version(&first).map_err(|error| error.to_string())?;
+        // 观察 frontier 增长但来源内容不变：版本必须保持稳定。
+        let mut second = first.clone();
+        second.observed_through_sequence = second.observed_through_sequence.saturating_add(1);
+        assert_eq!(
+            version_first,
+            raw_history_source_version(&second).map_err(|error| error.to_string())?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_history_source_version_tracks_locator_and_inline_source() -> Result<(), String> {
+        let store = seed_store()?;
+        store
+            .record_run_steer("r1", "locator-turn", "原文来源")
+            .map_err(|error| error.to_string())?;
+        let reference = store
+            .raw_input_history_reference("r1", None)
+            .map_err(|error| error.to_string())?;
+        let expected = raw_history_source_version(&reference).map_err(|error| error.to_string())?;
+        // 版本键反控：内容 SHA 不变、host locator 变化仍须产生新版本。
+        // 这里只验证来源键，不把它当作完整目录迁移的 runtime 验收。
+        let mut relocated = reference.clone();
+        let artifact = relocated
+            .artifact
+            .as_mut()
+            .ok_or("原文定位反控缺少物化引用")?;
+        artifact.path = artifact
+            .path
+            .with_file_name("restored-original-history.txt");
+        assert_ne!(
+            expected,
+            raw_history_source_version(&relocated).map_err(|error| error.to_string())?
+        );
+        let mut changed = reference.clone();
+        changed.inline_initial_text = Some("另一份原始输入".into());
+        assert_ne!(
+            expected,
+            raw_history_source_version(&changed).map_err(|error| error.to_string())?
+        );
+        Ok(())
+    }
+
+    #[test]
     fn ordinary_chat_run_without_plan_gets_no_capsule() -> Result<(), String> {
         let store =
             TaskRuntimeStore::new_in_memory().map_err(|err| format!("seed store failed: {err}"))?;
@@ -1737,7 +1971,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projector_after_registration_drop_removes_existing_capsule() -> Result<(), String> {
+    async fn projector_after_registration_drop_invalidates_existing_capsule() -> Result<(), String>
+    {
         let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
         let projector = Arc::new(TaskRuntimeContextProjector::new(Arc::clone(&registry)));
         let store = seed_projection_store("run-a", "alpha task")?;
@@ -1758,9 +1993,25 @@ mod tests {
             .await
             .map_err(|err| err.to_string())?;
         context.apply_projections(&outside);
-        if context.has_projection(RUNTIME_RECOVERY_MARKER) {
-            return Err("outside scope must remove the runtime capsule".to_string());
-        }
+        let cleared_version = outside
+            .iter()
+            .find(|projection| projection.marker == RUNTIME_RECOVERY_MARKER)
+            .and_then(|projection| projection.version.as_deref());
+        assert!(
+            context.has_projection(RUNTIME_RECOVERY_MARKER),
+            "immutable history must survive"
+        );
+        assert_eq!(
+            context.projection_version(RUNTIME_RECOVERY_MARKER),
+            cleared_version
+        );
+        let after_clear =
+            serde_json::to_value(context.messages()).map_err(|error| error.to_string())?;
+        context.apply_projections(&outside);
+        assert_eq!(
+            serde_json::to_value(context.messages()).map_err(|error| error.to_string())?,
+            after_clear
+        );
         Ok(())
     }
 
@@ -3983,9 +4234,9 @@ mod tests {
                 .project(&projection_context(Some("long-goal")))
                 .await
                 .map_err(|error| error.to_string())?;
-            if projections.len() != 3 {
+            if projections.len() != 5 {
                 return Err(format!(
-                    "expected goal, recovery and domain replaceable projections, got {}",
+                    "expected goal, recovery, budget, original-input and domain projections, got {}",
                     projections.len()
                 ));
             }
@@ -4326,5 +4577,653 @@ mod tests {
             "原Goal原文必须保留"
         );
         Ok(())
+    }
+    // 旧行为是事后隔离复现：旧 CLI ad0a22b / blob 67bdd20c 两个真实 producer
+    // 原文见 legacy 子模块；当前正式 projector 不注入手写 budget/recovery facts。
+    // 只用本机 axum 合成应答，fake usage 驱动原 store 记账，不代表缓存收益。
+    mod prefix_http_tests {
+        use super::*;
+        use crate::tasks::task_runtime::store;
+        use crate::tasks::task_runtime::types::{RunTurnOrigin, TurnVisibility};
+        use axum::{Json, Router, extract::State, routing::post};
+        use echo_agent::llm::cache::wire::{wire_prompt_fingerprint, wire_prompt_prefix_diff};
+        use echo_agent::llm::cache::{CacheHints, PromptCacheLayout, stable_prefix_hash};
+        use echo_agent::llm::{ChatRequest, LlmApiProtocol, LlmClient};
+        use echo_integration::providers::{
+            AnthropicClient, LlmConfig, OpenAiClient, ResponsesClient,
+        };
+        use serde_json::{Value, json};
+        use std::time::Duration;
+        use tokio::sync::Mutex;
+
+        #[derive(Clone)]
+        struct Capture {
+            protocol: LlmApiProtocol,
+            requests: Arc<Mutex<Vec<Value>>>,
+        }
+
+        async fn respond(State(capture): State<Capture>, Json(body): Json<Value>) -> Json<Value> {
+            let mut requests = capture.requests.lock().await;
+            requests.push(body);
+            let step = requests.len();
+            let output = format!("合成响应 {step}");
+            Json(match capture.protocol {
+                LlmApiProtocol::ChatCompletions => json!({
+                    "id":format!("chat-{step}"),"object":"chat.completion","created":0,
+                    "model":"prefix-fixture","choices":[{"index":0,"finish_reason":"stop",
+                    "message":{"role":"assistant","content":output}}],
+                    "usage":{"prompt_tokens":11,"completion_tokens":1,"total_tokens":12}
+                }),
+                LlmApiProtocol::Responses => json!({
+                    "id":format!("resp-{step}"),"object":"response","status":"completed",
+                    "model":"prefix-fixture","output":[{"type":"message",
+                    "id":format!("msg-{step}"),"role":"assistant","status":"completed",
+                    "content":[{"type":"output_text","text":output,"annotations":[]}]}],
+                    "usage":{"input_tokens":11,"output_tokens":1,"total_tokens":12}
+                }),
+                LlmApiProtocol::Anthropic => json!({
+                    "id":format!("anthropic-{step}"),"type":"message","role":"assistant",
+                    "model":"prefix-fixture","content":[{"type":"text","text":output}],
+                    "stop_reason":"end_turn","stop_sequence":null,
+                    "usage":{"input_tokens":11,"output_tokens":1}
+                }),
+            })
+        }
+
+        fn client(protocol: LlmApiProtocol, base: &str) -> Result<Box<dyn LlmClient>, String> {
+            let endpoint = format!("{base}/v1/{}", protocol.endpoint_path());
+            if protocol == LlmApiProtocol::Anthropic {
+                // Anthropic 公共构造器保留生产HTTP设置；执行者给整个native设置
+                // NO_PROXY=127.0.0.1,localhost，不修改并行测试的进程环境。
+                return Ok(Box::new(AnthropicClient::with_base_url(
+                    endpoint,
+                    "local-fake-key",
+                    "prefix-fixture",
+                )));
+            }
+            let config = LlmConfig::for_provider(
+                "prefix-local-fixture",
+                endpoint,
+                "local-fake-key",
+                "prefix-fixture",
+                protocol,
+            )
+            .map_err(|error| error.to_string())?;
+            let http = Arc::new(
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .map_err(|error| error.to_string())?,
+            );
+            match protocol {
+                LlmApiProtocol::ChatCompletions => OpenAiClient::with_client(http, config)
+                    .map(|client| Box::new(client) as Box<dyn LlmClient>),
+                LlmApiProtocol::Responses => ResponsesClient::with_client(http, config)
+                    .map(|client| Box::new(client) as Box<dyn LlmClient>),
+                LlmApiProtocol::Anthropic => return Err("Anthropic already handled".into()),
+            }
+            .map_err(|error| error.to_string())
+        }
+
+        fn request(context: &ContextManager) -> ChatRequest {
+            let mut request = ChatRequest::new(context.messages().to_vec());
+            let layout = PromptCacheLayout::from_messages(&request.messages, &[]);
+            request.cache_hints = Some(CacheHints {
+                breakpoints: vec![],
+                stable_prefix_hash: Some(stable_prefix_hash(
+                    layout.system,
+                    layout.canonical,
+                    layout.tools,
+                    layout.history,
+                )),
+                segments: layout.segment_ranges(),
+            });
+            request
+        }
+
+        fn contains_text(body: &Value, text: &str) -> bool {
+            match body {
+                Value::String(value) => value.contains(text),
+                Value::Array(values) => values.iter().any(|value| contains_text(value, text)),
+                Value::Object(values) => values.values().any(|value| contains_text(value, text)),
+                _ => false,
+            }
+        }
+
+        async fn exchange(
+            protocol: LlmApiProtocol,
+            old: bool,
+            base: &str,
+            requests: &Arc<Mutex<Vec<Value>>>,
+        ) -> Result<(), String> {
+            let run_id = "prefix-http-run";
+            let turn_id = "prefix-http-turn";
+            let original_goal = "保留准确原始目标 🧭";
+            let store = seed_projection_store(run_id, original_goal)?;
+            store
+                .configure_run_continuation(run_id, true, false, Some(10_000), None)
+                .map_err(|error| error.to_string())?;
+            store
+                .transition_run(run_id, TaskRunStatus::Running)
+                .map_err(|error| error.to_string())?;
+            let claim = store
+                .claim_run_turn(
+                    run_id,
+                    turn_id,
+                    RunTurnOrigin::User,
+                    TurnVisibility::Visible,
+                )
+                .map_err(|error| error.to_string())?;
+            assert!(
+                matches!(claim, store::RunTurnClaimOutcome::Started(_)),
+                "HTTP记账前必须实际启动RunTurn"
+            );
+            let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
+            let _registration = registry.register(run_id, Arc::clone(&store));
+            let projector = TaskRuntimeContextProjector::new(registry);
+            let client = client(protocol, base)?;
+            let mut context = ContextManager::builder(32_000).build();
+            context.push(Message::system(
+                "固定规则：遵守原始目标及真实工具结果。".into(),
+            ));
+            context.push(Message::user(original_goal.into()));
+            let mut goal_before = None;
+            let mut recovery_before = None;
+            for step in 1..=3 {
+                let projections = if old {
+                    // 原 TaskRuntime project 的三 marker 替换路由。旧两字段 literal
+                    // 仅机械适配为 replacing；业务文本未改写、未预置不稳定字段。
+                    vec![
+                        ContextProjection::replacing(
+                            RUNTIME_GOAL_MARKER,
+                            legacy::build_runtime_goal_contract_checked(&store, run_id)
+                                .map_err(|error| error.to_string())?
+                                .map(Message::user),
+                        ),
+                        ContextProjection::replacing(
+                            RUNTIME_RECOVERY_MARKER,
+                            legacy::build_runtime_recovery_capsule_checked(&store, run_id)
+                                .map_err(|error| error.to_string())?
+                                .map(Message::user),
+                        ),
+                        ContextProjection::replacing(DOMAIN_METHOD_MARKER, None),
+                    ]
+                } else {
+                    projector
+                        .project(&projection_context(Some(run_id)))
+                        .await
+                        .map_err(|error| error.to_string())?
+                };
+                let text = |marker: &str| {
+                    projections
+                        .iter()
+                        .find(|projection| projection.marker == marker)
+                        .and_then(|projection| projection.message.as_ref())
+                        .and_then(|message| message.content.as_text())
+                };
+                let goal = text(RUNTIME_GOAL_MARKER).ok_or("missing current Goal")?;
+                let recovery = text(RUNTIME_RECOVERY_MARKER).ok_or("missing recovery")?;
+                if step > 1 {
+                    assert_eq!(
+                        goal_before.as_ref() == Some(&goal),
+                        !old,
+                        "Goal body must be stable only after removing per-call budget"
+                    );
+                    assert_ne!(
+                        recovery_before.as_ref(),
+                        Some(&recovery),
+                        "real store steer must update current recovery in both arms"
+                    );
+                }
+                goal_before = Some(goal);
+                recovery_before = Some(recovery);
+                context.apply_projection_scope("pre-model", &projections);
+                assert!(
+                    context
+                        .messages()
+                        .iter()
+                        .any(|message| message.content.as_text_ref() == Some(original_goal))
+                );
+                let response = client
+                    .chat(request(&context))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                assert_eq!(response.content(), Some(format!("合成响应 {step}")));
+                {
+                    let captured = requests.lock().await;
+                    let body = captured.last().ok_or("actual HTTP request missing")?;
+                    // 前缀稳定本身不能证明最新事实抵达模型；逐一核对真实投影正文。
+                    for projection in &projections {
+                        if let Some(message) = &projection.message {
+                            let text =
+                                message.content.as_text().ok_or("projection text missing")?;
+                            assert!(
+                                contains_text(body, &text),
+                                "actual HTTP body lost current projection: {}",
+                                projection.marker
+                            );
+                        }
+                    }
+                }
+                let usage = response
+                    .usage
+                    .ok_or("fake HTTP response usage not parsed")?;
+                assert_eq!(usage.effective_prompt_tokens(), 11);
+                store
+                    .account_run_turn_usage(
+                        run_id,
+                        turn_id,
+                        &format!("http-{step}"),
+                        u64::from(usage.effective_prompt_tokens()),
+                        u64::from(usage.completion_tokens.unwrap_or(0)),
+                    )
+                    .map_err(|error| error.to_string())?;
+                context.push(response.message);
+                if step < 3 {
+                    let steer = format!("补充约束 {step}：保留已完成工作的证据。");
+                    store
+                        .record_run_steer(run_id, turn_id, &steer)
+                        .map_err(|error| error.to_string())?;
+                    context.push(Message::user(steer));
+                }
+            }
+            assert_eq!(
+                store
+                    .get_run(run_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or("run missing")?
+                    .goal,
+                original_goal
+            );
+            Ok(())
+        }
+
+        async fn capture(protocol: LlmApiProtocol, old: bool) -> Result<Vec<Value>, String> {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let state = Capture {
+                protocol,
+                requests: Arc::clone(&requests),
+            };
+            let router = Router::new()
+                .route("/v1/*endpoint", post(respond))
+                .with_state(state);
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .map_err(|error| error.to_string())?;
+            let base = format!(
+                "http://{}",
+                listener.local_addr().map_err(|error| error.to_string())?
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, router).await });
+            let result = tokio::time::timeout(
+                Duration::from_secs(20),
+                exchange(protocol, old, &base, &requests),
+            )
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            server.abort();
+            let _ = server.await;
+            result?;
+            let captured = requests.lock().await.clone();
+            assert_eq!(
+                captured.len(),
+                3,
+                "exactly three actual HTTP requests per arm"
+            );
+            Ok(captured)
+        }
+
+        async fn verify(protocol: LlmApiProtocol) -> Result<(), String> {
+            let before = capture(protocol, true).await?;
+            let after = capture(protocol, false).await?;
+            for (label, bodies, expected_append) in [
+                ("旧producer隔离复现", before, false),
+                ("正式projector", after, true),
+            ] {
+                let mut previous = None;
+                for (index, body) in bodies.iter().enumerate() {
+                    let fingerprint =
+                        wire_prompt_fingerprint(body).map_err(|error| error.to_string())?;
+                    if let Some(previous) = previous {
+                        let diff = wire_prompt_prefix_diff(previous, body)
+                            .map_err(|error| error.to_string())?;
+                        assert_eq!(
+                            diff.is_append_only, expected_append,
+                            "{protocol:?} {label}: {diff:?}"
+                        );
+                        if !expected_append {
+                            assert!(
+                                diff.first_difference
+                                    .as_deref()
+                                    .is_some_and(|path| path.starts_with("messages[")),
+                                "{diff:?}"
+                            );
+                        }
+                        println!(
+                            "{}",
+                            json!({"protocol":format!("{protocol:?}"),"arm":label,
+                            "request":index.saturating_add(1),"fingerprint":fingerprint,"diff":diff})
+                        );
+                    }
+                    previous = Some(body);
+                }
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn app_projector_chat_http_before_after_three_requests() -> Result<(), String> {
+            verify(LlmApiProtocol::ChatCompletions).await
+        }
+
+        #[tokio::test]
+        async fn app_projector_responses_http_before_after_three_requests() -> Result<(), String> {
+            verify(LlmApiProtocol::Responses).await
+        }
+
+        #[tokio::test]
+        async fn app_projector_anthropic_http_before_after_three_requests() -> Result<(), String> {
+            verify(LlmApiProtocol::Anthropic).await
+        }
+
+        mod legacy {
+            use super::*;
+            // ad0a22b87bc115a6fd157c7ee49e63cf3e58017f:compact_context.rs
+            // blob 67bdd20cfdfb51bc8767361dea7c1abeb4701a49。
+            // 两函数只加pub(super)并经等价rustfmt缩进/换行；字符串与计算不变。
+            pub(super) fn build_runtime_goal_contract_checked(
+                store: &TaskRuntimeStore,
+                run_id: &str,
+            ) -> Result<Option<String>, super::store::StoreError> {
+                let Some(state) = store.get_run_state(run_id)? else {
+                    return Ok(None);
+                };
+                let Some(continuation) = state.continuation.as_ref() else {
+                    return Ok(None);
+                };
+                if !continuation.enabled {
+                    return Ok(None);
+                }
+                let goal_reference = store.canonical_goal_reference(run_id)?;
+                let run = state.run;
+                let mut hasher = Sha256::new();
+                hasher.update(run.goal.as_bytes());
+                let goal_hash = format!("{:x}", hasher.finalize());
+                let objective = run
+                    .goal
+                    .chars()
+                    .take(MAX_GOAL_CONTRACT_CHARS)
+                    .collect::<String>();
+                let objective_truncated = run.goal.chars().count() > MAX_GOAL_CONTRACT_CHARS;
+                let plan_revision = store
+                    .get_plan(run_id)
+                    .ok()
+                    .flatten()
+                    .map(|plan| plan.revision);
+                let remaining_tokens = continuation
+                    .token_budget
+                    .map(|budget| budget.saturating_sub(continuation.tokens_used));
+                let remaining_time_seconds = continuation
+                    .time_budget_seconds
+                    .map(|budget| budget.saturating_sub(continuation.time_used_seconds));
+
+                let mut contract = format!(
+                    "{RUNTIME_GOAL_MARKER}\n\
+                     Run: id={}, status={}, objective_sha256={}, plan_revision={}\n\
+                     Objective{}:\n{}\n\
+                     Continuation contract:\n\
+                     - This finite Turn ending is not evidence that the TaskRun Goal is complete.\n\
+                     - Do not narrow or replace the objective with what fits in one Turn.\n\
+                     - Before completion, audit the original objective, current plan, artifacts, and verification evidence.\n\
+                     - TaskRuntime completion blockers are authoritative; final wording never overrides them.\n\
+                     - On a recoverable blocker, record the concrete blocker and preserve resumable state.\n\
+                     {round_review}\
+                     Budget: tokens_used={}, token_budget={}, tokens_remaining={}; time_used_seconds={}, time_budget_seconds={}, time_remaining_seconds={}\n",
+                    run.run_id,
+                    run.status.as_str(),
+                    goal_hash,
+                    plan_revision
+                        .map(|revision| revision.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    if objective_truncated {
+                        let artifact = goal_reference.as_ref().ok_or_else(|| {
+                            super::store::StoreError::InvalidPlan(
+                                "长Goal缺本机可读引用".to_string(),
+                            )
+                        })?;
+                        format!(
+                            " (bounded here; recover the full current Goal with host read_artifact: {}; sha256={})",
+                            artifact.artifact.path.display(),
+                            artifact.goal_sha256
+                        )
+                    } else {
+                        String::new()
+                    },
+                    objective,
+                    continuation.tokens_used,
+                    continuation
+                        .token_budget
+                        .map(|budget| budget.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    remaining_tokens
+                        .map(|tokens| tokens.to_string())
+                        .unwrap_or_else(|| "unbounded".to_string()),
+                    continuation.time_used_seconds,
+                    continuation
+                        .time_budget_seconds
+                        .map(|budget| budget.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    remaining_time_seconds
+                        .map(|seconds| seconds.to_string())
+                        .unwrap_or_else(|| "unbounded".to_string()),
+                    round_review = GOAL_ROUND_REVIEW_RULES,
+                );
+                if let Some(reference) = goal_reference {
+                    contract.push_str(&format_goal_reference(&reference)?);
+                }
+                Ok(Some(contract))
+            }
+
+            pub(super) fn build_runtime_recovery_capsule_checked(
+                store: &TaskRuntimeStore,
+                run_id: &str,
+            ) -> Result<Option<String>, super::store::StoreError> {
+                let state = store
+                    .get_run_state(run_id)?
+                    .ok_or_else(|| super::store::StoreError::RunNotFound(run_id.to_string()))?;
+                let run = state.run;
+                let continuation = state.continuation;
+                let recent_constraints = state.recent_constraints;
+                let raw_history = store.raw_input_history_reference(run_id, None)?;
+                let goal_reference = store.canonical_goal_reference(run_id)?;
+                let plan = store.get_plan(run_id).unwrap_or_default();
+                let todos = store.list_todos(run_id).unwrap_or_default();
+                let cells = store.list_background_cells(run_id).unwrap_or_default();
+
+                let has_plan_tasks = plan
+                    .as_ref()
+                    .map(|plan| !plan.tasks.is_empty())
+                    .unwrap_or(false);
+                let has_runtime_todos = todos.iter().any(|todo| !todo.task_id.trim().is_empty());
+                if !has_plan_tasks
+                    && !has_runtime_todos
+                    && recent_constraints.is_empty()
+                    && raw_history.source_records == 0
+                    && goal_reference.is_none()
+                    && cells.is_empty()
+                    && continuation.as_ref().is_none_or(|state| !state.enabled)
+                {
+                    return Ok(None);
+                }
+
+                let mut out = String::new();
+                out.push_str(RUNTIME_RECOVERY_MARKER);
+                out.push('\n');
+                out.push_str(
+                    "Purpose: recover active TaskRuntime state after context compression. \
+                     Continue unfinished work from this capsule; do not treat it as a new user request. \
+                     The file-backed TaskRuntimeStore remains authoritative.\n",
+                );
+                out.push_str(&format!(
+                    "Run: id={}, status={}, route={}, domain={}\nGoal: {}\n",
+                    run.run_id,
+                    run.status.as_str(),
+                    run.route,
+                    run.domain_profile.as_str(),
+                    truncate_chars(&run.goal, MAX_GOAL_CHARS),
+                ));
+                if run.goal.chars().count() > MAX_GOAL_CHARS
+                    && let Some(artifact) = store.objective_artifact_path(run_id)
+                {
+                    out.push_str(&format!(
+                        "Full objective artifact: {}\n",
+                        artifact.display()
+                    ));
+                }
+                if let Some(continuation) = continuation {
+                    out.push_str(&format!(
+                        "Continuation: active_turn={}, last_turn={}, turns_next={}, tokens_used={}, token_budget={}, tokens_remaining={}, time_used_seconds={}, time_budget_seconds={}, time_remaining_seconds={}, compactions={}, deferred={}, pause={}\n",
+                        continuation
+                            .active_turn
+                            .as_ref()
+                            .map(|turn| format!("{}#{}", turn.turn_id, turn.ordinal))
+                            .unwrap_or_else(|| "none".to_string()),
+                        continuation
+                            .last_turn
+                            .as_ref()
+                            .map(|turn| format!("{}:{}", turn.turn_id, turn.status.as_str()))
+                            .unwrap_or_else(|| "none".to_string()),
+                        continuation.next_turn_ordinal,
+                        continuation.tokens_used,
+                        continuation
+                            .token_budget
+                            .map(|budget| budget.to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        continuation
+                            .token_budget
+                            .map(|budget| budget.saturating_sub(continuation.tokens_used).to_string())
+                            .unwrap_or_else(|| "unbounded".to_string()),
+                        continuation.time_used_seconds,
+                        continuation
+                            .time_budget_seconds
+                            .map(|budget| budget.to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        continuation
+                            .time_budget_seconds
+                            .map(|budget| {
+                                budget
+                                    .saturating_sub(continuation.time_used_seconds)
+                                    .to_string()
+                            })
+                            .unwrap_or_else(|| "unbounded".to_string()),
+                        continuation.compaction_count,
+                        continuation.deferred,
+                        continuation
+                            .pause
+                            .as_ref()
+                            .map(|pause| pause.reason.as_str())
+                            .unwrap_or("none"),
+                    ));
+                }
+
+                if let Some(plan) = &plan {
+                    out.push_str(&format!(
+                        "Plan: id={}, execution_mode={}, tasks={}\n",
+                        plan.plan_id,
+                        plan.execution_mode.as_str(),
+                        plan.tasks.len()
+                    ));
+                    push_short_list(&mut out, "Assumptions", &plan.assumptions, 3, 120);
+                    push_short_list(&mut out, "Risks", &plan.risks, 3, 120);
+                }
+
+                // ADR 0037: incremental user constraints recorded via run steers are as
+                // binding as the Goal — surface them in the compression-safe capsule so
+                // narrowed context cannot silently drop them.
+                if !recent_constraints.is_empty() {
+                    out.push_str("Recent user constraints:\n");
+                    // journal 保留全文；受保护 capsule 只放有界预览和可恢复原文引用。
+                    // 最近四条仍仅是本切片展示，不代表全部有效要求已得到覆盖。
+                    for steer in recent_constraints
+                        .iter()
+                        .rev()
+                        .take(4)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                    {
+                        let turn_preview = truncate_chars(&steer.turn_id, MAX_TASK_TITLE_CHARS);
+                        if steer.text.chars().count() <= crate::prepared_turn::PREVIEW_CHARS {
+                            out.push_str(&format!("- (turn {turn_preview}) {}\n", steer.text));
+                            continue;
+                        }
+                        let artifact = store.recorded_user_steer_artifact(run_id, steer)?;
+                        out.push_str(&format!(
+                            "- (turn {turn_preview}) {}\n",
+                            crate::prepared_turn::build_original_message_reference(
+                                &steer.text,
+                                &artifact
+                            ),
+                        ));
+                    }
+                    out.push('\n');
+                }
+
+                out.push_str(&format_raw_history_reference(&raw_history)?);
+                if let Some(reference) = goal_reference {
+                    out.push_str(&format_goal_reference(&reference)?);
+                }
+
+                push_task_group(
+                    &mut out,
+                    "Running tasks",
+                    &todos,
+                    plan.as_ref().map(|p| p.tasks.as_slice()).unwrap_or(&[]),
+                    store,
+                    run_id,
+                    &[TodoStatus::Running],
+                    4,
+                );
+                push_task_group(
+                    &mut out,
+                    "Blocked/failed tasks",
+                    &todos,
+                    plan.as_ref().map(|p| p.tasks.as_slice()).unwrap_or(&[]),
+                    store,
+                    run_id,
+                    &[
+                        TodoStatus::Blocked,
+                        TodoStatus::Failed,
+                        TodoStatus::Cancelled,
+                        TodoStatus::TimedOut,
+                    ],
+                    4,
+                );
+                push_task_group(
+                    &mut out,
+                    "Pending next tasks",
+                    &todos,
+                    plan.as_ref().map(|p| p.tasks.as_slice()).unwrap_or(&[]),
+                    store,
+                    run_id,
+                    &[TodoStatus::Pending],
+                    6,
+                );
+                push_task_group(
+                    &mut out,
+                    "Recently completed tasks",
+                    &todos,
+                    plan.as_ref().map(|p| p.tasks.as_slice()).unwrap_or(&[]),
+                    store,
+                    run_id,
+                    &[TodoStatus::Completed],
+                    5,
+                );
+                push_background_cells(&mut out, &cells);
+
+                Ok(Some(out))
+            }
+        }
     }
 }

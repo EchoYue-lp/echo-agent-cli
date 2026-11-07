@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::{Duration, Instant};
 
-use echo_agent::compression::{ContextProjection, PreModelContextProjector, ProjectionContext};
+use echo_agent::compression::{
+    ContextProjection, PreModelContextProjector, ProjectionContext, projection_content_version,
+};
 use echo_agent::error::Result as AgentResult;
 use echo_agent::llm::types::Message;
 use futures::future::BoxFuture;
@@ -331,22 +333,46 @@ impl PreModelContextProjector for EkoContextProjector {
                 // boundary; no fallible file read occurs in this projector.
                 projections.extend(prepared.projections());
             }
-            let contract = context
+            // 回合契约、进度提醒与后台观察都是"本回合的运行事实"，不是固定指令。
+            // 它们按内容版本追加在已见历史之后：同一回合内内容不变就不重复物化，
+            // 换回合/换内容时只追加新版本，绝不改写早部历史。
+            let turn_id = context.turn_id.as_deref().unwrap_or_default();
+            if let Some(contract) = context
                 .turn_id
                 .as_deref()
-                .and_then(|turn_id| self.turns.contract(turn_id));
-            projections.push(ContextProjection {
-                marker: TURN_CONTRACT_MARKER.to_string(),
-                message: contract.map(render_turn_contract).map(Message::user),
-            });
+                .and_then(|turn_id| self.turns.contract(turn_id))
+            {
+                let text = render_turn_contract(contract);
+                projections.push(ContextProjection::versioned(
+                    TURN_CONTRACT_MARKER,
+                    projection_content_version(&[turn_id, text.as_str()]),
+                    Some(Message::user(text)),
+                ));
+            } else {
+                projections.push(ContextProjection::versioned(
+                    TURN_CONTRACT_MARKER,
+                    projection_content_version(&[turn_id, "cleared"]),
+                    None,
+                ));
+            }
             let remind = context
                 .turn_id
                 .as_deref()
                 .is_some_and(|turn_id| self.turns.progress_reminder(turn_id, context.iteration));
-            projections.push(ContextProjection {
-                marker: PROGRESS_REMINDER_MARKER.to_string(),
-                message: remind.then(|| Message::user("No user-visible natural-language progress report has been published for at least 60 seconds. At this existing model safe point, briefly report the current finding, changed plan, blocker, or verification result before continuing. If there is no new finding, say what you are still waiting for; do not invent progress or a completion.".to_string())),
-            });
+            if remind {
+                let text = "No user-visible natural-language progress report has been published for at least 60 seconds. At this existing model safe point, briefly report the current finding, changed plan, blocker, or verification result before continuing. If there is no new finding, say what you are still waiting for; do not invent progress or a completion.";
+                projections.push(ContextProjection::versioned(
+                    PROGRESS_REMINDER_MARKER,
+                    projection_content_version(&[turn_id, context.iteration.to_string().as_str()]),
+                    Some(Message::user(text.to_string())),
+                ));
+            } else {
+                projections.push(ContextProjection::versioned(
+                    PROGRESS_REMINDER_MARKER,
+                    projection_content_version(&[turn_id, "cleared"]),
+                    None,
+                ));
+            }
             projections.push(self.hot_memory.projection());
             let pending_command_cell_watch = match (
                 self.command_cell_watch.as_ref(),
@@ -373,10 +399,19 @@ impl PreModelContextProjector for EkoContextProjector {
                 },
                 _ => None,
             };
-            projections.push(ContextProjection {
-                marker: "[eko_pending_command_cell_watches]".to_string(),
-                message: pending_command_cell_watch.map(Message::user),
-            });
+            if let Some(watch) = pending_command_cell_watch {
+                projections.push(ContextProjection::versioned(
+                    "[eko_pending_command_cell_watches]",
+                    projection_content_version(&[turn_id, watch.as_str()]),
+                    Some(Message::user(watch)),
+                ));
+            } else {
+                projections.push(ContextProjection::versioned(
+                    "[eko_pending_command_cell_watches]",
+                    projection_content_version(&[turn_id, "cleared"]),
+                    None,
+                ));
+            }
             Ok(projections)
         })
     }

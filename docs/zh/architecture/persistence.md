@@ -109,9 +109,11 @@ Journal append 是 surface 交付边界。surface 接收 journaled event，而�
 ## ReAct Checkpoint 与 ConversationStore
 
 压缩预算与活动窗口由框架拥有；EKO 不复制 selector。TaskRuntime goal/recovery capsule
-是可替换的 protected projection，最近四条已记录 steer 按时间顺序保留完整有界 excerpt，
+按语义版本追加，只有最新动态版本 protected，旧版可由原压缩安全点回收；固定 Goal
+指令与动态预算分开。最近四条已记录 steer 按时间顺序保留完整有界 excerpt，
 压缩和刷新不依赖模型重新猜测约束。手动变换成功后的 ChatEventLog safe point 由 app-core
 owner 结算，取消或 caller drop 不丢弃已接受提交。见 [ADR 0048](../adr/0048-context-compression-product-policy.md)。
+动态来源和清除策略见 [ADR 0065](../adr/0065-cache-prefix-facts.md)。
 
 Workspace runtime 同时配置：
 
