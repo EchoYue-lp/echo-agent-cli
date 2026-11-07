@@ -191,10 +191,9 @@ pub async fn update_full_config(
                         .configured_models
                         .iter_mut()
                         .find(|model| model.id == active_model_id)
+                    && let Some(max_tokens) = m.max_tokens
                 {
-                    if let Some(max_tokens) = m.max_tokens {
-                        active_model.max_tokens = Some(max_tokens);
-                    }
+                    active_model.max_tokens = Some(max_tokens);
                 }
             }
 
