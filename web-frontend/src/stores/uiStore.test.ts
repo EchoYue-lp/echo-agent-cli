@@ -27,3 +27,17 @@ describe('settings navigation', () => {
     expect(useUiStore.getState().activeSettingsTab).toBe('providers');
   });
 });
+
+describe('workspace reconnect presentation intent', () => {
+  it('carries only target id and generation and clears it on cancellation or a new create intent', () => {
+    const target = { workspaceId: 'ubuntu-project', workspaceGeneration: 'original-generation' };
+    useUiStore.getState().openWorkspaceDialog('ssh', target);
+    expect(useUiStore.getState().workspaceDialogOpen).toBe(true);
+    expect(useUiStore.getState().workspaceDialogReconnect).toEqual(target);
+    useUiStore.getState().closeWorkspaceDialog();
+    expect(useUiStore.getState().workspaceDialogReconnect).toBeNull();
+    useUiStore.getState().openWorkspaceDialog('ssh', target);
+    useUiStore.getState().openWorkspaceDialog('new_local');
+    expect(useUiStore.getState().workspaceDialogReconnect).toBeNull();
+  });
+});

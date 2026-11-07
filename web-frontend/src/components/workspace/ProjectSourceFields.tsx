@@ -32,15 +32,32 @@ export const emptyProjectSource = (): ProjectSourceDraft => ({
   remotePath: '',
 });
 
-export function localProjectSource(draft: ProjectSourceDraft): ProjectSource {
-  if (!draft.localPath.trim()) throw new Error('请选择本地文件夹');
-  if (draft.kind === 'existing_local')
+export function localProjectSource(
+  draft: ProjectSourceDraft,
+  workspaceName = ''
+): ProjectSource | undefined {
+  if (draft.kind === 'existing_local') {
+    if (!draft.localPath.trim()) throw new Error('请选择本地文件夹');
     return { kind: 'existing_local', path: draft.localPath.trim() };
-  if (draft.kind !== 'new_local') throw new Error('请先连接并验证远程目录');
-  const name = draft.directoryName.trim();
-  if (!name || name === '.' || name === '..' || name.includes('/') || name.includes('\\')) {
-    throw new Error('请输入一个新的文件夹名称，不要包含路径分隔符');
   }
+  if (draft.kind !== 'new_local') throw new Error('请先连接并验证远程目录');
+  // 默认显示名称由现后端 WorkspaceId 处理，不拿显式目录名规则抢先拒绝。
+  if (!draft.localPath.trim() && draft.directoryName === '') {
+    if (!workspaceName.trim() || workspaceName.trim() === '.' || workspaceName.trim() === '..')
+      throw new Error('请输入有效的工作空间名称');
+    return undefined;
+  }
+  const name = draft.directoryName === '' ? workspaceName.trim() : draft.directoryName;
+  if (
+    !name.trim() ||
+    name === '.' ||
+    name === '..' ||
+    name.includes('/') ||
+    name.includes('\\') ||
+    name.includes('\0')
+  )
+    throw new Error('请输入一个新的文件夹名称，不要包含路径分隔符');
+  // 显式目录名保留原值交原 NewLocal，默认父目录仍由 registry 解析。
   return { kind: 'new_local', parent: draft.localPath.trim(), directory_name: name };
 }
 
@@ -56,6 +73,8 @@ interface Props {
   fixedLocation?: boolean;
   draftConnectionId?: string;
   retainConnection?: boolean;
+  workspaceName?: string;
+  defaultProjectRoot?: string;
 }
 
 export function ProjectSourceFields({
@@ -67,6 +86,8 @@ export function ProjectSourceFields({
   fixedLocation = false,
   draftConnectionId,
   retainConnection = false,
+  workspaceName = '',
+  defaultProjectRoot = '',
 }: Props) {
   const [connectionId, setConnectionId] = useState<string>();
   const [issue, setIssue] = useState('');
@@ -134,14 +155,16 @@ export function ProjectSourceFields({
         {draft.kind !== 'ssh' ? (
           <>
             <label className="block space-y-1 text-xs text-[var(--text-secondary)]">
-              <span>{draft.kind === 'new_local' ? '父文件夹' : '项目文件夹'}</span>
+              <span>{draft.kind === 'new_local' ? '父文件夹（可选）' : '项目文件夹'}</span>
               <span className="flex gap-2">
                 <input
                   aria-label={draft.kind === 'new_local' ? '父文件夹' : '项目文件夹'}
                   value={draft.localPath}
                   onChange={(event) => update({ localPath: event.target.value })}
                   className={inputClass}
-                  placeholder="选择或输入绝对路径"
+                  placeholder={
+                    draft.kind === 'new_local' ? '留空使用默认位置' : '选择或输入绝对路径'
+                  }
                 />
                 <button
                   type="button"
@@ -158,10 +181,18 @@ export function ProjectSourceFields({
                 <span>新文件夹名称</span>
                 <input
                   value={draft.directoryName}
+                  placeholder={workspaceName || '默认使用工作空间名称'}
                   onChange={(event) => update({ directoryName: event.target.value })}
                   className={inputClass}
                 />
               </label>
+            )}
+            {draft.kind === 'new_local' && !draft.localPath.trim() && (
+              <p className="break-all text-xs text-[var(--text-secondary)]">
+                {draft.directoryName !== ''
+                  ? `默认位置；新文件夹原样命名为「${draft.directoryName}」，创建后显示实际位置。`
+                  : `默认项目位置：${defaultProjectRoot || '由系统默认位置创建，无需选择父文件夹。'}`}
+              </p>
             )}
           </>
         ) : (

@@ -161,6 +161,132 @@ beforeEach(() => {
 });
 
 describe('task and workspace navigation', () => {
+  it('offers reconnect for a remote recent-task transition without loading the old chat', async () => {
+    const remote = {
+      ...workspace('b'),
+      metadata: {
+        tags: [],
+        project_location: {
+          kind: 'ssh' as const,
+          host: '111.229.245.175',
+          user: 'ubuntu',
+          port: 22,
+          path: '/home/ubuntu/ssh-test',
+        },
+      },
+    };
+    mocks.workspace.workspaces = [workspace('a'), remote];
+    mocks.switchTo.mockRejectedValueOnce(new Error('project SSH connection has not been prepared'));
+    const view = render(<LeftSidebar onNewTask={vi.fn()} />);
+    fireEvent.click(await view.findByRole('button', { name: '打开任务 remote-task，b' }));
+    await waitFor(() =>
+      expect(mocks.ui.openWorkspaceDialog).toHaveBeenCalledWith('ssh', {
+        workspaceId: 'b',
+        workspaceGeneration: 'b-v1',
+      })
+    );
+    expect(mocks.switchTo).toHaveBeenCalledExactlyOnceWith('b', undefined, 'b-v1');
+    expect(mocks.load).not.toHaveBeenCalled();
+    expect(mocks.openChat).not.toHaveBeenCalled();
+  });
+  it('fences a recent remote task to its captured generation when the id is replaced during switch', async () => {
+    const remote = {
+      ...workspace('b'),
+      metadata: {
+        tags: [],
+        project_location: {
+          kind: 'ssh' as const,
+          host: '111.229.245.175',
+          user: 'ubuntu',
+          port: 22,
+          path: '/home/ubuntu/ssh-test',
+        },
+      },
+    };
+    mocks.workspace.workspaces = [workspace('a'), remote];
+    mocks.switchTo.mockImplementationOnce(async (_id, _connection, generation) => {
+      expect(generation).toBe('b-v1');
+      mocks.workspace.workspaces = [
+        workspace('a'),
+        { ...remote, product_data_generation: 'replacement' },
+      ];
+      throw new Error('stale workspace generation');
+    });
+    const view = render(<LeftSidebar onNewTask={vi.fn()} />);
+    fireEvent.click(await view.findByRole('button', { name: '打开任务 remote-task，b' }));
+    await waitFor(() =>
+      expect(mocks.toast).toHaveBeenCalledWith('error', 'stale workspace generation')
+    );
+    expect(mocks.switchTo).toHaveBeenCalledExactlyOnceWith('b', undefined, 'b-v1');
+    expect(mocks.ui.openWorkspaceDialog).not.toHaveBeenCalled();
+    expect(mocks.workspace.current?.id).toBe('a');
+    expect(mocks.load).not.toHaveBeenCalled();
+    expect(mocks.openChat).not.toHaveBeenCalled();
+  });
+  it('does not open a reconnect intent after a newer navigation or replacement generation', async () => {
+    const remote = {
+      ...workspace('remote'),
+      metadata: {
+        tags: [],
+        project_location: {
+          kind: 'ssh' as const,
+          host: 'host',
+          user: 'ubuntu',
+          port: 22,
+          path: '/project',
+        },
+      },
+    };
+    mocks.workspace.workspaces.push(remote);
+    let reject: (e: Error) => void = () => {};
+    mocks.switchTo.mockImplementationOnce(
+      () =>
+        new Promise((_, fail) => {
+          reject = fail;
+        })
+    );
+    const view = render(<LeftSidebar onNewTask={vi.fn()} />);
+    fireEvent.click(view.getByRole('button', { name: '打开工作空间 remote' }));
+    mocks.ui.beginNavigation();
+    mocks.workspace.workspaces = mocks.workspace.workspaces.map((x) =>
+      x.id === 'remote' ? { ...x, product_data_generation: 'replacement' } : x
+    );
+    await act(async () => reject(new Error('project SSH connection has not been prepared')));
+    expect(mocks.ui.openWorkspaceDialog).not.toHaveBeenCalled();
+    expect(mocks.openChat).not.toHaveBeenCalled();
+  });
+
+  it('routes a saved SSH workspace switch failure to its original reconnect dialog', async () => {
+    const remote = {
+      ...workspace('remote'),
+      metadata: {
+        tags: [],
+        project_location: {
+          kind: 'ssh' as const,
+          host: '111.229.245.175',
+          user: 'ubuntu',
+          port: 22,
+          path: '/home/ubuntu/ssh-test',
+        },
+      },
+    };
+    mocks.workspace.workspaces.push(remote);
+    mocks.switchTo.mockRejectedValueOnce(
+      new Error('Failed to switch workspace: project SSH connection has not been prepared')
+    );
+    const view = render(<LeftSidebar onNewTask={vi.fn()} />);
+    fireEvent.click(view.getByRole('button', { name: '打开工作空间 remote' }));
+    await waitFor(() =>
+      expect(mocks.ui.openWorkspaceDialog).toHaveBeenCalledWith('ssh', {
+        workspaceId: 'remote',
+        workspaceGeneration: 'remote-v1',
+      })
+    );
+    expect(mocks.openChat).not.toHaveBeenCalled();
+    expect(mocks.workspace.current?.id).toBe('a');
+    expect(mocks.toast).toHaveBeenCalledWith('error', expect.stringContaining('重新连接'));
+  });
+
   const run = (id: string, conversationId: string): TaskRun => {
     const original: TaskRun = {
       run_id: id,
@@ -541,18 +667,20 @@ describe('task and workspace navigation', () => {
   it('waits for the original workspace transition before loading the task', async () => {
     const transition = deferred<void>();
     mocks.switchTo.mockImplementation((id: string) => {
-      mocks.conversation.newConversationEpoch += 1;
       return transition.promise.then(() => {
+        // 与真实fenced switch相同，只有原生接受后才分离来源投影。
+        mocks.conversation.newConversationEpoch += 1;
         mocks.workspace.current = mocks.workspace.workspaces.find((item) => item.id === id) ?? null;
         mocks.conversation.workspaceId = id;
       });
     });
     const view = render(<LeftSidebar onNewTask={vi.fn()} />);
     fireEvent.click(await view.findByRole('button', { name: '打开任务 remote-task，b' }));
-    expect(mocks.switchTo).toHaveBeenCalledWith('b');
+    expect(mocks.switchTo).toHaveBeenCalledWith('b', undefined, 'b-v1');
     expect(mocks.load).not.toHaveBeenCalled();
     await act(async () => transition.resolve());
     expect(mocks.load).toHaveBeenCalledExactlyOnceWith('remote-task');
+    expect(mocks.openChat).toHaveBeenCalledOnce();
   });
   it('does not load the old task after a newer new-task intent', async () => {
     const transition = deferred<void>();

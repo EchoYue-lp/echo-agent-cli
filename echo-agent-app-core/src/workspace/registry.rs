@@ -175,6 +175,12 @@ impl WorkspaceRegistry {
                 parent,
                 directory_name,
             } => {
+                // EKO 的默认位置仍只由本 registry 拥有；显式目录名不经 WorkspaceId 清洗。
+                let parent = if parent.as_os_str().is_empty() {
+                    self.base_dir.clone()
+                } else {
+                    parent
+                };
                 let parent = parent.canonicalize()?;
                 if !parent.is_dir() {
                     anyhow::bail!("Project parent is not a directory");
@@ -887,6 +893,159 @@ mod tests {
         assert_eq!(reopened.execution_location(), effective);
         assert!(reopened.local_project_root().is_none());
         assert_eq!(reopened.project_root, None);
+        Ok(())
+    }
+
+    #[test]
+    fn new_local_empty_parent_uses_registry_base_and_preserves_explicit_names() -> anyhow::Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let registry = WorkspaceRegistry::with_base_dir(temp.path().join("default-base"))?;
+        let long_name = "名🦀".repeat(34);
+        for (index, name) in ["Test", "空格 与 🦀", "CaseSensitive", long_name.as_str()]
+            .iter()
+            .enumerate()
+        {
+            let workspace = registry.create_local_project(
+                &format!("workspace-{index}"),
+                WorkspaceKind::General,
+                ProjectSource::NewLocal {
+                    parent: PathBuf::new(),
+                    directory_name: (*name).to_string(),
+                },
+            )?;
+            let project = registry.base_dir().join(name);
+            assert!(project.is_dir());
+            assert_eq!(
+                workspace.project_location(),
+                ProjectLocation::Local {
+                    path: project.clone()
+                }
+            );
+            assert_eq!(
+                registry.inspect(&workspace.id)?.project_location(),
+                workspace.project_location()
+            );
+            fs::write(project.join("preserve.txt"), "原有正文🙂")?;
+            assert!(
+                registry
+                    .create_local_project(
+                        &format!("collision-{index}"),
+                        WorkspaceKind::General,
+                        ProjectSource::NewLocal {
+                            parent: PathBuf::new(),
+                            directory_name: (*name).to_string()
+                        }
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                fs::read_to_string(project.join("preserve.txt"))?,
+                "原有正文🙂"
+            );
+        }
+        // 大小写是否碰撞由真实测试文件系统决定；无论平台都不得覆盖原内容。
+        let case = registry.base_dir().join("casesensitive");
+        let result = registry.create_local_project(
+            "case-probe",
+            WorkspaceKind::General,
+            ProjectSource::NewLocal {
+                parent: PathBuf::new(),
+                directory_name: "casesensitive".to_string(),
+            },
+        );
+        if registry
+            .base_dir()
+            .join("CaseSensitive")
+            .canonicalize()
+            .ok()
+            == case.canonicalize().ok()
+        {
+            assert!(result.is_err());
+        } else {
+            assert!(result.is_ok());
+        }
+        assert_eq!(
+            fs::read_to_string(
+                registry
+                    .base_dir()
+                    .join("CaseSensitive")
+                    .join("preserve.txt")
+            )?,
+            "原有正文🙂"
+        );
+        let duplicate = registry.create_local_project(
+            "workspace-0",
+            WorkspaceKind::General,
+            ProjectSource::NewLocal {
+                parent: PathBuf::new(),
+                directory_name: "must-not-be-created".to_string(),
+            },
+        );
+        assert!(duplicate.is_err());
+        assert!(!registry.base_dir().join("must-not-be-created").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn default_constructor_and_explicit_parent_keep_distinct_locations_without_overwrite()
+    -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let registry = WorkspaceRegistry::with_base_dir(temp.path().join("registry"))?;
+        let workspace = registry.create("默认 名字🦀", WorkspaceKind::General)?;
+        assert_eq!(workspace.root, registry.default_root("默认 名字🦀"));
+        assert_eq!(
+            workspace.project_location(),
+            ProjectLocation::Local {
+                path: workspace.root.clone()
+            }
+        );
+        let original = fs::read(WorkspaceLayout::manifest(&workspace.root))?;
+        assert!(
+            registry
+                .create("默认 名字🦀", WorkspaceKind::General)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(WorkspaceLayout::manifest(&workspace.root))?,
+            original
+        );
+        let parent = temp.path().join("custom-parent");
+        fs::create_dir(&parent)?;
+        let explicit = registry.create_local_project(
+            "different-display-name",
+            WorkspaceKind::General,
+            ProjectSource::NewLocal {
+                parent: parent.clone(),
+                directory_name: "Explicit 🦀".to_string(),
+            },
+        )?;
+        assert_eq!(
+            explicit.project_location(),
+            ProjectLocation::Local {
+                path: parent.join("Explicit 🦀")
+            }
+        );
+        let occupied = registry.default_root("rollback-empty-parent");
+        fs::create_dir_all(&occupied)?;
+        fs::write(occupied.join(".workspace.json"), "keep-original")?;
+        assert!(
+            registry
+                .create_local_project(
+                    "rollback-empty-parent",
+                    WorkspaceKind::General,
+                    ProjectSource::NewLocal {
+                        parent: PathBuf::new(),
+                        directory_name: "owned-new-directory".to_string()
+                    }
+                )
+                .is_err()
+        );
+        assert!(!registry.base_dir().join("owned-new-directory").exists());
+        assert_eq!(
+            fs::read_to_string(occupied.join(".workspace.json"))?,
+            "keep-original"
+        );
         Ok(())
     }
 

@@ -12,6 +12,7 @@ import {
   localProjectSource,
   type ProjectSourceDraft,
 } from './ProjectSourceFields';
+import { useUiStore } from '../../stores/uiStore';
 import { workspaceLocationLabel } from '../../lib/workspacePresentation';
 
 interface Props {
@@ -39,6 +40,7 @@ function observeDirectory(original: Promise<{ path: string }>): Promise<{ path: 
 }
 
 export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props) {
+  const reconnectRequest = useUiStore((state) => state.workspaceDialogReconnect);
   const workspaces = useWorkspaceStore((s) => s.workspaces);
   const current = useWorkspaceStore((s) => s.current);
   const init = useWorkspaceStore((s) => s.init);
@@ -57,6 +59,8 @@ export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props)
   const [creationStage, setCreationStage] = useState('处理中…');
   const [error, setError] = useState('');
   const [showPicker, setShowPicker] = useState(false);
+  const latestWorkspaces = useRef(workspaces);
+  latestWorkspaces.current = workspaces;
   const live = useRef(false);
   const opened = useRef(isOpen);
   opened.current = isOpen;
@@ -78,7 +82,7 @@ export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props)
   useEffect(() => {
     operation.current = null;
     setCreating(false);
-  }, [isOpen, initialSource]);
+  }, [isOpen, initialSource, reconnectRequest]);
   const ownsOperation = (token: symbol) =>
     live.current && opened.current && operation.current === token;
   const verifyRemote = async (intent: Extract<ProjectSource, { kind: 'ssh' }>) => {
@@ -129,17 +133,42 @@ export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props)
       setReconnecting(undefined);
       setDefaultRoot('');
       setError('');
+      if (reconnectRequest) {
+        const target = latestWorkspaces.current.find(
+          (item) =>
+            item.id === reconnectRequest.workspaceId &&
+            item.product_data_generation === reconnectRequest.workspaceGeneration
+        );
+        const location = target?.metadata.project_location;
+        if (target && location?.kind === 'ssh') {
+          setView('reconnect');
+          setReconnecting(target);
+          setSource({
+            ...emptyProjectSource(),
+            kind: 'ssh',
+            host: location.host,
+            user: location.user ?? '',
+            port: location.port?.toString() ?? '',
+            remotePath: location.path,
+          });
+          setError('远程连接尚未准备，请在此重新连接；原工作空间和数据保留。');
+        } else {
+          setView('list');
+          setError('工作空间已变化，请重新选择后连接。');
+        }
+      }
     }
-  }, [isOpen, init, initialSource]);
+  }, [isOpen, init, initialSource, reconnectRequest]);
 
   // Fetch default root path when name changes
   useEffect(() => {
     const trimmed = newName.trim();
-    if (!trimmed) {
+    if (!isOpen || view !== 'create' || !trimmed) {
       setDefaultRoot('');
       return;
     }
     let cancelled = false;
+    setDefaultRoot('');
     workspaceApi
       .defaultRoot(trimmed)
       .then((res) => {
@@ -151,7 +180,7 @@ export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props)
     return () => {
       cancelled = true;
     };
-  }, [newName]);
+  }, [newName, isOpen, view, source.kind, source.localPath, source.directoryName]);
 
   const handleBrowse = useCallback(async () => {
     if (isTauri()) {
@@ -188,9 +217,9 @@ export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props)
     const token = Symbol('create-workspace');
     operation.current = token;
     try {
-      let intent = source.kind === 'ssh' ? remoteSource : localProjectSource(source);
-      if (!intent) throw new Error('请先测试 SSH 连接');
-      if (intent.kind === 'ssh') {
+      let intent = source.kind === 'ssh' ? remoteSource : localProjectSource(source, name);
+      if (source.kind === 'ssh' && !intent) throw new Error('请先测试 SSH 连接');
+      if (intent?.kind === 'ssh') {
         if (!intent.path.trim()) throw new Error('请输入远程项目文件夹，连接测试不要求目录');
         setCreationStage('正在验证远程目录…');
         const verified = await verifyRemote(intent);
@@ -213,16 +242,21 @@ export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props)
   };
 
   const handleSwitch = async (id: string) => {
+    const target = workspaces.find((workspace) => workspace.id === id);
+    if (!target || operation.current) return;
+    const token = Symbol('open-existing-workspace');
+    operation.current = token;
     try {
-      await switchTo(id);
-      onClose();
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : '切换失败';
-      setError(msg);
-      const workspace = workspaces.find((workspace) => workspace.id === id);
-      const location = workspace?.metadata.project_location;
-      if (workspace && location?.kind === 'ssh') {
-        setReconnecting(workspace);
+      await switchTo(id, undefined, target.product_data_generation);
+      if (ownsOperation(token)) onClose();
+    } catch (error) {
+      if (!ownsOperation(token)) return;
+      const location = target.metadata.project_location;
+      if (location.kind === 'ssh') {
+        setError(
+          `远程连接尚未准备，请重新连接；原工作空间和数据保留。${error instanceof Error ? error.message : String(error)}`
+        );
+        setReconnecting(target);
         setRemoteSource(undefined);
         setSource({
           ...emptyProjectSource(),
@@ -233,7 +267,11 @@ export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props)
           remotePath: location.path,
         });
         setView('reconnect');
+      } else {
+        setError(error instanceof Error ? error.message : '切换失败');
       }
+    } finally {
+      if (ownsOperation(token)) operation.current = null;
     }
   };
 
@@ -244,11 +282,21 @@ export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props)
     setCreating(true);
     setError('');
     try {
+      const initialTarget = latestWorkspaces.current.find((item) => item.id === reconnecting.id);
+      if (initialTarget?.product_data_generation !== reconnecting.product_data_generation)
+        throw new Error('工作空间已变化，请重新选择后连接。');
       setCreationStage('正在验证原远程目录…');
       await verifyRemote(remoteSource);
       if (!ownsOperation(token)) return;
+      const target = latestWorkspaces.current.find((item) => item.id === reconnecting.id);
+      if (target?.product_data_generation !== reconnecting.product_data_generation)
+        throw new Error('工作空间已变化，请重新选择后连接。');
       setCreationStage('正在连接工作空间…');
-      await switchTo(reconnecting.id, remoteSource.connection_id);
+      await switchTo(
+        reconnecting.id,
+        remoteSource.connection_id,
+        reconnecting.product_data_generation
+      );
       if (!ownsOperation(token)) return;
       onClose();
     } catch (error) {
@@ -546,6 +594,8 @@ export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props)
                 onBrowse={handleBrowse}
                 onRemoteSource={setRemoteSource}
                 busy={creating}
+                workspaceName={newName.trim()}
+                defaultProjectRoot={defaultRoot}
               />
               <details className="text-[11px] text-[var(--text-tertiary)]">
                 <summary className="cursor-pointer">本机数据保存位置</summary>

@@ -101,6 +101,16 @@ OpenSSH的退出状态可以直接来自payload。124可能是程序自然返回
 
 该边界参考[POSIX异步列表与输入重定向](https://pubs.opengroup.org/onlinepubs/9799919799/utilities/V3_chap02.html)、[OpenSSH退出状态](https://man.openbsd.org/ssh#EXIT_STATUS)，并对照本机moss-agent/dev `41856a8590e3`的`spawn_process_settled`：取消后仍收集原child，终止后等待communicate。复用的是所有权与回收模式，不部署其远端服务、操作库或设备协议。本地夹具与脚本测量不替代真实SSH、GUI及App验收。
 
+## 2026-11-03：默认本地创建与已有 SSH 的重连入口
+
+新建本地文件夹未选择父文件夹、且新目录名称字段留空时，GUI 直接复用原 `source=None/root=None` 创建路径：`WorkspaceRegistry::create` 决定默认目录与 `Local(workspace.root)`，此模式项目与本机数据共处默认 root。界面显示原 `get_default_root(name)` 返回的真实目标，名称尚未填入时不强制用户先选择父目录。项目位置与本机数据 root 分别记录，但默认或显式选择的路径都可能物理重合，不保证物理分离；不能把元数据 root 当成自定义项目父目录。
+
+目录名称留空仅以工作空间名称作为默认值；用户实际输入任何非空目录名称，即使与显示名称相同，仍按显式输入处理。显式父文件夹保留原输入；父文件夹留空时由原 Registry 的 `base_dir` 字段提供默认父目录，再沿原 `NewLocal` 单组件校验、`PathBuf::join`、独占 `create_dir`、同一 manifest/index 发布与失败后的自有空目录回滚。目录名不经 `WorkspaceId` 清洗或 64 字符截断，大小写、空格和 Unicode 保留；文件系统自身的大小写/冲突规则不被规避。已有目录模式继续要求有效路径。创建失败保留草稿和错误，不覆盖既有项目或自动重发。默认目标异步读回只更新展示，不写入手输字段；切名称、切模式或关闭后旧响应退役。
+
+持久化 SSH Workspace 只保存目标与位置，不证明新应用进程已经持有可用认证连接。侧栏已有工作空间及远端最近任务切换失败时，复用原工作空间弹窗的重连分支，携带 workspace ID 与 generation 作为界面导航意图，给出中文恢复提示并保留原错误。密码/私钥口令仍由用户在原掩码表单输入，不缓存、读取旧认证或借另一个 owner。目标认证与同一远程目录验证成功后，原 `switchTo(connection_id, expected_generation)` 才尝试进入；取消、迟到或 generation 被替换不得发起新的切换或重建工作空间。界面意图不成为连接、注册表或执行状态的新权威。
+
+本轮前端正式定向 5 个 suite 共 90 项通过，类型检查、ESLint 零警告及格式检查均自然 0。受控完整 app-core crate 使用同两条真实临时目录测试：原 Registry 空父目录行为实际 1 项失败／自然 101（os error 2），保留控制实际 1 项通过／自然 0；仅切换固定修复后，两项各选中 1 项并全部通过、无忽略。两阶段真实 Cargo NoRun 均自然 0、编译 W0/E0，实际 lib test 程序及完整指纹和依赖元数据已保留；同一 GREEN 来源执行定向 `cargo clippy -p echo-agent-app-core --lib --tests --no-default-features --offline --locked -- -D warnings` 自然 0、W0/E0。此受控本地 Registry／文件系统资格不代替实际 SSH/PTY、GUI、新 App 用户手验或发布，正式联合 66a502 来源的 fresh 风险 gate 仍为自然 1、资格缺失，不能借测试绿冒风险 gate 0。测试不访问原用户工作空间或真实服务器，也不操作当前运行包、窗口、认证或 SSH 全局配置。现有公开 API/SDK/examples 未新增；官网没有新增能力说明，后续只按最终合格来源同步。
+
 ## 2026-11-07：免安装 SSH 的通信代际恢复
 
 背景：旧SSH master断开、原命令255且结果未知时，原operation和Workspace guard必须保留。

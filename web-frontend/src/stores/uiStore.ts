@@ -34,10 +34,14 @@ interface UiState {
   terminalOpen: boolean;
   workspaceDialogOpen: boolean;
   workspaceDialogSource: WorkspaceSourceKind;
+  workspaceDialogReconnect: { workspaceId: string; workspaceGeneration: string } | null;
   /** Presentation intent only; canonical Workspace/Conversation stores own transitions. */
   navigationEpoch: number;
   beginNavigation: () => number;
-  openWorkspaceDialog: (source?: WorkspaceSourceKind) => void;
+  openWorkspaceDialog: (
+    source?: WorkspaceSourceKind,
+    reconnect?: { workspaceId: string; workspaceGeneration: string }
+  ) => void;
   closeWorkspaceDialog: () => void;
   toggleLeftSidebar: () => void;
   openSettings: () => void;
@@ -114,19 +118,21 @@ export const useUiStore = create<UiState>((set, get) => ({
   terminalOpen: false,
   workspaceDialogOpen: false,
   workspaceDialogSource: 'existing_local',
+  workspaceDialogReconnect: null,
   navigationEpoch: 0,
   beginNavigation: () => {
     const epoch = get().navigationEpoch + 1;
     set({ navigationEpoch: epoch });
     return epoch;
   },
-  openWorkspaceDialog: (source = 'existing_local') =>
+  openWorkspaceDialog: (source = 'existing_local', reconnect) =>
     set((state) => ({
       workspaceDialogOpen: true,
       workspaceDialogSource: source,
+      workspaceDialogReconnect: reconnect ?? null,
       navigationEpoch: state.navigationEpoch + 1,
     })),
-  closeWorkspaceDialog: () => set({ workspaceDialogOpen: false }),
+  closeWorkspaceDialog: () => set({ workspaceDialogOpen: false, workspaceDialogReconnect: null }),
 
   toggleLeftSidebar: () => set((s) => ({ leftSidebarOpen: !s.leftSidebarOpen })),
   openSettings: () => set({ settingsOpen: true, activeSettingsTab: 'providers' }),

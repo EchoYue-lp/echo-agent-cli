@@ -207,6 +207,35 @@ describe('project source admission', () => {
     expect(api.connectSsh.mock.calls.at(-1)?.at(0)).toBe('reply-fork-independent-draft');
   });
 
+  it('uses only new-local defaults and preserves explicit directory names without sanitizing', () => {
+    const draft = { ...emptyProjectSource(), kind: 'new_local' as const };
+    expect(localProjectSource(draft, 'Test')).toBeUndefined();
+    for (const parent of ['', '/explicit'])
+      expect(() =>
+        localProjectSource({ ...draft, localPath: parent, directoryName: '   ' }, 'Test')
+      ).toThrow('请输入一个新的文件夹名称');
+    expect(localProjectSource(draft, '研究/2026')).toBeUndefined();
+    for (const invalid of ['', '.', '..'])
+      expect(() => localProjectSource(draft, invalid)).toThrow('请输入有效的工作空间名称');
+    for (const explicit of ['Test', '名字 与 🦀', ' long 🦀 '.repeat(12)]) {
+      expect(localProjectSource({ ...draft, directoryName: explicit }, explicit)).toEqual({
+        kind: 'new_local',
+        parent: '',
+        directory_name: explicit,
+      });
+    }
+    expect(localProjectSource({ ...draft, directoryName: '项目 🦀' }, 'Test')).toEqual({
+      kind: 'new_local',
+      parent: '',
+      directory_name: '项目 🦀',
+    });
+    expect(localProjectSource({ ...draft, localPath: '/explicit' }, '项目 🦀')).toEqual({
+      kind: 'new_local',
+      parent: '/explicit',
+      directory_name: '项目 🦀',
+    });
+    expect(() => localProjectSource(emptyProjectSource(), 'Test')).toThrow('请选择本地文件夹');
+  });
   it('keeps existing folder selection distinct from new folder creation', () => {
     const draft = {
       ...emptyProjectSource(),

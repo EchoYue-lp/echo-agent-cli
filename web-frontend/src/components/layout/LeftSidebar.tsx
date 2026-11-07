@@ -321,6 +321,28 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
     };
   }, [recentScopes, recentWorkspaceCount, recentRunPages, conversations]);
 
+  const reportWorkspaceSwitchFailure = (workspace: Workspace | undefined, error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    const latest = useWorkspaceStore
+      .getState()
+      .workspaces.find((item) => item.id === workspace?.id);
+    if (
+      workspace &&
+      workspaceIsRemote(workspace) &&
+      latest?.product_data_generation === workspace.product_data_generation
+    ) {
+      openWorkspaceDialog('ssh', {
+        workspaceId: workspace.id,
+        workspaceGeneration: workspace.product_data_generation,
+      });
+      useToastStore
+        .getState()
+        .addToast('error', `远程工作空间尚未连接，请在原认证表单重新连接；原数据保留。${message}`);
+    } else {
+      useToastStore.getState().addToast('error', message);
+    }
+  };
+
   const openRecentTask = async (task: RecentTask) => {
     const epoch = useUiStore.getState().beginNavigation();
     const before = useWorkspaceStore.getState();
@@ -339,10 +361,11 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
           ? null
           : task.workspaceId === GLOBAL_WORKSPACE_ID
             ? before.exit()
-            : before.switchTo(task.workspaceId);
-      // switchTo detaches synchronously; later new-task actions must supersede this intent.
-      const draftEpoch = useConversationStore.getState().newConversationEpoch;
+            : before.switchTo(task.workspaceId, undefined, task.workspaceGeneration);
       if (transition) await transition;
+      // Fenced switch 仅在原生接受后分离来源；先拒绝后继导航，再绑定新稿代次。
+      if (useUiStore.getState().navigationEpoch !== epoch) return;
+      const draftEpoch = useConversationStore.getState().newConversationEpoch;
       const actual = useWorkspaceStore.getState().current;
       if (
         useUiStore.getState().navigationEpoch !== epoch ||
@@ -398,9 +421,12 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       }
     } catch (error) {
       if (useUiStore.getState().navigationEpoch === epoch)
-        useToastStore
-          .getState()
-          .addToast('error', error instanceof Error ? error.message : '打开任务失败');
+        if ((useWorkspaceStore.getState().current?.id ?? GLOBAL_WORKSPACE_ID) !== task.workspaceId)
+          reportWorkspaceSwitchFailure(target, error);
+        else
+          useToastStore
+            .getState()
+            .addToast('error', error instanceof Error ? error.message : '打开任务失败');
     }
   };
 
@@ -483,7 +509,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
     }
     const epoch = useUiStore.getState().beginNavigation();
     try {
-      await switchTo(ws.id);
+      await switchTo(ws.id, undefined, ws.product_data_generation);
       const actual = useWorkspaceStore.getState().current;
       if (
         useUiStore.getState().navigationEpoch !== epoch ||
@@ -494,10 +520,8 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       setExpandedId(ws.id);
       useWorkspaceViewStore.getState().openChat();
     } catch (error) {
-      if (useUiStore.getState().navigationEpoch === epoch)
-        useToastStore
-          .getState()
-          .addToast('error', error instanceof Error ? error.message : '切换工作空间失败');
+      if (useUiStore.getState().navigationEpoch !== epoch) return;
+      reportWorkspaceSwitchFailure(ws, error);
     }
   };
 
@@ -523,9 +547,9 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
 
   const handleNewConversation = async (e: React.MouseEvent, ws: Workspace) => {
     e.stopPropagation();
+    const epoch = useUiStore.getState().beginNavigation();
     try {
-      const epoch = useUiStore.getState().beginNavigation();
-      if (current?.id !== ws.id) await switchTo(ws.id);
+      if (current?.id !== ws.id) await switchTo(ws.id, undefined, ws.product_data_generation);
       const actual = useWorkspaceStore.getState().current;
       if (
         useUiStore.getState().navigationEpoch !== epoch ||
@@ -539,7 +563,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       setExpandedId(ws.id);
       setShowAllConvs(false);
     } catch (err) {
-      console.error('Start new conversation failed:', err);
+      if (useUiStore.getState().navigationEpoch === epoch) reportWorkspaceSwitchFailure(ws, err);
     }
   };
 
