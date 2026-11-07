@@ -21,7 +21,6 @@ export function ConfigPanel() {
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
-  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const load = async () => {
@@ -55,7 +54,7 @@ export function ConfigPanel() {
 
     try {
       // Persist all changes to YAML config file. The backend transaction also
-      // syncs system_prompt and max_iterations to the running agents (primary
+      // syncs system_prompt to the running agents (primary
       // + pools), so no second update_config round-trip is needed here.
       const updatedFull = await configApi.updateFull(edit, controller.signal);
       const savedDepth = readMaxSubagentDepth(updatedFull);
@@ -173,30 +172,6 @@ export function ConfigPanel() {
           rows={8}
           className="min-h-[200px] resize-y font-mono leading-relaxed"
         />
-      </Section>
-
-      <Section title="高级/调试">
-        <button
-          type="button"
-          onClick={() => setAdvancedOpen((open) => !open)}
-          aria-expanded={advancedOpen}
-          className="min-h-9 rounded-lg px-3 py-2 text-left text-sm text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)]"
-        >
-          {advancedOpen ? '收起高级运行参数' : '展开高级运行参数'}
-        </button>
-        {advancedOpen && (
-          <div className="mt-3 space-y-3 rounded-lg bg-[var(--bg-secondary)] p-4">
-            <Field
-              label="单轮推理安全上限"
-              value={String(edit.agent?.max_iterations ?? agentConfig.max_iterations)}
-              onChange={(v) => markDirty({ agent: { ...edit.agent, max_iterations: Number(v) } })}
-              type="number"
-            />
-            <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
-              仅用于调试或防止异常循环。0 表示不限制，长程 CoWork 任务建议保持 0。
-            </p>
-          </div>
-        )}
       </Section>
 
       {/* MCP */}

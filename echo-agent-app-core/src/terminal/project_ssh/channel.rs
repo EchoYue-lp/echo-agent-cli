@@ -2,7 +2,7 @@
 //! and streaming readers. There is one connection owner and launch path.
 
 use super::sftp::{remote_failure, sftp_error, unavailable};
-use super::{ProjectSshConnection, RemoteOperationResources};
+use super::{ProjectSshConnection, RemoteOperationResources, SshChannelPurpose};
 use echo_agent::error::Result;
 use openssh_sftp_client::{Sftp, SftpAuxiliaryData, SftpOptions};
 use std::ops::Deref;
@@ -20,6 +20,7 @@ impl SftpChannel {
     pub(super) async fn open(
         connection: Arc<ProjectSshConnection>,
         registration: Arc<OnceLock<Arc<RemoteOperationResources>>>,
+        purpose: SshChannelPurpose,
     ) -> Result<Self> {
         let operation = connection.operation().map_err(unavailable)?;
         let target = connection.effective_target().map_err(unavailable)?.clone();
@@ -29,6 +30,16 @@ impl SftpChannel {
             .add_destination(&mut command)
             .map_err(unavailable)?;
         command.arg("sftp");
+        // 仅替换协议夹具的本机进程来源；真实SFTP初始化、管道和资源结算保持原路径。
+        #[cfg(test)]
+        if let Some(launcher) = connection
+            .test_subsystem_launcher
+            .lock()
+            .map_err(|e| unavailable(e.to_string()))?
+            .clone()
+        {
+            command = launcher()?;
+        }
         let child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -37,7 +48,7 @@ impl SftpChannel {
             .map_err(|error| {
                 unavailable(format!("cannot start system SSH SFTP channel: {error}"))
             })?;
-        Self::from_spawned(connection, registration, child, operation, target).await
+        Self::from_spawned(connection, registration, child, operation, target, purpose).await
     }
 
     pub(super) async fn from_spawned(
@@ -46,7 +57,9 @@ impl SftpChannel {
         mut child: tokio::process::Child,
         operation: super::ProjectSshOperation,
         target: crate::terminal::TerminalTarget,
+        purpose: SshChannelPurpose,
     ) -> Result<Self> {
+        connection.record_channel_spawn(purpose);
         let resources = registration
             .get_or_init(|| {
                 connection.retain_remote_operation(&child, target, operation, Vec::new())

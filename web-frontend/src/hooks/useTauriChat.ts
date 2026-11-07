@@ -389,7 +389,11 @@ export function useTauriChat() {
         });
         return;
       }
-      if (event.payload.source === 'execution') {
+      if (
+        event.payload.source === 'execution' ||
+        (event.payload.source === 'agent' &&
+          event.payload.event.payload.type === 'transcript_projection_settlement')
+      ) {
         if (!isCurrentStreamEvent(event)) return;
         handleChatEventEnvelope(event, {
           assistantIdRef,
@@ -571,7 +575,12 @@ export function useTauriChat() {
                 });
                 if (!aborted && setupIdentityGeneration === identityGenerationRef.current) {
                   for (const event of projectionReplay.events) {
-                    if (event.payload.source === 'execution') applyEvent(event);
+                    if (
+                      event.payload.source === 'execution' ||
+                      (event.payload.source === 'agent' &&
+                        event.payload.event.payload.type === 'transcript_projection_settlement')
+                    )
+                      applyEvent(event);
                   }
                 }
               }

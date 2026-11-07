@@ -5,3 +5,6 @@ pub mod detector;
 pub mod gitignore;
 pub mod prompt;
 pub mod test_runner;
+
+#[cfg(test)]
+pub(crate) mod startup_tests;

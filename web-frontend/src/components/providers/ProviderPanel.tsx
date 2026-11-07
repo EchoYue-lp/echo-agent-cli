@@ -51,7 +51,6 @@ interface ModelDraft {
   imageInput: boolean;
   audioInput: boolean;
   videoInput: boolean;
-  temperature: string;
   maxTokens: string;
   contextWindow: string;
 }
@@ -90,7 +89,6 @@ const emptyModel = (protocol: LlmApiProtocol = 'chat_completions'): ModelDraft =
   imageInput: false,
   audioInput: false,
   videoInput: false,
-  temperature: '',
   maxTokens: '',
   contextWindow: '',
 });
@@ -102,7 +100,6 @@ const modelDraft = (model: ConfiguredModel): ModelDraft => ({
   imageInput: model.input_modalities.includes('image'),
   audioInput: model.input_modalities.includes('audio'),
   videoInput: model.input_modalities.includes('video'),
-  temperature: model.temperature == null ? '' : String(model.temperature),
   maxTokens: model.max_tokens == null ? '' : String(model.max_tokens),
   contextWindow: model.context_window == null ? '' : String(model.context_window),
 });
@@ -270,7 +267,6 @@ export function ProviderPanel() {
         model: modelForm.model.trim(),
         api_protocol: modelForm.protocol,
         input_modalities: modalities(),
-        temperature: modelForm.temperature ? Number(modelForm.temperature) : undefined,
         max_tokens: modelForm.maxTokens ? Number(modelForm.maxTokens) : undefined,
         context_window: modelForm.contextWindow ? Number(modelForm.contextWindow) : undefined,
         set_default: false,
@@ -662,9 +658,8 @@ export function ProviderPanel() {
               高级参数
             </button>
             {advancedOpen && (
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 {[
-                  ['Temperature', 'temperature'],
                   ['Max tokens', 'maxTokens'],
                   ['Context window', 'contextWindow'],
                 ].map(([label, key]) => (
@@ -672,8 +667,8 @@ export function ProviderPanel() {
                     {label}
                     <input
                       type="number"
-                      step={key === 'temperature' ? '0.1' : '1'}
-                      value={modelForm[key as 'temperature' | 'maxTokens' | 'contextWindow']}
+                      step="1"
+                      value={modelForm[key as 'maxTokens' | 'contextWindow']}
                       onChange={(event) =>
                         setModelForm((value) => ({ ...value, [key]: event.target.value }))
                       }

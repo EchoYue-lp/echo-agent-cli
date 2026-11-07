@@ -56,7 +56,12 @@ impl SftpLanes {
                 let connection = connection.upgrade().ok_or_else(|| {
                     unavailable("project SSH connection was dropped before lane checkout")
                 })?;
-                SftpChannel::open(connection, registration).await
+                SftpChannel::open(
+                    connection,
+                    registration,
+                    super::SshChannelPurpose::OrdinarySftp,
+                )
+                .await
             })
         }))
     }
@@ -121,34 +126,65 @@ impl SftpLanes {
         }
     }
 
-    /// 关闭准入并结算所有空闲车道；在途操作会先自然归还 permit。
-    pub(super) async fn shutdown(&self) -> Result<()> {
+    pub(super) fn begin_shutdown(&self) {
         self.closing.store(true, Ordering::Release);
-        // 取得全部 permit 表示没有在途操作，此时空闲车道可以安全关闭。
-        let drained = Arc::clone(&self.permits)
-            .acquire_many_owned(LANE_CAPACITY as u32)
+    }
+
+    /// 关闭观察失败后由原连接 owner 显式恢复准入，不重放在途操作。
+    pub(super) fn reopen_after_failed_close(&self) {
+        self.closing.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) async fn shutdown(&self) -> Result<()> {
+        self.shutdown_before(tokio::time::Instant::now() + super::super::CLOSE_OBSERVATION_TIMEOUT)
             .await
-            .map_err(|_| unavailable("project SSH SFTP lanes are already closed"))?;
-        let mut lanes = std::mem::take(&mut *self.idle.lock().await);
+    }
+
+    /// 同一绝对期限覆盖排队和物理关闭观察。超时只结束观察，不丢弃
+    /// 正在执行的文件请求或关闭它们的原物理任务。
+    pub(super) async fn shutdown_before(&self, deadline: tokio::time::Instant) -> Result<()> {
+        self.begin_shutdown();
+        let drained = tokio::time::timeout_at(
+            deadline,
+            Arc::clone(&self.permits).acquire_many_owned(LANE_CAPACITY as u32),
+        )
+        .await
+        .map_err(|_| {
+            unavailable("SFTP lane drain observation timed out; original operations retained")
+        })?
+        .map_err(|_| unavailable("project SSH SFTP lanes are already closed"))?;
+        let lanes = std::mem::take(&mut *self.idle.lock().await);
         let (operations, opened, reused) = self.stats();
         tracing::info!(
             operations,
             opened,
             reused,
             closed_lanes = lanes.len(),
-            "project SSH SFTP lanes closed"
+            "project SSH SFTP lane close observation started"
         );
-        drop(drained);
-        let mut failure = None;
-        for channel in lanes.drain(..) {
-            if let Err(error) = channel.finish(false).await {
-                failure.get_or_insert(error);
+        let physical = tokio::spawn(async move {
+            // 全部 permit 随物理关闭保留；再次关闭不能越过仍未结算的
+            // 原任务而假报成功。丢弃 JoinHandle 只分离观察者，不取消任务。
+            let _drained = drained;
+            let mut failure = None;
+            for channel in lanes {
+                if let Err(error) = channel.finish(false).await {
+                    tracing::warn!(%error, "original SFTP lane failed to close");
+                    failure.get_or_insert(error);
+                }
             }
-        }
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+            match failure {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        });
+        tokio::time::timeout_at(deadline, physical)
+            .await
+            .map_err(|_| {
+                unavailable("SFTP close observation timed out; original close task retained")
+            })?
+            .map_err(|error| unavailable(format!("SFTP close task observation failed: {error}")))?
     }
 
     async fn acquire(&self) -> Result<OwnedSemaphorePermit> {
@@ -308,9 +344,14 @@ mod fixture_tests {
         connection: Arc<ProjectSshConnection>,
         _service: Arc<TerminalService>,
         directory: std::path::PathBuf,
+        _temporary: tempfile::TempDir,
     }
 
     async fn fixture(owner: &str) -> Result<Fixture> {
+        fixture_with_close_delay(owner, false).await
+    }
+
+    async fn fixture_with_close_delay(owner: &str, delayed_close: bool) -> Result<Fixture> {
         let service = TerminalService::new();
         let target = TerminalTarget::Ssh {
             host: "fixture.invalid".into(),
@@ -325,8 +366,6 @@ mod fixture_tests {
             .map_err(|_| unavailable("duplicate fixture target"))?;
         let temporary = tempfile::tempdir()?;
         let directory = temporary.path().to_path_buf();
-        // keep the directory alive for the whole fixture lifetime
-        let _kept = temporary.keep();
 
         let opened = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&opened);
@@ -341,12 +380,29 @@ mod fixture_tests {
                     .ok_or_else(|| unavailable("fixture connection was dropped"))?;
                 counter.fetch_add(1, Ordering::SeqCst);
                 let operation = connection.operation().map_err(unavailable)?;
-                let child = tokio::process::Command::new("/usr/libexec/sftp-server")
+                let mut command = if delayed_close {
+                    // 标准协议不变；服务端EOF后本地原child还需一秒才退出，
+                    // 用于观察关闭超时时是否仍由原物理任务持有。
+                    let mut command = tokio::process::Command::new("/bin/sh");
+                    command.args(["-c", "/usr/libexec/sftp-server; /bin/sleep 1"]);
+                    command
+                } else {
+                    tokio::process::Command::new("/usr/libexec/sftp-server")
+                };
+                let child = command
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
                     .spawn()?;
-                SftpChannel::from_spawned(connection, registration, child, operation, target).await
+                SftpChannel::from_spawned(
+                    connection,
+                    registration,
+                    child,
+                    operation,
+                    target,
+                    super::super::SshChannelPurpose::OrdinarySftp,
+                )
+                .await
             })
         });
         Ok(Fixture {
@@ -355,6 +411,7 @@ mod fixture_tests {
             connection,
             _service: service,
             directory,
+            _temporary: temporary,
         })
     }
 
@@ -393,7 +450,104 @@ mod fixture_tests {
             (3, 1, 2),
             "一次新开、两次复用，供长期结构化日志核对"
         );
+        assert_eq!(
+            fixture
+                .connection
+                .spawn_counts
+                .ordinary_sftp
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            fixture
+                .connection
+                .spawn_counts
+                .preparation_sftp
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            fixture
+                .connection
+                .spawn_counts
+                .streaming_sftp
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            fixture
+                .connection
+                .spawn_counts
+                .execution
+                .load(Ordering::Acquire),
+            0
+        );
         fixture.lanes.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn warm_pool_cannot_bypass_original_service_shutdown() -> Result<()> {
+        use echo_agent::tools::filesystem::FileSystem;
+
+        let fixture = fixture("lane-shutdown-admission").await?;
+        metadata_of(&fixture.lanes, fixture.directory.clone()).await?;
+        fixture
+            .connection
+            .sftp_lanes
+            .set(fixture.lanes.clone())
+            .map_err(|_| unavailable("duplicate fixture lane pool"))?;
+        let files = fixture
+            .connection
+            .file_system(fixture.directory.to_string_lossy().into_owned())
+            .map_err(unavailable)?;
+        // 仅切换原service的准入；暖池自身未关闭，才能证明每次复用也
+        // 经过连接门禁。复用失败不得新开网络连接或再次执行文件操作。
+        fixture
+            ._service
+            .shutting_down
+            .store(true, Ordering::Release);
+        let directory = fixture.directory.clone();
+        let attempted = tokio::task::spawn_blocking(move || files.metadata(&directory))
+            .await
+            .map_err(|error| unavailable(error.to_string()))?;
+        fixture
+            ._service
+            .shutting_down
+            .store(false, Ordering::Release);
+        fixture.lanes.shutdown().await?;
+        assert!(attempted.is_err());
+        assert_eq!(fixture.lanes.stats(), (1, 1, 0));
+        assert_eq!(
+            fixture.connection.active_operations.load(Ordering::Acquire),
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn close_timeout_keeps_physical_close_and_blocks_false_retry_success() -> Result<()> {
+        let fixture = fixture_with_close_delay("lane-close-physical", true).await?;
+        metadata_of(&fixture.lanes, fixture.directory.clone()).await?;
+        let first = fixture
+            .lanes
+            .shutdown_before(tokio::time::Instant::now() + std::time::Duration::from_millis(50))
+            .await;
+        let retained = fixture.connection.active_operations.load(Ordering::Acquire) > 0;
+        let second = fixture
+            .lanes
+            .shutdown_before(tokio::time::Instant::now() + std::time::Duration::from_millis(50))
+            .await;
+        // 原物理任务自然退出后，重试只观察它，不重发任何文件请求。
+        fixture.lanes.shutdown().await?;
+        assert!(first.is_err());
+        assert!(retained);
+        assert!(second.is_err());
+        assert_eq!(fixture.lanes.stats(), (1, 1, 0));
+        assert_eq!(
+            fixture.connection.active_operations.load(Ordering::Acquire),
+            0
+        );
         Ok(())
     }
 
@@ -440,6 +594,65 @@ mod fixture_tests {
                 .await
                 .is_err(),
             "关闭后的车道池不得再接受新操作"
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn shutdown_observation_is_bounded_and_keeps_inflight_operation() -> Result<()> {
+        let fixture = fixture("lane-close-inflight").await?;
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, blocked) = tokio::sync::oneshot::channel();
+        let lanes = fixture.lanes.clone();
+        let directory = fixture.directory.clone();
+        let active = tokio::spawn(async move {
+            lanes
+                .run(false, move |client| async move {
+                    let _ = entered.send(());
+                    blocked
+                        .await
+                        .map_err(|error| unavailable(error.to_string()))?;
+                    client
+                        .fs()
+                        .metadata(directory)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| client.error(error, false))
+                })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started)
+            .await
+            .map_err(|_| unavailable("original lane did not start"))?
+            .map_err(|error| unavailable(error.to_string()))?;
+        let observation = tokio::time::timeout(
+            crate::terminal::CLOSE_OBSERVATION_TIMEOUT + std::time::Duration::from_secs(2),
+            fixture.lanes.shutdown(),
+        )
+        .await;
+        let physically_owned = fixture.connection.active_operations.load(Ordering::Acquire) > 0;
+        // 先释放原操作并完成真实结算，再报告断言失败，不能把夹具留作孤儿进程。
+        let _ = release.send(());
+        active
+            .await
+            .map_err(|error| unavailable(error.to_string()))??;
+        fixture.lanes.shutdown().await?;
+        assert!(
+            observation.is_ok(),
+            "pool close must return its own bounded observation, not hang until the caller times out"
+        );
+        assert!(
+            observation
+                .map_err(|_| unavailable("outer observation timed out"))?
+                .is_err(),
+            "an in-flight operation is not a confirmed close"
+        );
+        assert!(
+            physically_owned,
+            "failed close observation must retain the original physical operation"
+        );
+        assert_eq!(
+            fixture.connection.active_operations.load(Ordering::Acquire),
+            0
         );
         Ok(())
     }

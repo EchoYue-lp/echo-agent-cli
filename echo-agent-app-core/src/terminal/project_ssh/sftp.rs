@@ -1,6 +1,7 @@
 //! Standard SFTP operations; no terminal-output file protocol or local fallback.
 
 use super::channel::{SftpChannel, SftpClient};
+use super::generations::{ConnectionSource, RequestSnapshot};
 use super::reader::ProjectSftpReader;
 use super::{ProjectSshConnection, remote_path, validate_remote_text};
 use echo_agent::error::{ReactError, Result, ToolError};
@@ -16,7 +17,7 @@ use std::sync::{Arc, OnceLock};
 use tokio::runtime::Handle;
 
 pub struct ProjectSshFileSystem {
-    connection: Arc<ProjectSshConnection>,
+    connection: ConnectionSource,
     directory: PathBuf,
     runtime: Handle,
     read_client: Option<Arc<SftpClient>>,
@@ -25,6 +26,13 @@ pub struct ProjectSshFileSystem {
 impl ProjectSshFileSystem {
     pub(super) fn new(
         connection: Arc<ProjectSshConnection>,
+        remote_directory: String,
+    ) -> std::result::Result<Self, String> {
+        Self::with_source(ConnectionSource::Physical(connection), remote_directory)
+    }
+
+    pub(super) fn with_source(
+        connection: ConnectionSource,
         remote_directory: String,
     ) -> std::result::Result<Self, String> {
         validate_remote_text(&remote_directory)?;
@@ -68,8 +76,12 @@ impl ProjectSshFileSystem {
         // FileSystem's existing contract requires a blocking caller. All tool
         // algorithms and model-before-context preparation are offloaded by the
         // original caller and retain their invocation resource guards.
-        self.runtime
-            .block_on(with_sftp(Arc::clone(&self.connection), mutating, operation))
+        let snapshot = self.connection.capture().map_err(unavailable)?;
+        let result =
+            self.runtime
+                .block_on(with_sftp(snapshot.connection.clone(), mutating, operation));
+        drop(snapshot);
+        result
     }
 }
 
@@ -127,9 +139,10 @@ impl FileSystem for ProjectSshFileSystem {
         // 同一物理连接内稳定，重连后必然变化。再拼远程根目录，隔离同一连接上
         // 不同项目根里的同名路径。远程根已由 new/verify_directory 校验为 UTF-8
         // 绝对路径，lossy 转换不会改变这里要表达的身份。
+        let snapshot = self.connection.capture().ok()?;
         Some(format!(
             "{}:{}",
-            self.connection.generation(),
+            snapshot.connection.generation(),
             self.directory.to_string_lossy()
         ))
     }
@@ -139,12 +152,14 @@ impl FileSystem for ProjectSshFileSystem {
             return Ok(None);
         }
         let registration = Arc::new(OnceLock::new());
+        let snapshot = self.connection.capture().map_err(unavailable)?;
         let channel = self.runtime.block_on(SftpChannel::open(
-            Arc::clone(&self.connection),
+            snapshot.connection.clone(),
             registration,
+            super::SshChannelPurpose::PreparationSftp,
         ))?;
         let files = Self {
-            connection: Arc::clone(&self.connection),
+            connection: ConnectionSource::Admitted(snapshot),
             directory: self.directory.clone(),
             runtime: self.runtime.clone(),
             read_client: Some(channel.client()),
@@ -162,12 +177,16 @@ impl FileSystem for ProjectSshFileSystem {
             ));
         }
         let path = self.path(path)?;
+        let snapshot = self.connection.capture().map_err(unavailable)?;
         let reader = self.runtime.block_on(ProjectSftpReader::open(
-            Arc::clone(&self.connection),
+            snapshot.connection.clone(),
             self.runtime.clone(),
             path,
         ))?;
-        Ok(Box::new(reader))
+        Ok(Box::new(SnapshotReader {
+            reader,
+            _snapshot: snapshot,
+        }))
     }
     fn current_dir(&self) -> Result<PathBuf> {
         Ok(self.directory.clone())
@@ -444,16 +463,25 @@ impl FileSystem for ProjectSshFileSystem {
             ));
         }
         let path = self.path(path)?;
+        let snapshot = self.connection.capture().map_err(unavailable)?;
+        let files = Self {
+            connection: ConnectionSource::Admitted(snapshot.clone()),
+            directory: self.directory.clone(),
+            runtime: self.runtime.clone(),
+            read_client: None,
+        };
         let execute = |command| {
-            let sandbox = self.connection.sandbox();
+            let sandbox = super::sandbox::ProjectSshSandbox::with_source(
+                ConnectionSource::Admitted(snapshot.clone()),
+            );
             self.runtime.block_on(sandbox.execute(command))
         };
         let checkpoint = echo_agent::tools::git_checkpoint::create_checkpoint_with_backend(
-            &path, self, &execute,
+            &path, &files, &execute,
         )?;
         if checkpoint.is_some() {
             echo_agent::tools::git_checkpoint::cleanup_old_checkpoints_with_backend(
-                &path, 10, self, &execute,
+                &path, 10, &files, &execute,
             )?;
         }
         Ok(checkpoint)
@@ -464,19 +492,33 @@ impl FileSystem for ProjectSshFileSystem {
             return Err(invalid("compare-and-swap is unavailable in a read session"));
         }
         let path = self.path(path)?;
-        self.runtime.block_on(super::cas::compare_and_swap(
-            Arc::clone(&self.connection),
+        let snapshot = self.connection.capture().map_err(unavailable)?;
+        let result = self.runtime.block_on(super::cas::compare_and_swap(
+            ConnectionSource::Admitted(snapshot.clone()),
             self.directory.clone(),
             path,
             expected,
             bytes,
-        ))
+        ));
+        drop(snapshot);
+        result
     }
 }
 
 struct ProjectReadSession {
     files: ProjectSshFileSystem,
     channel: Option<SftpChannel>,
+}
+
+struct SnapshotReader {
+    reader: ProjectSftpReader,
+    _snapshot: RequestSnapshot,
+}
+
+impl std::io::Read for SnapshotReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.reader.read(buffer)
+    }
 }
 
 impl ProjectReadSession {
@@ -591,7 +633,16 @@ where
     // 每次文件操作不再重新启动标准 SFTP 子进程：操作在连接级车道上执行，
     // 车道独占、可疑即弃，关闭时由 observe_idle 统一结算。观察者被丢弃
     // 不取消已在途的请求，这一语义由 SftpLanes::run 的独立任务保持。
-    connection.sftp_lanes().run(mutating, operation).await
+    // 复用通道也必须经过原连接的准入；仅在新开通道时检查会让暖池
+    // 绕过连接/服务的关闭。guard 随实际操作任务保留到其物理返回。
+    let admitted = connection.operation().map_err(unavailable)?;
+    connection
+        .sftp_lanes()
+        .run(mutating, move |client| async move {
+            let _admitted = admitted;
+            operation(client).await
+        })
+        .await
 }
 
 fn metadata_value(metadata: openssh_sftp_client::metadata::MetaData) -> Result<FileMetadata> {
@@ -667,9 +718,136 @@ fn invalid(message: impl Into<String>) -> ReactError {
 
 #[cfg(all(test, target_os = "macos"))]
 mod startup_protocol_tests {
+    use super::super::generations::ProjectSshOwner;
     use super::*;
     use echo_agent::tools::filesystem::FileSystemReadSession;
+    use std::io::Read;
     use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn generation_real_sftp_session_and_reader_remain_on_original_connection()
+    -> anyhow::Result<()> {
+        enum PinnedRead {
+            Session(Box<dyn FileSystemReadSession>),
+            Reader(Box<dyn Read + Send>, Vec<u8>),
+        }
+        // 同一真实stdio协议覆盖准备会话和分块reader；仅认证/进程来源使用本机夹具。
+        for streaming in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let expected = "跨代际读取 🧪\n".repeat(16_384).into_bytes();
+            let path = temp.path().join("AGENTS.md");
+            std::fs::write(&path, &expected)?;
+            let service = crate::terminal::TerminalService::new();
+            let target = crate::terminal::TerminalTarget::Ssh {
+                host: "fixture.invalid".into(),
+                user: Some("fixture".into()),
+                port: Some(22),
+            };
+            let original = ProjectSshConnection::prepare(&service, "read-original", target.clone())
+                .map_err(anyhow::Error::msg)?;
+            let next = ProjectSshConnection::prepare(&service, "read-successor", target.clone())
+                .map_err(anyhow::Error::msg)?;
+            for connection in [&original, &next] {
+                connection
+                    .effective_target
+                    .set(target.clone())
+                    .map_err(|_| anyhow::anyhow!("duplicate fixture target"))?;
+                *connection
+                    .test_subsystem_launcher
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))? = Some(Arc::new(|| {
+                    Ok(tokio::process::Command::new("/usr/libexec/sftp-server"))
+                }));
+            }
+            let owner = ProjectSshOwner::new(original.clone());
+            let files = Arc::new(
+                ProjectSshFileSystem::with_source(
+                    ConnectionSource::Current(owner.clone()),
+                    temp.path().to_string_lossy().into_owned(),
+                )
+                .map_err(anyhow::Error::msg)?,
+            );
+            let namespace = files.cache_namespace();
+            let opened_files = files.clone();
+            let read_path = path.clone();
+            let pinned = tokio::task::spawn_blocking(move || -> anyhow::Result<PinnedRead> {
+                if streaming {
+                    let mut reader = opened_files.open_read(&read_path)?;
+                    let mut prefix = vec![0; 8192];
+                    reader.read_exact(&mut prefix)?;
+                    Ok(PinnedRead::Reader(reader, prefix))
+                } else {
+                    Ok(PinnedRead::Session(
+                        opened_files
+                            .begin_read_session()?
+                            .ok_or_else(|| anyhow::anyhow!("preparation session missing"))?,
+                    ))
+                }
+            })
+            .await??;
+            owner
+                .publish(&original, next.clone())
+                .map_err(anyhow::Error::msg)?;
+            assert_ne!(files.cache_namespace(), namespace);
+            owner.reap_retired(&service).await;
+            assert!(!original.closing.load(Ordering::Acquire));
+            // 后续若错误重选当前连接，将在原operation门禁失败且不会连接网络。
+            next.begin_shutdown();
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let bytes = match pinned {
+                    PinnedRead::Session(session) => {
+                        assert_eq!(session.files().cache_namespace(), namespace);
+                        let bytes = session.files().read(&path)?;
+                        session.finish()?;
+                        bytes
+                    }
+                    PinnedRead::Reader(mut reader, mut bytes) => {
+                        reader.read_to_end(&mut bytes)?;
+                        bytes
+                    }
+                };
+                assert_eq!(bytes, expected);
+                Ok(())
+            })
+            .await??;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while owner.connections().len() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            assert_eq!(original.active_operations.load(Ordering::Acquire), 0);
+            let expected_preparation = usize::from(!streaming);
+            assert_eq!(
+                original
+                    .spawn_counts
+                    .preparation_sftp
+                    .load(Ordering::Acquire),
+                expected_preparation
+            );
+            assert_eq!(
+                original.spawn_counts.streaming_sftp.load(Ordering::Acquire),
+                usize::from(streaming)
+            );
+            assert_eq!(
+                original.spawn_counts.ordinary_sftp.load(Ordering::Acquire),
+                0
+            );
+            assert_eq!(
+                next.spawn_counts.preparation_sftp.load(Ordering::Acquire),
+                0
+            );
+            assert_eq!(next.spawn_counts.streaming_sftp.load(Ordering::Acquire), 0);
+            owner
+                .close(
+                    &service,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn startup_one_real_sftp_subsystem_serves_all_preparation_reads_and_settles()
@@ -702,12 +880,13 @@ mod startup_protocol_tests {
             child,
             operation,
             target,
+            super::super::SshChannelPurpose::PreparationSftp,
         )
         .await?;
         // 任何意外重新开通道均在原 operation 门禁处失败，不产生网络请求。
         connection.begin_shutdown();
         let files = ProjectSshFileSystem {
-            connection: connection.clone(),
+            connection: ConnectionSource::Physical(connection.clone()),
             directory: temp.path().to_path_buf(),
             runtime: Handle::try_current()?,
             read_client: Some(channel.client()),
@@ -747,6 +926,20 @@ mod startup_protocol_tests {
         })
         .await??;
         assert_eq!(connection.active_operations.load(Ordering::Acquire), 0);
+        assert_eq!(
+            connection
+                .spawn_counts
+                .preparation_sftp
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            connection
+                .spawn_counts
+                .ordinary_sftp
+                .load(Ordering::Acquire),
+            0
+        );
         assert_eq!(
             std::fs::read_to_string(temp.path().join("AGENTS.md"))?,
             "本地协议夹具 🧪"

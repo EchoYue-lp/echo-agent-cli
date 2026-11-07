@@ -111,7 +111,12 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, RunDrive
     let settlement_store = store.clone();
     let settlement_run_id = run_id.clone();
     let settlement_cancel = cancel.clone();
-    let pool_lease = match pool.acquire(&run_id).await {
+    let admission = if store.project_environment().is_some() {
+        pool.acquire_for_turn(&run_id).await
+    } else {
+        pool.acquire(&run_id).await
+    };
+    let pool_lease = match admission {
         Ok(lease) => lease,
         Err(error) => {
             let message = format!("pool acquire failed for run {run_id}: {error}");

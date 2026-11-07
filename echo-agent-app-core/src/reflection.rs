@@ -196,9 +196,10 @@ async fn generate_reflection(
     timeout: Duration,
 ) -> Result<String, ReflectionError> {
     messages.push(Message::user(REFLECTION_INSTRUCTION.to_string()));
-    let options = SimpleChatOptions::default()
-        .with_temperature(0.2)
-        .with_max_tokens(300);
+    let options = SimpleChatOptions {
+        temperature: None,
+        max_tokens: Some(300),
+    };
     let generated = tokio::time::timeout(timeout, llm.chat_simple_with_options(messages, options))
         .await
         .map_err(|_| ReflectionError::Timeout)?

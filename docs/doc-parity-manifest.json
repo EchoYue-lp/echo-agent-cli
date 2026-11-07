@@ -613,6 +613,12 @@
       "kind": "adr",
       "sourceLanguage": "zh",
       "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "adr/0063-project-context-startup.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
     }
   ],
   "engineeringEntries": [

@@ -40,7 +40,6 @@ const model = {
   has_auth_token: true,
   auth_source: 'config',
   base_url: provider.base_url,
-  temperature: null,
   max_tokens: null,
   context_window: null,
   thinking_levels: ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
@@ -158,6 +157,26 @@ describe('ProviderPanel', () => {
     expect(getByRole('dialog', { name: '编辑模型' })).toBeTruthy();
     expect((getByLabelText('API 模型名称') as HTMLInputElement).value).toBe('model-a');
     expect((getByLabelText('图片') as HTMLInputElement).checked).toBe(true);
+  });
+
+  it('omits temperature from the model editor and saved request', async () => {
+    const { getByLabelText, getByRole, queryByLabelText } = render(<ProviderPanel />);
+    await waitFor(() => getByRole('button', { name: '编辑 Model A' }));
+    fireEvent.click(getByRole('button', { name: '编辑 Model A' }));
+    fireEvent.click(getByRole('button', { name: '高级参数' }));
+    expect(queryByLabelText('Temperature')).toBeNull();
+    fireEvent.change(getByLabelText('Max tokens'), { target: { value: '4096' } });
+    fireEvent.change(getByLabelText('Context window'), { target: { value: '128000' } });
+    fireEvent.click(getByRole('button', { name: '保存模型' }));
+    await waitFor(() => expect(mocks.upsertConfigured).toHaveBeenCalledOnce());
+    const request = mocks.upsertConfigured.mock.calls.at(0)?.at(0);
+    expect(request).not.toHaveProperty('temperature');
+    expect(request).toMatchObject({
+      id: model.id,
+      api_protocol: 'responses',
+      max_tokens: 4096,
+      context_window: 128000,
+    });
   });
 
   it.each([

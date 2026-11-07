@@ -215,6 +215,12 @@ export const MessageBubble = memo(function MessageBubble({
       )
   );
   const hasBody = Boolean(message.content.trim());
+  // 历史恢复沿原运行态保留失败原因；失败不是助手最终答案，也不能被空行过滤隐藏。
+  const failureReason =
+    message.executionStatus?.status === 'failed' && message.executionStatus.reason?.trim()
+      ? message.executionStatus.reason
+      : null;
+  const showFailureReason = Boolean(failureReason && !message.content.includes(failureReason));
 
   if (message.role === 'user' && message.agentInput) return <AgentInputMessage message={message} />;
 
@@ -248,6 +254,7 @@ export const MessageBubble = memo(function MessageBubble({
     !isUser &&
     !hasBody &&
     !hasVisibleNativeContent &&
+    !showFailureReason &&
     images.length === 0 &&
     files.length === 0 &&
     !hasExecutionProcess &&
@@ -383,6 +390,14 @@ export const MessageBubble = memo(function MessageBubble({
             sections. This is what makes it read as one continuous flow. */}
         {!isUser && (
           <div className="w-full space-y-2">
+            {showFailureReason && (
+              <div
+                role="alert"
+                className="whitespace-pre-wrap break-words rounded-lg border border-[var(--color-error)] bg-[var(--bg-secondary)] px-3 py-2 text-sm text-[var(--text-primary)]"
+              >
+                本次处理失败：{failureReason}
+              </div>
+            )}
             {message.internalAgent && (
               <span className="inline-flex h-5 items-center rounded border border-[var(--border-primary)] px-1.5 text-[10px] font-medium text-[var(--text-tertiary)]">
                 Agent 内部消息

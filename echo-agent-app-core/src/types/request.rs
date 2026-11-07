@@ -61,9 +61,6 @@ pub struct UpdateConfigRequest {
     pub model: Option<String>,
     pub system_prompt: Option<String>,
     pub token_limit: Option<usize>,
-    /// ReAct loop ceiling for the running agents (EKO `0` = unlimited
-    /// sentinel; resolved before reaching the framework).
-    pub max_iterations: Option<usize>,
 }
 
 /// PUT /api/config/full — 完整配置更新
@@ -88,7 +85,6 @@ pub struct UpdateFullConfigRequest {
 #[ts(export, rename = "ModelUpdate")]
 pub struct ModelUpdate {
     pub max_tokens: Option<u32>,
-    pub temperature: Option<f32>,
 }
 
 #[derive(Debug, Deserialize, TS)]
@@ -96,7 +92,6 @@ pub struct ModelUpdate {
 pub struct AgentUpdate {
     pub name: Option<String>,
     pub system_prompt: Option<String>,
-    pub max_iterations: Option<usize>,
     pub memory_path: Option<String>,
 }
 

@@ -927,13 +927,69 @@ struct PrimaryTaskTurnPersistence {
     replay_safe_tools: HashSet<String>,
 }
 
+#[derive(Clone)]
 struct RunTurnPersistence {
     blocking: TaskRuntimeOperation,
     turn_id: String,
+    workspace_id: String,
+    conversation_id: String,
+    chat_events: Option<Arc<crate::chat_event_log::ChatEventLog>>,
+}
+
+impl RunTurnPersistence {
+    async fn publish(
+        &self,
+        event: crate::chat_driver::ChatDriverEvent,
+    ) -> echo_agent::error::Result<()> {
+        // 最小 embedding 可明确没有产品 publication owner；真实 App 从原绑定取得同一 Arc。
+        let Some(log) = self.chat_events.clone() else {
+            return Ok(());
+        };
+        let workspace_id = self.workspace_id.clone();
+        let conversation_id = self.conversation_id.clone();
+        let root_turn_id = self.turn_id.clone();
+        let published = self
+            .blocking
+            .run_owned("publish original owned RunTurn chat event", move || {
+                log.append(&workspace_id, Some(&conversation_id), &root_turn_id, event)
+                    .map(|event| (log, event))
+                    .map_err(|error| {
+                        StoreError::InvalidPlan(format!("owned RunTurn publication: {error}"))
+                    })
+            })
+            .await
+            .map_err(|error| {
+                EkoAgentTurnSink::persistence_error("owned RunTurn publication failed", error)
+            })?;
+        // 耐久事实在原日志；没有可见 surface 不影响冷历史，live 拒绝不回滚原发布。
+        if !published.0.deliver_projected_event(&published.1, &[]) {
+            tracing::warn!("owned RunTurn publication committed; live delivery was rejected");
+        }
+        Ok(())
+    }
+
+    async fn publish_terminal(&self, receipt: &TurnReceipt) -> echo_agent::error::Result<()> {
+        if receipt.turn_id.as_str() != self.turn_id {
+            return Err(echo_agent::error::ReactError::Other(
+                "owned RunTurn publication receipt changed turn".into(),
+            ));
+        }
+        // 仅在调用者已持久化本原 RunTurn terminal 后发布产品状态；不创建 Frame 状态。
+        let status = match &receipt.outcome {
+            TurnOutcome::Completed => "completed",
+            TurnOutcome::Cancelled => "cancelled",
+            TurnOutcome::Failed(_) => "failed",
+        };
+        self.publish(crate::chat_driver::ChatDriverEvent::TurnStatus {
+            status: status.to_string(),
+        })
+        .await
+    }
 }
 
 #[derive(Default)]
 struct EkoAgentTurnState {
+    closed: bool,
     output: String,
     native_event_ids: HashMap<String, String>,
     pending_verification: HashMap<String, String>,
@@ -992,8 +1048,11 @@ impl EkoAgentTurnSink {
             trace_sink,
             primary_task: None,
             run_turn: Some(RunTurnPersistence {
+                chat_events: blocking.store.original_chat_event_log(),
                 blocking,
                 turn_id: turn_id.to_string(),
+                workspace_id: run.workspace_id.clone(),
+                conversation_id: run.conversation_id.clone(),
             }),
             mutating_tools,
             state: std::sync::Mutex::new(EkoAgentTurnState::default()),
@@ -1030,6 +1089,7 @@ impl EkoAgentTurnSink {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.closed = true;
         if let Some(final_answer) = final_answer.filter(|answer| !answer.is_empty()) {
             state.output = final_answer.to_string();
         }
@@ -1055,6 +1115,16 @@ impl EventSink for EkoAgentTurnSink {
         &self,
         envelope: echo_agent::agent::EventEnvelope,
     ) -> echo_agent::error::Result<SinkControl> {
+        if self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .closed
+        {
+            return Err(echo_agent::error::ReactError::Other(
+                "owned EKO event sink is already closed".into(),
+            ));
+        }
         let source_event_id = envelope.event_id.to_string();
         let native_started = !self
             .state
@@ -1068,7 +1138,11 @@ impl EventSink for EkoAgentTurnSink {
         ) || (native_started
             && matches!(
                 &envelope.payload,
-                AgentEvent::FinalAnswer(_) | AgentEvent::Cancelled | AgentEvent::Error { .. }
+                AgentEvent::FinalAnswer(_)
+                    | AgentEvent::Cancelled
+                    | AgentEvent::Error { .. }
+                    // 保存事实沿同一个owner的journal发布；不能用它补造执行头。
+                    | AgentEvent::TranscriptProjectionSettlement(_)
             ))
         {
             if envelope
@@ -1119,8 +1193,10 @@ impl EventSink for EkoAgentTurnSink {
                     "native event identity has conflicting canonical content".into(),
                 ));
             }
+            // 原 Frame envelope 是 source 身份权威；Run 级 context 不伪造 execution。
+            let source_execution_id = envelope.execution_id.as_ref().map(ToString::to_string);
             let payload = serde_json::json!({
-                "kind": "native_agent_event", "execution_id": self.context.execution_id,
+                "kind": "native_agent_event", "execution_id": source_execution_id,
                 "agent": self.context.agent_role, "agent_envelope": envelope,
             });
             // Persist in the existing TaskRuntime journal before the original
@@ -1133,7 +1209,7 @@ impl EventSink for EkoAgentTurnSink {
             if let Some(blocking) = persistence {
                 let run_id = self.context.run_id.clone();
                 let task_id = self.context.task_id.clone();
-                let execution_id = self.context.execution_id.clone();
+                let execution_id = source_execution_id.clone();
                 let persisted = payload.clone();
                 blocking
                     .run("persist native Agent envelope observation", move |store| {
@@ -1148,6 +1224,16 @@ impl EventSink for EkoAgentTurnSink {
                     .map_err(|error| {
                         Self::persistence_error("native Agent envelope persistence failed", error)
                     })?;
+            }
+            if let Some(owner) = self.run_turn.as_ref() {
+                // 缺失头仍保未确认，绝不从 Started 文本/Final/EOF 在 sink 后补 owner。
+                if source_execution_id.is_some() {
+                    owner
+                        .publish(crate::chat_driver::ChatDriverEvent::Agent(Box::new(
+                            envelope.clone(),
+                        )))
+                        .await?;
+                }
             }
             self.emit(RuntimeEventKind::Note, payload);
             self.state

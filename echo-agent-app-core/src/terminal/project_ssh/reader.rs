@@ -29,7 +29,12 @@ impl ProjectSftpReader {
         runtime: Handle,
         path: PathBuf,
     ) -> Result<Self> {
-        let channel = SftpChannel::open(connection, Arc::new(OnceLock::new())).await?;
+        let channel = SftpChannel::open(
+            connection,
+            Arc::new(OnceLock::new()),
+            super::SshChannelPurpose::StreamingSftp,
+        )
+        .await?;
         let opened = {
             let client = channel.client();
             client.open(path).await

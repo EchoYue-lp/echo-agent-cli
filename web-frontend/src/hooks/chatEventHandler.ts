@@ -72,7 +72,16 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
         ctx,
         ownsOperation ? { at, scope, eventId: envelope.event_id } : undefined,
         payload.event.execution_id,
-        payload.event.event_id
+        payload.event.event_id,
+        {
+          rootTurnId: envelope.root_turn_id,
+          timestamp: at,
+          sequence: envelope.sequence,
+          saveScope: JSON.stringify([
+            envelope.workspace_id,
+            envelope.conversation_id ?? envelope.root_turn_id,
+          ]),
+        }
       );
       break;
     }
@@ -189,7 +198,8 @@ function handleAgentEvent(
   ctx: EventContext,
   observation?: { at: number; scope: string; eventId: string },
   executionId?: string | null,
-  publicationEventId?: string
+  publicationEventId?: string,
+  journal?: { rootTurnId: string; timestamp: number; sequence: number; saveScope: string }
 ): void {
   switch (event.type) {
     case 'execution_status': {
@@ -241,22 +251,18 @@ function handleAgentEvent(
     case 'context_compressed':
       handleChatEvent({ type: 'context_compressed', ...event.data }, ctx);
       break;
-    case 'transcript_projection_settlement':
-      // 保存检查点不改变运行状态；真正的终态仍由 turn_status 结算。
-      if (event.data.status !== 'settled') {
-        handleChatEvent(
-          {
-            type: 'notice',
-            level: 'warning',
-            code: event.type,
-            message: `会话保存尚未确认（${event.data.status}）：${
-              event.data.error_class ?? '未提供错误分类'
-            }${event.data.detail ? `；${event.data.detail}` : ''}`,
-          },
-          ctx
-        );
-      }
+    case 'transcript_projection_settlement': {
+      // 事实已由原journal发布；错误/取消后仍可呈现，但不能复活执行或重写正文。
+      if (!publicationEventId || !journal) break;
+      const store = useChatStore.getState();
+      store.observeTranscriptSave(journal.saveScope, {
+        eventId: publicationEventId,
+        sequence: journal.sequence,
+        timestamp: journal.timestamp,
+        receipt: event.data,
+      });
       break;
+    }
     case 'tool_call':
       handleChatEvent({ type: 'run_status', status: 'using_tool' }, ctx);
       if (observation)
@@ -288,10 +294,19 @@ function handleAgentEvent(
       if (event.data.failure.terminal_kind === 'cancelled') {
         handleChatEvent({ type: 'cancelled' }, ctx);
       } else {
-        handleChatEvent(
-          { type: 'error', message: `${event.data.source}: ${event.data.message}` },
-          ctx
-        );
+        const message = `${event.data.source}: ${event.data.message}`;
+        if (!ctx.assistantIdRef.current && publicationEventId && journal) {
+          const store = useChatStore.getState();
+          const alreadyVisible = store.messages.some(
+            (item) => item.id === journal.rootTurnId && item.content.includes(`[Error] ${message}`)
+          );
+          if (!alreadyVisible)
+            store.appendLocalAssistantNote(`[Error] ${message}`, {
+              id: `journal-error:${publicationEventId}`,
+              timestamp: journal.timestamp,
+            });
+        }
+        handleChatEvent({ type: 'error', message }, ctx);
       }
       break;
     case 'budget_decision':

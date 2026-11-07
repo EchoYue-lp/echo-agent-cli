@@ -2609,7 +2609,28 @@ impl input_pump::ChannelInputPumpAdapter for ChannelInputPumpAdapter {
                     reply,
                 ));
             };
-            let execution = match pool.acquire(&item.agent_conversation_id).await {
+            // 仅实际经过 conversation driver 的入口延后准备；Planned Resume
+            // 由计划执行器接管，保留完整初始化，不给持久会话留下未确认标记。
+            let prepare_in_driver = match &intent {
+                crate::conversation_input::ChannelExecutionIntent::Chat => true,
+                crate::conversation_input::ChannelExecutionIntent::Resume {
+                    expected,
+                    driver_continuation_enabled,
+                } => matches!(
+                    channel_resume_dispatch(
+                        expected.clone(),
+                        *driver_continuation_enabled,
+                        &item.attempt.turn_id
+                    ),
+                    ChannelResumeDispatch::Continuation(_)
+                ),
+            };
+            let admission = if prepare_in_driver {
+                pool.acquire_for_turn(&item.agent_conversation_id).await
+            } else {
+                pool.acquire(&item.agent_conversation_id).await
+            };
+            let execution = match admission {
                 Ok(execution) => execution,
                 Err(error) => {
                     return Err(input_pump::ChannelInputExecutionError::before_driver(
@@ -2874,15 +2895,17 @@ impl input_pump::ChannelInputPumpAdapter for ChannelInputPumpAdapter {
                         drop(_effect_publication);
                         crate::chat_driver::with_foreground_pool_execution(
                             Arc::downgrade(&held_execution),
-                            crate::foreground_turn::drive_foreground_chat_with_source_ingress(
-                                lease,
-                                &agent,
-                                &turn,
-                                resources,
-                                binding,
-                                Some(input_source),
-                                observer,
-                                durable_terminal,
+                            Box::pin(
+                                crate::foreground_turn::drive_foreground_chat_with_source_ingress(
+                                    lease,
+                                    &agent,
+                                    &turn,
+                                    resources,
+                                    binding,
+                                    Some(input_source),
+                                    observer,
+                                    durable_terminal,
+                                ),
                             ),
                         )
                         .await
@@ -2902,8 +2925,8 @@ impl input_pump::ChannelInputPumpAdapter for ChannelInputPumpAdapter {
                                 lease.retain_execution(held_execution.clone());
                                 drop(_effect_publication);
                                 crate::chat_driver::with_foreground_pool_execution(Arc::downgrade(&held_execution),
-                                    crate::foreground_turn::drive_foreground_chat_with_source_ingress(
-                                        lease, &agent, &turn, resources, Some(binding), Some(input_source), observer, durable_terminal)).await
+                                    Box::pin(crate::foreground_turn::drive_foreground_chat_with_source_ingress(
+                                        lease, &agent, &turn, resources, Some(binding), Some(input_source), observer, durable_terminal))).await
                             }
                             ChannelResumeDispatch::Planned(expected) => {
                                 let launch = match resources.store.clone() {

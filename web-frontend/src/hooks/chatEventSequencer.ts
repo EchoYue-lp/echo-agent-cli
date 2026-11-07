@@ -54,6 +54,8 @@ export class ChatEventSequencer {
         if (
           envelope.payload.source === 'input_lifecycle' ||
           envelope.payload.source === 'execution' ||
+          (envelope.payload.source === 'agent' &&
+            envelope.payload.event.payload.type === 'transcript_projection_settlement') ||
           terminalTurnStatus ||
           shouldProjectTurn(envelope.stream_id, envelope.turn_id)
         ) {

@@ -431,7 +431,7 @@ pub struct TerminalService {
     sessions: DashMap<String, Arc<TerminalSession>>,
     events: broadcast::Sender<TerminalEvent>,
     creation_lock: Mutex<()>,
-    project_connections: DashMap<String, Arc<ProjectSshConnection>>,
+    project_connections: DashMap<String, Arc<project_ssh::ProjectSshOwner>>,
     project_creation_lock: Mutex<()>,
     shutting_down: AtomicBool,
     observation_timeout: Duration,
@@ -568,10 +568,12 @@ impl TerminalService {
             return Err(format!("terminal '{id}' already exists"));
         }
         if project_launch.is_none()
-            && self
-                .project_connections
-                .iter()
-                .any(|connection| connection.master_terminal_id() == id)
+            && self.project_connections.iter().any(|owner| {
+                owner
+                    .master_ids()
+                    .iter()
+                    .any(|master| master.as_str() == id.as_str())
+            })
         {
             return Err(
                 "terminal id is reserved by an original project authentication preparation"
@@ -636,7 +638,7 @@ impl TerminalService {
         let authentication_ids = self
             .project_connections
             .iter()
-            .map(|connection| connection.master_terminal_id().to_string())
+            .flat_map(|owner| owner.master_ids())
             .collect::<std::collections::HashSet<_>>();
         let mut sessions = self
             .sessions
@@ -670,7 +672,7 @@ impl TerminalService {
         if self
             .project_connections
             .iter()
-            .any(|connection| connection.master_terminal_id() == id)
+            .any(|owner| owner.master_ids().iter().any(|master| master == id))
         {
             return Err("project authentication master belongs to its project; close the draft/project connection through its original owner".to_string());
         }
@@ -702,7 +704,7 @@ impl TerminalService {
             let authentication_ids = self
                 .project_connections
                 .iter()
-                .map(|connection| connection.master_terminal_id().to_string())
+                .flat_map(|owner| owner.master_ids())
                 .collect::<std::collections::HashSet<_>>();
             self.sessions
                 .iter()

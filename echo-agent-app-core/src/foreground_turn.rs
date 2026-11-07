@@ -2215,8 +2215,12 @@ where
     });
     let memory_generation = resources.memory_generation.clone();
     lease.entry.driver_started.store(true, Ordering::Release);
+    // 同一原任务继续轮询；将大child future固定到堆，避免多层task-local按值叠加poll栈帧。
     let result = CURRENT_FOREGROUND_TURN
-        .scope(Arc::clone(&lease.entry), execute(controlled_resources))
+        .scope(
+            Arc::clone(&lease.entry),
+            Box::pin(execute(controlled_resources)),
+        )
         .await
         .and_then(|finite_outcome| {
             let active_run = lease.entry.active_run_id.lock().map_err(|_| {

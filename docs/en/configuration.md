@@ -54,7 +54,6 @@ configured_models:
     input_modalities: ["text", "image"]
     enabled: true
     max_tokens: 8192
-    temperature: 0.7
     context_window: 396000
 ```
 
@@ -85,7 +84,6 @@ See [ADR 0048](./adr/0048-context-compression-product-policy.md).
 
 | Field | Meaning |
 | --- | --- |
-| `max_iterations` | Maximum ReAct iterations for one turn; `0` means no product cap |
 | `tool_timeout_ms` | Timeout for one tool call |
 | `max_tool_output_tokens` | Context budget for one tool result; full output can be persisted as an artifact |
 | `token_limit` | Explicit compression threshold; `0` uses model/application policy |

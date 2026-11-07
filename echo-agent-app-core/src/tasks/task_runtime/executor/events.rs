@@ -113,11 +113,19 @@ async fn drive_owned_agent_turn(
     trace_sink: Option<ExecSink>,
     workspace_io: Option<crate::state::WorkspaceIoInvocation>,
     invocation_resources: Vec<echo_agent::tools::InvocationResourceGuard>,
-) -> Result<(TurnReceipt, EkoAgentTurnObservation), ExecError> {
+) -> Result<
+    (
+        TurnReceipt,
+        EkoAgentTurnObservation,
+        Option<RunTurnPersistence>,
+    ),
+    ExecError,
+> {
     let run_id = run.run_id.clone();
     let conversation_id = run.conversation_id.clone();
-    let message_id = Some(run.root_message_id.clone()).filter(|value| !value.trim().is_empty());
     let turn_id = turn_id.to_string();
+    // 当前原 RunTurn 的消息坐标与其独立日志根一致；Run 的原 goal/root 字段保持原值。
+    let message_id = Some(turn_id.clone());
     let mut prompt = prompt.to_string();
     let core_trace_sink = exec_trace_sink_to_core(trace_sink.clone());
     let trace_sink_for_scope = trace_sink.clone();
@@ -239,8 +247,9 @@ async fn drive_owned_agent_turn(
                 .drive(&*agent, request, &sink)
                 .await
                 .map_err(ExecError::from)?;
+            let publication = sink.run_turn.clone();
             let observation = sink.finish(receipt.final_answer.as_deref());
-            Ok((receipt, observation))
+            Ok((receipt, observation, publication))
         },
     )
     .await
@@ -392,7 +401,7 @@ pub(crate) async fn drive_agent_run_with_resources(
                 )));
             }
         }
-        let (mut turn_receipt, turn_observation) = drive_owned_agent_turn(
+        let (mut turn_receipt, turn_observation, publication) = drive_owned_agent_turn(
             blocking.clone(),
             &primary_agent,
             &run_for_scope,
@@ -442,6 +451,12 @@ pub(crate) async fn drive_agent_run_with_resources(
         )
         .await
         .map_err(ExecError::Other)?;
+        if let Some(publication) = publication {
+            publication
+                .publish_terminal(&turn_receipt)
+                .await
+                .map_err(ExecError::from)?;
+        }
         if decision == super::turn_lifecycle::RunTurnDecision::Stop {
             break;
         }

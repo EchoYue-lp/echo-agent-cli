@@ -126,7 +126,7 @@ pub fn prepare_runtime_llm(
     })
 }
 
-/// Result of the shared EKO connection probe used by GUI, TUI, and CLI.
+/// GUI 与应用运行时共用的模型连接测试结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeLlmConnectionTest {
     pub response: String,
@@ -134,8 +134,7 @@ pub struct RuntimeLlmConnectionTest {
 }
 
 /// Send one minimal request through the exact client configuration used by the
-/// live agent. Surface-specific code only resolves user input and renders this
-/// result; protocol behavior remains identical across GUI, TUI, and CLI.
+/// live agent. GUI只负责解析输入和展示结果；temperature不再是EKO产品配置或请求来源。
 pub async fn test_runtime_llm_connection(
     runtime: &model_config::ModelRuntimeConfig,
 ) -> Result<RuntimeLlmConnectionTest, String> {
@@ -143,7 +142,13 @@ pub async fn test_runtime_llm_connection(
     let messages = vec![Message::user("Hi, respond with just 'OK'.".to_string())];
     let response = prepared
         .client
-        .chat_simple(messages)
+        .chat_simple_with_options(
+            messages,
+            echo_agent::llm::SimpleChatOptions {
+                temperature: None,
+                ..Default::default()
+            },
+        )
         .await
         .map_err(|error| format!("API call failed: {error}"))?;
     Ok(RuntimeLlmConnectionTest {
@@ -186,7 +191,7 @@ pub(crate) async fn prepare_agent_model_publication(
         .prepare_model_generation(
             prepared.config.clone(),
             prepared.client.clone(),
-            runtime.temperature,
+            None,
             runtime.max_tokens.or(Some(DEFAULT_MAX_TOKENS)),
             prepared.thinking.clone(),
             token_limit,
@@ -201,7 +206,7 @@ pub(crate) async fn prepare_agent_model_publication(
             .prepare_model_generation(
                 prepared.config.clone(),
                 prepared.client.clone(),
-                runtime.temperature,
+                None,
                 runtime.max_tokens.or(Some(DEFAULT_MAX_TOKENS)),
                 prepared.thinking.clone(),
                 token_limit,

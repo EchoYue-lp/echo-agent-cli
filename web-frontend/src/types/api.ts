@@ -969,12 +969,10 @@ export interface FullConfigUpdateRequest {
   max_subagent_depth?: 1 | 2 | 3;
   model?: {
     max_tokens?: number;
-    temperature?: number;
   };
   agent?: {
     name?: string;
     system_prompt?: string;
-    max_iterations?: number;
     memory_path?: string;
   };
   mcp?: { config_path?: string };

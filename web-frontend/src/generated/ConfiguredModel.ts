@@ -18,7 +18,6 @@ export type ConfiguredModel = {
   has_auth_token: boolean;
   auth_source: string;
   base_url: string | null;
-  temperature: number | null;
   max_tokens: number | null;
   context_window: number | null;
 };

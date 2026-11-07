@@ -32,6 +32,36 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe('聊天正文与空消息投影', () => {
+  it('恢复无正文的失败消息时显示原运行态原因，取消与重复错误不另生成失败说明', () => {
+    const reason = 'LLM Error: API error (status 403): 不支持当前工具。';
+    const message: ChatMessage = {
+      ...emptyReply,
+      executionStatus: {
+        execution_id: 'original-execution',
+        request_id: null,
+        sequence: 2,
+        phase: 'Terminal',
+        status: 'failed',
+        reason,
+      },
+    };
+    const { rerender } = render(<MessageBubble message={message} />);
+    expect(screen.getByRole('alert').textContent).toContain(reason);
+    expect(screen.queryByRole('button', { name: '分叉会话' })).toBeNull();
+    rerender(<MessageBubble message={{ ...message, content: `[Error] ${reason}` }} />);
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByText(`[Error] ${reason}`)).toBeDefined();
+    rerender(
+      <MessageBubble
+        message={{
+          ...message,
+          executionStatus: { ...message.executionStatus!, status: 'cancelled' },
+        }}
+      />
+    );
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
   it('已结束的空 canonical assistant 行不会留下机器人或消息空壳', () => {
     const { container, rerender } = render(<MessageBubble message={emptyReply} />);
     expect(container.childElementCount).toBe(0);

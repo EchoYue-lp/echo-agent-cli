@@ -16,7 +16,7 @@ function fullConfig(depth: number = 1) {
   return {
     max_subagent_depth: depth,
     model: { provider: 'test', name: 'test', has_auth_token: false },
-    agent: { model: 'test', system_prompt: 'Test', max_iterations: 10, token_limit: 4000 },
+    agent: { model: 'test', system_prompt: 'Test', token_limit: 4000 },
     mcp: { config_path: null },
     channels: {
       qq: { enabled: false, app_id: '' },
@@ -63,6 +63,23 @@ describe('EKO subagent depth configuration', () => {
     expect(useUiStore.getState().settingsOpen).toBe(true);
     expect(api.updateFull).not.toHaveBeenCalled();
     useUiStore.setState({ settingsOpen: false, activeSettingsTab: 'providers' });
+  });
+
+  it('does not expose or submit a fixed Agent iteration ceiling', async () => {
+    render(<ConfigPanel />);
+    await screen.findByRole('combobox', { name: '最大子智能体层数' });
+    expect(screen.queryByRole('button', { name: /高级运行参数/ })).toBeNull();
+    expect(screen.queryByText('单轮推理安全上限')).toBeNull();
+    fireEvent.change(screen.getByRole('combobox', { name: '最大子智能体层数' }), {
+      target: { value: '2' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+    await waitFor(() =>
+      expect(api.updateFull).toHaveBeenCalledWith(
+        { max_subagent_depth: 2 },
+        expect.any(AbortSignal)
+      )
+    );
   });
 
   it('saves the selected limit through the existing owned config endpoint', async () => {

@@ -2591,7 +2591,6 @@ export const providerApi = {
     model: string;
     api_protocol: LlmApiProtocol;
     input_modalities: ModelInputModality[];
-    temperature?: number;
     max_tokens?: number;
     context_window?: number | null;
     enabled?: boolean;

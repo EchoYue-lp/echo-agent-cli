@@ -9,6 +9,7 @@ import type {
   ChatMessage,
   ApprovalRequest,
   ChatRunStatus,
+  TranscriptProjectionSettlement,
 } from '../types/api';
 import { useConversationStore } from './conversationStore';
 
@@ -18,6 +19,14 @@ export interface ChatActivity {
   startedAt: number;
   lastEventAt: number;
   scope?: string;
+}
+
+/** 原journal的临时保存观察；不写canonical正文，也不参与TaskRun结算。 */
+export interface TranscriptSaveObservation {
+  eventId: string;
+  sequence: number;
+  timestamp: number;
+  receipt: TranscriptProjectionSettlement;
 }
 
 /** 当前上下文窗口占用快照（对齐 Claude Code statusline 语义）。 */
@@ -81,6 +90,8 @@ interface ChatState {
   runStatus: ChatRunStatus;
   /** 仅来自实际运行事件；计时刷新不产生新事件或发现。 */
   activity: ChatActivity | null;
+  transcriptSaves: Record<string, TranscriptSaveObservation[]>;
+  observeTranscriptSave: (scope: string, observation: TranscriptSaveObservation) => void;
   observeActivity: (key: string, label: string, at?: number, scope?: string) => void;
   noteActivityEvent: (at?: number) => void;
   pendingHitlRequests: PendingHitlRequest[];
@@ -114,7 +125,7 @@ interface ChatState {
   projectAssistantError: (id: string, error: string) => void;
   handoffToTaskRuntime: (id: string, content: string, isRunning: boolean) => void;
   /** Insert a non-streaming assistant note (e.g. background subagent finished). */
-  appendLocalAssistantNote: (content: string) => void;
+  appendLocalAssistantNote: (content: string, source?: { id: string; timestamp: number }) => void;
   setStreaming: (v: boolean) => void;
   setThinking: (v: boolean) => void;
   setRunStatus: (status: ChatRunStatus) => void;
@@ -148,6 +159,40 @@ function trimToMax(msgs: ChatMessage[]): ChatMessage[] {
 
 let msgCounter = 0;
 const nextId = () => `msg-${++msgCounter}-${Date.now()}`;
+
+function transcriptSaveNotes(observations: TranscriptSaveObservation[]): ChatMessage[] {
+  const notes: ChatMessage[] = [];
+  const unconfirmed = new Set<string>();
+  let lastConfirmed: TranscriptSaveObservation | undefined;
+  for (const observation of observations) {
+    const receipt = observation.receipt;
+    const operation = receipt.operation_id
+      ? JSON.stringify([receipt.operation_id, receipt.generation_id])
+      : null;
+    let content: string;
+    if (receipt.status === 'settled') {
+      lastConfirmed = observation;
+      if (!operation || !unconfirmed.delete(operation)) continue;
+      content = '此前未确认的会话保存操作现已收到确认。任务执行状态仍以原运行结果为准。';
+    } else {
+      if (operation) unconfirmed.add(operation);
+      content = `会话保存尚未确认（${receipt.status}）：${
+        receipt.error_class ?? '未提供错误分类'
+      }${receipt.detail ? `；${receipt.detail}` : ''}\n\n最后收到的保存确认：${
+        lastConfirmed ? new Date(lastConfirmed.timestamp).toISOString() : '暂无可核验的确认回执'
+      }。此前的确认不代表本次内容已经保存。`;
+    }
+    notes.push({
+      id: `journal-save:${observation.eventId}`,
+      role: 'assistant',
+      content,
+      finalAnswerConfirmed: false,
+      isStreaming: false,
+      timestamp: observation.timestamp,
+    });
+  }
+  return notes;
+}
 
 /** Auto-save to conversationStore after state changes that add messages. */
 function autoSave() {
@@ -184,10 +229,37 @@ export const useChatStore = create<ChatState>((set, get) => ({
   isThinking: false,
   runStatus: 'idle',
   activity: null,
+  transcriptSaves: {},
   pendingHitlRequests: [],
   isHistoryView: false,
   contextWindow: null,
   usageAccumulator: { totalInput: 0, totalCached: 0 },
+
+  observeTranscriptSave: (scope, observation) =>
+    set((state) => {
+      if (!Number.isFinite(observation.timestamp) || observation.sequence < 1) return state;
+      const previous = state.transcriptSaves[scope] ?? [];
+      if (previous.some((entry) => entry.eventId === observation.eventId)) return state;
+      const confirmed =
+        observation.receipt.status === 'settled' &&
+        Boolean(observation.receipt.operation_id) &&
+        observation.receipt.attempt > 0;
+      // no-op/旧checkpoint的Settled没有新batch回执，不能覆盖未确认的内容保存。
+      if (observation.receipt.status === 'settled' && !confirmed) return state;
+      // 尾部可以先到；按原序号重投影，不能用“最新观察”丢弃随后补读的历史确认。
+      const observations = [...previous, observation].sort((a, b) => a.sequence - b.sequence);
+      const notes = transcriptSaveNotes(observations);
+      const sourceIds = new Set(observations.map((entry) => `journal-save:${entry.eventId}`));
+      const messages = state.messages.filter((message) => !sourceIds.has(message.id));
+      for (const note of notes) {
+        const next = messages.findIndex((message) => message.timestamp > note.timestamp);
+        messages.splice(next < 0 ? messages.length : next, 0, note);
+      }
+      return {
+        transcriptSaves: { ...state.transcriptSaves, [scope]: observations },
+        messages: trimToMax(messages),
+      };
+    }),
 
   observeActivity: (key, label, at = Date.now(), scope) =>
     set((state) => {
@@ -464,21 +536,28 @@ export const useChatStore = create<ChatState>((set, get) => ({
     scheduleAutoSave();
   },
 
-  appendLocalAssistantNote: (content) => {
-    set((s) => ({
-      messages: trimToMax([
-        ...s.messages,
-        {
-          id: nextId(),
-          role: 'assistant',
-          content,
-          finalAnswerConfirmed: false,
-          isStreaming: false,
-          timestamp: Date.now(),
-        },
-      ]),
-    }));
-    scheduleAutoSave();
+  appendLocalAssistantNote: (content, source) => {
+    const id = source?.id ?? nextId();
+    set((s) => {
+      if (s.messages.some((message) => message.id === id)) return s;
+      const note: ChatMessage = {
+        id,
+        role: 'assistant',
+        content,
+        finalAnswerConfirmed: false,
+        isStreaming: false,
+        timestamp: source?.timestamp ?? Date.now(),
+      };
+      const messages = [...s.messages];
+      const next = source
+        ? messages.findIndex((message) => message.timestamp > source.timestamp)
+        : -1;
+      // 只把原错误放回其历史时间位置，不重排canonical消息；否则重试会误取后一轮输入。
+      messages.splice(next < 0 ? messages.length : next, 0, note);
+      return { messages: trimToMax(messages) };
+    });
+    // 显式源ID是原journal的只读投影，不重写canonical历史或会话元数据。
+    if (!source) scheduleAutoSave();
   },
 
   setStreaming: (v) => set((state) => ({ isStreaming: v, activity: v ? state.activity : null })),
@@ -561,6 +640,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   clearMessages: () =>
     set({
       messages: [],
+      transcriptSaves: {},
       agentInputs: [],
       agentInputsBinding: null,
       agentInputReadError: null,
@@ -578,6 +658,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   replaceMessages: (messages) =>
     set({
       messages: trimToMax(messages),
+      transcriptSaves: {},
       isStreaming: false,
       isCancelled: false,
       isHistoryView: true,

@@ -24,9 +24,6 @@ pub struct Profile {
     /// 最大迭代次数
     #[serde(default = "default_max_iterations")]
     pub max_iterations: usize,
-    /// 温度参数 (0.0-2.0)
-    #[serde(default)]
-    pub temperature: Option<f64>,
     /// 最大 Token 限制
     #[serde(default)]
     pub max_tokens: Option<u32>,
@@ -62,7 +59,6 @@ impl Profile {
             theme: default_theme(),
             output_format: default_output_format(),
             max_iterations: default_max_iterations(),
-            temperature: None,
             max_tokens: None,
             active: false,
             created_at: now.clone(),

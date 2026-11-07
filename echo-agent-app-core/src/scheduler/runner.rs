@@ -291,9 +291,12 @@ fn build_occurrence_fire_fn_with_cancel(
                 let run_agent = match &pool {
                     Some(pool) => {
                         let run_key = format!("__cron__:{}:{owned_fire_id}", owned_task.id);
-                        let acquired = pool
-                            .acquire(&run_key)
-                            .await
+                        let admission = if owned_store.project_environment().is_some() {
+                            pool.acquire_for_turn(&run_key).await
+                        } else {
+                            pool.acquire(&run_key).await
+                        };
+                        let acquired = admission
                             .map_err(|error| format!("cron pool acquire failed: {error}"))?;
                         let agent = acquired.agent();
                         receipt_owner.retain(pool.retain_for_supervised_run(run_key, acquired))?;

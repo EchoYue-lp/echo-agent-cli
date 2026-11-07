@@ -6,6 +6,8 @@
 pub struct AgentPool {
     shared: SharedResources,
     agents: RwLock<HashMap<String, PooledAgent>>,
+    /// 仅串行构造/发布；远程准备期间不持有实例表锁。
+    creation: tokio::sync::Mutex<()>,
     /// Primary Agent owned by this pool generation. Workspace forks create a
     /// dedicated primary; the bootstrap pool references the process primary.
     primary_agent: RwLock<Option<AgentHandle>>,
@@ -463,6 +465,7 @@ impl AgentPool {
         let pool = Arc::new(Self {
             shared,
             agents: RwLock::new(HashMap::new()),
+            creation: tokio::sync::Mutex::new(()),
             primary_agent: RwLock::new(Some(runtime.agent_handle.clone())),
             primary_model_consumers: RwLock::new(Some(runtime.model_consumers.clone())),
             mcp_config_snapshot: RwLock::new(Some(runtime.mcp_config_runtime.snapshot().await)),
@@ -587,6 +590,7 @@ impl AgentPool {
         let mut pool = Arc::new(Self {
             shared,
             agents: RwLock::new(HashMap::new()),
+            creation: tokio::sync::Mutex::new(()),
             primary_agent: RwLock::new(None),
             primary_model_consumers: RwLock::new(None),
             mcp_config_snapshot: RwLock::new(mcp_config_snapshot.clone()),
@@ -818,6 +822,7 @@ impl AgentPool {
         Self {
             shared,
             agents: RwLock::new(HashMap::new()),
+            creation: tokio::sync::Mutex::new(()),
             primary_agent: RwLock::new(Some(agent.clone())),
             primary_model_consumers: RwLock::new(None),
             mcp_config_snapshot: RwLock::new(None),
@@ -888,12 +893,11 @@ impl AgentPool {
     /// have an independent capacity limit; task subagents and the background
     /// agent have separate product ownership.
     ///
-    /// The write lock is held across the entire operation (including async
-    /// agent creation) to prevent TOCTOU races between concurrent acquirers.
-    pub async fn acquire(
+    async fn try_acquire_cached(
         &self,
         conversation_id: &str,
-    ) -> Result<AgentPoolExecutionLease, PoolError> {
+        prepare_in_driver: bool,
+    ) -> Result<Option<AgentPoolExecutionLease>, PoolError> {
         let mut agents = self.agents.write().await;
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(PoolError::ShuttingDown);
@@ -909,23 +913,18 @@ impl AgentPool {
 
         // Fast path: reuse existing agent
         if let Some(existing) = agents.get_mut(conversation_id) {
+            if !prepare_in_driver && !existing.raw_context_initialized.load(Ordering::Acquire) {
+                return Ok(None);
+            }
             existing.last_used = Instant::now();
             let permission_mode = *self.permission_mode.read().await;
             let thinking_override = self.thinking_override.read().await.clone();
-            let max_iterations = crate::infra::resolved_max_iterations(
-                self.app_config.read().await.agent.max_iterations,
-            );
             let _updated = existing.handle.try_write(|agent| {
                 if agent.get_permission_mode() != permission_mode {
                     agent.set_permission_mode(permission_mode);
                 }
                 if agent.thinking() != thinking_override.as_ref() {
                     agent.set_thinking(thinking_override);
-                }
-                if agent.config().get_max_iterations() != max_iterations
-                    && let Err(error) = agent.set_max_iterations(max_iterations)
-                {
-                    tracing::warn!(%error, "AgentPool: rejected deferred max_iterations publication");
                 }
             });
             let handle = existing.handle.clone();
@@ -939,11 +938,58 @@ impl AgentPool {
                     registry,
                     tools,
                     self.tool_control.clone(),
+                    existing.raw_context_initialized.clone(),
                 );
             drop(agents);
-            return Ok(lease);
+            return Ok(Some(lease));
         }
 
+        Ok(None)
+    }
+
+    /// 独立调用保持完整初始化；由 chat driver 驱动的调用使用 acquire_for_turn。
+    pub async fn acquire(
+        &self,
+        conversation_id: &str,
+    ) -> Result<AgentPoolExecutionLease, PoolError> {
+        self.acquire_inner(conversation_id, false).await
+    }
+
+    /// 调用方必须进入既有 driver 的可失败上下文准备边界，不能直接请求模型。
+    pub async fn acquire_for_turn(
+        &self,
+        conversation_id: &str,
+    ) -> Result<AgentPoolExecutionLease, PoolError> {
+        self.acquire_inner(conversation_id, true).await
+    }
+
+    async fn acquire_inner(
+        &self,
+        conversation_id: &str,
+        context_prepared_by_invocation: bool,
+    ) -> Result<AgentPoolExecutionLease, PoolError> {
+        if let Some(lease) = self
+            .try_acquire_cached(conversation_id, context_prepared_by_invocation)
+            .await?
+        {
+            return Ok(lease);
+        }
+        let creation_wait_started = std::time::Instant::now();
+        let _creation = self.creation.lock().await;
+        let creation_wait_ms = creation_wait_started.elapsed().as_millis();
+        // 等待构造锁期间同 key 可能已建立，或准入已经关闭。
+        if let Some(lease) = self
+            .try_acquire_cached(conversation_id, context_prepared_by_invocation)
+            .await?
+        {
+            return Ok(lease);
+        }
+        if !context_prepared_by_invocation
+            && let Some(lease) = self.prepare_deferred_cached_agent(conversation_id).await?
+        {
+            return Ok(lease);
+        }
+        let mut agents = self.agents.write().await;
         // Enforce the requested class limit and evict only from that class.
         // Dedicated background and task subagents own separate admission paths.
         let capacity_limited = Self::is_conversation_agent(conversation_id)
@@ -993,11 +1039,24 @@ impl AgentPool {
             }
         }
 
-        // Create new agent (lock is held — prevents concurrent insert races)
+        drop(agents);
+        let creation_started = std::time::Instant::now();
         let pooled = self
-            .create_agent(conversation_id)
+            .create_agent_with_context(conversation_id, context_prepared_by_invocation)
             .await
             .map_err(|e| PoolError::AgentCreation(e.to_string()))?;
+        let mut agents = self.agents.write().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(PoolError::ShuttingDown);
+        }
+        if self.workspace_transitioning.load(Ordering::Acquire) {
+            return Err(PoolError::WorkspaceTransition);
+        }
+        if self.admission.is_retiring(conversation_id) {
+            return Err(PoolError::ConversationRetirementPending {
+                conversation_id: conversation_id.to_string(),
+            });
+        }
         let handle = pooled.handle.clone();
 
         let lease = self
@@ -1008,16 +1067,116 @@ impl AgentPool {
                 pooled.subagent_registry.clone(),
                 pooled.tool_manager.clone(),
                 self.tool_control.clone(),
+                pooled.raw_context_initialized.clone(),
             );
         agents.insert(conversation_id.to_string(), pooled);
 
         tracing::info!(
             conv_id = %conversation_id,
             pool_size = agents.len(),
+            creation_wait_ms,
+            creation_ms = creation_started.elapsed().as_millis(),
             "AgentPool: new agent created"
         );
         drop(agents);
         Ok(lease)
+    }
+
+    /// 延后构造的实例也可能被反思/压缩等原始消费者取得；在原实例上补全，
+    /// 不重建、不丢消息，也不等待正在执行的 Agent 而持有构造互斥。
+    async fn prepare_deferred_cached_agent(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<AgentPoolExecutionLease>, PoolError> {
+        let agents = self.agents.write().await;
+        let Some(pooled) = agents.get(conversation_id) else {
+            return Ok(None);
+        };
+        if self.admission.is_active(conversation_id) {
+            return Err(PoolError::AgentCreation(
+                "project context is not initialized while its original turn is active".into(),
+            ));
+        }
+        let handle = pooled.handle.clone();
+        let mut agent = handle.inner().clone().try_write_owned().map_err(|_| {
+            PoolError::AgentCreation("project context initialization requires an idle Agent".into())
+        })?;
+        let lease = self
+            .admission
+            .issue_process_scoped(
+                conversation_id,
+                handle.clone(),
+                &self.process_agent_execution,
+            )?
+            .with_plugin_generation(
+                &*self.agent_generation.read().await,
+                pooled.subagent_registry.clone(),
+                pooled.tool_manager.clone(),
+                self.tool_control.clone(),
+                pooled.raw_context_initialized.clone(),
+            );
+        let physical = lease
+            .retain_physical_projection(None)
+            .map_err(PoolError::AgentCreation)?;
+        drop(agents);
+        let project = self.project_root.read().await.clone();
+        let cwd = self.working_dir.read().await.clone();
+        let state = self
+            .shared
+            .workspace_data_root
+            .as_deref()
+            .map(crate::workspace::layout::WorkspaceLayout::state_dir);
+        let files = self
+            .shared
+            .file_system
+            .clone()
+            .or_else(|| agent.file_system())
+            .unwrap_or_else(|| Arc::new(echo_agent::tools::files::LocalFileSystem));
+        let executor = self
+            .shared
+            .sandbox_manager
+            .clone()
+            .or_else(|| agent.sandbox_manager().cloned())
+            .ok_or_else(|| {
+                PoolError::AgentCreation("project context executor unavailable".into())
+            })?;
+        let prepared = crate::infra::prepare_project_context_at_location(
+            project.as_deref(),
+            cwd.as_deref(),
+            state.as_deref(),
+            files,
+            executor,
+            vec![echo_agent::tools::InvocationResourceGuard::new(physical)],
+            agent.config().get_token_limit(),
+        )
+        .await
+        .map_err(PoolError::AgentCreation)?;
+        prepared.publish_projections(&mut agent).await;
+        drop(agent);
+        let mut agents = self.agents.write().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(PoolError::ShuttingDown);
+        }
+        if self.workspace_transitioning.load(Ordering::Acquire) {
+            return Err(PoolError::WorkspaceTransition);
+        }
+        if self.admission.is_retiring(conversation_id) {
+            return Err(PoolError::ConversationRetirementPending {
+                conversation_id: conversation_id.into(),
+            });
+        }
+        let pooled = agents
+            .get_mut(conversation_id)
+            .ok_or_else(|| PoolError::AgentCreation("initializing Agent disappeared".into()))?;
+        if !Arc::ptr_eq(pooled.handle.inner(), handle.inner()) {
+            return Err(PoolError::AgentCreation(
+                "initializing Agent generation changed".into(),
+            ));
+        }
+        pooled
+            .raw_context_initialized
+            .store(true, Ordering::Release);
+        Ok(Some(lease))
     }
 
     /// Lease an existing agent without creating a new one.
@@ -1055,6 +1214,7 @@ impl AgentPool {
                             pooled.subagent_registry.clone(),
                             pooled.tool_manager.clone(),
                             self.tool_control.clone(),
+                            pooled.raw_context_initialized.clone(),
                         )
                     })
             })
@@ -1138,6 +1298,9 @@ impl AgentPool {
             return Err(PoolError::RetirementReceiptMismatch);
         }
         let conversation_id = retirement.key.clone();
+        // 退休票先封住 key，再等待在途构造，防止退休完成后旧构造重新发布。
+        let creation = self.creation.lock().await;
+        drop(creation);
         self.admission.wait_key_idle(&conversation_id).await;
         let mut agents = self.agents.write().await;
         let removed = agents.remove(&conversation_id).is_some();
@@ -1187,6 +1350,7 @@ impl AgentPool {
 
     /// Update the pool's app config snapshot used for future agents.
     pub async fn update_app_config(&self, app_config: EkoConfig) {
+        let _creation = self.creation.lock().await;
         let _agents = self.agents.write().await;
         *self.app_config.write().await = app_config;
     }
@@ -1396,7 +1560,9 @@ impl AgentPool {
     /// so it is updated first. Idle agents mirror the mode immediately; a busy
     /// agent refreshes its informational config on its next pool acquisition.
     pub async fn apply_permission_mode(&self, mode: PermissionMode) {
+        let _creation = self.creation.lock().await;
         *self.permission_mode.write().await = mode;
+        drop(_creation);
 
         if let Some(service) = &self.shared.permission_service {
             service.set_mode(mode).await;
@@ -1439,7 +1605,9 @@ impl AgentPool {
     /// Publish a product system prompt to the primary, every existing pooled
     /// Agent, and the config template used for future pool admissions.
     pub async fn apply_system_prompt(&self, system_prompt: String) {
+        let _creation = self.creation.lock().await;
         self.app_config.write().await.agent.system_prompt = system_prompt.clone();
+        drop(_creation);
         let mut handles = self
             .agents
             .read()
@@ -1475,7 +1643,9 @@ impl AgentPool {
     /// Agent, the creation template used for future pool admissions, and every
     /// Subagent generation that inherits the parent's thinking.
     pub async fn apply_thinking(&self, thinking: Option<echo_agent::llm::ThinkingConfig>) {
+        let _creation = self.creation.lock().await;
         *self.thinking_override.write().await = thinking.clone();
+        drop(_creation);
 
         let agents = self.agents.read().await;
         let mut handles = agents
@@ -1510,44 +1680,15 @@ impl AgentPool {
         }
     }
 
-    /// Publish the ReAct loop ceiling to the primary and every existing pooled
-    /// Agent. The EKO sentinel value is also stored in the pool's config
-    /// template so future admissions resolve the same ceiling.
-    pub async fn apply_max_iterations(&self, eko_value: usize) {
-        self.app_config.write().await.agent.max_iterations = eko_value;
-        let resolved = crate::infra::resolved_max_iterations(eko_value);
-
-        let agents = self.agents.read().await;
-        let mut handles = agents
-            .values()
-            .map(|pooled| pooled.handle.clone())
-            .collect::<Vec<_>>();
-        drop(agents);
-        if let Some(primary) = self.primary_agent.read().await.clone()
-            && !handles
-                .iter()
-                .any(|candidate| Arc::ptr_eq(candidate.inner(), primary.inner()))
-        {
-            handles.push(primary);
-        }
-        for handle in handles {
-            let _updated = handle.try_write(|agent| {
-                if agent.config().get_max_iterations() != resolved
-                    && let Err(error) = agent.set_max_iterations(resolved)
-                {
-                    tracing::warn!(%error, "AgentPool: rejected max_iterations publication");
-                }
-            });
-        }
-    }
-
     /// Project the current EKO tool-control generation into the primary and
     /// every cached Agent. Runs already holding a snapshot remain unchanged;
     /// the next run observes the new generation.
     pub(crate) async fn publish_tool_control_generation(
         &self,
     ) -> Result<(), crate::tool_control::ToolControlError> {
+        let _creation = self.creation.lock().await;
         let agents = self.agents.write().await;
+        drop(_creation);
         // Read the authority only after publication owns the pool generation.
         // Concurrent older publishers therefore observe the newest revision
         // instead of overwriting a later mutation with a stale snapshot.
@@ -1604,9 +1745,11 @@ impl AgentPool {
     /// Called after a workspace switch so that background tasks and
     /// multi-conversation agents operate in the new workspace root.
     pub async fn apply_working_dir(&self, path: Option<std::path::PathBuf>) {
+        let _creation = self.creation.lock().await;
         *self.working_dir.write().await = path.clone();
         let artifact_config = crate::infra::tool_output_artifact_config(path.as_deref());
         *self.tool_output_artifacts.write().await = artifact_config.clone();
+        drop(_creation);
         let agents: Vec<AgentHandle> = self
             .agents
             .read()
@@ -1633,7 +1776,9 @@ impl AgentPool {
 
     /// Apply one workspace prompt/skill profile to existing and future agents.
     pub async fn apply_workspace_routing(&self, kind: WorkspaceKind) {
+        let _creation = self.creation.lock().await;
         *self.workspace_kind.write().await = kind.clone();
+        drop(_creation);
         let agents: Vec<AgentHandle> = self
             .agents
             .read()
@@ -1660,7 +1805,9 @@ impl AgentPool {
         &self,
         store: Arc<dyn echo_agent::memory::ConversationStore>,
     ) {
+        let _creation = self.creation.lock().await;
         *self.conversation_store_override.write().await = Some(store.clone());
+        drop(_creation);
         let agents: Vec<AgentHandle> = self
             .agents
             .read()
@@ -1678,7 +1825,9 @@ impl AgentPool {
 
     /// Rebind existing and future pooled agents to the active checkpoint store.
     pub async fn apply_state_store(&self, store: Arc<dyn echo_agent::state::RuntimeStateStore>) {
+        let _creation = self.creation.lock().await;
         *self.state_store_override.write().await = Some(store.clone());
+        drop(_creation);
         let agents: Vec<AgentHandle> = self
             .agents
             .read()
@@ -1892,6 +2041,8 @@ impl AgentPool {
 
     pub(crate) async fn join_known_executions(&self) -> Result<(), String> {
         self.begin_shutdown();
+        let creation = self.creation.lock().await;
+        drop(creation);
         self.admission.join_known().await
     }
 
@@ -1920,6 +2071,7 @@ impl AgentPool {
             None
         };
         self.admission.join_known().await?;
+        let _creation = self.creation.lock().await;
         let mut agents = self.agents.write().await;
         let count = agents.len();
         agents.clear();
@@ -1944,6 +2096,11 @@ impl AgentPool {
             #[cfg(test)]
             committed: false,
         };
+
+        // 先封准入，再只等待在途构造越过原发布点；不能持构造锁等现有
+        // 执行结束，后者仍可能需要获取其它 key 以完成结算。
+        let creation = self.creation.lock().await;
+        drop(creation);
 
         // An issued handle is execution ownership even before its framework
         // execution mutex is locked. Closing admission under the agents write
@@ -2046,6 +2203,14 @@ impl AgentPool {
     /// keep it as `session_id` so existing `session_id`-keyed paths (e.g.
     /// background tasks) continue to work.
     async fn create_agent(&self, conversation_id: &str) -> anyhow::Result<PooledAgent> {
+        self.create_agent_with_context(conversation_id, false).await
+    }
+
+    async fn create_agent_with_context(
+        &self,
+        conversation_id: &str,
+        context_prepared_by_invocation: bool,
+    ) -> anyhow::Result<PooledAgent> {
         // 1. Create a base agent — pass conversation_id + state_store at build
         //    time so the agent boots with everything the framework's checkpoint
         //    helpers need. (Previously the pool called `set_state_store` here,
@@ -2068,6 +2233,7 @@ impl AgentPool {
             .get(conversation_id)
             .cloned();
         let params = infra::AgentCreateParams {
+            context_prepared_by_invocation,
             file_system: self.shared.file_system.clone(),
             sandbox_executor: self.shared.sandbox_manager.clone(),
             local_skill_executor: self.shared.local_skill_executor.clone(),
@@ -2303,12 +2469,16 @@ impl AgentPool {
                 )
             })
             .await;
-        Ok(PooledAgent::new(
+        let pooled = PooledAgent::new(
             handle,
             model_consumers,
             conversation_id.to_string(),
             registry,
             tools,
-        ))
+        );
+        pooled
+            .raw_context_initialized
+            .store(!context_prepared_by_invocation, Ordering::Release);
+        Ok(pooled)
     }
 }

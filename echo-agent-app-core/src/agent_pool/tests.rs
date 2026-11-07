@@ -997,7 +997,6 @@ mod tests {
             base_url: Some("http://127.0.0.1:11434/v1/chat/completions".to_string()),
             api_key_env: None,
             requires_api_key: false,
-            temperature: None,
             max_tokens: None,
             context_window: None,
             thinking_profile: echo_agent::llm::ThinkingProfile::unknown(),
@@ -1837,7 +1836,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thinking_and_iteration_publication_do_not_wait_for_busy_agents() -> TestResult {
+    async fn thinking_publication_does_not_wait_for_busy_agents() -> TestResult {
         let pool = create_test_pool(3, false).await?;
         let existing = pool
             .acquire("busy-config")
@@ -1854,9 +1853,6 @@ mod tests {
         )
         .await
         .map_err(|_| "thinking publication waited for a busy agent".to_string())?;
-        tokio::time::timeout(Duration::from_secs(1), pool.apply_max_iterations(0))
-            .await
-            .map_err(|_| "max_iterations publication waited for a busy agent".to_string())?;
         drop(busy);
 
         let refreshed = pool
@@ -1883,14 +1879,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn max_iterations_applies_to_primary_existing_and_future_agents() -> TestResult {
-        let pool = create_test_pool(3, false).await?;
+    async fn unbounded_primary_existing_and_future_agents_have_no_product_iteration_cap()
+    -> TestResult {
+        // 此控制必须从 EKO 真实主工厂启动；通用 framework 测试模板仍保留自身默认预算。
+        let mut config = EkoConfig::default();
+        config.agent.max_iterations = 10;
+        let created = crate::infra::create_agent_with_diagnostics(
+            &crate::infra::AgentCreateParams::default(),
+            &config,
+        )
+        .await?;
+        let pool =
+            AgentPool::new_for_test(AgentHandle::new(created.agent), None, None, 3, false).await;
+        pool.app_config.write().await.agent.max_iterations = 10;
         let existing = pool
             .acquire("iterations-existing")
             .await
             .map_err(|error| error.to_string())?;
-
-        pool.apply_max_iterations(37).await;
 
         for handle in [
             pool.primary_agent()
@@ -1902,7 +1907,7 @@ mod tests {
                 handle
                     .read(|agent| agent.config().get_max_iterations())
                     .await,
-                37
+                usize::MAX
             );
         }
         let future = pool
@@ -1914,7 +1919,7 @@ mod tests {
                 .agent()
                 .read(|agent| agent.config().get_max_iterations())
                 .await,
-            37
+            usize::MAX
         );
         Ok(())
     }
@@ -3894,6 +3899,406 @@ mod tests {
         );
         drop(context);
         drop(lease);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn startup_slow_creation_does_not_block_cached_acquire_or_resurrect_retired_key()
+    -> anyhow::Result<()> {
+        use crate::project::startup_tests::CountingFiles;
+        let temp = tempfile::tempdir()?;
+        let files = Arc::new(CountingFiles::new(temp.path().to_path_buf()));
+        let mut pool = create_test_pool(4, false)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let store = crate::project::startup_tests::task_store(files.clone())?;
+        let _resource_scope = store.test_resource_scope();
+        pool.shared.sandbox_manager = store
+            .project_environment()
+            .map(|environment| environment.executor);
+        pool.shared.task_runtime_store = Some(store.clone());
+        pool.shared.tool_manager = None;
+        pool.shared.file_system = Some(files.clone());
+        *pool.working_dir.write().await = Some(temp.path().to_path_buf());
+        *pool.project_root.write().await = Some(temp.path().to_path_buf());
+        let cached = pool.acquire("existing").await?;
+        let original = cached.agent();
+        drop(cached);
+        let pool = Arc::new(pool);
+        files.gate.enabled.store(true, Ordering::SeqCst);
+        struct Release(Arc<crate::project::startup_tests::ReadGate>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.release.add_permits(1);
+            }
+        }
+        let release = Release(files.gate.clone());
+        let pending_pool = pool.clone();
+        let pending = tokio::spawn(async move { pending_pool.acquire_for_turn("slow").await });
+        tokio::time::timeout(Duration::from_secs(10), files.gate.reached.acquire())
+            .await??
+            .forget();
+        let existing =
+            tokio::time::timeout(Duration::from_secs(2), pool.acquire("existing")).await??;
+        assert!(Arc::ptr_eq(existing.agent().inner(), original.inner()));
+        drop(existing);
+        let retirement = pool.begin_conversation_retirement("slow")?;
+        let retirement_pool = pool.clone();
+        let retiring = tokio::spawn(async move {
+            retirement_pool
+                .complete_conversation_retirement(retirement)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !retiring.is_finished(),
+            "retirement must retain its closed key until original creation returns"
+        );
+        drop(release);
+        assert!(matches!(
+            pending.await?,
+            Err(PoolError::ConversationRetirementPending { .. })
+        ));
+        assert!(!retiring.await??);
+        assert!(pool.lease_existing("slow").await?.is_none());
+        assert_eq!(
+            files.opened.load(Ordering::SeqCst),
+            files.closed.load(Ordering::SeqCst)
+        );
+        pool.shutdown().await.map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_raw_acquire_completes_cancelled_deferred_agent_without_losing_identity()
+    -> anyhow::Result<()> {
+        use crate::project::startup_tests::CountingFiles;
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("project");
+        std::fs::create_dir(&root)?;
+        let files = Arc::new(CountingFiles::new(root.clone()));
+        std::fs::write(root.join("AGENTS.md"), "RAW_CURRENT_RULE")?;
+        let mut pool = create_test_pool(4, false)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let store = crate::project::startup_tests::task_store(files.clone())?;
+        let _resource_scope = store.test_resource_scope();
+        pool.shared.sandbox_manager = store
+            .project_environment()
+            .map(|environment| environment.executor);
+        pool.shared.task_runtime_store = Some(store.clone());
+        pool.shared.tool_manager = None;
+        pool.shared.file_system = Some(files.clone());
+        *pool.working_dir.write().await = Some(temp.path().join("product-data"));
+        *pool.project_root.write().await = Some(root.clone());
+        let deferred = pool.acquire_for_turn("cancelled-before-driver").await?;
+        let original = deferred.agent();
+        assert_eq!(files.count("read", &root.join("AGENTS.md")), 0);
+        assert!(
+            pool.acquire("cancelled-before-driver").await.is_err(),
+            "raw access must not wait on an active uninitialized invocation"
+        );
+        drop(deferred);
+        let raw = pool.acquire("cancelled-before-driver").await?;
+        assert!(Arc::ptr_eq(raw.agent().inner(), original.inner()));
+        assert_eq!(files.count("read", &root.join("AGENTS.md")), 1);
+        let context = raw.agent().read(|agent| agent.context().clone()).await;
+        assert!(
+            context
+                .lock()
+                .await
+                .messages()
+                .iter()
+                .filter_map(|m| m.content.as_text())
+                .any(|text| text.contains("RAW_CURRENT_RULE"))
+        );
+        drop(raw);
+        let raw = pool.acquire("cancelled-before-driver").await?;
+        assert_eq!(files.count("read", &root.join("AGENTS.md")), 1);
+        drop(raw);
+        // 规则失败仍不能把缓存实例标为已初始化；修正后使用同一个实例恢复。
+        std::fs::write(root.join("AGENTS.md"), [0xff])?;
+        let deferred = pool.acquire_for_turn("failed-preparation").await?;
+        let failed_handle = deferred.agent();
+        drop(deferred);
+        assert!(pool.acquire("failed-preparation").await.is_err());
+        std::fs::write(root.join("AGENTS.md"), "RECOVERED_RULE")?;
+        let recovered = pool.acquire("failed-preparation").await?;
+        assert!(Arc::ptr_eq(
+            recovered.agent().inner(),
+            failed_handle.inner()
+        ));
+        drop(recovered);
+        assert_eq!(
+            files.opened.load(Ordering::SeqCst),
+            files.closed.load(Ordering::SeqCst)
+        );
+        pool.shutdown().await.map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_retirement_wait_does_not_hold_creation_needed_by_active_turn()
+    -> anyhow::Result<()> {
+        let pool = Arc::new(
+            create_test_pool(4, false)
+                .await
+                .map_err(anyhow::Error::msg)?,
+        );
+        let active = pool.acquire("active").await?;
+        let retirement = pool.begin_conversation_retirement("active")?;
+        let waiting_pool = pool.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_pool
+                .complete_conversation_retirement(retirement)
+                .await
+        });
+        // 原 active lease 保证等待不能结束；下一次创建必须仍能完成。
+        tokio::task::yield_now().await;
+        let other = tokio::time::timeout(
+            Duration::from_secs(10),
+            pool.acquire("needed-to-settle-active"),
+        )
+        .await??;
+        drop(other);
+        drop(active);
+        assert!(tokio::time::timeout(Duration::from_secs(10), waiting).await???);
+        pool.shutdown().await.map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_active_turn_publishes_readiness_for_steer_and_raw_readers()
+    -> anyhow::Result<()> {
+        use crate::project::startup_tests::CountingFiles;
+        let temp = tempfile::tempdir()?;
+        std::fs::write(temp.path().join("AGENTS.md"), "ACTIVE_CURRENT_RULE")?;
+        let files = Arc::new(CountingFiles::new(temp.path().to_path_buf()));
+        let store = crate::project::startup_tests::task_store(files.clone())?;
+        let _resource_scope = store.test_resource_scope();
+        let mut pool = Box::pin(create_test_pool(4, false))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        pool.shared.sandbox_manager = store
+            .project_environment()
+            .map(|environment| environment.executor);
+        pool.shared.task_runtime_store = Some(store.clone());
+        pool.shared.tool_manager = None;
+        pool.shared.file_system = Some(files.clone());
+        *pool.working_dir.write().await = Some(temp.path().to_path_buf());
+        *pool.project_root.write().await = Some(temp.path().to_path_buf());
+        let client = Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .with_response(r#"{"intent":"FALLBACK","skill":null,"confidence":1.0}"#)
+                .with_stream_script(vec![
+                    echo_agent::testing::StreamChunk::Delay(Duration::from_secs(60)),
+                    echo_agent::testing::StreamChunk::Terminal {
+                        finish_reason: Some("stop".into()),
+                        usage: None,
+                    },
+                ]),
+        );
+        pool.set_llm_client_override_for_test(client).await;
+        let pool = Arc::new(pool);
+        let execution = Box::pin(pool.acquire_for_turn("active-context")).await?;
+        let handle = execution.agent();
+        let original = handle.clone();
+        assert!(
+            !execution
+                .context_initialization_for(&original)
+                .ok_or_else(|| anyhow::anyhow!("missing readiness"))?
+                .load(Ordering::Acquire)
+        );
+        let held = Arc::new(Mutex::new(Some(execution)));
+        struct Sink(Arc<tokio::sync::Semaphore>);
+        impl crate::chat_driver::ChatSink for Sink {
+            fn on_event(&self, event: crate::chat_driver::ChatDriverEvent) -> bool {
+                if matches!(event, crate::chat_driver::ChatDriverEvent::Agent(_)) {
+                    self.0.add_permits(1);
+                }
+                true
+            }
+        }
+        let reached = Arc::new(tokio::sync::Semaphore::new(0));
+        let cancel = CancellationToken::new();
+        let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: crate::workspace::WorkspaceExecutionScope::global(
+                temp.path().to_path_buf(),
+            ),
+            workspace_io_receipt: None,
+            pool: Some(pool.clone()),
+            store: None,
+            sink: Arc::new(Sink(reached.clone())),
+            webhook_emitter: None,
+            conv_id: Some("active-context".into()),
+            root_message_id: "active-context-turn".into(),
+            attachments: Vec::new(),
+            cancel: cancel.clone(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let foreign_client =
+            Arc::new(echo_agent::testing::MockLlmClient::new().with_response("foreign done"));
+        let mut foreign = echo_agent::agent::ReactAgentBuilder::new()
+            .model("foreign-context")
+            .llm_client(foreign_client)
+            .file_system(files.clone())
+            .auto_project_rules(false)
+            .working_dir(temp.path().to_path_buf())
+            .build()?;
+        foreign.set_sandbox_executor(Arc::new(
+            echo_agent::sandbox::SandboxManager::local_sandbox(),
+        ));
+        foreign.set_pre_model_context_projector(Some(Arc::new(
+            crate::turn_context::EkoContextProjector::new(
+                crate::tasks::task_runtime::compact_context::task_runtime_projection_registry(),
+                crate::turn_context::turn_prompt_context_registry(),
+            ),
+        )));
+        let foreign = AgentHandle::new(foreign);
+        let foreign_turn = crate::prepared_turn::PreparedUserTurn {
+            instruction: "other Agent".into(),
+            resources: Vec::new(),
+            authorship: crate::prepared_turn::InstructionAuthorship::User,
+            agent_input: None,
+        };
+        let foreign_resources = crate::chat_resources::ChatResources {
+            execution_scope: resources.execution_scope.clone(),
+            workspace_io_receipt: None,
+            pool: Some(pool.clone()),
+            store: None,
+            sink: Arc::new(Sink(reached.clone())),
+            webhook_emitter: None,
+            conv_id: Some("foreign-context".into()),
+            root_message_id: "foreign-context-turn".into(),
+            attachments: Vec::new(),
+            cancel: CancellationToken::new(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        };
+        let foreign_outcome = crate::chat_driver::with_foreground_pool_execution(
+            Arc::downgrade(&held),
+            Box::pin(crate::chat_driver::drive_chat(
+                &foreign,
+                &foreign_turn,
+                Arc::new(foreign_resources),
+            )),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert_eq!(foreign_outcome, crate::chat_driver::TurnOutcome::Completed);
+        assert!(
+            !held
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lease lock poisoned"))?
+                .as_ref()
+                .and_then(|execution| execution.context_initialization_for(&original))
+                .ok_or_else(|| anyhow::anyhow!("missing original marker"))?
+                .load(Ordering::Acquire)
+        );
+        // 外来实例的事件不作为下一次原实例已开始的证据。
+        while let Ok(permit) = reached.try_acquire() {
+            permit.forget();
+        }
+        let weak = Arc::downgrade(&held);
+        let drive = tokio::spawn(Box::pin(async move {
+            let turn = crate::prepared_turn::PreparedUserTurn {
+                instruction: "你好".into(),
+                resources: Vec::new(),
+                authorship: crate::prepared_turn::InstructionAuthorship::User,
+                agent_input: None,
+            };
+            crate::chat_driver::with_foreground_pool_execution(
+                weak,
+                Box::pin(crate::chat_driver::drive_chat(&handle, &turn, resources)),
+            )
+            .await
+        }));
+        struct Cancel(CancellationToken);
+        impl Drop for Cancel {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+        let cancel_guard = Cancel(cancel.clone());
+        tokio::time::timeout(Duration::from_secs(10), reached.acquire())
+            .await??
+            .forget();
+        assert!(!drive.is_finished());
+        let raw = tokio::time::timeout(
+            Duration::from_secs(2),
+            Box::pin(pool.acquire("active-context")),
+        )
+        .await??;
+        assert!(Arc::ptr_eq(raw.agent().inner(), original.inner()));
+        assert_eq!(files.count("read", &temp.path().join("AGENTS.md")), 2);
+        drop(raw);
+        drop(cancel_guard);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), drive)
+            .await??
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert_eq!(outcome, crate::chat_driver::TurnOutcome::Cancelled);
+        held.lock()
+            .map_err(|_| anyhow::anyhow!("lease lock poisoned"))?
+            .take();
+        pool.shutdown().await.map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn startup_deferred_raw_keeps_explicit_outer_root_across_nested_git_repository()
+    -> anyhow::Result<()> {
+        use crate::project::startup_tests::CountingFiles;
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("outer");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested)?;
+        for directory in [&root, &nested] {
+            let status = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(directory)
+                .status()?;
+            anyhow::ensure!(status.success(), "fixture git init failed");
+        }
+        std::fs::write(root.join("AGENTS.md"), "NESTED_OUTER_SCOPE")?;
+        std::fs::write(nested.join("AGENTS.md"), "NESTED_INNER_SCOPE")?;
+        let files = Arc::new(CountingFiles::new(root.clone()));
+        let store = crate::project::startup_tests::task_store(files.clone())?;
+        let _resource_scope = store.test_resource_scope();
+        let mut pool = Box::pin(create_test_pool(4, false))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        pool.shared.sandbox_manager = store
+            .project_environment()
+            .map(|environment| environment.executor);
+        pool.shared.task_runtime_store = Some(store.clone());
+        pool.shared.tool_manager = None;
+        pool.shared.file_system = Some(files);
+        *pool.project_root.write().await = Some(root);
+        *pool.working_dir.write().await = Some(nested);
+        let eager = Box::pin(pool.acquire("nested-eager")).await?;
+        let eager_handle = eager.agent();
+        drop(eager);
+        let deferred = Box::pin(pool.acquire_for_turn("nested-deferred")).await?;
+        let original = deferred.agent();
+        drop(deferred);
+        let raw = Box::pin(pool.acquire("nested-deferred")).await?;
+        assert!(Arc::ptr_eq(raw.agent().inner(), original.inner()));
+        for handle in [eager_handle, raw.agent()] {
+            let context = handle.read(|agent| agent.context().clone()).await;
+            let text = context
+                .lock()
+                .await
+                .messages()
+                .iter()
+                .filter_map(|message| message.content.as_text())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(text.matches("NESTED_OUTER_SCOPE").count(), 1);
+            assert_eq!(text.matches("NESTED_INNER_SCOPE").count(), 1);
+        }
+        drop(raw);
+        pool.shutdown().await.map_err(anyhow::Error::msg)?;
         Ok(())
     }
 }

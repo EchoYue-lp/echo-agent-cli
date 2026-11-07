@@ -158,7 +158,6 @@ pub struct McpToolInfo {
 pub struct AgentConfigResponse {
     pub model: String,
     pub system_prompt: String,
-    pub max_iterations: usize,
     pub token_limit: usize,
     pub session_id: Option<String>,
     /// 可用的模型列表
@@ -186,7 +185,6 @@ pub struct ModelConfigResponse {
     pub has_auth_token: bool,
     pub base_url: Option<String>,
     pub max_tokens: Option<u32>,
-    pub temperature: Option<f32>,
 }
 
 #[derive(Debug, Serialize, TS)]

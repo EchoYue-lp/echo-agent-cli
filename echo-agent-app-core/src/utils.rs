@@ -30,20 +30,15 @@ pub fn find_project_root_with_file_system(
         "pom.xml",
         "Makefile",
     ];
-    // A repository boundary outranks nested package manifests. Otherwise a
-    // workspace such as `repo/crate/Cargo.toml` would hide `repo/AGENTS.md`.
-    for directory in start.ancestors() {
-        for marker in VCS_MARKERS {
-            if files.exists(&directory.join(marker))? {
-                return Ok(Some(directory.to_path_buf()));
-            }
-        }
-    }
-    for directory in start.ancestors() {
-        for marker in FALLBACK_MARKERS {
-            if files.exists(&directory.join(marker))? {
-                return Ok(Some(directory.to_path_buf()));
-            }
+    // 按原 VCS→fallback、祖先→marker 顺序构造候选。远程提供者可
+    // 流水化已知名称的 metadata，不枚举整个仓库或用户 HOME。
+    for markers in [VCS_MARKERS, FALLBACK_MARKERS] {
+        let paths = start
+            .ancestors()
+            .flat_map(|directory| markers.iter().map(move |marker| directory.join(marker)))
+            .collect::<Vec<_>>();
+        if let Some(path) = files.first_existing_path(&paths)? {
+            return Ok(path.parent().map(Path::to_path_buf));
         }
     }
     Ok(None)

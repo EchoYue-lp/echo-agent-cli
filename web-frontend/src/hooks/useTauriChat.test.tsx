@@ -2879,6 +2879,180 @@ describe('useTauriChat foreground turn recovery', () => {
     second.unmount();
   });
 
+  it('非零游标重开先收新尾部，随后原前缀恢复确认与告警且不重复', async () => {
+    const conversationId = 'conversation-save-rehydrate';
+    const rootTurnId = 'original-save-root';
+    const saving = (
+      sequence: number,
+      status: 'settled' | 'blocked',
+      operation: string,
+      detail: string | null
+    ) =>
+      agentEnvelope(
+        rootTurnId,
+        sequence,
+        {
+          type: 'transcript_projection_settlement',
+          data: {
+            status,
+            operation_id: operation,
+            conversation_id: conversationId,
+            generation_id: 'original-generation',
+            attempt: 1,
+            error_class: status === 'settled' ? null : 'outcome_unknown',
+            detail,
+          },
+        },
+        conversationId,
+        rootTurnId
+      );
+    const confirmed = saving(1, 'settled', 'confirmed-original', null);
+    const original = saving(2, 'blocked', 'original-unconfirmed-operation', '原保存仍未确认');
+    const tail = saving(3, 'blocked', 'new-tail-operation', '新尾部保存未确认');
+    let reloading = false;
+    useConversationStore.setState({ activeId: conversationId });
+    mocks.apiInvoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === 'get_active_chat_turn') return null;
+      if (command === 'list_queued_chat_inputs') return { queue_revision: 0, items: [] };
+      if (command === 'replay_chat_events') {
+        const all = reloading ? [confirmed, original, tail] : [confirmed, original];
+        const cursor = typeof args?.afterCursor === 'number' ? args.afterCursor : 0;
+        const events = all.filter((event) => event.sequence > cursor);
+        return {
+          ...emptyReplay(),
+          events,
+          retained_earliest_cursor: 1,
+          returned_earliest_cursor: events.at(0)?.sequence ?? null,
+          latest_cursor: reloading ? 3 : 2,
+        };
+      }
+      return { success: true };
+    });
+    const first = renderHook(() => useTauriChat());
+    await waitFor(() =>
+      expect(
+        useChatStore.getState().messages.some((note) => note.content.includes('原保存仍未确认'))
+      ).toBe(true)
+    );
+    first.unmount();
+    useChatStore.getState().replaceMessages([]);
+    reloading = true;
+    const second = renderHook(() => useTauriChat());
+    await waitFor(() => {
+      const notes = useChatStore.getState().messages;
+      expect(notes.filter((note) => note.content.includes('原保存仍未确认'))).toHaveLength(1);
+      const latest = notes.filter((note) => note.content.includes('新尾部保存未确认'));
+      expect(latest).toHaveLength(1);
+      expect(latest.at(0)?.content).toContain('2026-08-18T00:00:00.000Z');
+      expect(latest.at(0)?.content).not.toContain('暂无可核验');
+    });
+    expect(mocks.apiInvoke).toHaveBeenCalledWith('replay_chat_events', {
+      workspaceId: 'global',
+      conversationId,
+      messageKey: undefined,
+      afterCursor: 2,
+    });
+    act(() => {
+      mocks.listeners.get('chat://event')?.({ payload: tail });
+    });
+    expect(
+      useChatStore.getState().messages.filter((note) => note.content.includes('新尾部保存未确认'))
+    ).toHaveLength(1);
+    expect(useChatStore.getState().runStatus).toBe('idle');
+    expect(useChatStore.getState().isStreaming).toBe(false);
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('send_chat', expect.anything());
+    second.unmount();
+  });
+
+  it('跨轮live保存告警不丢失，也不把取消与正文重新绑定到旧轮', async () => {
+    const conversationId = 'conversation-save-live';
+    const original = 'original-turn-save';
+    const current = 'current-turn-save';
+    const snapshot = {
+      ...activeSnapshot,
+      conversation_id: conversationId,
+      root_turn_id: original,
+      active_turn_id: original,
+    };
+    useConversationStore.setState({ activeId: conversationId });
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn') return snapshot;
+      if (command === 'list_queued_chat_inputs') return { queue_revision: 0, items: [] };
+      if (command === 'replay_chat_events') return emptyReplay();
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() =>
+      expect(useChatStore.getState().messages.some((message) => message.id === original)).toBe(true)
+    );
+    const emit = (event: ChatEventEnvelope) =>
+      mocks.listeners.get('chat://event')?.({ payload: event });
+    act(() => {
+      emit(turnStatusEnvelope(original, original, 1, 'running', conversationId));
+      emit(turnStatusEnvelope(original, original, 2, 'failed', conversationId));
+      useChatStore.getState().startAssistantMessage(current);
+      emit(turnStatusEnvelope(current, current, 3, 'running', conversationId));
+      emit(
+        agentEnvelope(
+          original,
+          4,
+          {
+            type: 'transcript_projection_settlement',
+            data: {
+              status: 'blocked',
+              operation_id: 'old-save-operation',
+              conversation_id: conversationId,
+              generation_id: 'original-generation',
+              attempt: 1,
+              error_class: 'outcome_unknown',
+              detail: '旧轮保存未确认',
+            },
+          },
+          conversationId,
+          original
+        )
+      );
+      emit(agentEnvelope(current, 5, nativeCommentary('当前轮正文', 1), conversationId, current));
+      emit(
+        agentEnvelope(
+          original,
+          6,
+          nativeCommentary('不能复活旧轮正文', 2),
+          conversationId,
+          original
+        )
+      );
+    });
+    expect(
+      useChatStore.getState().messages.filter((note) => note.content.includes('旧轮保存未确认'))
+    ).toHaveLength(1);
+    expect(useChatStore.getState().runStatus).toBe('running');
+    expect(
+      useChatStore
+        .getState()
+        .messages.find((message) => message.id === current)
+        ?.assistantBlocks?.map((block) => block.content)
+        .join('')
+    ).toBe('当前轮正文');
+    expect(
+      useChatStore
+        .getState()
+        .messages.some((message) =>
+          message.assistantBlocks?.some((block) => block.content.includes('不能复活旧轮正文'))
+        )
+    ).toBe(false);
+    await act(async () => {
+      await hook.result.current.cancel();
+    });
+    expect(mocks.apiInvoke).toHaveBeenCalledWith('cancel_chat', {
+      workspaceId: 'global',
+      conversationId,
+      expectedRootTurnId: current,
+      expectedActiveTurnId: current,
+    });
+    hook.unmount();
+  });
+
   it('does not cancel or fail a replay with no active snapshot and no terminal fact', async () => {
     const conversationId = 'conversation-inactive-partial-replay';
     const rootTurnId = 'inactive-partial-turn';

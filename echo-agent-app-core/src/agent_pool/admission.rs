@@ -21,15 +21,9 @@
 //
 // # Usage
 //
-// ```rust,ignore
-// // After bootstrap:
-// let pool = AgentPool::from_runtime(&runtime, PoolConfig::default(), None).await;
-//
-// // Acquire an agent for a conversation:
-// let lease = pool.acquire("conv-001").await?;
-// let agent = lease.agent();
-// agent.chat_stream("Hello").await;  // Keep `lease` until execution settles.
-// ```
+// 产品模型循环通过 ScopedChatRuntime / drive_chat 取得并保留执行lease，
+// 由原invocation准备与turn registration发布规则。不要把取得AgentHandle
+// 等同于模型准入或直接调用裸chat；reflection等普通消费者可读取完整快照。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -359,6 +353,7 @@ struct PooledAgent {
     _conversation_id: String,
     created_at: Instant,
     last_used: Instant,
+    raw_context_initialized: Arc<AtomicBool>,
 }
 
 struct AgentPoolAdmission {
@@ -444,6 +439,7 @@ impl AgentPoolAdmission {
         );
         drop(leases);
         Ok(AgentPoolExecutionLease {
+            context_initialization: None,
             physical: Arc::new(AgentPoolPhysicalLease {
                 token: Some(token),
                 admission: Some((Arc::clone(self), key.to_string())),
@@ -623,6 +619,7 @@ impl Drop for AgentPoolRetirementAdmission {
 /// receipt to drop before clearing or rebinding pooled agents.
 #[must_use]
 pub struct AgentPoolExecutionLease {
+    context_initialization: Option<Arc<AtomicBool>>,
     physical: Arc<AgentPoolPhysicalLease>,
     agent: AgentHandle,
     domain_generation: Option<(
@@ -693,6 +690,18 @@ impl Drop for AgentPoolPhysicalProjection {
 }
 
 impl AgentPoolExecutionLease {
+    pub(crate) fn context_initialization_for(
+        &self,
+        agent: &AgentHandle,
+    ) -> Option<Arc<AtomicBool>> {
+        // ambient foreground scope 可包裹其它调用，只有原实例能确认其缓存事实。
+        if Arc::ptr_eq(self.agent.inner(), agent.inner()) {
+            self.context_initialization.clone()
+        } else {
+            None
+        }
+    }
+
     pub fn agent(&self) -> AgentHandle {
         self.agent.clone()
     }
@@ -703,7 +712,9 @@ impl AgentPoolExecutionLease {
         registry: Arc<echo_agent::subagent::SubagentRegistry>,
         tools: Arc<echo_agent::tools::ToolManager>,
         tool_control: Arc<crate::tool_control::ToolControlService>,
+        context_initialization: Arc<AtomicBool>,
     ) -> Self {
+        self.context_initialization = Some(context_initialization);
         self.domain_generation = Some((
             generation.domain_components.clone(),
             generation.domain_output_style.clone(),
@@ -747,6 +758,7 @@ impl AgentPoolExecutionLease {
         let retention = self.retain_physical_projection(None)?;
         Ok(AgentPoolExecutionProjection {
             execution: Self {
+                context_initialization: self.context_initialization.clone(),
                 physical: self.physical.clone(),
                 agent: self.agent.clone(),
                 domain_generation: self.domain_generation.clone(),
@@ -822,6 +834,7 @@ impl AgentPoolExecutionLease {
 
     pub(crate) fn unpooled(agent: AgentHandle) -> Self {
         Self {
+            context_initialization: None,
             physical: Arc::new(AgentPoolPhysicalLease {
                 token: None,
                 admission: None,
@@ -1060,6 +1073,7 @@ impl PooledAgent {
             _conversation_id: conversation_id,
             created_at: now,
             last_used: now,
+            raw_context_initialized: Arc::new(AtomicBool::new(true)),
         }
     }
 }

@@ -17,12 +17,20 @@ async fn probe_model_connectivity(model: &str) -> echo_agent::error::Result<()> 
     crate::config::apply_env_overrides(&mut app_config);
     let runtime = model_config::resolve_runtime_model(&app_config, Some(model))
         .map_err(|error| ReactError::Other(error.to_string()))?;
-    let prepared = prepare_runtime_llm(&runtime).map_err(ReactError::Other)?;
+    probe_runtime_model_connectivity(&runtime).await
+}
+
+/// 诊断和连通性测试使用同一已解析模型；不从真实用户配置制造采样覆盖。
+async fn probe_runtime_model_connectivity(
+    runtime: &model_config::ModelRuntimeConfig,
+) -> echo_agent::error::Result<()> {
+    use echo_agent::error::ReactError;
+    let prepared = prepare_runtime_llm(runtime).map_err(ReactError::Other)?;
     let response = prepared
         .client
         .chat(echo_agent::llm::ChatRequest {
             messages: vec![echo_agent::prelude::Message::user("hi".to_string())],
-            temperature: Some(0.0),
+            temperature: None,
             max_tokens: Some(1),
             ..Default::default()
         })

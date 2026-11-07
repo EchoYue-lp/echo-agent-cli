@@ -3170,31 +3170,6 @@ impl AppState {
         }
     }
 
-    /// Publish the ReAct loop ceiling (EKO `0` = unlimited sentinel) to the
-    /// process primary/pool and every loaded workspace pool, so a saved
-    /// `max_iterations` actually reaches the agents the user is talking to.
-    pub async fn apply_max_iterations_to_agents(&self, eko_value: usize) {
-        match self.connection.pool.as_ref() {
-            Some(pool) => pool.apply_max_iterations(eko_value).await,
-            None => {
-                let resolved = crate::infra::resolved_max_iterations(eko_value);
-                self.connection
-                    .primary_agent()
-                    .write(|agent| {
-                        if agent.config().get_max_iterations() != resolved
-                            && let Err(error) = agent.set_max_iterations(resolved)
-                        {
-                            tracing::warn!(%error, "rejected max_iterations publication");
-                        }
-                    })
-                    .await;
-            }
-        }
-        for (_, runtime) in self.workspace.runtimes.loaded_execution_runtimes().await {
-            runtime.pool().apply_max_iterations(eko_value).await;
-        }
-    }
-
     /// Discover persisted conversation addresses from the existing workspace
     /// registry and per-workspace ConversationStores.
     pub async fn discover_agent_endpoints(
@@ -5882,7 +5857,37 @@ impl AppState {
         workspace_id: &crate::workspace::WorkspaceId,
         connection_id: &str,
         expected_generation: Option<&str>,
+        expected_connection: Option<Arc<crate::terminal::ProjectSshConnection>>,
     ) -> anyhow::Result<()> {
+        self.reconnect_workspace_project_with_verifier(
+            workspace_id,
+            connection_id,
+            expected_generation,
+            expected_connection,
+            |connection, target, path| async move {
+                connection.verify_target_directory(target, path).await
+            },
+        )
+        .await
+    }
+
+    async fn reconnect_workspace_project_with_verifier<F, Fut>(
+        &self,
+        workspace_id: &crate::workspace::WorkspaceId,
+        connection_id: &str,
+        expected_generation: Option<&str>,
+        previous: Option<Arc<crate::terminal::ProjectSshConnection>>,
+        verifier: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnOnce(
+                Arc<crate::terminal::ProjectSshConnection>,
+                crate::terminal::TerminalTarget,
+                String,
+            ) -> Fut
+            + Send,
+        Fut: std::future::Future<Output = Result<String, String>> + Send,
+    {
         if connection_id == workspace_id.as_str() {
             anyhow::bail!("Reconnection must hand off a newly prepared draft connection");
         }
@@ -5900,17 +5905,28 @@ impl AppState {
         else {
             anyhow::bail!("This project uses a local folder");
         };
+        let current = self.terminal.project_ssh(workspace_id.as_str()).ok();
+        let unchanged = match (&previous, &current) {
+            (None, None) => true,
+            (Some(expected), Some(actual)) => Arc::ptr_eq(expected, actual),
+            _ => false,
+        };
+        if !unchanged {
+            anyhow::bail!(
+                "SSH connection generation changed while reconnect was queued; candidate was not published"
+            );
+        }
         let connection = self
             .terminal
             .project_ssh(connection_id)
             .map_err(anyhow::Error::msg)?;
-        let actual_path = connection
-            .verify_target_directory(
-                crate::terminal::TerminalTarget::Ssh { host, user, port },
-                path,
-            )
-            .await
-            .map_err(anyhow::Error::msg)?;
+        let actual_path = verifier(
+            connection.clone(),
+            crate::terminal::TerminalTarget::Ssh { host, user, port },
+            path,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
         let crate::terminal::TerminalTarget::Ssh { host, user, port } =
             connection.effective_target().map_err(anyhow::Error::msg)?
         else {
@@ -5925,33 +5941,25 @@ impl AppState {
         if workspace.metadata.project_execution_location.as_ref() != Some(&actual) {
             anyhow::bail!("远程主机或目录身份已变化；本次重连未修改项目位置");
         }
-        self.ensure_workspace_idle_for_delete_inner(workspace_id)
-            .await?;
-        self.workspace
-            .runtimes
-            .shutdown_and_evict_if_idle(workspace_id)
-            .await?;
-        // Retirement is already physical. A later close/reassignment failure
-        // must not leave the current pointer referring to that retired host;
-        // the original transition receipt still reports the failure.
-        if self
-            .workspace
-            .current
-            .read()
-            .await
-            .as_ref()
-            .is_some_and(|host| host.id() == workspace_id)
-        {
-            *self.workspace.current.write().await = None;
+        // 通信恢复不退休Host/store；旧请求和unknown保留原代际。
+        match previous {
+            Some(previous) => {
+                self.terminal
+                    .reconnect_project_ssh_checked(
+                        workspace_id.as_str(),
+                        connection_id,
+                        &previous,
+                        &connection,
+                    )
+                    .await
+            }
+            None => {
+                self.terminal
+                    .reassign_project_ssh_checked(connection_id, workspace_id.as_str(), &connection)
+                    .await
+            }
         }
-        self.terminal
-            .close_project_ssh(workspace_id.as_str())
-            .await
-            .map_err(anyhow::Error::msg)?;
-        self.terminal
-            .reassign_project_ssh_checked(connection_id, workspace_id.as_str(), &connection)
-            .await
-            .map_err(anyhow::Error::msg)?;
+        .map_err(anyhow::Error::msg)?;
         Ok(())
     }
 
@@ -6020,6 +6028,18 @@ impl AppState {
         self: &Arc<Self>,
         request: WorkspaceTransitionRequest,
     ) -> anyhow::Result<WorkspaceSettlementOutcome> {
+        // 请求第一次进入原owned队列前固定预期代际；不能等前次发布后重新取current。
+        let expected_project_connection = match &request {
+            WorkspaceTransitionRequest::SwitchRegistered {
+                workspace_id,
+                connection_id: Some(_),
+                ..
+            }
+            | WorkspaceTransitionRequest::ReconnectProject { workspace_id, .. } => {
+                self.terminal.project_ssh(workspace_id.as_str()).ok()
+            }
+            _ => None,
+        };
         let mut settlement = self.workspace.settlement.lock().await;
         if let Some(previous) = settlement.as_mut() {
             if let Err(error) = await_workspace_settlement(previous).await {
@@ -6067,12 +6087,30 @@ impl AppState {
                                 &workspace_id,
                                 &connection_id,
                                 expected_generation.as_deref(),
+                                expected_project_connection,
                             )
                             .await?;
                     }
-                    let receipt = state
-                        .switch_registered_workspace_inner(workspace_id, expected_generation)
+                    let mut receipt = state
+                        .switch_registered_workspace_inner(
+                            workspace_id.clone(),
+                            expected_generation,
+                        )
                         .await?;
+                    if let Some(error) = state
+                        .terminal
+                        .project_ssh_uncertainty(workspace_id.as_str())
+                    {
+                        receipt.status = WorkspaceTransitionStatus::Degraded;
+                        receipt
+                            .degraded_subsystems
+                            .push(WorkspaceSubsystemTransition {
+                                subsystem: "ssh_previous_operation".into(),
+                                target_root: receipt.target_root.clone(),
+                                stale_roots: Vec::new(),
+                                error,
+                            });
+                    }
                     Ok(WorkspaceSettlementOutcome::Transition(
                         state
                             .reconcile_extension_skills_after_workspace_load(receipt)
@@ -6089,6 +6127,7 @@ impl AppState {
                             &workspace_id,
                             &connection_id,
                             expected_generation.as_deref(),
+                            expected_project_connection,
                         )
                         .await?;
                     Ok(WorkspaceSettlementOutcome::ProjectReconnected)

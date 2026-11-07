@@ -247,12 +247,10 @@ pub(crate) fn load_instruction_projection_with_file_system(
     ))
 }
 
-/// 每条消息的准备入口：项目根与 cwd 已解析，规则正文按提供者的 stat 指纹复用。
+/// 每条消息的准备入口：项目根与 cwd 已解析，严格读取当前规则正文。
 ///
-/// 复用只发生在 `FileSystem::cache_namespace() == Some(_)` 的提供者上，且每次
-/// 仍先 `symlink_metadata` 校验 mtime/len；本地/默认提供者保持每次真实读取。
-/// 投影 revision 仍由本次实际拿到（或校验后复用）的正文哈希决定，缓存不会让
-/// 旧正文混进新 revision；读哪些文件与优先级仍由 [`InstructionProvider`] 决定。
+/// 项目正文由当前调用的严格读取获得；同轮投影复用已准备值，不能用
+/// mtime/长度命中跳过下一次调用的内容读取。传输复用归原只读会话。
 pub(crate) fn load_resolved_instruction_projection(
     working_dir: Option<&std::path::Path>,
     project_root: Option<&std::path::Path>,

@@ -1,5 +1,6 @@
 //! The existing SandboxExecutor contract over the owned OpenSSH connection.
 
+use super::generations::{ConnectionSource, RequestSnapshot};
 use super::sftp::{remote_failure, unavailable};
 use super::{ProjectSshConnection, RemoteOperationResources, remote_path, shell_quote};
 use echo_agent::error::{Result, SandboxError};
@@ -16,12 +17,29 @@ use tokio_util::sync::CancellationToken;
 const DEFAULT_OUTPUT_BYTES: u64 = 1024 * 1024;
 
 pub struct ProjectSshSandbox {
-    connection: Arc<ProjectSshConnection>,
+    connection: ConnectionSource,
 }
 
 impl ProjectSshSandbox {
     pub(super) fn new(connection: Arc<ProjectSshConnection>) -> Self {
+        Self::with_source(ConnectionSource::Physical(connection))
+    }
+
+    pub(super) fn with_source(connection: ConnectionSource) -> Self {
         Self { connection }
+    }
+
+    async fn execute_selected(
+        snapshot: std::result::Result<RequestSnapshot, String>,
+        command: SandboxCommand,
+        limits: ResourceLimits,
+        cancel: Option<Arc<CancellationToken>>,
+    ) -> Result<ExecutionResult> {
+        let snapshot = snapshot.map_err(unavailable)?;
+        let result =
+            Self::execute_owned(snapshot.connection.clone(), command, limits, cancel).await;
+        drop(snapshot);
+        result
     }
 
     async fn execute_owned(
@@ -31,6 +49,17 @@ impl ProjectSshSandbox {
         cancel: Option<Arc<CancellationToken>>,
     ) -> Result<ExecutionResult> {
         Self::execute_with_launcher(connection, command, limits, cancel, |connection, script| {
+            // 与现有execute_with_launcher同一物理启动接缝；夹具只替换进程，
+            // 原快照、CAS、wait/管道/guard与错误路径仍走生产实现，不连接网络。
+            #[cfg(test)]
+            if let Some(launcher) = connection
+                .test_execution_launcher
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+            {
+                return launcher(script);
+            }
             let mut ssh = connection.slave_command().map_err(unavailable)?;
             ssh.arg("-T");
             connection.add_destination(&mut ssh).map_err(unavailable)?;
@@ -67,8 +96,7 @@ impl ProjectSshSandbox {
             )
             .into());
         }
-        // 远端截止时间：由目标机器自己看门狗终止负载，而不是本机只观察。
-        // 这样 `timeout` 到点时命令真的会停，而不是等它自然结束（可能是几十分钟）。
+        // 期限监督在目标机器执行；本机预算到达/取消请求不等同于远端停止证明。
         let effective_deadline_secs = timeout_secs(&command, &limits);
         let script = deadline_script(&command_script(&command)?, effective_deadline_secs)?;
         let target = connection.effective_target().map_err(unavailable)?.clone();
@@ -113,6 +141,7 @@ impl ProjectSshSandbox {
                 .map_err(|error| {
                     unavailable(format!("cannot start system SSH execution: {error}"))
                 })?;
+            connection.record_channel_spawn(super::SshChannelPurpose::Execution);
             let resources = registration
                 .get_or_init(|| {
                     connection.retain_remote_operation(
@@ -169,6 +198,10 @@ impl ProjectSshSandbox {
             let stdout = stdout.await;
             let stderr = stderr.await;
             let input = input.await;
+            #[cfg(test)]
+            resources
+                .test_local_exit_observed
+                .store(true, std::sync::atomic::Ordering::Release);
             let exit_code = match status.code() {
                 Some(code) if code != 255 => code,
                 _ => {
@@ -267,8 +300,11 @@ impl ProjectSshSandbox {
         tokio::pin!(cancellation);
         let deadline = tokio::time::sleep(timeout);
         tokio::pin!(deadline);
+        let stop_observation = tokio::time::sleep(super::super::CLOSE_OBSERVATION_TIMEOUT);
+        tokio::pin!(stop_observation);
         let mut cancellation_requested = false;
         let mut timeout_observed = false;
+        let mut stop_observation_started = false;
         loop {
             tokio::select! {
                 result = &mut physical => {
@@ -279,51 +315,88 @@ impl ProjectSshSandbox {
                                 && !resources.is_settled()
                             {
                                 resources.mark_stop_unknown("original physical task observation was lost after SSH spawn");
-                                resources.wait_for_settlement().await;
+                                let until = if stop_observation_started {
+                                    stop_observation.deadline()
+                                } else {
+                                    tokio::time::Instant::now() + super::super::CLOSE_OBSERVATION_TIMEOUT
+                                };
+                                if !super::wait_for_unknown_settlement(
+                                    resources,
+                                    until.saturating_duration_since(tokio::time::Instant::now()),
+                                ).await {
+                                    tracing::warn!("SSH physical observation was lost; original unknown resources retained");
+                                }
                             }
                             return Err(remote_failure(format!("SSH physical result observation failed: {error}"), true));
                         }
                     };
                     let result = result?;
-                    // 远端看门狗用 124 表示"到点并已实际终止负载"：这是有证据的
-                    // 超时，不是"本机不看了"。
-                    if timeout_observed && !cancellation_requested && result.exit_code == 124 {
+                    // 本机预算与退出原因是两件事：payload也能自行返回124。
+                    // timed_out只记录观察预算，不能从它推出看门狗或目标停止。
+                    let budget_elapsed = timeout_observed || start.elapsed() >= timeout;
+                    if budget_elapsed && !cancellation_requested && result.exit_code == 124 {
                         let mut timed_out = result;
                         timed_out.timed_out = true;
                         return Ok(timed_out);
                     }
-                    // 取消仍不主动终止（真实终止属于后续独立决策），但必须把
-                    // "命令是被截止时间杀掉的，还是自己跑完的"说清楚，否则用户
-                    // 无法判断该核对什么。
+                    // 取消仍只发起观察。没有独立原因凭据时保留未知，不能把
+                    // 124说成已杀掉，也不能把其它退出码说成一定早于期限。
                     if cancellation_requested {
-                        let message = if result.exit_code == 124 {
-                            format!(
-                                "取消已请求；远端看门狗在该命令的 {effective_deadline_secs} 秒截止时实际终止了负载（exit 124）。副作用需先核对再重试"
-                            )
+                        let budget = if budget_elapsed {
+                            "本机观察期限已到；"
                         } else {
-                            format!(
-                                "取消已请求；远端命令在截止时间之前自行结束（exit {}）。副作用需先核对再重试",
-                                result.exit_code
-                            )
+                            ""
                         };
-                        return Err(remote_failure(message, true));
+                        return Err(remote_failure(format!(
+                            "取消已请求；{budget}原命令已返回（exit {}），退出原因未确认。副作用需先核对再重试",
+                            result.exit_code,
+                        ), true));
                     }
-                    if timeout_observed {
+                    if budget_elapsed {
                         return Err(remote_failure(format!("Timeout was requested; original remote command subsequently completed with exit {}. Verify effects before retry", result.exit_code), true));
                     }
                     return Ok(result);
                 },
                 _ = &mut cancellation, if !cancellation_requested => {
                     cancellation_requested = true;
-                    // 取消不会立刻结束物理执行：远端看门狗仍在该命令自己的
-                    // 截止时间终止负载。把上界写进日志，验收和排障都能看出
-                    // "为什么还要等"。
+                    if !stop_observation_started {
+                        stop_observation.as_mut().reset(
+                            tokio::time::Instant::now() + super::super::CLOSE_OBSERVATION_TIMEOUT,
+                        );
+                        stop_observation_started = true;
+                    }
                     tracing::warn!(
                         deadline_secs = effective_deadline_secs,
-                        "remote command cancellation requested; target-side watchdog will terminate the payload at its deadline"
+                        "remote command cancellation requested; original stop observation is bounded and target stop is unconfirmed"
                     );
                 }
-                _ = &mut deadline, if !timeout_observed => timeout_observed = true,
+                _ = &mut deadline, if !timeout_observed => {
+                    timeout_observed = true;
+                    if !stop_observation_started {
+                        stop_observation.as_mut().reset(
+                            tokio::time::Instant::now() + super::super::CLOSE_OBSERVATION_TIMEOUT,
+                        );
+                        stop_observation_started = true;
+                    }
+                },
+                _ = &mut stop_observation, if stop_observation_started => {
+                    let stop_known = original_resources.get().is_some_and(|resources| resources.is_settled());
+                    if let Some(resources) = original_resources.get()
+                        && !stop_known
+                    {
+                        resources.mark_stop_unknown("bounded SSH stop observation expired; original physical operation retained");
+                    }
+                    let fact = if stop_known {
+                        "原命令退出已确认，但结果观察尚未结算"
+                    } else {
+                        "远端停止尚未确认"
+                    };
+                    // 丢弃JoinHandle只结束本观察者；原physical任务、child与guards
+                    // 继续由原连接持有，不能abort、清unknown或自动重放控制动作。
+                    return Err(remote_failure(format!(
+                        "停止观察期限已到；{fact}。原连接仍持有原物理任务及未结算资源，副作用需先核对再重试",
+                    ), true));
+                },
             }
         }
     }
@@ -339,16 +412,50 @@ impl SandboxExecutor for ProjectSshSandbox {
     }
 
     fn is_available(&self) -> BoxFuture<'_, bool> {
-        Box::pin(async move { self.connection.check_authenticated().await.is_ok() })
+        let snapshot = self.connection.capture();
+        Box::pin(async move {
+            match snapshot {
+                Ok(snapshot) => snapshot.connection.check_authenticated().await.is_ok(),
+                Err(_) => false,
+            }
+        })
     }
 
     fn execute(&self, command: SandboxCommand) -> BoxFuture<'_, Result<ExecutionResult>> {
-        Box::pin(Self::execute_owned(
-            Arc::clone(&self.connection),
+        Box::pin(Self::execute_selected(
+            self.connection.capture(),
             command,
             ResourceLimits::unrestricted(),
             None,
         ))
+    }
+
+    fn execute_stream<'a>(
+        &'a self,
+        command: SandboxCommand,
+    ) -> BoxFuture<
+        'a,
+        Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<Item = echo_agent::sandbox::SandboxStreamEvent> + Send + 'a,
+                >,
+            >,
+        >,
+    > {
+        // 调用即捕获；默认trait到首次poll才execute，会误选重连后的代际。
+        let execution = self.execute(command);
+        Box::pin(async move {
+            let result = execution.await?;
+            let events: std::pin::Pin<
+                Box<
+                    dyn futures::Stream<Item = echo_agent::sandbox::SandboxStreamEvent> + Send + 'a,
+                >,
+            > = Box::pin(futures::stream::once(async move {
+                echo_agent::sandbox::SandboxStreamEvent::Complete(result)
+            }));
+            Ok(events)
+        })
     }
 
     fn execute_with_limits(
@@ -356,8 +463,8 @@ impl SandboxExecutor for ProjectSshSandbox {
         command: SandboxCommand,
         limits: ResourceLimits,
     ) -> BoxFuture<'_, Result<ExecutionResult>> {
-        Box::pin(Self::execute_owned(
-            Arc::clone(&self.connection),
+        Box::pin(Self::execute_selected(
+            self.connection.capture(),
             command,
             limits,
             None,
@@ -370,8 +477,8 @@ impl SandboxExecutor for ProjectSshSandbox {
         limits: ResourceLimits,
         cancel: Option<Arc<CancellationToken>>,
     ) -> BoxFuture<'_, Result<ExecutionResult>> {
-        Box::pin(Self::execute_owned(
-            Arc::clone(&self.connection),
+        Box::pin(Self::execute_selected(
+            self.connection.capture(),
             command,
             limits,
             cancel,
@@ -379,20 +486,22 @@ impl SandboxExecutor for ProjectSshSandbox {
     }
 
     fn cleanup(&self) -> BoxFuture<'_, Result<()>> {
+        let connections = self.connection.connections();
         Box::pin(async move {
-            self.connection
-                .retry_retained_children()
-                .await
-                .map_err(unavailable)?;
-            if self
-                .connection
-                .active_operations
-                .load(std::sync::atomic::Ordering::Acquire)
-                != 0
-            {
-                return Err(unavailable(self.connection.unsettled_remote_operation().unwrap_or_else(|| {
+            for connection in connections {
+                connection
+                    .retry_retained_children()
+                    .await
+                    .map_err(unavailable)?;
+                if connection
+                    .active_operations
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != 0
+                {
+                    return Err(unavailable(connection.unsettled_remote_operation().unwrap_or_else(|| {
                     "original SSH operations remain active; cleanup has no remote completion proof".to_string()
                 })));
+                }
             }
             Ok(())
         })
@@ -421,49 +530,86 @@ fn validate_capabilities(command: &SandboxCommand, limits: &ResourceLimits) -> R
 }
 
 /// 远端看门狗执行的有效期限（秒）。与本地观察用的 `timeout` 同源，
-/// 保证"本机判定超时"和"远端真的开始终止"是同一时刻，而不是两套口径。
+/// 本机保留精确Duration，目标按秒上取整，不承诺两者同一时刻触发。
 fn timeout_secs(command: &SandboxCommand, limits: &ResourceLimits) -> u64 {
     let timeout = limits
         .cpu_time_secs
         .map(Duration::from_secs)
         .map(|limit| limit.min(command.timeout))
         .unwrap_or(command.timeout);
-    timeout.as_secs().max(1)
+    // 目标timer粒度为秒，向上取整避免早于原Duration发送终止信号；
+    // 本机观察预算仍使用原精确Duration，不以扩大预算掩盖等待。
+    let seconds = if timeout.subsec_nanos() == 0 {
+        timeout.as_secs()
+    } else {
+        timeout.as_secs().saturating_add(1)
+    };
+    seconds.max(1)
 }
 
-/// 用 POSIX `sh` 包一层看门狗，让目标机器在到点时真正终止负载。
+/// 用 POSIX `sh` 在目标机器监督期限，届时发送 TERM，再按宽限尝试 KILL。
 ///
 /// 负载本身仍是原来的 `cd ... || exit 125; exec ...` 脚本，因此 shell 语义、
 /// 环境变量和退出码都不变；只有"到点后由谁负责结束"从本机观察变成远端执行。
-/// 终止顺序是先 `TERM` 再宽限 `KILL`；是否真的走到终止用标记文件回报，
-/// 命中时统一以 124 退出（与 `timeout(1)` 的约定一致），由本地映射成超时结果。
+/// 看门狗分支与负载本身都可能返回124；退出码本身不证明终止原因，
+/// 更不证明被操作的服务已经停止。客户端仍须保留未知及原物理观察。
 fn deadline_script(script: &str, timeout_seconds: u64) -> Result<String> {
     let payload = shell_quote(script).map_err(unavailable)?;
-    // 看门狗自己轮询，负载提前结束就立刻退出，避免每次命令都在远端留一个
-    // 睡到超时的孤儿 sleep。标记文件按会话派生，先删再跑，防止上次异常退出
-    // 留下的残留被误读成"本次已到点"。
+    // POSIX异步列表默认把stdin设为空；负载必须显式继承原输入。
+    // timer停止时必须kill+wait其原sleep子进程，再由parent wait timer。
+    // 仅kill外层subshell会留下sleep持有输出管道，给每条快命令多加约1秒。
+    // PID发布期间先记录停止请求，发布完成再回收，不能在spawn半途退出。
     Ok(format!(
-        "eko_marker=\"${{TMPDIR:-/tmp}}/.eko-deadline-$$\"\n\
-         rm -f \"$eko_marker\"\n\
-         sh -c {payload} &\n\
-         eko_child=$!\n\
-         ( eko_elapsed=0\n\
-           while [ \"$eko_elapsed\" -lt {timeout_seconds} ]; do\n\
-             sleep 1\n\
-             eko_elapsed=$((eko_elapsed + 1))\n\
-             kill -0 \"$eko_child\" 2>/dev/null || exit 0\n\
-           done\n\
-           : > \"$eko_marker\"\n\
-           kill -TERM \"$eko_child\" 2>/dev/null\n\
-           sleep 5\n\
-           kill -KILL \"$eko_child\" 2>/dev/null ) &\n\
-         eko_watchdog=$!\n\
-         wait \"$eko_child\"\n\
-         eko_status=$?\n\
-         kill \"$eko_watchdog\" 2>/dev/null\n\
-         if [ -f \"$eko_marker\" ]; then rm -f \"$eko_marker\"; exit 124; fi\n\
-         rm -f \"$eko_marker\"\n\
-         exit $eko_status"
+        r#"eko_marker="${{TMPDIR:-/tmp}}/.eko-deadline-$$"
+rm -f "$eko_marker"
+sh -c {payload} <&0 &
+eko_child=$!
+(
+  eko_elapsed=0
+  eko_timer=
+  eko_spawning=0
+  eko_stopping=0
+  eko_reap_timer() {{
+    if [ -n "$eko_timer" ]; then
+      kill "$eko_timer" 2>/dev/null
+      wait "$eko_timer" 2>/dev/null
+      eko_timer=
+    fi
+  }}
+  eko_stop_timer() {{
+    eko_stopping=1
+    if [ "$eko_spawning" -eq 0 ]; then eko_reap_timer; exit 0; fi
+  }}
+  trap eko_stop_timer HUP INT TERM
+  eko_tick() {{
+    eko_spawning=1
+    sleep "$1" &
+    eko_timer=$!
+    eko_spawning=0
+    if [ "$eko_stopping" -ne 0 ]; then eko_reap_timer; exit 0; fi
+    wait "$eko_timer"
+    eko_tick_status=$?
+    eko_timer=
+    [ "$eko_stopping" -eq 0 ] && [ "$eko_tick_status" -eq 0 ]
+  }}
+  while [ "$eko_elapsed" -lt {timeout_seconds} ]; do
+    eko_tick 1 || exit 0
+    eko_elapsed=$((eko_elapsed + 1))
+    kill -0 "$eko_child" 2>/dev/null || exit 0
+  done
+  : > "$eko_marker"
+  kill -TERM "$eko_child" 2>/dev/null
+  eko_tick 5 || exit 0
+  kill -KILL "$eko_child" 2>/dev/null
+) </dev/null &
+eko_watchdog=$!
+wait "$eko_child"
+eko_status=$?
+kill "$eko_watchdog" 2>/dev/null
+wait "$eko_watchdog" 2>/dev/null
+if [ -f "$eko_marker" ]; then rm -f "$eko_marker"; exit 124; fi
+rm -f "$eko_marker"
+exit $eko_status"#
     ))
 }
 
@@ -616,9 +762,10 @@ mod tests {
             .effective_target
             .set(target)
             .map_err(|_| "duplicate fixture target".to_string())?;
-        service
-            .project_connections
-            .insert("fixture".into(), Arc::clone(&connection));
+        service.project_connections.insert(
+            "fixture".into(),
+            super::super::ProjectSshOwner::new(Arc::clone(&connection)),
+        );
         Ok((service, connection))
     }
 
@@ -658,6 +805,313 @@ mod tests {
             .with_resource_guards(vec![echo_agent::tools::InvocationResourceGuard::new(
                 GuardDrop(Arc::clone(dropped)),
             )])
+    }
+
+    #[cfg(unix)]
+    struct ReleaseLocalFixture(std::path::PathBuf);
+    #[cfg(unix)]
+    impl Drop for ReleaseLocalFixture {
+        fn drop(&mut self) {
+            let _release = std::fs::write(&self.0, b"release");
+        }
+    }
+
+    #[cfg(unix)]
+    struct ShellReceiptFixture {
+        connection: Arc<ProjectSshConnection>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(unix)]
+    impl SandboxExecutor for ShellReceiptFixture {
+        fn name(&self) -> &str {
+            "ssh"
+        }
+        fn isolation_level(&self) -> IsolationLevel {
+            IsolationLevel::None
+        }
+        fn is_available(&self) -> BoxFuture<'_, bool> {
+            Box::pin(async { true })
+        }
+        fn execute(&self, command: SandboxCommand) -> BoxFuture<'_, Result<ExecutionResult>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let connection = self.connection.clone();
+            Box::pin(ProjectSshSandbox::execute_with_launcher(
+                connection,
+                command,
+                ResourceLimits::unrestricted(),
+                None,
+                |_, _| {
+                    let mut command = tokio::process::Command::new("/bin/sh");
+                    command.args(["-c", "exit 255"]);
+                    Ok(command)
+                },
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_consumer_keeps_original_ssh_unknown_failure_and_guards()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use echo_agent::tools::{
+            Tool, ToolContext, ToolFailureCategory, ToolRecoveryAction, ToolSideEffect,
+        };
+        let (service, connection) = fixture_connection()?;
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool = echo_agent::tools::shell::ShellTool::new().with_sandbox(Arc::new(
+            ShellReceiptFixture {
+                connection: connection.clone(),
+                calls: calls.clone(),
+            },
+        ));
+        let context = ToolContext {
+            working_dir: Some(std::path::PathBuf::from("/")),
+            resource_guards: vec![echo_agent::tools::InvocationResourceGuard::new(GuardDrop(
+                dropped.clone(),
+            ))],
+            ..Default::default()
+        };
+        let parameters = std::collections::HashMap::from([
+            ("command".to_string(), serde_json::json!("printf fixture")),
+            ("timeout".to_string(), serde_json::json!(1)),
+        ]);
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            tool.execute_with_context(parameters, &context),
+        )
+        .await??;
+        drop(context);
+        tokio::task::yield_now().await;
+        let resource = wait_for_unknown(&connection).await?;
+        let retained = !resource.is_settled()
+            && resource.stop_is_unknown()
+            && dropped.load(std::sync::atomic::Ordering::Acquire) == 0;
+        // 原本机fixture的child退出已被同一wait观察；在断言前收回夹具，
+        // 不把该本机清理能力暴露为远端unknown恢复API。
+        resource.complete_with_proof();
+        tokio::task::yield_now().await;
+        service.close_project_ssh("fixture").await?;
+        assert!(retained);
+        assert!(!result.success);
+        let failure = result.failure.ok_or("Shell lost structured failure")?;
+        assert_eq!(failure.category, ToolFailureCategory::PartialSideEffect);
+        assert_eq!(failure.side_effect, ToolSideEffect::Possible);
+        assert_eq!(failure.recovery, ToolRecoveryAction::VerifyThenRetry);
+        assert!(!failure.allows_automatic_retry());
+        assert!(
+            result
+                .metadata
+                .get("duration_ms")
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|millis| millis >= 1000),
+            "buffered execution already exceeded its one-second budget"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::Acquire), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_consumer_keeps_known_not_started_ssh_failure_without_effects()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use echo_agent::tools::{
+            Tool, ToolContext, ToolFailureCategory, ToolRecoveryAction, ToolSideEffect,
+        };
+        let (service, connection) = fixture_connection()?;
+        connection.begin_shutdown();
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool = echo_agent::tools::shell::ShellTool::new().with_sandbox(Arc::new(
+            ShellReceiptFixture {
+                connection: connection.clone(),
+                calls: calls.clone(),
+            },
+        ));
+        let context = ToolContext {
+            working_dir: Some(std::path::PathBuf::from("/")),
+            resource_guards: vec![echo_agent::tools::InvocationResourceGuard::new(GuardDrop(
+                dropped.clone(),
+            ))],
+            ..Default::default()
+        };
+        let parameters = std::collections::HashMap::from([(
+            "command".to_string(),
+            serde_json::json!("printf fixture"),
+        )]);
+        let result = tool.execute_with_context(parameters, &context).await?;
+        drop(context);
+        tokio::task::yield_now().await;
+        service.close_project_ssh("fixture").await?;
+        assert!(!result.success);
+        let failure = result.failure.ok_or("Shell lost structured failure")?;
+        assert_eq!(failure.category, ToolFailureCategory::Unavailable);
+        assert_eq!(failure.side_effect, ToolSideEffect::None);
+        assert_eq!(failure.recovery, ToolRecoveryAction::RestoreThenRetry);
+        assert!(!failure.allows_automatic_retry());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::Acquire), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wrapper_regression_stdin_and_payload_diagnostics_are_preserved()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (_service, connection) = fixture_connection()?;
+        let directory = tempfile::tempdir()?;
+        let launch_directory = directory.path().to_path_buf();
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let input = "输入不能丢失 🧪\n";
+        let mut command = fixture_command(&dropped);
+        command.kind = CommandKind::Shell("cat; printf payload_diagnostic >&2; exit 7".into());
+        command.stdin = Some(input.to_string());
+        let result = ProjectSshSandbox::execute_with_launcher(
+            connection.clone(),
+            command,
+            ResourceLimits::unrestricted(),
+            None,
+            move |_, script| {
+                let mut command = tokio::process::Command::new("/bin/sh");
+                command
+                    .args(["-c", &script])
+                    .env("TMPDIR", launch_directory);
+                Ok(command)
+            },
+        )
+        .await?;
+        assert_eq!(result.exit_code, 7);
+        assert_eq!(result.stdout, input);
+        assert_eq!(result.stderr, "payload_diagnostic");
+        assert!(!result.timed_out);
+        assert!(!result.cancelled);
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert_eq!(
+            connection
+                .active_operations
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wrapper_regression_cancel_natural_124_is_not_claimed_killed()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (_service, connection) = fixture_connection()?;
+        let directory = tempfile::tempdir()?;
+        let started = directory.path().join("started");
+        let release = directory.path().join("release");
+        let _release = ReleaseLocalFixture(release.clone());
+        let launch_directory = directory.path().to_path_buf();
+        let script = format!(
+            "printf started > {}; while [ ! -f {} ]; do /bin/sleep 0.01; done; exit 124",
+            shell_quote(started.to_str().ok_or("invalid fixture path")?)?,
+            shell_quote(release.to_str().ok_or("invalid fixture path")?)?,
+        );
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancel = Arc::new(CancellationToken::new());
+        let mut command = fixture_command(&dropped).with_cancel(Some(cancel.clone()));
+        command.kind = CommandKind::Shell(script);
+        command.timeout = Duration::from_secs(30);
+        let operation = ProjectSshSandbox::execute_with_launcher(
+            connection.clone(),
+            command,
+            ResourceLimits::unrestricted(),
+            None,
+            move |_, script| {
+                let mut command = tokio::process::Command::new("/bin/sh");
+                command
+                    .args(["-c", &script])
+                    .env("TMPDIR", launch_directory);
+                Ok(command)
+            },
+        );
+        tokio::pin!(operation);
+        assert!(matches!(
+            futures::poll!(operation.as_mut()),
+            std::task::Poll::Pending
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        cancel.cancel();
+        // 负载仍被原release门阻塞，此次poll只能先消费取消请求；无需猜延迟。
+        assert!(matches!(
+            futures::poll!(operation.as_mut()),
+            std::task::Poll::Pending
+        ));
+        std::fs::write(&release, b"release")?;
+        let result = tokio::time::timeout(Duration::from_secs(5), operation.as_mut()).await?;
+        let error = result
+            .err()
+            .ok_or("cancelled observation unexpectedly succeeded")?;
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::Acquire), 1);
+        let message = error.to_string();
+        assert!(message.contains("124"));
+        assert!(
+            !message.contains("实际终止"),
+            "natural 124 is not a watchdog kill receipt: {message}"
+        );
+        assert!(message.contains("退出原因未确认"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wrapper_regression_transport_loss_observation_is_bounded_and_keeps_unknown()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (service, connection) = fixture_connection()?;
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut command = fixture_command(&dropped);
+        command.timeout = Duration::from_millis(20);
+        let mut observer = tokio::spawn(ProjectSshSandbox::execute_with_launcher(
+            connection.clone(),
+            command,
+            ResourceLimits::unrestricted(),
+            None,
+            |_, _| {
+                let mut command = tokio::process::Command::new("/bin/sh");
+                command.args(["-c", "exit 255"]);
+                Ok(command)
+            },
+        ));
+        let resource = wait_for_unknown(&connection).await?;
+        let observed = tokio::time::timeout(
+            crate::terminal::CLOSE_OBSERVATION_TIMEOUT + Duration::from_secs(2),
+            &mut observer,
+        )
+        .await;
+        let returned = observed.is_ok();
+        let retained = !resource.is_settled()
+            && resource.stop_is_unknown()
+            && dropped.load(std::sync::atomic::Ordering::Acquire) == 0;
+        // 仅此自有本机夹具的退出已被原wait观察；先完成cleanup，不能把
+        // SSH255推广为远端停止证明，也不能为让断言通过而提前清债。
+        resource.complete_with_proof();
+        let result = match observed {
+            Ok(result) => result?,
+            Err(_) => observer.await?,
+        };
+        tokio::task::yield_now().await;
+        service.close_project_ssh("fixture").await?;
+        assert!(
+            returned,
+            "the observer must return bounded unknown instead of hanging"
+        );
+        assert!(
+            retained,
+            "bounded observation cannot settle the original unknown operation"
+        );
+        assert!(result.is_err());
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::Acquire), 1);
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -765,12 +1219,6 @@ mod tests {
     #[tokio::test]
     async fn timeout_and_cancel_only_observe_the_same_physical_invocation_until_exit()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
-        struct ReleaseLocalFixture(std::path::PathBuf);
-        impl Drop for ReleaseLocalFixture {
-            fn drop(&mut self) {
-                let _release = std::fs::write(&self.0, b"release");
-            }
-        }
         let (_service, connection) = fixture_connection()?;
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("release");
@@ -844,6 +1292,99 @@ mod tests {
 mod deadline_tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn wrapper_regression_fractional_timeout_is_not_rounded_down() {
+        let mut command = SandboxCommand::shell("true");
+        command.timeout = Duration::from_millis(1500);
+        assert_eq!(timeout_secs(&command, &ResourceLimits::unrestricted()), 2);
+        let mut limits = ResourceLimits::unrestricted();
+        limits.cpu_time_secs = Some(1);
+        assert_eq!(timeout_secs(&command, &limits), 1);
+    }
+
+    fn timer_is_running(pid: u32) -> std::io::Result<bool> {
+        Command::new("/bin/sh")
+            .args(["-c", "kill -0 \"$1\" 2>/dev/null", "owned-timer"])
+            .arg(pid.to_string())
+            .status()
+            .map(|status| status.success())
+    }
+
+    #[tokio::test]
+    async fn wrapper_regression_reaps_timer_without_waiting_for_its_wake()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir()?;
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin)?;
+        let ready = directory.path().join("timer-ready");
+        let gate_path = directory.path().join("timer-gate");
+        let sleep = bin.join("sleep");
+        // 在原外部sleep边界控制唤醒，避免把CPU负载或1秒时钟精度当判据。
+        // parent先完成payload；timer若没被真正回收，会持续占有原输出管道。
+        std::fs::write(
+            &sleep,
+            r#"#!/bin/sh
+printf '%s\n' "$$" > "$EKO_TEST_TIMER_READY"
+IFS= read -r ignored < "$EKO_TEST_TIMER_GATE"
+"#,
+        )?;
+        std::fs::set_permissions(&sleep, std::fs::Permissions::from_mode(0o755))?;
+        assert!(Command::new("mkfifo").arg(&gate_path).status()?.success());
+        let mut gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&gate_path)?;
+        let ready_path = shell_quote(ready.to_str().ok_or("invalid fixture path")?)?;
+        let payload = format!(
+            "eko_probe_round=0; while [ ! -s {ready_path} ]; do eko_probe_round=$((eko_probe_round + 1)); [ \"$eko_probe_round\" -lt 1000 ] || exit 91; /bin/sleep 0.01; done; printf payload_stdout; printf payload_stderr >&2"
+        );
+        let script = deadline_script(&payload, 30)?;
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", &script])
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("TMPDIR", directory.path())
+            .env("EKO_TEST_TIMER_READY", &ready)
+            .env("EKO_TEST_TIMER_GATE", &gate_path);
+        let mut physical = tokio::task::spawn_blocking(move || command.output());
+        let observed = tokio::time::timeout(Duration::from_secs(5), &mut physical).await;
+        let returned_before_wake = observed.is_ok();
+        let timer_pid = std::fs::read_to_string(&ready)
+            .and_then(|pid| pid.trim().parse::<u32>().map_err(std::io::Error::other));
+        let timer_still_running = match &timer_pid {
+            Ok(pid) => timer_is_running(*pid),
+            Err(error) => Err(std::io::Error::other(error.to_string())),
+        };
+        // 不管观察是否超时，先释放原夹具并收集输出；不能丢弃物理线程。
+        gate.write_all(b"release\n")?;
+        let output = match observed {
+            Ok(result) => result??,
+            Err(_) => physical.await??,
+        };
+        let timer_pid = timer_pid?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while timer_is_running(timer_pid)? {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await??;
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout)?, "payload_stdout");
+        assert_eq!(String::from_utf8(output.stderr)?, "payload_stderr");
+        assert!(
+            returned_before_wake,
+            "completed payload must not wait for the timer's scheduled wake"
+        );
+        assert!(
+            !timer_still_running?,
+            "redirecting timer pipes does not replace stopping and reaping it"
+        );
+        Ok(())
+    }
 
     fn run_wrapped(script: &str, seconds: u64) -> std::io::Result<std::process::Output> {
         let wrapped = deadline_script(script, seconds).map_err(std::io::Error::other)?;

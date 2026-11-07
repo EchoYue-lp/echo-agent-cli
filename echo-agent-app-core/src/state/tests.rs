@@ -236,6 +236,7 @@ mod model_mutation_tests {
     async fn agent_projection(handle: &AgentHandle) -> Result<AgentModelProjection, String> {
         handle
             .read(|agent| {
+                assert_eq!(agent.config().get_temperature(), None);
                 let llm = agent
                     .llm_config()
                     .ok_or_else(|| "agent has no LLM config".to_string())?;
@@ -6759,6 +6760,312 @@ mod service_bootstrap_tests {
                 .map_err(|error| error.to_string())?
                 .map(|run| run.status),
             Some(crate::tasks::task_runtime::TaskRunStatus::Paused)
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn generation_pending_reconnect_rejects_second_queued_candidate() -> anyhow::Result<()> {
+        use crate::workspace::{ProjectLocation, WorkspaceKind};
+        let directory = tempfile::tempdir()?;
+        let state = Arc::new(
+            boot_recovery_state(&directory.path().join("registry")).map_err(anyhow::Error::msg)?,
+        );
+        let location = ProjectLocation::Ssh {
+            host: "fixture.invalid".into(),
+            user: Some("fixture".into()),
+            port: Some(22),
+            path: "/fixture-remote".into(),
+        };
+        let target = state.workspace.registry.create_project(
+            "queued-generation-target",
+            WorkspaceKind::General,
+            location.clone(),
+            Some(location),
+        )?;
+        let original = state
+            .terminal
+            .test_install_project_generation("queued-original", 0, "original")
+            .await
+            .map_err(anyhow::Error::msg)?;
+        state
+            .terminal
+            .reassign_project_ssh_checked("queued-original", target.id.as_str(), &original)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let a = state
+            .terminal
+            .test_install_project_generation("queued-draft-a", 0, "a")
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let _b = state
+            .terminal
+            .test_install_project_generation("queued-draft-b", 0, "b")
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let focus = state
+            .workspace
+            .registry
+            .create("blocked-focus", WorkspaceKind::General)?;
+        let (entered, release) = state
+            .park_next_workspace_transition()
+            .map_err(anyhow::Error::msg)?;
+        let blocking = state
+            .run_owned_workspace_transition(WorkspaceTransitionRequest::Switch(Box::new(focus)));
+        tokio::pin!(blocking);
+        assert!(matches!(
+            futures::poll!(blocking.as_mut()),
+            std::task::Poll::Pending
+        ));
+        entered.await?;
+        let first = state.reconnect_workspace_project_owned(
+            target.id.clone(),
+            "queued-draft-a".into(),
+            Some(target.product_data_generation.clone()),
+        );
+        let second = state.reconnect_workspace_project_owned(
+            target.id.clone(),
+            "queued-draft-b".into(),
+            Some(target.product_data_generation.clone()),
+        );
+        tokio::pin!(first, second);
+        // 确认两个原入口都已实际入队，不能用sleep或仅“准备spawn”冒并发证据。
+        assert!(matches!(
+            futures::poll!(first.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(matches!(
+            futures::poll!(second.as_mut()),
+            std::task::Poll::Pending
+        ));
+        release
+            .send(())
+            .map_err(|_| anyhow::anyhow!("blocking transition vanished"))?;
+        let (focused, first_result, second_result) = tokio::join!(blocking, first, second);
+        let active = state
+            .terminal
+            .project_ssh(target.id.as_str())
+            .map_err(anyhow::Error::msg)?;
+        let second_kept = state.terminal.project_ssh("queued-draft-b").is_ok();
+        state
+            .terminal
+            .close_project_ssh(target.id.as_str())
+            .await
+            .map_err(anyhow::Error::msg)?;
+        state
+            .terminal
+            .close_project_ssh("queued-draft-a")
+            .await
+            .map_err(anyhow::Error::msg)?;
+        state
+            .terminal
+            .close_project_ssh("queued-draft-b")
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert!(focused.is_ok());
+        assert!(
+            first_result.is_ok(),
+            "first candidate failed: {first_result:?}"
+        );
+        assert!(
+            second_result.is_err(),
+            "queued candidate captured after first publication: {second_result:?}"
+        );
+        assert!(Arc::ptr_eq(&active, &a) && second_kept);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn generation_workspace_reconnect_preserves_host_store_and_old_unknown_guards()
+    -> anyhow::Result<()> {
+        use crate::workspace::{ProjectLocation, WorkspaceKind};
+        use echo_agent::sandbox::SandboxCommand;
+        let directory = tempfile::tempdir()?;
+        let state =
+            boot_recovery_state(&directory.path().join("registry")).map_err(anyhow::Error::msg)?;
+        let location = ProjectLocation::Ssh {
+            host: "fixture.invalid".into(),
+            user: Some("fixture".into()),
+            port: Some(22),
+            path: "/fixture-remote".into(),
+        };
+        let workspace = state.workspace.registry.create_project(
+            "generation-workspace",
+            WorkspaceKind::General,
+            location.clone(),
+            Some(location),
+        )?;
+        let original = state
+            .terminal
+            .test_install_project_generation("workspace-original-auth", 255, "original")
+            .await
+            .map_err(anyhow::Error::msg)?;
+        state
+            .terminal
+            .reassign_project_ssh_checked(
+                "workspace-original-auth",
+                workspace.id.as_str(),
+                &original,
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let (files, executor) = state
+            .terminal
+            .project_ssh_adapters(workspace.id.as_str(), "/fixture-remote".into())
+            .map_err(anyhow::Error::msg)?;
+        // 仅替换认证/目录验证的外部事实，Host及全部本机store走生产构造路径。
+        let host = state
+            .workspace
+            .runtimes
+            .test_bind_verified_project(
+                workspace.clone(),
+                (std::path::PathBuf::from("/fixture-remote"), files, executor),
+            )
+            .await?;
+        *state.workspace.current.write().await = Some(host.clone());
+        let store = host.task_runtime().await?;
+        let resources = state
+            .project_resources_for_workspace(
+                workspace.id.as_str(),
+                &workspace.product_data_generation,
+            )
+            .await?;
+        let original_files = resources.files.clone();
+        let original_executor = resources.executor.clone();
+        let failed = resources
+            .executor
+            .execute(
+                SandboxCommand::program("fixture-control", Vec::new())
+                    .with_working_dir(&resources.working_dir)
+                    .with_timeout(std::time::Duration::from_secs(1))
+                    .with_resource_guards(vec![echo_agent::tools::InvocationResourceGuard::new(
+                        resources.lifetime.clone(),
+                    )]),
+            )
+            .await;
+        drop(resources);
+        assert!(failed.is_err());
+        assert!(
+            state
+                .ensure_workspace_idle_for_delete(&workspace.id)
+                .await
+                .is_err(),
+            "old native fixture still holds its original Workspace guard"
+        );
+        state
+            .terminal
+            .test_disconnect_original_master(&original)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let draft = state
+            .terminal
+            .test_install_project_generation(
+                "workspace-successor-auth",
+                0,
+                "new target observation",
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let wrong = state
+            .reconnect_workspace_project_with_verifier(
+                &workspace.id,
+                "workspace-successor-auth",
+                Some(&workspace.product_data_generation),
+                Some(original.clone()),
+                |_, _, _| async { Ok("/different-directory".to_string()) },
+            )
+            .await;
+        assert!(wrong.is_err());
+        assert!(Arc::ptr_eq(
+            &state
+                .terminal
+                .project_ssh(workspace.id.as_str())
+                .map_err(anyhow::Error::msg)?,
+            &original
+        ));
+        let stale = state
+            .reconnect_workspace_project_with_verifier(
+                &workspace.id,
+                "workspace-successor-auth",
+                Some("stale-product-generation"),
+                Some(original.clone()),
+                |_, _, _| async { Err("verification must not be reached".to_string()) },
+            )
+            .await;
+        assert!(stale.is_err());
+        state
+            .reconnect_workspace_project_with_verifier(
+                &workspace.id,
+                "workspace-successor-auth",
+                Some(&workspace.product_data_generation),
+                Some(original.clone()),
+                |connection, target, path| async move {
+                    connection.verify_effective_target(&target)?;
+                    Ok(path)
+                },
+            )
+            .await?;
+        let current_host = state
+            .workspace
+            .runtimes
+            .loaded_host(&workspace.id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Host disappeared"))?;
+        assert!(Arc::ptr_eq(&host, &current_host));
+        assert!(Arc::ptr_eq(&store, &current_host.task_runtime().await?));
+        let current = state
+            .project_resources_for_workspace(
+                workspace.id.as_str(),
+                &workspace.product_data_generation,
+            )
+            .await?;
+        assert!(Arc::ptr_eq(&original_files, &current.files));
+        assert!(Arc::ptr_eq(&original_executor, &current.executor));
+        let observed = original_executor
+            .execute(
+                SandboxCommand::program("fixture-query", Vec::new())
+                    .with_working_dir("/fixture-remote")
+                    .with_timeout(std::time::Duration::from_secs(1)),
+            )
+            .await?;
+        assert_eq!(observed.stdout, "new target observation");
+        assert!(Arc::ptr_eq(
+            &state
+                .terminal
+                .project_ssh(workspace.id.as_str())
+                .map_err(anyhow::Error::msg)?,
+            &draft
+        ));
+        assert!(
+            state
+                .terminal
+                .project_ssh_uncertainty(workspace.id.as_str())
+                .is_some()
+        );
+        drop(current);
+        assert!(
+            state
+                .ensure_workspace_idle_for_delete(&workspace.id)
+                .await
+                .is_err(),
+            "successful new query must not clear old unknown or guard"
+        );
+        state
+            .terminal
+            .test_settle_local_unknown(&original)
+            .map_err(anyhow::Error::msg)?;
+        state
+            .terminal
+            .close_project_ssh(workspace.id.as_str())
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert!(
+            state
+                .ensure_workspace_idle_for_delete(&workspace.id)
+                .await
+                .is_ok()
         );
         Ok(())
     }

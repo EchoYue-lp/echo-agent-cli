@@ -259,3 +259,58 @@ npx vitest run \
 变化，故不修改其示例。官网用户能力介绍仅需同步旧格式承诺取消与 runtime 最终事件保留
 的边界；由 Delivery 在真实 EKO 来源固定并审阅后处理中文提案，不手改自动镜像或同步
 manifest，不提前宣告实际后端桥、新版 native 或网站部署通过。
+
+
+## 2026-11-02：后台 native publication 的 test-only 冻结切点
+
+原自动 Cron 已有真正 Completed 的 Run 和任务卡公开回答，但主聊天只有用户输入。原六条 native 元数据的外层 execution_id 均缺失；原 TaskRuntime journal 有事件，同 conversation 的 ChatEventLog 没有 publication。原 StoredMessage 只有 candidate／approved 计数与摘要，不能由它补造公开发布。模型已回答、任务卡全文可见、Framework Settled、产品 Run／Turn 终态与主聊天发布分别验收，不互相代签。
+
+后台应在原真实 owner／RunTurn admission 和原 AgentTurnDriver 上保持 typed Started／实际 source 身份，将原 envelope 原样进入原 TaskRuntime journal及同一已绑定 ChatEventLog。只借原 Weak runtime 的共享 log Arc，不按路径重开第二个 store，不复制整个 physical driver execution ID 到其多个 RunTurn，不新建 UUID 或从 FinalAnswer／字符串／EOF 后补 execution。原 driver 的 None transport identity 合法，不能假称已有自动回填；Root 另授的 Framework 机制仅在 fresh cursor0、首真实 Started 经原 projection 验证且首 envelope 尚未生成时绑定 missing execution。prefix-first、None＋非0 resume 仍不绑定，显式 caller 原合同及 raw owner／EOF 不变。该机制本切点尚未取得本线的 Rust GREEN。
+
+后台产品 TurnStatus 必须在原 durable RunTurn terminal／typed receipt 及原 decision 之后，使用同 workspace／conversation／root／turn／message scope 发布真实 completed／failed／cancelled。Frame Settled 单独不授产品成功；不得由任务卡 summary、candidate、RunCompleted 文案或缺失旧 payload拼出 native terminal。缺 publication、错 execution／scope、缺真实 Settled 或后继产品失败时，原 strict history／Fork 继续拒绝 raw fallback。旧真实 payload 已失证的部分保持 gap，不从摘要恢复为完整旧 Run 回放。
+
+Root 对精候选四文件独审 pass C0/I0/M0 后，本切点只正式采用原 executor/tests.rs 的 c197c28353ea2df0298c63ade1c5e029ba78edbf4427311cd7e9bc5540780597 测试差量（after 0874319e3d99db24f97cc8d1778a6e99df530e84a1f5bc6e3b51b567fe5f424d），不采用三个生产文件。两个新 selector 为：
+
+- `tasks::task_runtime::executor::tests::unattended_owned_turn_preserves_real_native_execution_header`
+- `tasks::task_runtime::executor::tests::unattended_owned_turn_publishes_strict_cold_history_without_raw_fallback`
+
+新夹具明确是受控合成 Model（MockLlmClient／MockTool），经原 unattended／RunTurn／Driver／sink／共享 log／strict cold consumer；不是旧 Cron payload replay，也不是 App/native 通过。第二例保留缺 publication、缺 Settled、foreign owner、产品 failed 及真正 cold reopen 的验证目标。当前只做正式测试源码／Source 和命令 packet 准备，尚未 CLI NoRun／实际 list／Rust RED／GREEN；类型与 warning 资格未取得。只有实际新程序 list 各确1、在精基线上取得目标 RED，再在 F 真实 GREEN／冻结及 Root 精组合授权后取得同 selector GREEN，才可声明相应 producer／consumer 修复。
+
+F Source 正经历独立 test-only RED→fix 阶段，当前不运行 CLI Cargo、不计算或宣称最终 consumer、不改 policy／Cargo.lock／R03 已过源码；风险摘要绑定须由 Root 在最终精 source 组稳定后另行批准。源审、静态检查或旧 R03 library consumer 不能代替后台 App 已修。所有 Eclip GUI／AX／焦点／截图／消息触发／重开退出动作继续禁止；既有真实 Run 与 UserRoot／Auth／配置／MCP／通知状态不改。
+
+本次没有公共 API／协议／示例调用形状变化，仅新增现有 library consumer 的回归测试并记录约束与未验证状态，examples 不需新增调用；官网本切点不复制或更新，后续由 Root 在正式组合与真实验证后按其独立 owner 流程处理。三个生产源码 patch、原 publication 权威和 reader 均保持原基底，正式修复与必要资源仍待 Root 下一精 GO。
+
+
+## 2026-11-03：无人值守 RunTurn 的主聊天 publication 原链闭合
+
+应用复用原TaskRuntimeStore已绑定的Weak CommandCellRuntimeService，借其原chat_events Arc接入同一ChatEventLog，不按路径打开第二log/store，不新增owner、执行器或后台模型循环。原EkoAgentTurnSink::for_run持久化原canonical native envelope，execution_id只消费原envelope头；Frame c623的fresh Started机制仍由框架负责，App不从payload/Final/EOF补头，不造UUID，不将physical driver ID当每轮execution。每个已接纳RunTurn的消息坐标与独立journal root一致，TaskRun原Goal/root字段保持。原native append沿TaskRuntimeOperation::run_owned监督，durable append后再best-effort live delivery；产品TurnStatus仅在原persist_run_turn_terminal和decision完成后，由原typed receipt明确映射，不能制造Frame Settled或把TaskRunCompleted文本当公开正文。
+
+严格历史reader和raw fallback门槛不变。基线tests087下，真实unattended原链header通过，publication以“original unattended producer did not publish cold history”实际RED101；采用原684三生产文件后，同两测试GREEN、整个executor79/79和指定原6项回归通过。原Clippy101暴露原foreign-owner负控Box重复分配；Root74650准许只就地替换Box内容，ctor/ID/错误传播/断言/预算/场景不变，tests精4f。新19ec程序NoRun0/W0/E0、两目标各1/1和整个executor79/79，再取得targeted Clippy0及fmt write/check0；原6回归明确复用77d原件，未声称新程序另跑6次。缺publication、缺Settled、错owner、后继产品failed及真实FileStore cold reopen强断言均保留。
+
+夹具仍明确为新受控合成Model经过原App生产路径，原旧Cron完整payload缺口不补造；此处不签GUI/App/外部provider/native/main CI或全局Goal。当前机器绑定为d542锁、b94 policy、19ec consumer/274输入，精后继与每次fresh风险gate及原失败分别记录在原风险决定文档。只允许Root已审的具体输入与原五风险集合，不把source-only测试修复或同锁批准当未来来源通行证。
+
+## 2026-11-07：中断前发现与保存事实分别投影
+
+内部续跑只扣住当前轮最终综合，不再整体过滤已由 Framework 发布的
+Commentary、PartialAnswer、Unknown 和独立 Reasoning。保留原 phase、事件身份与顺序；
+只有原 sink 接受的公开报告重置进度计时，Reasoning 仍不计作报告，最终回答和 TaskRun
+完成仍沿原确认路径。
+
+TaskRuntime 自有执行的 `TranscriptProjectionSettlement` 在已有原生执行头之后，复用同一个
+owner 的 journal、作用域校验与发布路径保存；它不能补造执行头、改变运行终态或触发工具重放。
+前端把原保存事实作为只读观察呈现，错误或取消之后仍保留告警，按原事件 ID 和时间去重；
+清空视图后由同一 journal 重建，不把该告警写成新的 canonical 助手正文。
+
+“最后收到保存确认”只采用携带原 operation ID 且实际尝试提交的 `settled` 回执。
+没有新批次的 no-op 结算不能替代内容保存确认；没有回执时显示未知。此前的确认只覆盖此前
+提交的内容，不能证明后续正文已经保存；只有同一 operation 和 generation 的后继确认，才说明
+原来未确认的操作已收到确认。其它操作保存成功不清除原未知结果。此临时观察在既有 ChatStore
+内派生，不新增持久化权威、恢复状态机或结束判定器。
+
+保存事实独立于“当前展示轮次”持续消费，不推进旧轮正文或重新绑定执行引用。
+临时投影按原序号补入事实、按原事件 ID 去重；尾部先到或多笔保存交错时重新派生视图，
+不能因已经见到较新序号就拒绝历史前缀。告警保持原时间与身份，后补的旧确认可修正
+“最后收到确认”的派生说明，不生成新的 canonical 回答或保存成功事实。
+
+本单元覆盖原始事件经 owned sink、journal 冷读及前端历史重投影的路径；实际模型、真实 SSH、
+GUI 重开和最终 App 仍须按免安装 SSH 运维计划分别验收，不以本地夹具替代。

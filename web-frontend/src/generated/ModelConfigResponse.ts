@@ -6,5 +6,4 @@ export type ModelConfigResponse = {
   has_auth_token: boolean;
   base_url: string | null;
   max_tokens: number | null;
-  temperature: number | null;
 };

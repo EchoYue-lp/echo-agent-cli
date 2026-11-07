@@ -61,7 +61,7 @@ fn default_eko_agent_settings() -> AgentSettings {
     AgentSettings {
         name: "eko".to_string(),
         system_prompt: DEFAULT_EKO_SYSTEM_PROMPT.to_string(),
-        max_iterations: 10,
+        max_iterations: 0,
         enable_tools: true,
         enable_memory: true,
         enable_human_in_loop: true,
@@ -82,7 +82,11 @@ fn deserialize_eko_agent_settings<'de, D>(deserializer: D) -> Result<AgentSettin
 where
     D: serde::Deserializer<'de>,
 {
-    let patch = serde_json::Value::deserialize(deserializer)?;
+    let mut patch = serde_json::Value::deserialize(deserializer)?;
+    // 旧文件中的有限轮数不再是 Eclip 产品配置，不能重新限制主 Agent。
+    if let Some(fields) = patch.as_object_mut() {
+        fields.remove("max_iterations");
+    }
     if let Some(fields) = patch.as_object() {
         for removed in ["enable_tools", "enable_memory", "enable_human_in_loop"] {
             if fields.contains_key(removed) {
@@ -107,7 +111,12 @@ where
 {
     let mut value = serde_json::to_value(settings).map_err(serde::ser::Error::custom)?;
     if let Some(fields) = value.as_object_mut() {
-        for removed in ["enable_tools", "enable_memory", "enable_human_in_loop"] {
+        for removed in [
+            "enable_tools",
+            "enable_memory",
+            "enable_human_in_loop",
+            "max_iterations",
+        ] {
             fields.remove(removed);
         }
     }
@@ -151,7 +160,7 @@ impl EkoConfig {
                     base_url: None,
                     api_protocol: Some(model.api_protocol),
                     max_tokens: model.max_tokens,
-                    temperature: model.temperature,
+                    temperature: None,
                     context_window: model.context_window,
                     // 当前EKO配置没有额外来源事实；保留上述直接配置，不伪造provider事实。
                     facts: Default::default(),
@@ -198,7 +207,6 @@ pub struct ConfiguredModel {
     pub input_modalities: Vec<ModelInputModality>,
     pub enabled: bool,
     pub max_tokens: Option<u32>,
-    pub temperature: Option<f32>,
     pub context_window: Option<u32>,
 }
 
@@ -213,7 +221,6 @@ impl Default for ConfiguredModel {
             input_modalities: ModelInputModality::text_only(),
             enabled: true,
             max_tokens: None,
-            temperature: None,
             context_window: None,
         }
     }
@@ -548,6 +555,20 @@ mod tests {
         assert!(parsed.agent.enable_tools);
         assert!(parsed.agent.enable_memory);
         assert_eq!(parsed.agent.system_prompt, DEFAULT_EKO_SYSTEM_PROMPT);
+        Ok(())
+    }
+
+    #[test]
+    fn unbounded_agent_drops_retired_iteration_setting() -> Result<(), String> {
+        let parsed = serde_yaml::from_str::<EkoConfig>(
+            "agent:\n  name: existing-agent\n  max_iterations: 10\n",
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(parsed.agent.name, "existing-agent");
+        assert_eq!(parsed.agent.max_iterations, 0);
+        let yaml = serde_yaml::to_string(&parsed).map_err(|error| error.to_string())?;
+        assert!(!yaml.contains("max_iterations"));
+        assert_eq!(EkoConfig::default().agent.max_iterations, 0);
         Ok(())
     }
 

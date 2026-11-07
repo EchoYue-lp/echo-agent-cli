@@ -96,7 +96,6 @@ describe('ChatInput thinking publication', () => {
           has_auth_token: true,
           auth_source: 'config',
           base_url: 'https://example.test/v1/responses',
-          temperature: null,
           max_tokens: null,
           context_window: 32_000,
           thinking_levels: ['none', 'low', 'medium', 'high'],

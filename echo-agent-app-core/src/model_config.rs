@@ -41,7 +41,6 @@ pub struct ConfiguredModelView {
     pub has_auth_token: bool,
     pub auth_source: String,
     pub base_url: Option<String>,
-    pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
     pub context_window: Option<u32>,
 }
@@ -73,7 +72,6 @@ pub struct ModelRuntimeConfig {
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
     pub requires_api_key: bool,
-    pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
     pub context_window: Option<u32>,
 }
@@ -189,7 +187,6 @@ pub fn configured_model_views(config: &EkoConfig) -> Vec<ConfiguredModelView> {
                 has_auth_token: runtime.auth_token.is_some(),
                 auth_source: runtime.auth_source,
                 base_url: runtime.base_url,
-                temperature: model.temperature,
                 max_tokens: model.max_tokens,
                 context_window: Some(effective_context_window(model)),
             }
@@ -459,7 +456,6 @@ fn runtime_from_configured_model(
         base_url,
         api_key_env: provider_config.and_then(|provider| provider.api_key_env.clone()),
         requires_api_key: provider_config.is_some_and(|provider| provider.requires_api_key),
-        temperature: selected.temperature,
         max_tokens: selected.max_tokens,
         context_window: Some(effective_context_window(selected)),
     }

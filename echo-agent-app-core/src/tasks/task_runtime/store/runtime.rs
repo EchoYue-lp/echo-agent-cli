@@ -2071,6 +2071,18 @@ impl TaskRuntimeStore {
             .unwrap_or_else(|error| error.into_inner()) = Some(runtime);
     }
 
+    /// 借用此原 Store 已绑定的产品日志；不按路径重开第二个 ChatEventLog。
+    pub(crate) fn original_chat_event_log(
+        &self,
+    ) -> Option<std::sync::Arc<crate::chat_event_log::ChatEventLog>> {
+        self.command_cell_runtime
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .map(|runtime| runtime.chat_events())
+    }
+
     pub(crate) fn stop_owned_command_cells(&self, run_id: &str) -> Result<usize, StoreError> {
         let runtime = self
             .command_cell_runtime

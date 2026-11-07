@@ -21,6 +21,12 @@ use crate::conversation_deletion::ConversationDeletionService;
 use crate::evolution::ReviewIntegration;
 use crate::tasks::task_runtime::TaskRuntimeStore;
 
+type ProjectIoProviders = (
+    PathBuf,
+    Arc<dyn echo_agent::tools::filesystem::FileSystem>,
+    Arc<dyn echo_agent::sandbox::SandboxExecutor>,
+);
+
 type WorkspaceShutdownSettlement = Shared<BoxFuture<'static, Result<(), String>>>;
 type WorkspaceLifecycleBinding =
     Arc<std::sync::RwLock<std::sync::Weak<crate::runtime::ApplicationLifecycleRetention>>>;
@@ -312,65 +318,85 @@ impl WorkspaceRuntimeHost {
         subagent_depth_defaults: Arc<crate::subagent_policy::SubagentDepthDefaults>,
         terminal: Option<&Arc<crate::terminal::TerminalService>>,
     ) -> anyhow::Result<Arc<Self>> {
-        let (execution_root, project_file_system, project_executor): (
-            PathBuf,
-            Arc<dyn echo_agent::tools::filesystem::FileSystem>,
-            Arc<dyn echo_agent::sandbox::SandboxExecutor>,
-        ) = match workspace.project_location() {
-            super::ProjectLocation::Local { path } => {
-                let path = tokio::task::spawn_blocking(move || {
-                    let path = path.canonicalize()?;
-                    if !path.is_dir() {
-                        anyhow::bail!("Project location is not a directory");
-                    }
-                    Ok::<_, anyhow::Error>(path)
-                })
-                .await??;
-                (
-                    path,
-                    Arc::new(echo_agent::tools::files::LocalFileSystem),
-                    Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox()),
-                )
-            }
-            super::ProjectLocation::Ssh {
-                host,
-                user,
-                port,
-                path,
-            } => {
-                let terminal = terminal.ok_or_else(|| anyhow::anyhow!("SSH 项目连接服务不可用"))?;
-                let connection = terminal
-                    .project_ssh(workspace.id.as_str())
-                    .map_err(anyhow::Error::msg)?;
-                let actual = connection
-                    .verify_target_directory(
-                        crate::terminal::TerminalTarget::Ssh { host, user, port },
-                        path.clone(),
+        let (execution_root, project_file_system, project_executor): ProjectIoProviders =
+            match workspace.project_location() {
+                super::ProjectLocation::Local { path } => {
+                    let path = tokio::task::spawn_blocking(move || {
+                        let path = path.canonicalize()?;
+                        if !path.is_dir() {
+                            anyhow::bail!("Project location is not a directory");
+                        }
+                        Ok::<_, anyhow::Error>(path)
+                    })
+                    .await??;
+                    (
+                        path,
+                        Arc::new(echo_agent::tools::files::LocalFileSystem),
+                        Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox()),
                     )
-                    .await
-                    .map_err(anyhow::Error::msg)?;
-                let crate::terminal::TerminalTarget::Ssh { host, user, port } =
-                    connection.effective_target().map_err(anyhow::Error::msg)?
-                else {
-                    anyhow::bail!("SSH effective target is unavailable");
-                };
-                let actual_location = super::ProjectLocation::Ssh {
-                    host: host.clone(),
-                    user: user.clone(),
-                    port: *port,
-                    path: actual.clone(),
-                };
-                if workspace.metadata.project_execution_location.as_ref() != Some(&actual_location)
-                {
-                    anyhow::bail!("远程主机或目录身份已变化，请重新关联项目");
                 }
-                (
-                    PathBuf::from(&actual),
-                    connection.file_system(actual).map_err(anyhow::Error::msg)?,
-                    connection.sandbox(),
-                )
-            }
-        };
+                super::ProjectLocation::Ssh {
+                    host,
+                    user,
+                    port,
+                    path,
+                } => {
+                    let terminal =
+                        terminal.ok_or_else(|| anyhow::anyhow!("SSH 项目连接服务不可用"))?;
+                    let connection = terminal
+                        .project_ssh(workspace.id.as_str())
+                        .map_err(anyhow::Error::msg)?;
+                    let actual = connection
+                        .verify_target_directory(
+                            crate::terminal::TerminalTarget::Ssh { host, user, port },
+                            path.clone(),
+                        )
+                        .await
+                        .map_err(anyhow::Error::msg)?;
+                    let crate::terminal::TerminalTarget::Ssh { host, user, port } =
+                        connection.effective_target().map_err(anyhow::Error::msg)?
+                    else {
+                        anyhow::bail!("SSH effective target is unavailable");
+                    };
+                    let actual_location = super::ProjectLocation::Ssh {
+                        host: host.clone(),
+                        user: user.clone(),
+                        port: *port,
+                        path: actual.clone(),
+                    };
+                    if workspace.metadata.project_execution_location.as_ref()
+                        != Some(&actual_location)
+                    {
+                        anyhow::bail!("远程主机或目录身份已变化，请重新关联项目");
+                    }
+                    let (files, executor) = terminal
+                        .project_ssh_adapters(workspace.id.as_str(), actual.clone())
+                        .map_err(anyhow::Error::msg)?;
+                    (PathBuf::from(&actual), files, executor)
+                }
+            };
+        Self::open_with_verified_project(
+            workspace,
+            operation_stores,
+            operation_admission_open,
+            product_data_io,
+            lifecycle_retention,
+            subagent_depth_defaults,
+            (execution_root, project_file_system, project_executor),
+        )
+        .await
+    }
+
+    async fn open_with_verified_project(
+        workspace: Workspace,
+        operation_stores: Arc<std::sync::Mutex<Vec<std::sync::Weak<TaskRuntimeStore>>>>,
+        operation_admission_open: Arc<std::sync::atomic::AtomicBool>,
+        product_data_io: crate::product_data_io::ProductDataIoService,
+        lifecycle_retention: WorkspaceLifecycleBinding,
+        subagent_depth_defaults: Arc<crate::subagent_policy::SubagentDepthDefaults>,
+        project: ProjectIoProviders,
+    ) -> anyhow::Result<Arc<Self>> {
+        let (execution_root, project_file_system, project_executor) = project;
         let resources = WorkspaceRuntimeResources::prepare(workspace, product_data_io).await?;
         let workspace = resources.workspace().clone();
         Ok(Arc::new(Self {
@@ -1115,6 +1141,32 @@ impl WorkspaceRuntimeRegistry {
         )
         .await?;
         hosts.insert(workspace_id, Arc::clone(&host));
+        Ok(host)
+    }
+
+    /// 受控测试在真实认证/目录验证边界提供已验证夹具事实；Host和文件store仍由原构造路径创建。
+    #[cfg(test)]
+    pub(crate) async fn test_bind_verified_project(
+        &self,
+        workspace: Workspace,
+        project: ProjectIoProviders,
+    ) -> anyhow::Result<Arc<WorkspaceRuntimeHost>> {
+        let mut hosts = self.hosts.lock().await;
+        if hosts.contains_key(&workspace.id) {
+            anyhow::bail!("fixture must not replace an existing Host");
+        }
+        let id = workspace.id.clone();
+        let host = WorkspaceRuntimeHost::open_with_verified_project(
+            workspace,
+            self.operation_stores.clone(),
+            self.operation_admission_open.clone(),
+            self.product_data_io(),
+            self.lifecycle_retention.clone(),
+            self.subagent_depth_defaults.clone(),
+            project,
+        )
+        .await?;
+        hosts.insert(id, host.clone());
         Ok(host)
     }
 

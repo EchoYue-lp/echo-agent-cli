@@ -125,7 +125,6 @@ beforeEach(() => {
         has_auth_token: true,
         auth_source: 'config',
         base_url: 'https://example.test/v1',
-        temperature: null,
         max_tokens: null,
         context_window: 32_000,
         thinking_levels: [],

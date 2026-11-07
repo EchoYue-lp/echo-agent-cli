@@ -185,7 +185,7 @@ describe('optional settings screens', () => {
     const saved = (depth: number) => ({
       max_subagent_depth: depth,
       model: { provider: 'test', name: 'test', has_auth_token: false },
-      agent: { model: 'test', system_prompt: 'Test', max_iterations: 10, token_limit: 4000 },
+      agent: { model: 'test', system_prompt: 'Test', token_limit: 4000 },
       mcp: { config_path: null },
       channels: {
         qq: { enabled: false, app_id: '' },
@@ -222,8 +222,8 @@ describe('optional settings screens', () => {
     );
     expect(await screen.findByText('已保存')).toBeTruthy();
     expect((depth as HTMLSelectElement).value).toBe('2');
-    fireEvent.click(screen.getByRole('button', { name: '展开高级运行参数' }));
-    expect(screen.getByText('单轮推理安全上限')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '展开高级运行参数' })).toBeNull();
+    expect(screen.queryByText('单轮推理安全上限')).toBeNull();
     expect(screen.getByRole('button', { name: '高级' }).getAttribute('aria-expanded')).toBe(
       'false'
     );

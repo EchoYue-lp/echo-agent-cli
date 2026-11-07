@@ -1,4 +1,284 @@
 #[cfg(test)]
+mod ssh_operations_consumer_tests {
+    //! 验证原模型请求与项目投影，非真实 SSH/模型效果验收。
+    use super::*;
+    use echo_agent::agent::Agent;
+    use echo_agent::sandbox::{ExecutionResult, IsolationLevel, SandboxCommand, SandboxExecutor};
+    use echo_agent::testing::MockLlmClient;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct NamedExecutionFixture {
+        name: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SandboxExecutor for NamedExecutionFixture {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn isolation_level(&self) -> IsolationLevel {
+            IsolationLevel::None
+        }
+        fn is_available(&self) -> BoxFuture<'_, bool> {
+            Box::pin(async { true })
+        }
+        fn execute(&self, _command: SandboxCommand) -> BoxFuture<'_, Result<ExecutionResult>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "projection-only fixture cannot execute commands",
+                )
+                .into())
+            })
+        }
+    }
+
+    fn bound_store(
+        root: &std::path::Path,
+        files: Arc<crate::project::startup_tests::CountingFiles>,
+        executor: Arc<dyn SandboxExecutor>,
+    ) -> anyhow::Result<Arc<crate::tasks::task_runtime::TaskRuntimeStore>> {
+        let store = Arc::new(crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()?);
+        let workspace_id = store.active_workspace_id().to_string();
+        store.bind_project_environment(
+            &workspace_id,
+            crate::workspace::ProjectLocation::Ssh {
+                host: "fixture.invalid".to_string(),
+                user: Some("fixture".to_string()),
+                port: Some(22),
+                path: root.to_string_lossy().into_owned(),
+            },
+            1,
+            files,
+            executor,
+        )?;
+        Ok(store)
+    }
+
+    fn model_system_text(client: &MockLlmClient) -> anyhow::Result<String> {
+        Ok(client
+            .last_messages()
+            .ok_or_else(|| anyhow::anyhow!("model request absent"))?
+            .iter()
+            .filter(|message| matches!(message.role, echo_agent::llm::types::Role::System))
+            .filter_map(|message| message.content.as_text())
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    #[tokio::test]
+    async fn ssh_operations_reach_actual_execute_requests_and_clear_on_local_binding()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("remote-home");
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("AGENTS.md"), "OPERATIONS_PROJECT_RULE")?;
+        let files = Arc::new(crate::project::startup_tests::CountingFiles::new(
+            root.clone(),
+        ));
+        let commands = Arc::new(AtomicUsize::new(0));
+        let transport = Arc::new(MockLlmClient::new().with_responses([
+            "first query done",
+            "second query done",
+            "local query done",
+        ]));
+        let mut agent = ReactAgentBuilder::new()
+            .name("operations-projection-consumer")
+            .model("fixture-model")
+            .system_prompt("QUERY_FIXTURE")
+            .auto_project_rules(false)
+            .file_system(files.clone())
+            .working_dir(root.clone())
+            .llm_client(transport.clone())
+            .build()?;
+        let ssh: Arc<dyn SandboxExecutor> = Arc::new(NamedExecutionFixture {
+            name: "ssh",
+            calls: commands.clone(),
+        });
+        agent.set_sandbox_executor(ssh.clone());
+        prepare_project_context_at_location(
+            Some(&root),
+            Some(&root),
+            Some(directory.path()),
+            files.clone(),
+            ssh,
+            Vec::new(),
+            agent.config().get_token_limit(),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?
+        .publish_for_fresh_subagent(&mut agent)
+        .await;
+        // execute会重置上下文；检查真正请求而非预先拼好的提示词字符串。
+        for query in ["query the specified service", "query it again"] {
+            agent.execute(query).await?;
+            let text = model_system_text(&transport)?;
+            assert_eq!(text.matches("# SSH Operations").count(), 1);
+            assert_eq!(text.matches("OPERATIONS_PROJECT_RULE").count(), 1);
+        }
+        assert_eq!(files.count("read", &root.join("AGENTS.md")), 1);
+        let local: Arc<dyn SandboxExecutor> = Arc::new(NamedExecutionFixture {
+            name: "local",
+            calls: commands.clone(),
+        });
+        agent.set_sandbox_executor(local.clone());
+        prepare_project_context_at_location(
+            Some(&root),
+            Some(&root),
+            Some(directory.path()),
+            files.clone(),
+            local,
+            Vec::new(),
+            agent.config().get_token_limit(),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?
+        .publish_for_fresh_subagent(&mut agent)
+        .await;
+        agent.execute("query local files").await?;
+        let text = model_system_text(&transport)?;
+        assert!(!text.contains("# SSH Operations"));
+        assert_eq!(text.matches("OPERATIONS_PROJECT_RULE").count(), 1);
+        assert_eq!(files.count("read", &root.join("AGENTS.md")), 2);
+        assert_eq!(commands.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.call_count(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ssh_operations_factory_initializes_complete_snapshot_for_non_driver_consumers()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("remote-home");
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("AGENTS.md"), "INITIAL_OPERATIONS_RULE")?;
+        let files = Arc::new(crate::project::startup_tests::CountingFiles::new(
+            root.clone(),
+        ));
+        let commands = Arc::new(AtomicUsize::new(0));
+        let executor: Arc<dyn SandboxExecutor> = Arc::new(NamedExecutionFixture {
+            name: "ssh",
+            calls: commands.clone(),
+        });
+        let store = bound_store(&root, files.clone(), executor.clone())?;
+        let _resources = store.test_resource_scope();
+        let created = create_agent_with_diagnostics(
+            &AgentCreateParams {
+                project: Some(root.to_string_lossy().into_owned()),
+                working_dir: Some(root),
+                workspace_data_root: Some(directory.path().join("data")),
+                file_system: Some(files),
+                sandbox_executor: Some(executor),
+                task_runtime_store: Some(store.clone()),
+                ..Default::default()
+            },
+            &EkoConfig::default(),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        // 与原reflection消费者一致，只取得已初始化的完整快照。
+        // 产品模型循环另由下方factory→driver用例验证，不能用裸chat绕过准入。
+        let messages = created.agent.get_messages().await;
+        let text = messages
+            .iter()
+            .filter(|message| matches!(message.role, echo_agent::llm::types::Role::System))
+            .filter_map(|message| message.content.as_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(text.matches("# SSH Operations").count(), 1);
+        assert_eq!(text.matches("INITIAL_OPERATIONS_RULE").count(), 1);
+        assert_eq!(commands.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ssh_operations_reach_factory_and_driver_model_requests() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("remote-home");
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("AGENTS.md"), "DRIVER_OPERATIONS_RULE_ONE")?;
+        let files = Arc::new(crate::project::startup_tests::CountingFiles::new(
+            root.clone(),
+        ));
+        let commands = Arc::new(AtomicUsize::new(0));
+        let executor: Arc<dyn SandboxExecutor> = Arc::new(NamedExecutionFixture {
+            name: "ssh",
+            calls: commands.clone(),
+        });
+        let store = bound_store(&root, files.clone(), executor.clone())?;
+        let _resources = store.test_resource_scope();
+        let mut created = create_agent_with_diagnostics(
+            &AgentCreateParams {
+                context_prepared_by_invocation: true,
+                project: Some(root.to_string_lossy().into_owned()),
+                working_dir: Some(root.clone()),
+                workspace_data_root: Some(directory.path().join("data")),
+                file_system: Some(files.clone()),
+                sandbox_executor: Some(executor),
+                task_runtime_store: Some(store.clone()),
+                ..Default::default()
+            },
+            &EkoConfig::default(),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(files.count("read", &root.join("AGENTS.md")), 0);
+        let transport = Arc::new(
+            MockLlmClient::new().with_responses(["first query done", "second query done"]),
+        );
+        created.agent.set_llm_client(transport.clone());
+        let agent = AgentHandle::new(created.agent);
+        let (events, _received) = tokio::sync::mpsc::unbounded_channel();
+        let sink = Arc::new(crate::chat_driver::ChannelChatSink::new(events));
+        for (index, rule) in ["DRIVER_OPERATIONS_RULE_ONE", "DRIVER_OPERATIONS_RULE_TWO"]
+            .into_iter()
+            .enumerate()
+        {
+            std::fs::write(root.join("AGENTS.md"), rule)?;
+            let resources = Arc::new(crate::chat_resources::ChatResources {
+                execution_scope: crate::workspace::WorkspaceExecutionScope::global(root.clone()),
+                workspace_io_receipt: None,
+                pool: None,
+                store: None,
+                sink: sink.clone(),
+                webhook_emitter: None,
+                conv_id: Some("driver-operations".to_string()),
+                root_message_id: format!("driver-operations-{index}"),
+                attachments: Vec::new(),
+                cancel: echo_agent::agent::CancellationToken::new(),
+                review_integration: None,
+                memory_generation: None,
+                human_loop_provider: None,
+            });
+            let turn = crate::prepared_turn::PreparedUserTurn {
+                instruction: "query the specified service".to_string(),
+                resources: Vec::new(),
+                authorship: crate::prepared_turn::InstructionAuthorship::User,
+                agent_input: None,
+            };
+            let outcome = crate::chat_driver::drive_chat(&agent, &turn, resources)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            assert_eq!(outcome, crate::chat_driver::TurnOutcome::Completed);
+            let text = model_system_text(&transport)?;
+            assert_eq!(text.matches("# SSH Operations").count(), 1);
+            assert_eq!(text.matches(rule).count(), 1);
+            if index == 1 {
+                assert!(!text.contains("DRIVER_OPERATIONS_RULE_ONE"));
+            }
+            assert_eq!(
+                files.count("read", &root.join("AGENTS.md")),
+                index.saturating_add(1)
+            );
+        }
+        assert_eq!(commands.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.call_count(), 2);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod llm_config_tests {
     use super::{
         AgentCreateParams, build_llm_config, build_runtime_llm_config,

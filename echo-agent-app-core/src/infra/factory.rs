@@ -483,6 +483,8 @@ Use `create_complex_task` only for expensive multi-step work, architectural/mult
 pub struct AgentCreateParams {
     /// 池驱动的会话由实际 invocation 准备规则；构造只发现角色定义。
     /// 独立构造及 primary 默认保持模型准入前的完整初始化。
+    /// 完整快照供 reflection 等直接消费者读取；产品模型循环仍须经过
+    /// drive_chat 的 invocation 准入，裸 chat 不能代替该入口。
     pub context_prepared_by_invocation: bool,
     /// Immutable host target; every invocation still supplies its actual cwd.
     pub file_system: Option<Arc<dyn echo_agent::tools::filesystem::FileSystem>>,
@@ -1070,15 +1072,11 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
         )
         .await;
     }
-    let project_message = project_context
-        .map(|context| {
-            crate::project::prompt::PromptAssembler::project_context(
-                &context,
-                agent.config().get_token_limit(),
-            )
-        })
-        .filter(|assembly| !assembly.prompt.trim().is_empty())
-        .map(|assembly| echo_agent::llm::types::Message::system(assembly.prompt));
+    let project_message = crate::project::prompt::project_context_message(
+        project_context.as_ref(),
+        agent.config().get_token_limit(),
+        sandbox_manager.name(),
+    );
     agent.context().lock().await.replace_projection(
         crate::project::prompt::PROJECT_CONTEXT_PROJECTION,
         project_message,
@@ -1389,12 +1387,11 @@ pub(crate) async fn prepare_project_context_at_location(
         .await
         .map_err(|error| error.to_string())?;
     }
-    let message = context
-        .map(|context| {
-            crate::project::prompt::PromptAssembler::project_context(&context, model_window)
-        })
-        .filter(|assembly| !assembly.prompt.trim().is_empty())
-        .map(|assembly| echo_agent::llm::types::Message::system(assembly.prompt));
+    let message = crate::project::prompt::project_context_message(
+        context.as_ref(),
+        model_window,
+        executor.name(),
+    );
     Ok(PreparedProjectContext {
         instructions: snapshot,
         project: message,

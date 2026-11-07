@@ -574,7 +574,7 @@ where
                     .await?;
                 return Err("continuation cancelled during pool admission".into());
             }
-            result = pool.acquire(pool_key) => result,
+            result = pool.acquire_for_turn(pool_key) => result,
         } {
             Ok(execution) => execution,
             Err(error) => {
@@ -943,7 +943,10 @@ async fn prepare_chat_execution_with_source(
                     .map_err(|error| error.to_string())?
                 {
                     Some(lease) => lease,
-                    None => pool.acquire(key).await.map_err(|error| error.to_string())?,
+                    None => pool
+                        .acquire_for_turn(key)
+                        .await
+                        .map_err(|error| error.to_string())?,
                 };
                 let selected = pool.bind_domain(&lease, plugin_id).await?;
                 (Some(lease), Some(selected))
@@ -1183,6 +1186,11 @@ async fn drive_prepared_chat(
             .as_ref()
             .map(|projection| projection.execution())
     });
+    let context_initialization = match original_execution {
+        Some(execution) => execution.context_initialization_for(&agent),
+        None => foreground_pool_projection()?
+            .and_then(|projection| projection.execution().context_initialization_for(&agent)),
+    };
     let invocation_resources = match (domain_binding.as_ref(), original_execution) {
         (Some(binding), Some(execution)) => vec![execution.domain_resource_guard(
             &prepared.formal_run_id,
@@ -1270,6 +1278,7 @@ async fn drive_prepared_chat(
                 foreground_progress,
                 input_observer,
                 invocation_resources,
+                context_initialization,
             })
             .await
         });
@@ -1297,6 +1306,7 @@ async fn drive_prepared_chat(
                     origin: prepared.binding.origin,
                     transcript_visibility: TurnVisibility::Visible,
                     invocation_resources,
+                    context_initialization,
                 },
                 input_observer,
             ),
@@ -1459,6 +1469,7 @@ struct RegisteredTurnDriver {
     foreground_progress: Option<crate::foreground_turn::ForegroundTurnProgress>,
     input_observer: Option<InputReceiptObserver>,
     invocation_resources: Vec<echo_agent::tools::InvocationResourceGuard>,
+    context_initialization: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 async fn drive_registered_turn(
@@ -1482,6 +1493,7 @@ async fn drive_registered_turn(
                 origin: driver.binding.origin,
                 transcript_visibility: driver.binding.transcript_visibility,
                 invocation_resources: std::mem::take(&mut driver.invocation_resources),
+                context_initialization: driver.context_initialization.take(),
             },
             driver.input_observer,
         ),
@@ -1772,6 +1784,7 @@ struct ChatTurnModelScope {
     origin: RunTurnOrigin,
     transcript_visibility: TurnVisibility,
     invocation_resources: Vec<echo_agent::tools::InvocationResourceGuard>,
+    context_initialization: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 struct EkoTurnEventSink {
@@ -2060,11 +2073,12 @@ async fn project_eko_turn_event(
     if !state.expose_internal_synthesis && matches!(&event.payload, AgentEvent::FinalAnswer(_)) {
         state.expose_internal_synthesis = reveal_completed;
     }
+    // 内部续跑只扣住本轮最终综合；Framework已公开的阶段正文与独立Reasoning
+    // 仍按原phase发布，否则60秒报告计时和失败后可见发现都会丢失。
     let suppress_internal_transcript = !state.expose_internal_synthesis
-        && matches!(
-            &event.payload,
-            AgentEvent::AssistantMessage { .. } | AgentEvent::FinalAnswer(_)
-        );
+        && (matches!(&event.payload, AgentEvent::FinalAnswer(_))
+            || matches!(&event.payload, AgentEvent::AssistantMessage { block }
+                if block.phase == echo_agent::agent::AssistantPhase::FinalAnswer));
     if suppress_internal_transcript {
         return Ok(SinkControl::Continue);
     }
@@ -2114,6 +2128,7 @@ async fn drive_chat_inner(
         origin,
         transcript_visibility,
         invocation_resources,
+        context_initialization,
     } = scope;
     // The turn preserves user-authored text (or a long-text artifact reference).
     let mut msg: Message = turn.to_message().map_err(|e| {
@@ -2246,6 +2261,7 @@ async fn drive_chat_inner(
             },
         };
         if let Some((files, executor, local_state_dir)) = project_inputs {
+            let preparation_started = std::time::Instant::now();
             let prepared = crate::infra::prepare_dynamic_project_context(
                 working_dir.as_deref(),
                 local_state_dir.as_deref(),
@@ -2256,6 +2272,13 @@ async fn drive_chat_inner(
             )
             .await
             .map_err(ChatTurnError::from)?;
+            // 先成功发布当前事实，再向原pool缓存确认初始化；活动steer和只读
+            // 面板可继续复用同一实例。Execute/reset 后仍由原turn projector重发。
+            guard.context().lock().await.apply_projections(&prepared.projections());
+            if let Some(initialized) = context_initialization.as_ref() {
+                initialized.store(true, std::sync::atomic::Ordering::Release);
+            }
+            tracing::info!(%turn_id, elapsed_ms = preparation_started.elapsed().as_millis(), "turn project context prepared");
             _turn_projection_registration
                 .install_project_context(prepared)
                 .map_err(ChatTurnError::from)?;
@@ -3607,6 +3630,7 @@ mod tests {
             resources,
             ChatTurnModelScope {
                 invocation_resources: Vec::new(),
+                context_initialization: None,
                 turn_id: "setup-turn".to_string(),
                 bound_run_id: Some("setup-retry".to_string()),
                 driver_execution_context: None,
@@ -3704,6 +3728,7 @@ mod tests {
                     origin,
                     transcript_visibility: TurnVisibility::Internal,
                     invocation_resources: Vec::new(),
+                    context_initialization: None,
                 },
                 None,
             )
@@ -3974,6 +3999,113 @@ mod tests {
                 && source_execution.is_some()
                 && settled
         }
+    }
+
+    #[tokio::test]
+    async fn interrupted_task_progress_keeps_approved_internal_reports_without_final_synthesis()
+    -> anyhow::Result<()> {
+        use echo_agent::agent::{AssistantMessageBlock, AssistantPhase};
+        let sink = std::sync::Arc::new(MockChatSink::default());
+        let adapter = EkoTurnEventSink::new(
+            sink.clone(),
+            WebhookTurnObserver::new(None, "progress-source-fixture".to_string()),
+            None,
+            None,
+            "progress-turn".to_string(),
+            TurnVisibility::Internal,
+        );
+        let identity = EventIdentity::for_chat(
+            Some("progress-conversation".to_string()),
+            "progress-turn",
+            "progress-root",
+            None,
+        )?;
+        for (index, phase) in [
+            AssistantPhase::Commentary,
+            AssistantPhase::PartialAnswer,
+            AssistantPhase::Unknown,
+            AssistantPhase::Reasoning,
+            AssistantPhase::FinalAnswer,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sequence = u64::try_from(index)?.saturating_add(1);
+            let event = AgentEvent::AssistantMessage {
+                block: AssistantMessageBlock {
+                    provider_source: None,
+                    block_id: format!("progress-block-{index}"),
+                    request_id: "progress-request".into(),
+                    sequence,
+                    phase,
+                    delta: format!("approved fixture report {index}"),
+                    complete: true,
+                    provider: Some("progress-fixture".into()),
+                    reasoning: None,
+                },
+            };
+            adapter
+                .on_event(EventEnvelope::new(&identity, sequence, None, event)?)
+                .await?;
+        }
+        adapter
+            .on_event(EventEnvelope::new(
+                &identity,
+                6,
+                None,
+                AgentEvent::FinalAnswer("finite-turn final must remain internal".into()),
+            )?)
+            .await?;
+        adapter
+            .on_event(EventEnvelope::new(
+                &identity,
+                7,
+                None,
+                AgentEvent::Error {
+                    source: "fixture_interrupted".into(),
+                    message: "original execution interrupted".into(),
+                    failure: echo_agent::error::AgentFailure::message(
+                        "fixture_interrupted",
+                        "original execution interrupted",
+                    ),
+                },
+            )?)
+            .await?;
+        adapter
+            .stop_projector_for_test()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let events = sink
+            .events
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fixture sink poisoned"))?;
+        let phases = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                AgentEvent::AssistantMessage { block } => Some(block.phase),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            phases,
+            [
+                AssistantPhase::Commentary,
+                AssistantPhase::PartialAnswer,
+                AssistantPhase::Unknown,
+                AssistantPhase::Reasoning
+            ]
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(&event.payload, AgentEvent::Error { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(&event.payload, AgentEvent::FinalAnswer(_)))
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -6696,6 +6828,97 @@ mod tests {
             );
             assert_eq!(store.active_run_driver_count()?, 0);
         }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn startup_actual_factory_and_driver_read_rules_once_per_turn_and_refresh_external_edits()
+    -> anyhow::Result<()> {
+        use crate::project::startup_tests::CountingFiles;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("project");
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("AGENTS.md"), "STARTUP_FIRST_RULE")?;
+        let files = Arc::new(CountingFiles::new(root.clone()));
+        let store = crate::project::startup_tests::task_store(files.clone())?;
+        let _resource_scope = store.test_resource_scope();
+        let mut created = crate::infra::create_agent_with_diagnostics(
+            &crate::infra::AgentCreateParams {
+                context_prepared_by_invocation: true,
+                file_system: Some(files.clone()),
+                sandbox_executor: store
+                    .project_environment()
+                    .map(|environment| environment.executor),
+                task_runtime_store: Some(store.clone()),
+                project: Some(root.to_string_lossy().into_owned()),
+                working_dir: Some(root.clone()),
+                workspace_data_root: Some(temp.path().join("data")),
+                conversation_id: Some("startup-current-rules".into()),
+                ..Default::default()
+            },
+            &crate::config::EkoConfig::default(),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            files.count("read", &root.join("AGENTS.md")),
+            0,
+            "factory must leave invocation facts to the actual driver"
+        );
+        let client = Arc::new(
+            echo_agent::testing::MockLlmClient::new().with_responses(["first done", "second done"]),
+        );
+        created.agent.set_llm_client(client.clone());
+        let agent = AgentHandle::new(created.agent);
+        for (index, rule) in ["STARTUP_FIRST_RULE", "STARTUP_SECOND_RULE"]
+            .into_iter()
+            .enumerate()
+        {
+            std::fs::write(root.join("AGENTS.md"), rule)?;
+            let resources = Arc::new(crate::chat_resources::ChatResources {
+                execution_scope: crate::workspace::WorkspaceExecutionScope::global(root.clone()),
+                workspace_io_receipt: None,
+                pool: None,
+                store: None,
+                sink: Arc::new(MockChatSink::default()),
+                webhook_emitter: None,
+                conv_id: Some("startup-current-rules".into()),
+                root_message_id: format!("startup-{index}"),
+                attachments: Vec::new(),
+                cancel: echo_agent::agent::CancellationToken::new(),
+                review_integration: None,
+                memory_generation: None,
+                human_loop_provider: None,
+            });
+            let outcome = drive_chat(&agent, &make_turn("你好"), resources)
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            assert_eq!(outcome, TurnOutcome::Completed);
+            let text = client
+                .last_messages()
+                .ok_or_else(|| anyhow::anyhow!("missing model request"))?
+                .iter()
+                .filter_map(|m| m.content.as_text())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(text.matches(rule).count(), 1);
+            if index == 1 {
+                assert!(!text.contains("STARTUP_FIRST_RULE"));
+            }
+            assert_eq!(
+                files.count("read", &root.join("AGENTS.md")),
+                index.saturating_add(1)
+            );
+            // 根探测只访问已知 marker；构造不扫描结构，每条消息只扫描一次。
+            assert_eq!(files.count("read_dir", &root), index.saturating_add(1));
+            assert_eq!(files.opened.load(Ordering::SeqCst), index.saturating_add(2));
+            assert_eq!(
+                files.closed.load(Ordering::SeqCst),
+                files.opened.load(Ordering::SeqCst)
+            );
+        }
+        assert_eq!(client.call_count(), 2);
         Ok(())
     }
 }

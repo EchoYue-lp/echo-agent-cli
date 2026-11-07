@@ -3,8 +3,8 @@
 ## GUI 设置入口
 
 打开设置仍默认进入“模型”，用于管理供应商和默认模型，不增加总览页。“基础与扩展”中的
-“基础配置”直接打开智能体层数、系统提示词等常用应用配置，无需先展开“高级”。页面内的
-“高级/调试”继续折叠单轮推理安全上限；Worktree 和实验性自进化仍在侧栏“高级”分组。
+“基础配置”直接打开智能体层数、系统提示词等常用应用配置，无需先展开“高级”。
+Worktree 和实验性自进化仍在侧栏“高级”分组。
 IM 渠道、定时任务、工具与权限继续使用各自原入口。基础配置沿原保存接口持久化并读取
 后端保存结果，不改变运行中任务或既有恢复的配置绑定。
 
@@ -51,6 +51,11 @@ Eclip channel 通过 `AgentPool` 复用与其它 surface 相同的 provider/mode
 GUI 用户优先在“设置 → 模型”中管理 Provider 和模型。手写 YAML 时可从
 `config/eko.example.yaml` 开始，核心结构如下：
 
+Eclip 已取消 `temperature` 配置与界面参数；连接测试、doctor、主 Agent、只读及写入 Subagent、
+IM/cron 的共用装配和模型热换均不发送该参数。推理深度（thinking/reasoning）、最大输出 tokens
+和上下文窗口仍按各自已有合同处理，取消 temperature 不代表模型支持所有推理参数。
+旧文件中的该字段不再进入模型配置或请求；本次程序修改不会重写用户的真实配置文件。
+
 ```yaml
 model:
   default_model_id: "gateway:main"
@@ -72,12 +77,10 @@ configured_models:
     input_modalities: ["text", "image"]
     enabled: true
     max_tokens: 8192
-    temperature: 0.7
     context_window: 396000
 
 agent:
   name: "echo-assistant"
-  max_iterations: 0
   tool_timeout_ms: 120000
   max_tool_output_tokens: 8000
   token_limit: 0
@@ -168,12 +171,14 @@ GUI压缩面板及保留应用入口沿当前策略处理可选重点文本；�
 Goal、recovery capsule 和最近用户 steer 由 TaskRuntime projection 保留，完整历史仍由
 ConversationStore 保存。详见 [ADR 0048](./adr/0048-context-compression-product-policy.md)。
 
+Eclip 主 Agent 不设置固定的推理／工具迭代轮数上限，持续执行至完成或取消；基础配置不提供该参数。
+旧配置文件中的 `agent.max_iterations` 会被忽略，保存时不再写出。
+
 工具、workspace memory 与 human-loop 是 Eclip 固定启用的完整 Agent 能力；Eclip YAML 不接受
 framework 通用的 `enable_tools`、`enable_memory`、`enable_human_in_loop` 开关。
 
 | 字段                     | 含义                                                         |
 | ------------------------ | ------------------------------------------------------------ |
-| `max_iterations`         | 单 turn 最大 ReAct 迭代；`0` 表示不设产品上限，直到完成/取消 |
 | `tool_timeout_ms`        | 单次工具调用超时                                             |
 | `max_tool_output_tokens` | 单个工具结果进入模型上下文的预算，完整输出仍可落盘恢复       |
 | `token_limit`            | 显式上下文压缩阈值；`0` 使用模型窗口/应用策略                |

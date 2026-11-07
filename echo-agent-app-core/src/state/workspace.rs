@@ -709,18 +709,47 @@ impl ScopedChatRuntime {
         conversation_id: &str,
     ) -> std::result::Result<crate::agent_pool::AgentPoolExecutionLease, crate::agent_pool::PoolError>
     {
+        self.agent_for_preparation(conversation_id, false).await
+    }
+
+    /// 实际 chat driver 负责可失败的规则准备，避免构造时重复加载。
+    pub async fn agent_for_turn(
+        &self,
+        conversation_id: &str,
+    ) -> std::result::Result<crate::agent_pool::AgentPoolExecutionLease, crate::agent_pool::PoolError>
+    {
+        self.agent_for_preparation(conversation_id, true).await
+    }
+
+    async fn agent_for_preparation(
+        &self,
+        conversation_id: &str,
+        prepare_in_driver: bool,
+    ) -> std::result::Result<crate::agent_pool::AgentPoolExecutionLease, crate::agent_pool::PoolError>
+    {
         if let Err(error) = self.ensure_handoff_admission_allowed(conversation_id) {
             return Err(crate::agent_pool::PoolError::ConversationDeletionPending {
                 conversation_id: conversation_id.to_string(),
                 reason: error.to_string(),
             });
         }
-        self.agent_for_handoff(conversation_id).await
+        self.agent_for_handoff_preparation(conversation_id, prepare_in_driver)
+            .await
     }
 
     pub(crate) async fn agent_for_handoff(
         &self,
         conversation_id: &str,
+    ) -> std::result::Result<crate::agent_pool::AgentPoolExecutionLease, crate::agent_pool::PoolError>
+    {
+        self.agent_for_handoff_preparation(conversation_id, false)
+            .await
+    }
+
+    async fn agent_for_handoff_preparation(
+        &self,
+        conversation_id: &str,
+        prepare_in_driver: bool,
     ) -> std::result::Result<crate::agent_pool::AgentPoolExecutionLease, crate::agent_pool::PoolError>
     {
         if let Err(error) = self
@@ -734,6 +763,7 @@ impl ScopedChatRuntime {
             });
         }
         match self.pool.as_ref() {
+            Some(pool) if prepare_in_driver => pool.acquire_for_turn(conversation_id).await,
             Some(pool) => pool.acquire(conversation_id).await,
             None => Ok(crate::agent_pool::AgentPoolExecutionLease::unpooled(
                 self.primary_agent.clone(),

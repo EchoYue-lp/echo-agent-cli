@@ -144,6 +144,31 @@ describe('ChatEventSequencer', () => {
     expect(sequencer.cursor('conversation:one')).toBe(5);
   });
 
+  it('旧轮保存观察持续投影，但旧轮正文仍不能覆盖当前轮', () => {
+    const sequencer = new ChatEventSequencer();
+    const applied: number[] = [];
+    const apply = (event: ChatEventEnvelope) => applied.push(event.sequence);
+    const oldSave = {
+      ...turnEnvelope(3, 'turn-a'),
+      payload: {
+        source: 'agent',
+        event: {
+          payload: {
+            type: 'transcript_projection_settlement',
+            data: { status: 'blocked', operation_id: 'original-operation' },
+          },
+        },
+      },
+    } as ChatEventEnvelope;
+    sequencer.ingest(turnEnvelope(1, 'turn-a'), apply);
+    sequencer.ingest(turnEnvelope(2, 'turn-b'), apply);
+    sequencer.ingest(oldSave, apply);
+    sequencer.ingest(turnEnvelope(4, 'turn-a'), apply);
+    sequencer.ingest(turnEnvelope(5, 'turn-b'), apply);
+    expect(applied).toEqual([1, 2, 3, 5]);
+    expect(sequencer.cursor('conversation:one')).toBe(5);
+  });
+
   it('keeps continuation execution and its root terminal visible across turn ids', () => {
     const sequencer = new ChatEventSequencer();
     const projected: Array<[number, string]> = [];

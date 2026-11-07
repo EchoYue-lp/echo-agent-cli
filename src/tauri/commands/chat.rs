@@ -938,7 +938,7 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
     // receipt in the spawned turn until the shared driver and HITL reset have
     // both settled, so workspace publication cannot race an issued handle.
     let pool_execution = scoped_runtime
-        .agent_for(&conversation_id)
+        .agent_for_turn(&conversation_id)
         .await
         .map_err(|error| IpcError::Validation(error.to_string()))?;
     let agent_handle = pool_execution.agent();
@@ -1430,7 +1430,7 @@ pub async fn steer_chat_message(
             return Err(IpcError::Validation(format!("{error}{suffix}")));
         }
     };
-    let agent_execution = match scoped_runtime.agent_for(&conversation_id).await {
+    let agent_execution = match scoped_runtime.agent_for_turn(&conversation_id).await {
         Ok(execution) => execution,
         Err(error) => {
             let cleanup = prepared.cleanup_resources(&spill_dir).err();

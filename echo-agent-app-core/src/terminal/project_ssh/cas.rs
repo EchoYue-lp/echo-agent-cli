@@ -1,17 +1,17 @@
 //! One controlled server operation for the original cooperating-writer CAS.
 //! The script is fixed; file paths and bytes travel only in structured stdin.
 
+use super::generations::ConnectionSource;
+use super::remote_path;
 use super::sftp::remote_failure;
 #[cfg(test)]
 use super::sftp::unavailable;
-use super::{ProjectSshConnection, remote_path};
 use base64::Engine;
 use echo_agent::error::{Result, ToolError};
 use echo_agent::sandbox::{SandboxCommand, SandboxExecutor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 const HELPER: &str = include_str!("cas.py");
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
@@ -59,14 +59,14 @@ enum Reply {
 }
 
 pub(super) async fn compare_and_swap(
-    connection: Arc<ProjectSshConnection>,
+    source: ConnectionSource,
     directory: PathBuf,
     path: PathBuf,
     expected: &[u8],
     replacement: &[u8],
 ) -> Result<bool> {
     let request = request(&path, expected, replacement)?;
-    let sandbox = connection.sandbox();
+    let sandbox = super::sandbox::ProjectSshSandbox::with_source(source);
     // This is a read-only capability observation through the same original
     // connection. The mutating helper rechecks availability itself as well;
     // the probe is not a qualification receipt for that server/filesystem.

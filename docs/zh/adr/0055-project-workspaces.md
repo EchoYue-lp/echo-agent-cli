@@ -81,3 +81,48 @@ TaskRun 在原 `RunCreated`/目标版本中绑定经验证的位置 identity 和
 用户明确本项目不承担旧版本兼容。位置改为当前必填类型，当前 registry 的默认、本地目录与已验证 SSH 创建入口先提供显式位置，再取消旧 manifest 的缺字段推断；不改变原 registry、revision、execution identity 或连接 owner。当前测试夹具随新合同明确位置，旧 manifest 自动推断的验收退役，不以 skip 或兼容分支维持。
 
 前端 Workspace 类型同步必填位置，显示与项目终端直接读取该位置；verified SSH identity 仍用于实际执行展示，原用户配置保持独立。仅历史格式不再接纳，同版 inspect/reopen、代际校验、SSH 认证与 namespace、索引恢复和删除时保用户代码继续验收。Git Worktree 只解析实际生产者使用的 `--porcelain -z`，保留中文、emoji 和换行路径；非 NUL 旧文本或缺终止符的输入不构成可观察列表事实。
+
+
+## 2026-11-06：免安装 SSH 运维的应用策略
+
+日常运维沿既有 SSH Workspace、shell、文件与 command cell 完成，不新增远端 Eclip 服务、专用运维工具或任务状态机。SSH 运维要求与项目结构共用原 `eko:project-context` 投影，由初始工厂和 invocation 准备调用同一应用私有组装函数；`PreparedProjectContext` 保留本轮值，在 Execute/reset 后沿原 projector 发布。下一次本地绑定用同一投影槽替换或清除 SSH 内容，不把远端策略留在其它会话或全局静态前缀。
+
+executor 的 `ssh` 名称仅选择模型行为要求，不证明认证、主机身份、权限或实际执行结果；这些继续由原 Workspace generation、位置校验、文件/命令适配器、权限和 TaskRuntime 负责。普通聊天不因此增加远端探测。原本地 refresh 的本地合同继续保留，真实 SSH 主路径使用既有可失败的文件提供者准备入口。完整初始化快照供 reflection 等消费者读取，不等同于一次模型准入；产品首轮应沿 factory→drive_chat 验证，不能以绕过 turn registration 的裸 chat 代替。
+
+查询先回答用户范围，区分服务、进程和容器的计数与健康证据，说明采样时间和未知项；证据足够后收敛。控制需要原管理器或可靠身份与明确启动方式，控制后有界复查，不把 exit0 当健康。日志默认最近200行并受字节上限约束；跟踪只观察服务。断线或响应丢失时保留结果未知，重新查询不能证明上次命令是否执行，不自动重放控制操作。该策略描述目标行为，实际服务查询、控制、日志及故障表现仍须经原工具/TaskRun、真实模型、SSH 和 GUI 场景分别验收，提示词接线不等于完整运维交付。
+
+## 2026-11-07：SSH 命令包装的输入与观察边界
+
+远端命令的POSIX异步列表显式继承原stdin；否则未启用job control时会得到空输入。看门狗对子进程sleep承担回收责任，收到停止请求后终止并wait该原child，parent再wait看门狗。不能仅关闭外层subshell或重定向管道来隐藏残留；payload的stdout、stderr和正常退出码仍应保留。目标timer以秒为粒度时向上取整，避免早于原Duration发送信号；本机仍使用原精确观察预算。
+
+取消或本机预算到达后，观察沿既有CLOSE_OBSERVATION_TIMEOUT有界返回；原物理任务、child与invocation guards继续由原连接持有，不abort或清除unknown。等待原物理观察丢失后的结算也受同一观察期限约束。原SSH非255退出已经确认时，结果观察失败与停止未知分别表达；未知副作用仍不自动重放。
+
+OpenSSH的退出状态可以直接来自payload。124可能是程序自然返回，也可能与看门狗有关，不能据此声称“实际被杀掉”；timed_out只表示本机观察预算到达，取消也不证明被操作服务停止。需要目标状态时沿原管理器或工具再查，退出原因缺证据就保留未知。
+
+该边界参考[POSIX异步列表与输入重定向](https://pubs.opengroup.org/onlinepubs/9799919799/utilities/V3_chap02.html)、[OpenSSH退出状态](https://man.openbsd.org/ssh#EXIT_STATUS)，并对照本机moss-agent/dev `41856a8590e3`的`spawn_process_settled`：取消后仍收集原child，终止后等待communicate。复用的是所有权与回收模式，不部署其远端服务、操作库或设备协议。本地夹具与脚本测量不替代真实SSH、GUI及App验收。
+
+## 2026-11-07：免安装 SSH 的通信代际恢复
+
+背景：旧SSH master断开、原命令255且结果未知时，原operation和Workspace guard必须保留。
+此前重连复用删除前idle/Host退休与旧连接close，导致原unknown阻止同Workspace恢复查询。
+
+决策：TaskRuntime、Host、AgentPool、本机store和项目位置不因通信恢复替换。
+TerminalService在同一个项目owner内保存current及仍需结算的retired物理连接；新认证draft
+再次核对原host/user/port/目录和预期generation后原子发布，只影响后续新准入请求。
+原调用、guard及未知结果不转交，不自动重放启停，不以新目标状态证明原命令成功。
+
+文件方法、命令future（包括缓冲stream）在入口捕获同一个物理快照与request lifetime。
+准备session、reader和复合checkpoint/CAS的内部步骤复用该快照。发布封闭旧代际的新准入，
+已有快照的子步骤继续原连接；最后持有者释放后，原owner有界观察可回收的退休连接。
+旧unknown继续依赖原物理结算证据，不因超时、EOF、重连或本机观察结束而清除。
+
+关闭draft必须同时验证逻辑owner准入与物理master；已发布Workspace或包含退休连接的owner
+不能作为独立draft转交。关闭由原owner保存实际结算任务，观察者取消不丢关闭责任。
+所有current/retired共用一个绝对关闭观察期限；有未确认资源时保留原实例和错误。
+GUI沿现有transition回执说明“新连接可用，旧操作仍未知”，不另增设备控制台或任务状态。
+
+没有采用关闭检查放宽或覆盖map：会丢原资源责任。没有重建Host：会重开本机权威或使旧请求
+改绑。没有引入远端server或结果账本：本轮只恢复后续查询，找回原退出结果不在能力承诺内。
+机制限定在应用SSH适配；框架trait、工具schema、权限与恢复权威继续复用。
+唯一设计入口为docs/supreme/specs/ssh-remote-device-optimization/design.md；实际验证与真实SSH、
+GUI/模型及重新构建App仍须分别取得证据，本节不是已完成回执。

@@ -3,6 +3,5 @@
 export type AgentUpdate = {
   name: string | null;
   system_prompt: string | null;
-  max_iterations: number | null;
   memory_path: string | null;
 };

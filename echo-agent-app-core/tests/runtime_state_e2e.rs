@@ -23,7 +23,6 @@ fn make_app_config() -> EkoConfig {
     let mut c = EkoConfig::default();
     c.agent.name = "rt-test-agent".to_string();
     c.agent.system_prompt = "You are a test runtime agent.".to_string();
-    c.agent.max_iterations = 1;
     c.agent.token_limit = 4096;
     c.model_providers.insert(
         "test-provider".to_string(),

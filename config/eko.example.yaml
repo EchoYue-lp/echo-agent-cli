@@ -10,6 +10,7 @@ max_subagent_depth: 1
 # base_url 可填写 API 根地址，框架按模型协议解析标准 endpoint。
 # 本地 Provider 可设置 requires_api_key: false 并省略密钥。
 # GUI 与后台输入会读取同一份 default_model_id。
+# Eclip 不提供 temperature；思考深度、输出 tokens 和上下文窗口按各自合同配置。
 model:
   default_model_id: "deepseek:deepseek-v4-flash"
 
@@ -30,13 +31,11 @@ configured_models:
     input_modalities: ["text"] # 可追加 image、audio、video
     enabled: true
     max_tokens: 8192
-    temperature: 0.7
 
 # ── Agent 配置 ─────────────────────────────────────────────────────
 agent:
   name: "echo-assistant"                              # Agent 名称
   system_prompt: "You are Eclip, the user's local personal AI workbench. Work as a capable, evidence-driven collaborator across software, research, data, documents, and long-running tasks. Move authorized work to a verified result while respecting the user's instructions, workspace, and control over external side effects."  # 稳定身份；详细执行合同由应用层 PromptAssembler 注入
-  max_iterations: 0            # ReAct 最大迭代次数（0 = 无限制，直到任务完成或用户取消）
   memory_path: "~/.eko/store.json"  # 记忆存储路径
   tool_timeout_ms: 120000     # 单次工具调用超时（毫秒）
   max_tool_output_tokens: 8000 # 单个工具结果进入模型上下文的 Token 上限

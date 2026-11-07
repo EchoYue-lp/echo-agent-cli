@@ -744,7 +744,7 @@ async fn drive_one(
             turn_id.clone(),
         )
         .await?;
-    let pool_execution = scoped.agent_for(&address.conversation_id).await?;
+    let pool_execution = scoped.agent_for_turn(&address.conversation_id).await?;
     let agent = pool_execution.agent();
     let metrics = Arc::new(Mutex::new(SinkMetrics::default()));
     let renderer: Arc<dyn ChatSink> = Arc::new(MetricsSink {
@@ -793,13 +793,21 @@ async fn drive_one(
         memory_generation: None,
         human_loop_provider: Some(context.runtime.hitl_dispatcher.clone()),
     });
-    let outcome = echo_agent_app_core::api::foreground_turn::drive_foreground_chat(
-        lease, &agent, &turn, resources,
+    // 与GUI保持同一原lease/driver路径，性能探针不重复支付工厂上下文准备。
+    let held_execution = Arc::new(Mutex::new(Some(pool_execution)));
+    lease.retain_execution(held_execution.clone());
+    let outcome = echo_agent_app_core::api::chat_driver::with_foreground_pool_execution(
+        Arc::downgrade(&held_execution),
+        Box::pin(
+            echo_agent_app_core::api::foreground_turn::drive_foreground_chat(
+                lease, &agent, &turn, resources,
+            ),
+        ),
     )
     .await
     .map_err(anyhow::Error::msg)?;
     ensure!(matches!(outcome, TurnOutcome::Completed));
-    drop(pool_execution);
+    drop(held_execution);
 
     if require_command_cell_watch {
         let typed_watch_receipts = metrics

@@ -202,6 +202,253 @@ mod tests {
             .map_err(|error| error.to_string())
     }
 
+    #[tokio::test]
+    async fn interrupted_task_progress_keeps_original_save_settlement_in_owned_journal()
+    -> anyhow::Result<()> {
+        fn saving_failure(execution_id: &str) -> Vec<AgentEvent> {
+            vec![
+                scripted_execution_status(
+                    execution_id,
+                    echo_agent::agent::ExecutionStatusKind::Started,
+                    1,
+                ),
+                AgentEvent::TranscriptProjectionSettlement(
+                    echo_agent::memory::TranscriptProjectionSettlement {
+                        status: echo_agent::memory::TranscriptProjectionSettlementStatus::Blocked,
+                        operation_id: Some("original-save-operation".into()),
+                        conversation_id: Some("conv_test".into()),
+                        generation_id: Some("original-generation".into()),
+                        attempt: 1,
+                        error_class: Some(
+                            echo_agent::memory::TranscriptProjectionErrorClass::OutcomeUnknown,
+                        ),
+                        detail: Some("fixture save not confirmed".into()),
+                    },
+                ),
+                scripted_execution_status(
+                    execution_id,
+                    echo_agent::agent::ExecutionStatusKind::Failed,
+                    2,
+                ),
+                AgentEvent::Error {
+                    source: "fixture_interrupted".into(),
+                    message: "save interrupted".into(),
+                    failure: echo_agent::error::AgentFailure::message(
+                        "fixture_interrupted",
+                        "save interrupted",
+                    ),
+                },
+            ]
+        }
+        let directory = tempfile::tempdir()?;
+        let (store, _agent, log, runtime) = publication_run_fixture(directory.path()).await?;
+        let _resources = store.test_resource_scope();
+        let run_id = seed_run(
+            &store,
+            vec![solo_readonly_task("original-save-observation")],
+        )
+        .map_err(anyhow::Error::msg)?;
+        let run = store
+            .get_run(&run_id)?
+            .ok_or_else(|| anyhow::anyhow!("run missing"))?;
+        let turn = "owned-save-failure-turn";
+        store.claim_run_turn(&run_id, turn, RunTurnOrigin::User, TurnVisibility::Visible)?;
+        let sink = EkoAgentTurnSink::for_run(
+            &run,
+            turn,
+            TaskRuntimeOperation::new(store.clone()),
+            HashSet::new(),
+            None,
+        );
+        // RunTurn的原发布root是本轮turn；PlanTask helper的run.root_message_id
+        // 属于另一种上下文，不能拿它作为这个原ChatEventLog的publication root。
+        let identity = echo_agent::agent::EventIdentity::for_chat(
+            Some(run.conversation_id.clone()),
+            turn,
+            turn,
+            Some(run_id.clone()),
+        )?
+        .with_execution_id(turn)?;
+        let request =
+            TurnRequest::new(identity, "report original evidence").mode(TurnMode::Execute);
+        let receipt = AgentTurnDriver
+            .drive(
+                &ScriptedTurnAgent::new(saving_failure, turn),
+                request,
+                &sink,
+            )
+            .await?;
+        assert!(matches!(receipt.outcome, TurnOutcome::Failed(_)));
+        assert_eq!(
+            receipt.delivery,
+            echo_agent::runtime::TurnDeliveryOutcome::Delivered,
+            "the original source must reach its owned journal and publication: {receipt:?}"
+        );
+        let native = store
+            .list_events(&run_id, 0)?
+            .into_iter()
+            .filter(|event| {
+                event
+                    .payload
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("native_agent_event")
+            })
+            .map(|event| {
+                let raw = event
+                    .payload
+                    .get("agent_envelope")
+                    .ok_or_else(|| anyhow::anyhow!("native envelope missing"))?;
+                Ok(serde_json::from_value::<echo_agent::agent::EventEnvelope>(
+                    raw.clone(),
+                )?)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let saves = native
+            .iter()
+            .filter_map(|event| match &event.payload {
+                AgentEvent::TranscriptProjectionSettlement(settlement) => Some((event, settlement)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            saves.len(),
+            1,
+            "owned sink must persist the original save fact before publication"
+        );
+        let (event, settlement) = saves
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("save fact disappeared"))?;
+        assert_eq!(
+            settlement.operation_id.as_deref(),
+            Some("original-save-operation")
+        );
+        assert_eq!(
+            settlement.status,
+            echo_agent::memory::TranscriptProjectionSettlementStatus::Blocked
+        );
+        assert_eq!(
+            event.run_id.as_ref().map(|id| id.as_str()),
+            Some(run_id.as_str())
+        );
+        assert_eq!(
+            event.execution_id.as_ref().map(|id| id.as_str()),
+            Some(turn)
+        );
+        assert_eq!(
+            store.get_run(&run_id)?.map(|run| run.status),
+            Some(TaskRunStatus::Running)
+        );
+        let replay = log.replay(
+            &run.workspace_id,
+            Some(&run.conversation_id),
+            &run.root_message_id,
+            0,
+        )?;
+        let expected = serde_json::to_value(*event)?;
+        let published = replay
+            .events
+            .iter()
+            .find_map(|entry| match &entry.payload {
+                crate::chat_driver::ChatDriverEvent::Agent(original)
+                    if original.event_id == event.event_id =>
+                {
+                    Some(original)
+                }
+                _ => None,
+            })
+            .ok_or_else(|| anyhow::anyhow!("original save publication missing"))?;
+        assert_eq!(serde_json::to_value(published.as_ref())?, expected);
+        runtime.shutdown().await.map_err(anyhow::Error::msg)?;
+        drop(runtime);
+        drop(log);
+        drop(sink);
+        drop(store);
+        let cold = crate::chat_event_log::ChatEventLog::open(
+            directory.path().join("chat-events"),
+            crate::chat_event_log::ChatEventRetention::default(),
+        )?;
+        let replay = cold.replay(
+            &run.workspace_id,
+            Some(&run.conversation_id),
+            &run.root_message_id,
+            0,
+        )?;
+        let published = replay
+            .events
+            .iter()
+            .find_map(|entry| match &entry.payload {
+                crate::chat_driver::ChatDriverEvent::Agent(original)
+                    if original.event_id == event.event_id =>
+                {
+                    Some(original)
+                }
+                _ => None,
+            })
+            .ok_or_else(|| anyhow::anyhow!("cold original save publication missing"))?;
+        assert_eq!(
+            serde_json::to_value(published.as_ref())?,
+            expected,
+            "cold replay must retain the original save envelope, not reconstruct a notice"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn interrupted_task_progress_save_fact_cannot_create_execution_head() -> anyhow::Result<()>
+    {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+        let _resources = store.test_resource_scope();
+        let run_id = seed_run(&store, vec![solo_readonly_task("no-save-bootstrap")])
+            .map_err(anyhow::Error::msg)?;
+        let run = store
+            .get_run(&run_id)?
+            .ok_or_else(|| anyhow::anyhow!("run missing"))?;
+        let turn = "no-native-head-turn";
+        store.claim_run_turn(&run_id, turn, RunTurnOrigin::User, TurnVisibility::Visible)?;
+        let sink = EkoAgentTurnSink::for_run(
+            &run,
+            turn,
+            TaskRuntimeOperation::new(store.clone()),
+            HashSet::new(),
+            None,
+        );
+        let identity = turn_identity(&run, turn)
+            .map_err(anyhow::Error::msg)?
+            .with_execution_id(turn)?;
+        let save = echo_agent::memory::TranscriptProjectionSettlement {
+            status: echo_agent::memory::TranscriptProjectionSettlementStatus::Blocked,
+            operation_id: Some("not-an-execution-head".into()),
+            conversation_id: Some(run.conversation_id.clone()),
+            generation_id: None,
+            attempt: 1,
+            error_class: Some(echo_agent::memory::TranscriptProjectionErrorClass::OutcomeUnknown),
+            detail: None,
+        };
+        sink.on_event(echo_agent::agent::EventEnvelope::new(
+            &identity,
+            1,
+            None,
+            AgentEvent::TranscriptProjectionSettlement(save),
+        )?)
+        .await?;
+        sink.on_event(echo_agent::agent::EventEnvelope::new(
+            &identity,
+            2,
+            None,
+            AgentEvent::FinalAnswer("must not bootstrap publication".into()),
+        )?)
+        .await?;
+        assert!(!store.list_events(&run_id, 0)?.iter().any(|event| {
+            event
+                .payload
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("native_agent_event")
+        }));
+        Ok(())
+    }
+
     fn compiled_task_prompt(
         task: &PlanTask,
         dependency_summaries: &[(String, String)],
@@ -5793,6 +6040,276 @@ Read the runtime path and found one missing branch.
         .await?;
         assert!(matches!(receipt.outcome, TurnOutcome::Failed(_)));
         assert!(store.get_plan("mutating-domain")?.is_none());
+        Ok(())
+    }
+
+    // 新受控合成 Model，经原 unattended producer/RunTurn/Driver/sink；不是旧 Cron payload 重放。
+    async fn publication_run_fixture(
+        root: &std::path::Path,
+    ) -> anyhow::Result<(
+        Arc<TaskRuntimeStore>,
+        crate::agent_handle::AgentHandle,
+        Arc<crate::chat_event_log::ChatEventLog>,
+        Arc<super::super::command_cells::CommandCellRuntimeService>,
+    )> {
+        use echo_agent::testing::{MockLlmClient, MockTool};
+        let store = Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(
+            root.join("store"),
+        )?);
+        let log = Arc::new(crate::chat_event_log::ChatEventLog::open(
+            root.join("chat-events"),
+            crate::chat_event_log::ChatEventRetention::default(),
+        )?);
+        let runtime = super::super::command_cells::CommandCellRuntimeService::new(
+            Arc::new(echo_agent::sandbox::LocalSandbox::new(Default::default())),
+            log.clone(),
+            crate::product_data_io::ProductDataIoService::new(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        runtime.bind_store(&store);
+        let llm = Arc::new(
+            MockLlmClient::new()
+                .with_model_name("publication-fixture")
+                .then_tool_call("publication-read", "read_file", r#"{"path":"README.md"}"#)
+                .with_response("受控 publication 原公开回答🧭"),
+        );
+        let agent = crate::agent_handle::AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("publication-fixture")
+                .llm_client(llm)
+                .tool(Box::new(MockTool::new("read_file").with_parameters(serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]})).with_response("原只读证据")))
+                .build()?,
+        );
+        Ok((store, agent, log, runtime))
+    }
+
+    #[tokio::test]
+    async fn unattended_owned_turn_preserves_real_native_execution_header() -> anyhow::Result<()> {
+        use echo_agent::agent::{AgentEvent, EventEnvelope, ExecutionStatusKind};
+        let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".echo-semantic/local/cron-publication-tests");
+        std::fs::create_dir_all(&directory)?;
+        let root = tempfile::tempdir_in(directory)?;
+        let (store, agent, _log, runtime) = publication_run_fixture(root.path()).await?;
+        let _scope = store.test_resource_scope();
+        let result = launch_unattended_run(
+            store.clone(),
+            agent,
+            "cron",
+            "definition-fixture",
+            "occurrence-fixture",
+            "原 producer 身份核对",
+            CancellationToken::new(),
+            UnattendedWriteMode::Disabled,
+        )
+        .await;
+        runtime.shutdown().await.map_err(anyhow::Error::msg)?;
+        drop(runtime);
+        let run_id = result?;
+        let native = store
+            .list_events(&run_id, 0)?
+            .into_iter()
+            .filter(|event| {
+                event
+                    .payload
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("native_agent_event")
+            })
+            .map(|event| {
+                let raw = event
+                    .payload
+                    .get("agent_envelope")
+                    .ok_or_else(|| anyhow::anyhow!("original native envelope missing"))?;
+                Ok(serde_json::from_value::<EventEnvelope>(raw.clone())?)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let source = native
+            .iter()
+            .find_map(|event| match &event.payload {
+                AgentEvent::ExecutionStatus(status)
+                    if status.status == ExecutionStatusKind::Started =>
+                {
+                    Some(status.execution_id.clone())
+                }
+                _ => None,
+            })
+            .ok_or_else(|| anyhow::anyhow!("original typed Started missing"))?;
+        anyhow::ensure!(!source.is_empty(), "real source execution empty");
+        anyhow::ensure!(
+            !native.is_empty(),
+            "original producer did not persist native events"
+        );
+        for event in &native {
+            anyhow::ensure!(
+                event.execution_id.as_ref().map(|id| id.as_str()) == Some(source.as_str()),
+                "original canonical header lost typed source execution"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unattended_owned_turn_publishes_strict_cold_history_without_raw_fallback()
+    -> anyhow::Result<()> {
+        use echo_agent::llm::types::Role;
+        let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".echo-semantic/local/cron-publication-tests");
+        std::fs::create_dir_all(&directory)?;
+        let root = tempfile::tempdir_in(directory)?;
+        let (store, agent, log, runtime) = publication_run_fixture(root.path()).await?;
+        let _scope = store.test_resource_scope();
+        let result = launch_unattended_run(
+            store.clone(),
+            agent.clone(),
+            "cron",
+            "definition-fixture",
+            "occurrence-fixture",
+            "原 producer 冷历史核对",
+            CancellationToken::new(),
+            UnattendedWriteMode::Disabled,
+        )
+        .await;
+        runtime.shutdown().await.map_err(anyhow::Error::msg)?;
+        drop(runtime);
+        let run_id = result?;
+        let run = store
+            .get_run(&run_id)?
+            .ok_or_else(|| anyhow::anyhow!("original run missing"))?;
+        let inner = agent.inner().clone();
+        let messages = inner.read().await.get_messages().await;
+        let message = messages
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role == Role::Assistant
+                    && message.content.as_text().as_deref() == Some("受控 publication 原公开回答🧭")
+            })
+            .ok_or_else(|| anyhow::anyhow!("original canonical assistant message missing"))?;
+        anyhow::ensure!(
+            message.execution_status.is_some(),
+            "synthetic Model did not produce native canonical status"
+        );
+        let events =
+            log.native_history_publications(&run.workspace_id, &run.conversation_id, message)?;
+        let view = crate::conversation_projection::project_native_history_publication(
+            message,
+            &run.workspace_id,
+            &run.conversation_id,
+            &events,
+        )
+        .map_err(anyhow::Error::msg)?
+        .ok_or_else(|| anyhow::anyhow!("native view missing"))?;
+        anyhow::ensure!(
+            view.final_answer_confirmed
+                && view.content.as_deref() == Some("受控 publication 原公开回答🧭"),
+            "original unattended producer did not publish cold history"
+        );
+        let empty = crate::conversation_projection::project_native_history_publication(
+            message,
+            &run.workspace_id,
+            &run.conversation_id,
+            &[],
+        )
+        .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            empty.is_some_and(|view| !view.final_answer_confirmed && view.content.is_none()),
+            "missing publication gained raw fallback"
+        );
+        let missing_settled = events
+            .iter()
+            .filter(|event| {
+                !matches!(&event.payload,
+            crate::chat_driver::ChatDriverEvent::Agent(native)
+                if matches!(&native.payload, AgentEvent::ExecutionStatus(status)
+                    if status.status == echo_agent::agent::ExecutionStatusKind::Settled))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let incomplete = crate::conversation_projection::project_native_history_publication(
+            message,
+            &run.workspace_id,
+            &run.conversation_id,
+            &missing_settled,
+        )
+        .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            incomplete.is_some_and(|view| !view.final_answer_confirmed),
+            "missing real Settled was manufactured"
+        );
+        // 纯 consumer 故障夹具：不得把另一原 owner 或后继产品失败当本次成功。
+        let mut foreign = events.clone();
+        for event in &mut foreign {
+            if let crate::chat_driver::ChatDriverEvent::Agent(native) = &mut event.payload {
+                let identity = echo_agent::agent::EventIdentity::for_chat(
+                    Some(run.conversation_id.clone()),
+                    native.turn_id.as_str(),
+                    native
+                        .message_id
+                        .as_ref()
+                        .map(|id| id.as_str())
+                        .unwrap_or(native.turn_id.as_str()),
+                    Some(run.run_id.clone()),
+                )?
+                .with_execution_id("foreign-synthetic-owner")?;
+                let mut payload = native.payload.clone();
+                if let AgentEvent::ExecutionStatus(status) = &mut payload {
+                    status.execution_id = "foreign-synthetic-owner".to_string();
+                }
+                **native = echo_agent::agent::EventEnvelope::new(
+                    &identity,
+                    native.sequence,
+                    native.parent_event_id.clone(),
+                    payload,
+                )?;
+            }
+        }
+        let wrong_owner = crate::conversation_projection::project_native_history_publication(
+            message,
+            &run.workspace_id,
+            &run.conversation_id,
+            &foreign,
+        )
+        .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            wrong_owner.is_some_and(|view| !view.final_answer_confirmed),
+            "foreign publication owner gained success"
+        );
+        let mut product_failed = events.clone();
+        for event in &mut product_failed {
+            if let crate::chat_driver::ChatDriverEvent::TurnStatus { status } = &mut event.payload {
+                *status = "failed".to_string();
+            }
+        }
+        let failed = crate::conversation_projection::project_native_history_publication(
+            message,
+            &run.workspace_id,
+            &run.conversation_id,
+            &product_failed,
+        )
+        .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            failed.is_some_and(|view| !view.final_answer_confirmed),
+            "product failure was hidden by native Settled"
+        );
+        drop(log);
+        let cold = crate::chat_event_log::ChatEventLog::open(
+            root.path().join("chat-events"),
+            crate::chat_event_log::ChatEventRetention::default(),
+        )?;
+        let cold_events =
+            cold.native_history_publications(&run.workspace_id, &run.conversation_id, message)?;
+        let cold_view = crate::conversation_projection::project_native_history_publication(
+            message,
+            &run.workspace_id,
+            &run.conversation_id,
+            &cold_events,
+        )
+        .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            cold_view.is_some_and(|view| view.final_answer_confirmed),
+            "cold original publication not recoverable"
+        );
         Ok(())
     }
 }
