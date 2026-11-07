@@ -619,6 +619,24 @@
       "kind": "adr",
       "sourceLanguage": "zh",
       "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "adr/0064-background-cell-receipt-ownership.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "adr/0065-cache-prefix-facts.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "adr/0067-local-chart-rendering.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
     }
   ],
   "engineeringEntries": [
