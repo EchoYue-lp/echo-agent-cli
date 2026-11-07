@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo } from 'react';
+import { useState, useRef, useEffect, useMemo, useId } from 'react';
 import {
   Plus,
   Sun,
@@ -93,6 +93,8 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   const retrySideConversation = useConversationStore((s) => s.retrySideConversation);
 
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [recentExpanded, setRecentExpanded] = useState(true);
+  const recentListId = useId();
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<ConversationListItem[]>([]);
   const [searchResultScope, setSearchResultScope] = useState('');
@@ -770,58 +772,75 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
         {!isSearchingContent && (
           <section aria-label="最近任务" className="mb-3">
             <div className="flex items-center justify-between px-3 pb-2 text-[11px] font-medium text-[var(--text-tertiary)]">
-              <h2>最近任务</h2>
+              <h2 className="flex-1">
+                <button
+                  type="button"
+                  aria-expanded={recentExpanded}
+                  aria-controls={recentListId}
+                  onClick={() => setRecentExpanded((expanded) => !expanded)}
+                  className="flex min-h-7 w-full items-center justify-between gap-2 text-left hover:text-[var(--text-primary)]"
+                >
+                  最近任务
+                  {recentExpanded ? (
+                    <ChevronDown size={12} aria-hidden="true" />
+                  ) : (
+                    <ChevronRight size={12} aria-hidden="true" />
+                  )}
+                </button>
+              </h2>
               {recentLoading && (
                 <Loader2 size={12} className="animate-spin" aria-label="读取最近任务" />
               )}
             </div>
-            {recentTasks.slice(0, recentVisibleCount).map((task) => (
-              <button
-                type="button"
-                key={`${task.workspaceId}:${task.workspaceGeneration}:${task.run?.run_id ?? task.conversation.conversation_id}`}
-                onClick={() => void openRecentTask(task)}
-                aria-label={`打开任务 ${task.conversation.title || '新任务'}，${task.workspaceName}`}
-                title={`${task.conversation.title || '新任务'} · ${task.workspaceName}`}
-                className={`group flex min-h-8 w-full items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-[13px] transition-colors hover:bg-[var(--bg-sidebar-hover)] ${activeConvId === task.conversation.conversation_id && (current?.id ?? GLOBAL_WORKSPACE_ID) === task.workspaceId ? 'bg-[var(--bg-sidebar-active)] text-[var(--text-primary)]' : ''}`}
-              >
-                <MessageSquare size={13} className="shrink-0 text-[var(--text-tertiary)]" />
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate">{task.conversation.title || '新任务'}</span>
-                  {task.run && (
-                    <span className="block text-[10px] text-[var(--text-tertiary)]">
-                      {taskRunSourceLabel(task.run)} · {RUN_STATUS_LABEL[task.run.status]}
-                    </span>
-                  )}
-                </span>
-                <span className="max-w-[56px] shrink-0 truncate text-[10px] text-[var(--text-tertiary)]">
-                  {task.workspaceName}
-                </span>
-              </button>
-            ))}
-            {!recentLoading && recentTasks.length === 0 && (
-              <p className="px-3 py-2 text-xs text-[var(--text-tertiary)]">从一个新任务开始</p>
-            )}
-            {recentError && (
-              <p role="status" className="px-3 py-2 text-xs text-[var(--color-warning-text)]">
-                {recentError}
-              </p>
-            )}
-            {(recentHasMoreRuns ||
-              recentTasks.length > recentVisibleCount ||
-              recentWorkspaceCount < recentScopes.length) && (
-              <button
-                type="button"
-                disabled={recentLoading}
-                onClick={() => {
-                  setRecentVisibleCount((count) => count + 8);
-                  setRecentWorkspaceCount((count) => count + WORKSPACE_BATCH);
-                  setRecentRunPages((count) => count + 1);
-                }}
-                className="px-3 py-2 text-xs text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
-              >
-                查看更多任务
-              </button>
-            )}
+            <div id={recentListId} hidden={!recentExpanded}>
+              {recentTasks.slice(0, recentVisibleCount).map((task) => (
+                <button
+                  type="button"
+                  key={`${task.workspaceId}:${task.workspaceGeneration}:${task.run?.run_id ?? task.conversation.conversation_id}`}
+                  onClick={() => void openRecentTask(task)}
+                  aria-label={`打开任务 ${task.conversation.title || '新任务'}，${task.workspaceName}`}
+                  title={`${task.conversation.title || '新任务'} · ${task.workspaceName}`}
+                  className={`group flex min-h-8 w-full items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-[13px] transition-colors hover:bg-[var(--bg-sidebar-hover)] ${activeConvId === task.conversation.conversation_id && (current?.id ?? GLOBAL_WORKSPACE_ID) === task.workspaceId ? 'bg-[var(--bg-sidebar-active)] text-[var(--text-primary)]' : ''}`}
+                >
+                  <MessageSquare size={13} className="shrink-0 text-[var(--text-tertiary)]" />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate">{task.conversation.title || '新任务'}</span>
+                    {task.run && (
+                      <span className="block text-[10px] text-[var(--text-tertiary)]">
+                        {taskRunSourceLabel(task.run)} · {RUN_STATUS_LABEL[task.run.status]}
+                      </span>
+                    )}
+                  </span>
+                  <span className="max-w-[56px] shrink-0 truncate text-[10px] text-[var(--text-tertiary)]">
+                    {task.workspaceName}
+                  </span>
+                </button>
+              ))}
+              {!recentLoading && recentTasks.length === 0 && (
+                <p className="px-3 py-2 text-xs text-[var(--text-tertiary)]">从一个新任务开始</p>
+              )}
+              {recentError && (
+                <p role="status" className="px-3 py-2 text-xs text-[var(--color-warning-text)]">
+                  {recentError}
+                </p>
+              )}
+              {(recentHasMoreRuns ||
+                recentTasks.length > recentVisibleCount ||
+                recentWorkspaceCount < recentScopes.length) && (
+                <button
+                  type="button"
+                  disabled={recentLoading}
+                  onClick={() => {
+                    setRecentVisibleCount((count) => count + 8);
+                    setRecentWorkspaceCount((count) => count + WORKSPACE_BATCH);
+                    setRecentRunPages((count) => count + 1);
+                  }}
+                  className="px-3 py-2 text-xs text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
+                >
+                  查看更多任务
+                </button>
+              )}
+            </div>
           </section>
         )}
         <div className="flex items-center justify-between px-3 pb-2 text-[11px] font-medium text-[var(--text-tertiary)]">

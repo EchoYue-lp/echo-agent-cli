@@ -652,3 +652,20 @@ describe('task and workspace navigation', () => {
     }
   );
 });
+
+it('最近任务可以折叠和重新展开，不重新请求或改变工作空间', async () => {
+  mocks.list.mockImplementation(async (id: string) => (id === 'a' ? [task('collapsible')] : []));
+  const view = render(<LeftSidebar onNewTask={vi.fn()} />);
+  const item = await view.findByRole('button', { name: '打开任务 collapsible，a' });
+  const toggle = view.getByRole('button', { name: '最近任务' });
+  const calls = mocks.list.mock.calls.length;
+  expect(toggle.getAttribute('aria-expanded')).toBe('true');
+  fireEvent.click(toggle);
+  expect(toggle.getAttribute('aria-expanded')).toBe('false');
+  expect(view.queryByRole('button', { name: '打开任务 collapsible，a' })).toBeNull();
+  expect(view.getByRole('button', { name: '添加工作空间' })).toBeTruthy();
+  fireEvent.click(toggle);
+  expect(toggle.getAttribute('aria-expanded')).toBe('true');
+  expect(view.getByRole('button', { name: '打开任务 collapsible，a' })).toBe(item);
+  expect(mocks.list.mock.calls.length).toBe(calls);
+});
