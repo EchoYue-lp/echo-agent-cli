@@ -9542,7 +9542,8 @@ mod tests {
                 .await
                 .map_err(anyhow::Error::msg)?;
             let agent = execution.agent();
-            let root_turn = "durable-admission-original-root".to_string();
+            // GUI/Channel 夹具默认并行运行，共享进程 turn registry，原轮次必须各有身份。
+            let root_turn = format!("durable-admission-original-root:{}", uuid::Uuid::new_v4());
             let run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&root_turn);
             let lease = runtime
                 .begin_turn(&foreground, surface, &conversation, root_turn.clone())

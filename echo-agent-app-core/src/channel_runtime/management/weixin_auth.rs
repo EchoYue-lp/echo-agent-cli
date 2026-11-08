@@ -892,7 +892,8 @@ mod tests {
         challenges: Mutex<Vec<String>>,
         codes: Mutex<Vec<Option<String>>>,
         entered: tokio::sync::Notify,
-        release: tokio::sync::Notify,
+        // 这是持续开放的 HTTP 回应闸；旧轮询超时不能消耗后继轮询的释放事实。
+        release: tokio_util::sync::CancellationToken,
     }
 
     struct AuthHttpFixture {
@@ -936,7 +937,7 @@ mod tests {
             QrFixtureCase::InvalidProtocol => {
                 return axum::Json(serde_json::json!({"status":"confirmed"})).into_response();
             }
-            QrFixtureCase::HeldConfirmation => provider.release.notified().await,
+            QrFixtureCase::HeldConfirmation => provider.release.cancelled().await,
             QrFixtureCase::VerifyTimeout if poll == 0 => {
                 return axum::Json(serde_json::json!({"status":"need_verifycode"})).into_response();
             }
@@ -995,7 +996,7 @@ mod tests {
                 challenges: Mutex::new(Vec::new()),
                 codes: Mutex::new(Vec::new()),
                 entered: tokio::sync::Notify::new(),
-                release: tokio::sync::Notify::new(),
+                release: tokio_util::sync::CancellationToken::new(),
             });
             let listener =
                 tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
@@ -1054,7 +1055,7 @@ mod tests {
         async fn close(self) -> anyhow::Result<()> {
             self.runtime.weixin_auth.cancel();
             // 等待条件失败也先撤回准入、释放本机 held response，再观察两个原 owner。
-            self.provider.release.notify_one();
+            self.provider.release.cancel();
             let authentication = self.runtime.weixin_auth.wait().await;
             self.stop.cancel();
             let server = tokio::time::timeout(Duration::from_secs(3), self.server).await;
@@ -1167,7 +1168,7 @@ mod tests {
             .weixin_cancel(challenge.clone())
             .await
             .map_err(anyhow::Error::msg)?;
-        fixture.provider.release.notify_one();
+        fixture.provider.release.cancel();
         assert_eq!(cancelled.phase, "cancelled");
         assert_eq!(fixture.settle(&challenge).await?.phase, "cancelled");
         assert!(
@@ -1234,7 +1235,7 @@ mod tests {
             "AUTH_CREDENTIAL_PHASE:replacement-owned-persist-return elapsed_ms={}",
             elapsed.elapsed().as_millis()
         );
-        fixture.provider.release.notify_one();
+        fixture.provider.release.cancel();
         let observed = fixture.settle(&challenge).await;
         if let Ok(settled) = &observed {
             eprintln!(
@@ -1291,7 +1292,7 @@ mod tests {
                 .replace_stopped_plugin(Box::new(WeixinChannel::new(config)?))
                 .await?;
             let after = handle.management_snapshot().await.mutation_epoch;
-            fixture.provider.release.notify_one();
+            fixture.provider.release.cancel();
             let phase = fixture.settle(&challenge).await?.phase;
             let no_credential = fixture
                 .state
