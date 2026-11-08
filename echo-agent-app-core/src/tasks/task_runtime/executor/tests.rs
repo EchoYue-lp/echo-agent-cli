@@ -2601,6 +2601,33 @@ Read the runtime path and found one missing branch.
         }
     }
 
+    /// 原超时失败后读取计数，不改变 dispatch、commit 或取消的等待边界。
+    fn fixture_boundary_failure_metadata(
+        store: &TaskRuntimeStore,
+        run_id: &str,
+        dispatcher: &ScriptedDispatcher,
+        admission: &ExecutionAdmission,
+        execution_finished: bool,
+    ) -> String {
+        let plan = store.get_plan(run_id).map(|plan| plan.map(|plan| {
+            serde_json::json!({
+                "total": plan.tasks.len(),
+                "completed": plan.tasks.iter().filter(|task| task.status == echo_agent::tasks::TaskStatus::Completed).count(),
+                "running": plan.tasks.iter().filter(|task| task.status == echo_agent::tasks::TaskStatus::Running).count(),
+                "claimed": plan.tasks.iter().filter(|task| task.claim.is_some()).count(),
+                "first_four_committed": plan.tasks.iter().take(4).filter(|task| task.status == echo_agent::tasks::TaskStatus::Completed && task.claim.is_none()).count(),
+            })
+        })).map_err(|error| error.to_string());
+        serde_json::json!({
+            "dispatched": dispatcher.order().len(),
+            "returned": dispatcher.returned_count.load(std::sync::atomic::Ordering::Acquire),
+            "admission_active": admission.active_count(),
+            "execution_finished": execution_finished,
+            "plan": plan,
+        })
+        .to_string()
+    }
+
     impl TaskDispatcher for Arc<ScriptedDispatcher> {
         fn dispatch(
             &self,
@@ -3491,6 +3518,10 @@ Read the runtime path and found one missing branch.
         let run_store = store.clone();
         let run_dispatcher = dispatcher.clone();
         let run_id_for_task = run_id.clone();
+        let admission = Arc::new(ExecutionAdmission::with_capacity(
+            EkoExecutionLimits::default().max_concurrent_subagents,
+        ));
+        let run_admission = admission.clone();
         let execution = tokio::spawn(async move {
             execute_runtime_plan_with_admission(
                 run_store,
@@ -3503,9 +3534,7 @@ Read the runtime path and found one missing branch.
                 },
                 run_cancel,
                 Some(completion_sink),
-                Arc::new(ExecutionAdmission::with_capacity(
-                    EkoExecutionLimits::default().max_concurrent_subagents,
-                )),
+                run_admission,
             )
             .await
         });
@@ -3519,7 +3548,18 @@ Read the runtime path and found one missing branch.
                 .await
         })
         .await
-        .map_err(|_| "dispatch/cancellation boundary was not reached".to_string())??;
+        .map_err(|_| {
+            format!(
+                "dispatch/cancellation boundary was not reached; {}",
+                fixture_boundary_failure_metadata(
+                    &store,
+                    &run_id,
+                    &dispatcher,
+                    &admission,
+                    execution.is_finished()
+                )
+            )
+        })??;
         cancel.cancel();
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), execution)
@@ -3584,11 +3624,15 @@ Read the runtime path and found one missing branch.
             .map(|task| task.id.clone())
             .collect::<Vec<_>>();
         let cancel = CancellationToken::new();
+        let admission = Arc::new(ExecutionAdmission::with_capacity(
+            EkoExecutionLimits::default().max_concurrent_subagents,
+        ));
         let execution = {
             let run_store = store.clone();
             let run_dispatcher = dispatcher.clone();
             let run_id = run_id.clone();
             let run_cancel = cancel.clone();
+            let run_admission = admission.clone();
             tokio::spawn(async move {
                 execute_runtime_plan_with_admission(
                     run_store,
@@ -3601,9 +3645,7 @@ Read the runtime path and found one missing branch.
                     },
                     run_cancel,
                     Some(completion_sink),
-                    Arc::new(ExecutionAdmission::with_capacity(
-                        EkoExecutionLimits::default().max_concurrent_subagents,
-                    )),
+                    run_admission,
                 )
                 .await
             })
@@ -3617,7 +3659,18 @@ Read the runtime path and found one missing branch.
                 .await
         })
         .await
-        .map_err(|_| "dispatch/pause boundary was not reached".to_string())??;
+        .map_err(|_| {
+            format!(
+                "dispatch/pause boundary was not reached; {}",
+                fixture_boundary_failure_metadata(
+                    &store,
+                    &run_id,
+                    &dispatcher,
+                    &admission,
+                    execution.is_finished()
+                )
+            )
+        })??;
         store
             .transition_run(&run_id, TaskRunStatus::Paused)
             .map_err(|error| error.to_string())?;

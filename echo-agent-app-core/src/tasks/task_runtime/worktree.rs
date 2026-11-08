@@ -2081,120 +2081,133 @@ mod tests {
     #[tokio::test]
     async fn merge_abort_checks_target_marker_and_preserves_target_stat_errors()
     -> Result<(), String> {
-        let fixture = super::super::project_environment_tests::EnvironmentFixture::new()?;
-        init_named_fixture_repo(&fixture.visible_root, "LOCAL\n")?;
-        init_named_fixture_repo(&fixture.target_root, "BASE\n")?;
-        run_git(&fixture.target_root, &["checkout", "-b", "conflict-side"])
-            .map_err(|error| error.to_string())?;
-        commit_fixture_change(&fixture.target_root, "SIDE\n")?;
-        run_git(&fixture.target_root, &["checkout", "main"]).map_err(|error| error.to_string())?;
-        commit_fixture_change(&fixture.target_root, "MAIN\n")?;
-        assert!(
-            run_git(
-                &fixture.target_root,
-                &["merge", "--no-gpg-sign", "conflict-side"]
-            )
-            .is_err()
-        );
-        let marker = fixture.visible_root.join(".git/MERGE_HEAD");
-        assert!(!marker.exists());
-        assert!(
+        // 同步 Git 在阻塞池执行，原 current_thread 继续驱动真实 Local owner。
+        tokio::task::spawn_blocking(|| -> std::result::Result<(), String> {
+            let fixture = super::super::project_environment_tests::EnvironmentFixture::new()?;
+            init_named_fixture_repo(&fixture.visible_root, "LOCAL\n")?;
+            init_named_fixture_repo(&fixture.target_root, "BASE\n")?;
+            run_git(&fixture.target_root, &["checkout", "-b", "conflict-side"])
+                .map_err(|error| error.to_string())?;
+            commit_fixture_change(&fixture.target_root, "SIDE\n")?;
+            run_git(&fixture.target_root, &["checkout", "main"])
+                .map_err(|error| error.to_string())?;
+            commit_fixture_change(&fixture.target_root, "MAIN\n")?;
+            assert!(
+                run_git(
+                    &fixture.target_root,
+                    &["merge", "--no-gpg-sign", "conflict-side"]
+                )
+                .is_err()
+            );
+            let marker = fixture.visible_root.join(".git/MERGE_HEAD");
+            assert!(!marker.exists());
+            assert!(
+                fixture
+                    .files
+                    .exists(&marker)
+                    .map_err(|error| error.to_string())?
+            );
+            let store = fixture.open("target.invalid", 1)?;
+            let environment = store
+                .project_environment()
+                .ok_or_else(|| "project environment missing".to_string())?;
+            abort_own_merge_in_environment(&fixture.visible_root, Some(&environment))
+                .map_err(|error| error.to_string())?;
+            assert!(
+                !fixture
+                    .files
+                    .exists(&marker)
+                    .map_err(|error| error.to_string())?
+            );
+            assert_eq!(
+                std::fs::read_to_string(fixture.target_root.join("shared.txt"))
+                    .map_err(|error| error.to_string())?,
+                "MAIN\n"
+            );
+            // A marker on the local decoy must not trigger an abort elsewhere.
+            std::fs::write(&marker, b"LOCAL MARKER").map_err(|error| error.to_string())?;
+            abort_own_merge_in_environment(&fixture.visible_root, Some(&environment))
+                .map_err(|error| error.to_string())?;
+            assert_eq!(
+                std::fs::read(&marker).map_err(|error| error.to_string())?,
+                b"LOCAL MARKER"
+            );
             fixture
-                .files
-                .exists(&marker)
-                .map_err(|error| error.to_string())?
-        );
-        let store = fixture.open("target.invalid", 1)?;
-        let environment = store
-            .project_environment()
-            .ok_or_else(|| "project environment missing".to_string())?;
-        abort_own_merge_in_environment(&fixture.visible_root, Some(&environment))
-            .map_err(|error| error.to_string())?;
-        assert!(
-            !fixture
-                .files
-                .exists(&marker)
-                .map_err(|error| error.to_string())?
-        );
-        assert_eq!(
-            std::fs::read_to_string(fixture.target_root.join("shared.txt"))
-                .map_err(|error| error.to_string())?,
-            "MAIN\n"
-        );
-        // A marker on the local decoy must not trigger an abort elsewhere.
-        std::fs::write(&marker, b"LOCAL MARKER").map_err(|error| error.to_string())?;
-        abort_own_merge_in_environment(&fixture.visible_root, Some(&environment))
-            .map_err(|error| error.to_string())?;
-        assert_eq!(
-            std::fs::read(&marker).map_err(|error| error.to_string())?,
-            b"LOCAL MARKER"
-        );
-        fixture
-            .fail_metadata
-            .store(true, std::sync::atomic::Ordering::Release);
-        let error = abort_own_merge_in_environment(&fixture.visible_root, Some(&environment))
-            .err()
-            .ok_or_else(|| "target metadata failure was hidden".to_string())?;
-        assert!(
-            error
-                .to_string()
-                .contains("fixture target metadata is unavailable")
-        );
-        Ok(())
+                .fail_metadata
+                .store(true, std::sync::atomic::Ordering::Release);
+            let error = abort_own_merge_in_environment(&fixture.visible_root, Some(&environment))
+                .err()
+                .ok_or_else(|| "target metadata failure was hidden".to_string())?;
+            assert!(
+                error
+                    .to_string()
+                    .contains("fixture target metadata is unavailable")
+            );
+            Ok(())
+        })
+        .await
+        .map_err(|error| format!("failed to join blocking Git fixture: {error}"))?
     }
 
     #[tokio::test]
     async fn retained_legacy_merge_and_discard_use_the_same_target_environment()
     -> Result<(), String> {
-        let fixture = super::super::project_environment_tests::EnvironmentFixture::new()?;
-        init_named_fixture_repo(&fixture.visible_root, "LOCAL\n")?;
-        init_named_fixture_repo(&fixture.target_root, "TARGET\n")?;
-        let local_merge =
-            create_legacy_unattended_worktree(&fixture.visible_root, "local-merge-decoy")?;
-        let target_merge = create_legacy_unattended_worktree(&fixture.target_root, "legacy-merge")?;
-        std::fs::write(local_merge.join("merged.txt"), b"LOCAL CHANGE")
-            .map_err(|error| error.to_string())?;
-        std::fs::write(target_merge.join("merged.txt"), b"TARGET CHANGE")
-            .map_err(|error| error.to_string())?;
-        let store = fixture.open("target.invalid", 1)?;
-        let outcome =
-            merge_unattended_worktree(&fixture.visible_root, "legacy-merge", Some(&store))
+        // 同步 Git 在阻塞池执行，原 current_thread 继续驱动真实 Local owner。
+        tokio::task::spawn_blocking(|| -> std::result::Result<(), String> {
+            let fixture = super::super::project_environment_tests::EnvironmentFixture::new()?;
+            init_named_fixture_repo(&fixture.visible_root, "LOCAL\n")?;
+            init_named_fixture_repo(&fixture.target_root, "TARGET\n")?;
+            let local_merge =
+                create_legacy_unattended_worktree(&fixture.visible_root, "local-merge-decoy")?;
+            let target_merge =
+                create_legacy_unattended_worktree(&fixture.target_root, "legacy-merge")?;
+            std::fs::write(local_merge.join("merged.txt"), b"LOCAL CHANGE")
                 .map_err(|error| error.to_string())?;
-        assert_eq!(outcome.status, WorktreeIntegrationStatus::Merged);
-        assert_eq!(
-            std::fs::read(fixture.target_root.join("merged.txt"))
-                .map_err(|error| error.to_string())?,
-            b"TARGET CHANGE"
-        );
-        assert!(!fixture.visible_root.join("merged.txt").exists());
-        assert_eq!(
-            std::fs::read(local_merge.join("merged.txt")).map_err(|error| error.to_string())?,
-            b"LOCAL CHANGE"
-        );
-        let local_discard =
-            create_legacy_unattended_worktree(&fixture.visible_root, "local-discard-decoy")?;
-        let target_discard =
-            create_legacy_unattended_worktree(&fixture.target_root, "legacy-discard")?;
-        std::fs::write(local_discard.join("retain.txt"), b"KEEP LOCAL")
-            .map_err(|error| error.to_string())?;
-        std::fs::write(target_discard.join("discard.txt"), b"DISCARD TARGET")
-            .map_err(|error| error.to_string())?;
-        discard_unattended_worktree(&fixture.visible_root, "legacy-discard", Some(&store))
-            .map_err(|error| error.to_string())?;
-        assert!(!target_discard.exists());
-        assert_eq!(
-            std::fs::read(local_discard.join("retain.txt")).map_err(|error| error.to_string())?,
-            b"KEEP LOCAL"
-        );
-        assert!(
-            branch_exists_in_environment(
-                &fixture.visible_root,
-                &format!("{BRANCH_PREFIX}local-discard-decoy"),
-                None
-            )
-            .map_err(|error| error.to_string())?
-        );
-        Ok(())
+            std::fs::write(target_merge.join("merged.txt"), b"TARGET CHANGE")
+                .map_err(|error| error.to_string())?;
+            let store = fixture.open("target.invalid", 1)?;
+            let outcome =
+                merge_unattended_worktree(&fixture.visible_root, "legacy-merge", Some(&store))
+                    .map_err(|error| error.to_string())?;
+            assert_eq!(outcome.status, WorktreeIntegrationStatus::Merged);
+            assert_eq!(
+                std::fs::read(fixture.target_root.join("merged.txt"))
+                    .map_err(|error| error.to_string())?,
+                b"TARGET CHANGE"
+            );
+            assert!(!fixture.visible_root.join("merged.txt").exists());
+            assert_eq!(
+                std::fs::read(local_merge.join("merged.txt")).map_err(|error| error.to_string())?,
+                b"LOCAL CHANGE"
+            );
+            let local_discard =
+                create_legacy_unattended_worktree(&fixture.visible_root, "local-discard-decoy")?;
+            let target_discard =
+                create_legacy_unattended_worktree(&fixture.target_root, "legacy-discard")?;
+            std::fs::write(local_discard.join("retain.txt"), b"KEEP LOCAL")
+                .map_err(|error| error.to_string())?;
+            std::fs::write(target_discard.join("discard.txt"), b"DISCARD TARGET")
+                .map_err(|error| error.to_string())?;
+            discard_unattended_worktree(&fixture.visible_root, "legacy-discard", Some(&store))
+                .map_err(|error| error.to_string())?;
+            assert!(!target_discard.exists());
+            assert_eq!(
+                std::fs::read(local_discard.join("retain.txt"))
+                    .map_err(|error| error.to_string())?,
+                b"KEEP LOCAL"
+            );
+            assert!(
+                branch_exists_in_environment(
+                    &fixture.visible_root,
+                    &format!("{BRANCH_PREFIX}local-discard-decoy"),
+                    None
+                )
+                .map_err(|error| error.to_string())?
+            );
+            Ok(())
+        })
+        .await
+        .map_err(|error| format!("failed to join blocking Git fixture: {error}"))?
     }
 
     fn init_repo() -> Result<(tempfile::TempDir, PathBuf), String> {

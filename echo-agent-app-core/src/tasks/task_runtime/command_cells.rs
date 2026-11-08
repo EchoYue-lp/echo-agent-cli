@@ -2686,6 +2686,46 @@ mod tests {
         AttendedMode, DomainProfile, RuntimeEventKind, TaskRunStatus,
     };
 
+    /// 仅在原断言失败后采样；不取得 observation lease、不等待新的生命周期边界。
+    fn fixture_cell_failure_metadata(
+        service: &CommandCellRuntimeService,
+        store: &TaskRuntimeStore,
+        run_id: Option<&str>,
+    ) -> String {
+        let snapshots = futures::FutureExt::now_or_never(service.inner.list()).map(|cells| {
+            cells
+                .into_iter()
+                .map(|cell| {
+                    serde_json::json!({
+                        "phase": cell.phase,
+                        "exit_code": cell.exit_code,
+                        "terminal": cell.phase.is_terminal(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        let persisted = run_id.map(|run_id| {
+            store
+                .list_background_cells(run_id)
+                .map(|cells| {
+                    serde_json::json!({
+                        "total": cells.len(),
+                        "active": cells.iter().filter(|cell| cell.is_active()).count(),
+                    })
+                })
+                .map_err(|error| error.to_string())
+        });
+        serde_json::json!({
+            "service_shell_available": service.governor.shell_semaphore().available_permits(),
+            "uses_process_governor": Arc::ptr_eq(&service.governor, &super::super::executor::process_execution_governor()),
+            "own_cells": snapshots,
+            "run_owner_count": service.run_cells.try_read().ok().map(|cells| cells.values().map(HashSet::len).sum::<usize>()),
+            "chat_owner_count": service.chat_cells.try_read().ok().map(|cells| cells.values().map(HashSet::len).sum::<usize>()),
+            "projection_debt_count": service.projection_degraded.try_read().ok().map(|debts| debts.len()),
+            "persisted": persisted,
+        }).to_string()
+    }
+
     fn test_service(root: &std::path::Path) -> Result<Arc<CommandCellRuntimeService>, String> {
         test_service_with_retention(root, crate::chat_event_log::ChatEventRetention::default())
     }
@@ -2738,7 +2778,9 @@ mod tests {
             cell_deadlines: RwLock::new(HashMap::new()),
             stores_by_workspace: RwLock::new(HashMap::new()),
             projection_degraded: RwLock::new(HashMap::new()),
-            governor: super::super::executor::process_execution_governor(),
+            // 每个夹具代表独立产品实例，使用同一真实 governor 实现与默认容量。
+            // 生产全局共享由下方真实构造器整合控制单独验证。
+            governor: super::super::executor::ProcessExecutionGovernor::isolated_for_test(),
             observers: TaskTracker::new(),
             shutdown: CancellationToken::new(),
             chat_events: Arc::new(chat_events),
@@ -2787,7 +2829,23 @@ mod tests {
     #[test]
     fn command_cells_and_task_runtime_share_the_process_execution_governor() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let service = test_service(temp.path())?;
+        // 直接进入生产构造器，不注入被断言的 governor，避免验证夹具自身。
+        let service = CommandCellRuntimeService::new(
+            Arc::new(echo_agent::sandbox::LocalSandbox::new(
+                echo_agent::sandbox::LocalConfig {
+                    enable_os_sandbox: false,
+                    ..Default::default()
+                },
+            )),
+            Arc::new(
+                crate::chat_event_log::ChatEventLog::open(
+                    temp.path().join("chat-events"),
+                    crate::chat_event_log::ChatEventRetention::default(),
+                )
+                .map_err(|error| error.to_string())?,
+            ),
+            crate::product_data_io::ProductDataIoService::new(),
+        )?;
         let process_governor = super::super::executor::process_execution_governor();
         assert!(Arc::ptr_eq(&service.governor, &process_governor));
         assert!(Arc::ptr_eq(
@@ -4249,7 +4307,12 @@ mod tests {
             }
         })
         .await
-        .map_err(|_| "cell projection did not reach terminal state".to_string())?;
+        .map_err(|_| {
+            format!(
+                "cell projection did not reach terminal state; {}",
+                fixture_cell_failure_metadata(&service, &store, Some("cell-run"))
+            )
+        })?;
 
         let events = store
             .list_events("cell-run", 0)
@@ -4445,7 +4508,18 @@ mod tests {
                 assert_eq!(terminal.snapshot.exit_code, Some(101));
             }
             service.shutdown().await?;
-            assert_eq!(service.governor.shell_semaphore().available_permits(), 1);
+            let available = service.governor.shell_semaphore().available_permits();
+            if available != 1 {
+                eprintln!(
+                    "occupied slot failure metadata: {}",
+                    fixture_cell_failure_metadata(
+                        &service,
+                        &store,
+                        run_owned.then_some("receipt-run"),
+                    )
+                );
+            }
+            assert_eq!(available, 1);
             store.shutdown_operations().await?;
         }
         Ok(())
@@ -5173,7 +5247,12 @@ mod tests {
             }
         })
         .await
-        .map_err(|_| "projection degradation was not exposed".to_string())?;
+        .map_err(|_| {
+            format!(
+                "projection degradation was not exposed; {}",
+                fixture_cell_failure_metadata(&service, &store, Some("terminal-repair"))
+            )
+        })?;
         assert_eq!(
             service
                 .run_cells

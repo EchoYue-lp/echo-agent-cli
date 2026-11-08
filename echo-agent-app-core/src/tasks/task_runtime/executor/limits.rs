@@ -861,3 +861,17 @@ impl From<ExecError> for super::store::RunDriverFailure {
         }
     }
 }
+
+#[cfg(test)]
+impl ProcessExecutionGovernor {
+    /// 独立夹具模拟一个产品实例，复用真实默认政策与准入机制。
+    /// 同一实例内的 Chat/Run 仍共享容量 1；生产全局接线另走真实构造器验证。
+    pub(crate) fn isolated_for_test() -> Arc<Self> {
+        let limits = EkoExecutionLimits::default();
+        Arc::new(Self {
+            write: Arc::new(Semaphore::new(limits.max_concurrent_writes.max(1))),
+            shell: Arc::new(Semaphore::new(limits.max_concurrent_shells.max(1))),
+            llm: Arc::new(Semaphore::new(limits.max_parallel_llm_calls.max(1))),
+        })
+    }
+}

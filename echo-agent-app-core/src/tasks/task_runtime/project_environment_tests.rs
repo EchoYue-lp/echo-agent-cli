@@ -5,7 +5,7 @@ use super::store::TaskRuntimeStore;
 use super::types::{AttendedMode, DomainProfile, TaskRunStatus};
 use echo_agent::error::{ReactError, Result};
 use echo_agent::sandbox::{
-    CommandKind, ExecutionResult, IsolationLevel, SandboxCommand, SandboxExecutor,
+    CommandKind, ExecutionResult, IsolationLevel, ResourceLimits, SandboxCommand, SandboxExecutor,
 };
 use echo_agent::tools::files::LocalFileSystem;
 use echo_agent::tools::filesystem::{FileEntry, FileMetadata, FileSystem};
@@ -166,39 +166,23 @@ impl FileSystem for TargetFiles {
 struct TargetExecutor {
     namespace: Namespace,
     calls: Arc<Mutex<Vec<PathBuf>>>,
+    owner: echo_agent::sandbox::LocalSandbox,
 }
 
-impl SandboxExecutor for TargetExecutor {
-    fn name(&self) -> &str {
-        "project-routing-fixture"
-    }
-    fn isolation_level(&self) -> IsolationLevel {
-        IsolationLevel::None
-    }
-    fn is_available(&self) -> BoxFuture<'_, bool> {
-        Box::pin(async { true })
-    }
-    fn execute(&self, command: SandboxCommand) -> BoxFuture<'_, Result<ExecutionResult>> {
-        Box::pin(async move {
-            let directory = command
-                .working_dir
-                .ok_or_else(|| ReactError::Other("actual invocation cwd missing".to_string()))?;
-            self.calls
-                .lock()
-                .map_err(|_| ReactError::Other("fixture calls lock poisoned".to_string()))?
-                .push(directory.clone());
-            let (program, mut args) = match command.kind {
-                CommandKind::Program { program, args } => (program, args),
-                CommandKind::Shell(script) => ("sh".to_string(), vec!["-c".to_string(), script]),
-                _ => {
-                    return Err(ReactError::Other(
-                        "routing fixture requires a program or shell".to_string(),
-                    ));
-                }
-            };
-            // git reports physical paths; translate only paths in this fixture
-            // namespace so production worktree algorithms see target paths.
-            for arg in &mut args {
+impl TargetExecutor {
+    fn map_command(&self, mut command: SandboxCommand) -> Result<SandboxCommand> {
+        let directory = command
+            .working_dir
+            .as_ref()
+            .ok_or_else(|| ReactError::Other("actual invocation cwd missing".to_string()))?;
+        self.calls
+            .lock()
+            .map_err(|_| ReactError::Other("fixture calls lock poisoned".to_string()))?
+            .push(directory.clone());
+        // git reports physical paths; translate only paths in this fixture
+        // namespace so production worktree algorithms see target paths.
+        if let CommandKind::Program { args, .. } = &mut command.kind {
+            for arg in args {
                 if Path::new(arg).starts_with(&self.namespace.visible) {
                     *arg = self
                         .namespace
@@ -207,26 +191,65 @@ impl SandboxExecutor for TargetExecutor {
                         .to_string();
                 }
             }
-            let output = std::process::Command::new(program)
-                .args(args)
-                .current_dir(self.namespace.physical(&directory)?)
-                .output()?;
-            let stdout = String::from_utf8_lossy(&output.stdout).replace(
-                &self.namespace.physical.to_string_lossy().to_string(),
-                &self.namespace.visible.to_string_lossy(),
-            );
-            Ok(ExecutionResult {
-                exit_code: output.status.code().unwrap_or(1),
-                stdout_bytes: u64::try_from(stdout.len()).unwrap_or(u64::MAX),
-                stderr_bytes: u64::try_from(output.stderr.len()).unwrap_or(u64::MAX),
-                stdout,
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                duration: std::time::Duration::ZERO,
-                sandbox_type: self.name().to_string(),
-                timed_out: false,
-                cancelled: false,
-                output_truncated: false,
-            })
+        }
+        // 仅转换命名空间；guard、取消与时限原样交给真实 Local owner。
+        command.working_dir = Some(self.namespace.physical(directory)?);
+        Ok(command)
+    }
+
+    fn map_result(&self, mut result: ExecutionResult) -> ExecutionResult {
+        result.stdout = result.stdout.replace(
+            &self.namespace.physical.to_string_lossy().to_string(),
+            &self.namespace.visible.to_string_lossy(),
+        );
+        result.stdout_bytes = u64::try_from(result.stdout.len()).unwrap_or(u64::MAX);
+        result
+    }
+}
+
+impl SandboxExecutor for TargetExecutor {
+    fn name(&self) -> &str {
+        "project-routing-fixture"
+    }
+    fn isolation_level(&self) -> IsolationLevel {
+        self.owner.isolation_level()
+    }
+    fn supports_physical_resource_ownership(&self) -> bool {
+        self.owner.supports_physical_resource_ownership()
+    }
+    fn is_available(&self) -> BoxFuture<'_, bool> {
+        self.owner.is_available()
+    }
+    fn execute(&self, command: SandboxCommand) -> BoxFuture<'_, Result<ExecutionResult>> {
+        Box::pin(async move {
+            Ok(self.map_result(self.owner.execute(self.map_command(command)?).await?))
+        })
+    }
+    fn execute_with_limits(
+        &self,
+        command: SandboxCommand,
+        limits: ResourceLimits,
+    ) -> BoxFuture<'_, Result<ExecutionResult>> {
+        Box::pin(async move {
+            Ok(self.map_result(
+                self.owner
+                    .execute_with_limits(self.map_command(command)?, limits)
+                    .await?,
+            ))
+        })
+    }
+    fn execute_with_limits_and_cancel(
+        &self,
+        command: SandboxCommand,
+        limits: ResourceLimits,
+        cancel: Option<Arc<echo_agent::agent::CancellationToken>>,
+    ) -> BoxFuture<'_, Result<ExecutionResult>> {
+        Box::pin(async move {
+            Ok(self.map_result(
+                self.owner
+                    .execute_with_limits_and_cancel(self.map_command(command)?, limits, cancel)
+                    .await?,
+            ))
         })
     }
 }
@@ -274,6 +297,10 @@ impl EnvironmentFixture {
         let executor = Arc::new(TargetExecutor {
             namespace,
             calls: calls.clone(),
+            owner: echo_agent::sandbox::LocalSandbox::new(echo_agent::sandbox::LocalConfig {
+                enable_os_sandbox: false,
+                ..Default::default()
+            }),
         });
         let data_root = temp.path().join("product-data/tasks");
         Ok(Self {
@@ -388,61 +415,68 @@ async fn run_created_reopen_rejects_same_path_on_another_host_without_events()
 #[tokio::test]
 async fn original_worktree_lifecycle_uses_target_git_and_keeps_invocation_checkout()
 -> std::result::Result<(), String> {
-    use echo_agent::subagent::IsolationProvider;
-    let fixture = EnvironmentFixture::new()?;
-    for (root, contents) in [
-        (&fixture.visible_root, "LOCAL"),
-        (&fixture.target_root, "TARGET"),
-    ] {
-        super::worktree::run_git(root, &["init", "-b", "main"])
+    // 同步 Git 在阻塞池执行，原 current_thread 继续驱动真实 Local owner。
+    tokio::task::spawn_blocking(|| -> std::result::Result<(), String> {
+        use echo_agent::subagent::IsolationProvider;
+        let fixture = EnvironmentFixture::new()?;
+        for (root, contents) in [
+            (&fixture.visible_root, "LOCAL"),
+            (&fixture.target_root, "TARGET"),
+        ] {
+            super::worktree::run_git(root, &["init", "-b", "main"])
+                .map_err(|error| error.to_string())?;
+            super::worktree::run_git(root, &["config", "user.name", "routing-test"])
+                .map_err(|error| error.to_string())?;
+            super::worktree::run_git(root, &["config", "user.email", "routing@local"])
+                .map_err(|error| error.to_string())?;
+            std::fs::write(root.join("same.txt"), contents).map_err(|error| error.to_string())?;
+            super::worktree::run_git(root, &["add", "same.txt"])
+                .map_err(|error| error.to_string())?;
+            super::worktree::run_git(
+                root,
+                &["-c", "commit.gpgsign=false", "commit", "-m", "fixture"],
+            )
             .map_err(|error| error.to_string())?;
-        super::worktree::run_git(root, &["config", "user.name", "routing-test"])
+        }
+        let store = fixture.open("target.invalid", 1)?;
+        let provider = store.project_isolation_provider(Some(fixture.visible_root.clone()));
+        let checkout = provider
+            .isolate(&echo_agent::subagent::IsolationRequest {
+                kind: "worktree".to_string(),
+                label: "writer-中文".to_string(),
+            })
             .map_err(|error| error.to_string())?;
-        super::worktree::run_git(root, &["config", "user.email", "routing@local"])
-            .map_err(|error| error.to_string())?;
-        std::fs::write(root.join("same.txt"), contents).map_err(|error| error.to_string())?;
-        super::worktree::run_git(root, &["add", "same.txt"]).map_err(|error| error.to_string())?;
-        super::worktree::run_git(
-            root,
-            &["-c", "commit.gpgsign=false", "commit", "-m", "fixture"],
-        )
-        .map_err(|error| error.to_string())?;
-    }
-    let store = fixture.open("target.invalid", 1)?;
-    let provider = store.project_isolation_provider(Some(fixture.visible_root.clone()));
-    let checkout = provider
-        .isolate(&echo_agent::subagent::IsolationRequest {
-            kind: "worktree".to_string(),
-            label: "writer-中文".to_string(),
-        })
-        .map_err(|error| error.to_string())?;
-    assert_ne!(checkout.path, fixture.visible_root);
-    assert_eq!(
+        assert_ne!(checkout.path, fixture.visible_root);
+        assert_eq!(
+            fixture
+                .files
+                .read(&checkout.path.join("same.txt"))
+                .map_err(|error| error.to_string())?,
+            b"TARGET"
+        );
         fixture
             .files
-            .read(&checkout.path.join("same.txt"))
-            .map_err(|error| error.to_string())?,
-        b"TARGET"
-    );
-    fixture
-        .files
-        .write(&checkout.path.join("same.txt"), b"TARGET CHANGED")
-        .map_err(|error| error.to_string())?;
-    let outcome = (checkout.finalize)().map_err(|error| error.to_string())?;
-    assert!(outcome.summary.contains("TARGET CHANGED"));
-    assert_eq!(
-        std::fs::read(fixture.visible_root.join("same.txt")).map_err(|error| error.to_string())?,
-        b"LOCAL"
-    );
-    assert!(
-        fixture
-            .calls
-            .lock()
-            .map_err(|error| error.to_string())?
-            .iter()
-            .any(|cwd| cwd != &fixture.visible_root)
-    );
-    Ok(())
+            .write(&checkout.path.join("same.txt"), b"TARGET CHANGED")
+            .map_err(|error| error.to_string())?;
+        let outcome = (checkout.finalize)().map_err(|error| error.to_string())?;
+        assert!(outcome.summary.contains("TARGET CHANGED"));
+        assert_eq!(
+            std::fs::read(fixture.visible_root.join("same.txt"))
+                .map_err(|error| error.to_string())?,
+            b"LOCAL"
+        );
+        assert!(
+            fixture
+                .calls
+                .lock()
+                .map_err(|error| error.to_string())?
+                .iter()
+                .any(|cwd| cwd != &fixture.visible_root)
+        );
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("failed to join blocking Git fixture: {error}"))?
 }
 
 #[tokio::test]
@@ -538,9 +572,75 @@ async fn scoped_command_cell_uses_actual_executor_and_checkout_and_rejects_forei
 }
 
 struct PendingPhysicalExecutor {
+    owner: Arc<dyn SandboxExecutor>,
+    readiness: PathBuf,
     started: tokio::sync::Notify,
     cancel_observed: tokio::sync::Notify,
     release: tokio::sync::Notify,
+}
+
+impl PendingPhysicalExecutor {
+    fn execute_owned(
+        &self,
+        command: SandboxCommand,
+        limits: Option<ResourceLimits>,
+        cancel: Option<Arc<echo_agent::agent::CancellationToken>>,
+    ) -> BoxFuture<'_, Result<ExecutionResult>> {
+        Box::pin(async move {
+            let _physical_guards = command.resource_guards.clone();
+            let timeout = limits
+                .as_ref()
+                .and_then(|limits| limits.cpu_time_secs)
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(command.timeout);
+            let deadline = tokio::time::Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| {
+                    ReactError::Other("fixture execution deadline overflow".to_string())
+                })?;
+            let cancel = cancel.or_else(|| command.cancel.clone()).ok_or_else(|| {
+                ReactError::Other("original cell cancellation token missing".to_string())
+            })?;
+            let execution = match limits {
+                Some(limits) => {
+                    self.owner
+                        .execute_with_limits_and_cancel(command, limits, Some(cancel.clone()))
+                }
+                None => self.owner.execute(command),
+            };
+            tokio::pin!(execution);
+            let mut readiness = tokio::time::interval(std::time::Duration::from_millis(10));
+            let mut started = false;
+            let result = loop {
+                tokio::select! {
+                    result = &mut execution => break result,
+                    _ = readiness.tick(), if !started => {
+                        if self.readiness.is_file() {
+                            started = true;
+                            self.started.notify_one();
+                        }
+                    }
+                }
+            };
+            // 原 Local owner 只有 cleanup 成功才返回 typed Cancelled；
+            // 未启动、其它错误和 Unknown 均原样透传，不冒充物理结算。
+            let cancellation_confirmed = started
+                && cancel.is_cancelled()
+                && matches!(&result, Err(ReactError::Sandbox(error))
+                    if matches!(error.as_ref(), echo_agent::error::SandboxError::Cancelled(_)));
+            if !cancellation_confirmed {
+                return result;
+            }
+            // 真实进程组已被原 Local owner 撤回；只延迟原回执交付，保有同一 guard。
+            // 交付屏障沿用原绝对预算，不重启执行时限。
+            self.cancel_observed.notify_one();
+            tokio::select! {
+                _ = self.release.notified() => {}
+                _ = tokio::time::sleep_until(deadline) => {}
+            }
+            result
+        })
+    }
 }
 
 impl SandboxExecutor for PendingPhysicalExecutor {
@@ -548,34 +648,31 @@ impl SandboxExecutor for PendingPhysicalExecutor {
         "pending-project-operation"
     }
     fn isolation_level(&self) -> IsolationLevel {
-        IsolationLevel::None
+        self.owner.isolation_level()
+    }
+    fn supports_physical_resource_ownership(&self) -> bool {
+        self.owner.supports_physical_resource_ownership()
     }
     fn is_available(&self) -> BoxFuture<'_, bool> {
-        Box::pin(async { true })
+        self.owner.is_available()
     }
     fn execute(&self, command: SandboxCommand) -> BoxFuture<'_, Result<ExecutionResult>> {
-        Box::pin(async move {
-            let _physical_guards = command.resource_guards;
-            let cancel = command.cancel.ok_or_else(|| {
-                ReactError::Other("original cell cancellation token missing".to_string())
-            })?;
-            self.started.notify_one();
-            cancel.cancelled().await;
-            self.cancel_observed.notify_one();
-            self.release.notified().await;
-            Ok(ExecutionResult {
-                exit_code: 130,
-                stdout: String::new(),
-                stderr: String::new(),
-                duration: std::time::Duration::ZERO,
-                sandbox_type: self.name().to_string(),
-                timed_out: false,
-                cancelled: true,
-                output_truncated: false,
-                stdout_bytes: 0,
-                stderr_bytes: 0,
-            })
-        })
+        self.execute_owned(command, None, None)
+    }
+    fn execute_with_limits(
+        &self,
+        command: SandboxCommand,
+        limits: ResourceLimits,
+    ) -> BoxFuture<'_, Result<ExecutionResult>> {
+        self.execute_owned(command, Some(limits), None)
+    }
+    fn execute_with_limits_and_cancel(
+        &self,
+        command: SandboxCommand,
+        limits: ResourceLimits,
+        cancel: Option<Arc<echo_agent::agent::CancellationToken>>,
+    ) -> BoxFuture<'_, Result<ExecutionResult>> {
+        self.execute_owned(command, Some(limits), cancel)
     }
 }
 
@@ -712,6 +809,8 @@ async fn cancelled_scoped_cell_retains_original_guard_until_physical_receipt()
     use echo_agent::tools::cell::{CommandCellOwner, CommandCellRequest};
     let mut fixture = EnvironmentFixture::new()?;
     let physical = Arc::new(PendingPhysicalExecutor {
+        owner: fixture.executor.clone(),
+        readiness: fixture.target_root.join(".physical-ready"),
         started: tokio::sync::Notify::new(),
         cancel_observed: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
@@ -740,7 +839,7 @@ async fn cancelled_scoped_cell_retains_original_guard_until_physical_receipt()
     let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let receipt = registry
         .launch(CommandCellRequest {
-            command: "pending write".to_string(),
+            command: "printf ready > .physical-ready; exec sleep 30".to_string(),
             working_dir: Some(fixture.visible_root.to_string_lossy().to_string()),
             owner: CommandCellOwner {
                 conversation_id: Some("conversation".to_string()),
@@ -797,116 +896,131 @@ async fn cancelled_scoped_cell_retains_original_guard_until_physical_receipt()
 #[tokio::test]
 async fn gui_local_git_uses_native_process_but_automatic_git_keeps_project_executor()
 -> std::result::Result<(), String> {
-    let fixture = EnvironmentFixture::new()?;
-    let store = TaskRuntimeStore::open_for_workspace(&fixture.data_root, "workspace")
-        .map_err(|error| error.to_string())?;
-    store
-        .bind_project_environment(
-            "workspace",
-            crate::workspace::ProjectLocation::Local {
-                path: fixture.visible_root.clone(),
-            },
-            1,
-            Arc::new(LocalFileSystem),
-            fixture.executor.clone(),
+    // 同步 Git 在阻塞池执行，原 current_thread 继续驱动真实 Local owner。
+    tokio::task::spawn_blocking(|| -> std::result::Result<(), String> {
+        let fixture = EnvironmentFixture::new()?;
+        let store = TaskRuntimeStore::open_for_workspace(&fixture.data_root, "workspace")
+            .map_err(|error| error.to_string())?;
+        store
+            .bind_project_environment(
+                "workspace",
+                crate::workspace::ProjectLocation::Local {
+                    path: fixture.visible_root.clone(),
+                },
+                1,
+                Arc::new(LocalFileSystem),
+                fixture.executor.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+        let version = store
+            .project_run_git(&fixture.visible_root, &["--version"])
+            .map_err(|error| error.to_string())?;
+        assert!(version.starts_with("git version "));
+        assert!(
+            fixture
+                .calls
+                .lock()
+                .map_err(|error| error.to_string())?
+                .is_empty()
+        );
+        let environment = store
+            .project_environment()
+            .ok_or_else(|| "original project environment missing".to_string())?;
+        super::worktree::run_git_in_environment(
+            &fixture.visible_root,
+            &["--version"],
+            Some(&environment),
         )
         .map_err(|error| error.to_string())?;
-    let version = store
-        .project_run_git(&fixture.visible_root, &["--version"])
-        .map_err(|error| error.to_string())?;
-    assert!(version.starts_with("git version "));
-    assert!(
-        fixture
-            .calls
-            .lock()
-            .map_err(|error| error.to_string())?
-            .is_empty()
-    );
-    let environment = store
-        .project_environment()
-        .ok_or_else(|| "original project environment missing".to_string())?;
-    super::worktree::run_git_in_environment(
-        &fixture.visible_root,
-        &["--version"],
-        Some(&environment),
-    )
-    .map_err(|error| error.to_string())?;
-    assert_eq!(
-        fixture
-            .calls
-            .lock()
-            .map_err(|error| error.to_string())?
-            .as_slice(),
-        std::slice::from_ref(&fixture.visible_root)
-    );
-    Ok(())
+        assert_eq!(
+            fixture
+                .calls
+                .lock()
+                .map_err(|error| error.to_string())?
+                .as_slice(),
+            std::slice::from_ref(&fixture.visible_root)
+        );
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("failed to join blocking Git fixture: {error}"))?
 }
 
 #[tokio::test]
 async fn gui_ssh_git_keeps_original_project_executor_without_local_fallback()
 -> std::result::Result<(), String> {
-    let fixture = EnvironmentFixture::new()?;
-    let store = fixture.open("original.invalid", 1)?;
-    let version = store
-        .project_run_git(&fixture.visible_root, &["--version"])
-        .map_err(|error| error.to_string())?;
-    assert!(version.starts_with("git version "));
-    assert_eq!(
-        fixture
-            .calls
-            .lock()
-            .map_err(|error| error.to_string())?
-            .as_slice(),
-        std::slice::from_ref(&fixture.visible_root)
-    );
-    Ok(())
+    // 同步 Git 在阻塞池执行，原 current_thread 继续驱动真实 Local owner。
+    tokio::task::spawn_blocking(|| -> std::result::Result<(), String> {
+        let fixture = EnvironmentFixture::new()?;
+        let store = fixture.open("original.invalid", 1)?;
+        let version = store
+            .project_run_git(&fixture.visible_root, &["--version"])
+            .map_err(|error| error.to_string())?;
+        assert!(version.starts_with("git version "));
+        assert_eq!(
+            fixture
+                .calls
+                .lock()
+                .map_err(|error| error.to_string())?
+                .as_slice(),
+            std::slice::from_ref(&fixture.visible_root)
+        );
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("failed to join blocking Git fixture: {error}"))?
 }
 
 #[tokio::test]
 async fn gui_mapped_local_git_keeps_the_original_project_executor()
 -> std::result::Result<(), String> {
-    let fixture = EnvironmentFixture::new()?;
-    let store = TaskRuntimeStore::open_for_workspace(&fixture.data_root, "workspace")
-        .map_err(|error| error.to_string())?;
-    store
-        .bind_project_environment(
-            "workspace",
-            crate::workspace::ProjectLocation::Local {
-                path: fixture.visible_root.clone(),
-            },
-            1,
-            fixture.files.clone(),
-            fixture.executor.clone(),
-        )
-        .map_err(|error| error.to_string())?;
-    for args in [
-        vec!["init"],
-        vec!["config", "--local", "eko.route-fixture", "target-only"],
-    ] {
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&fixture.target_root)
-            .args(args)
-            .output()
+    // 同步 Git 在阻塞池执行，原 current_thread 继续驱动真实 Local owner。
+    tokio::task::spawn_blocking(|| -> std::result::Result<(), String> {
+        let fixture = EnvironmentFixture::new()?;
+        let store = TaskRuntimeStore::open_for_workspace(&fixture.data_root, "workspace")
             .map_err(|error| error.to_string())?;
-        if !output.status.success() {
-            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        store
+            .bind_project_environment(
+                "workspace",
+                crate::workspace::ProjectLocation::Local {
+                    path: fixture.visible_root.clone(),
+                },
+                1,
+                fixture.files.clone(),
+                fixture.executor.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+        for args in [
+            vec!["init"],
+            vec!["config", "--local", "eko.route-fixture", "target-only"],
+        ] {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&fixture.target_root)
+                .args(args)
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+            }
         }
-    }
-    let value = store
-        .project_run_git(
-            &fixture.visible_root,
-            &["config", "--local", "--get", "eko.route-fixture"],
-        )
-        .map_err(|error| error.to_string())?;
-    assert_eq!(value.trim(), "target-only");
-    assert_eq!(
-        fixture
-            .calls
-            .lock()
-            .map_err(|error| error.to_string())?
-            .as_slice(),
-        std::slice::from_ref(&fixture.visible_root)
-    );
-    Ok(())
+        let value = store
+            .project_run_git(
+                &fixture.visible_root,
+                &["config", "--local", "--get", "eko.route-fixture"],
+            )
+            .map_err(|error| error.to_string())?;
+        assert_eq!(value.trim(), "target-only");
+        assert_eq!(
+            fixture
+                .calls
+                .lock()
+                .map_err(|error| error.to_string())?
+                .as_slice(),
+            std::slice::from_ref(&fixture.visible_root)
+        );
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("failed to join blocking Git fixture: {error}"))?
 }
