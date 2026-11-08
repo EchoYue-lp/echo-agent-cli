@@ -217,6 +217,10 @@ beforeEach(() => {
     configurable: true,
     value: vi.fn(),
   });
+  Object.defineProperty(HTMLElement.prototype, 'scrollTo', {
+    configurable: true,
+    value: vi.fn(),
+  });
 });
 afterEach(() => {
   cleanup();
@@ -228,6 +232,69 @@ afterEach(() => {
     refresh: originalActions.refresh,
   });
   vi.useRealTimers();
+});
+
+describe('chat scroll ownership', () => {
+  it('follows new messages and streaming inside the message list without scrolling ancestors', () => {
+    render(<ChatPanel />);
+    const list = screen.getByRole('log', { name: '消息列表' });
+    Object.defineProperty(list, 'scrollHeight', { configurable: true, value: 1600 });
+    const scroll = vi.mocked(list.scrollTo);
+    const ancestorScroll = vi.mocked(HTMLElement.prototype.scrollIntoView);
+    scroll.mockClear();
+    ancestorScroll.mockClear();
+
+    act(() =>
+      useChatStore.setState({
+        messages: [
+          {
+            id: 'scroll-message',
+            role: 'user',
+            content: '追加消息',
+            timestamp: 1,
+          },
+        ],
+      })
+    );
+    expect(scroll).toHaveBeenLastCalledWith({ top: 1600, behavior: 'smooth' });
+    expect(scroll.mock.contexts.at(-1)).toBe(list);
+
+    act(() => useChatStore.setState({ isStreaming: true }));
+    expect(scroll).toHaveBeenLastCalledWith({ top: 1600, behavior: 'auto' });
+    expect(ancestorScroll).not.toHaveBeenCalled();
+  });
+
+  it('preserves the reader position until they return near the bottom', () => {
+    render(<ChatPanel />);
+    const list = screen.getByRole('log', { name: '消息列表' });
+    Object.defineProperty(list, 'scrollHeight', { configurable: true, value: 1600 });
+    Object.defineProperty(list, 'clientHeight', { configurable: true, value: 400 });
+    list.scrollTop = 200;
+    fireEvent.scroll(list);
+    const scroll = vi.mocked(list.scrollTo);
+    scroll.mockClear();
+
+    act(() =>
+      useChatStore.setState({
+        messages: [
+          {
+            id: 'while-reading',
+            role: 'user',
+            content: '阅读历史时的新消息',
+            timestamp: 1,
+          },
+        ],
+      })
+    );
+    expect(scroll).not.toHaveBeenCalled();
+    expect(list.scrollTop).toBe(200);
+
+    list.scrollTop = 1150;
+    fireEvent.scroll(list);
+    act(() => useChatStore.setState({ isStreaming: true }));
+    expect(scroll).toHaveBeenCalledWith({ top: 1600, behavior: 'auto' });
+    expect(scroll.mock.contexts.at(-1)).toBe(list);
+  });
 });
 
 describe('主交互页入口', () => {

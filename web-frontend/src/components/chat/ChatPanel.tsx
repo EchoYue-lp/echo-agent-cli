@@ -225,7 +225,6 @@ export function ChatPanel() {
   );
 
   const scrollRef = useRef<HTMLDivElement>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
   const {
     sendMessage,
@@ -349,8 +348,11 @@ export function ChatPanel() {
   }, []);
 
   useEffect(() => {
-    if (isNearBottomRef.current && bottomRef.current) {
-      bottomRef.current.scrollIntoView({
+    const list = scrollRef.current;
+    if (isNearBottomRef.current && list) {
+      // 只滚动消息列表；scrollIntoView 会连带滚动 overflow-hidden 的三栏共同祖先。
+      list.scrollTo({
+        top: list.scrollHeight,
         behavior: isStreaming ? 'auto' : 'smooth',
       });
     }
@@ -776,7 +778,7 @@ export function ChatPanel() {
                 </div>
               )}
             </div>
-            <div ref={bottomRef} className="h-1" />
+            <div className="h-1" />
           </div>
         )}
       </AgentPane>

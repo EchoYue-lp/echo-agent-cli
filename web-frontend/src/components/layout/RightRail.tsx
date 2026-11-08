@@ -48,7 +48,8 @@ export function RightRail() {
   }, [scope, conversationId, bindScope, loadRuns]);
 
   return (
-    <div className="h-full min-h-0 overflow-y-auto">
+    // 让绝对定位的读屏标签也归属内部滚动区域，避免撑出整个三栏布局的滚动范围。
+    <div className="relative h-full min-h-0 overflow-y-auto">
       <section className="eko-task-history" aria-label="正式任务运行历史">
         <header>
           <div>
