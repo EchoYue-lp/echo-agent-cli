@@ -955,18 +955,38 @@ impl ChannelRuntime {
     }
     async fn watch_original_transport(&self, handle: &ChannelHandle) -> Result<(), String> {
         let observation = handle.transport_status().await;
+        let epoch = observation.mutation_epoch;
         let Some(mut receiver) = observation.receiver else {
             return Ok(());
         };
-        receiver.borrow_and_update();
+        let channel = match handle.id() {
+            "qqbot" => "qqbot",
+            "feishu" => "feishu",
+            "weixin" => "weixin",
+            _ => "other",
+        };
+        let initial = if receiver.has_changed().is_err() {
+            echo_agent::channels::ChannelTransportSnapshot::unknown()
+        } else {
+            receiver.borrow_and_update().clone()
+        };
         let root = self.root();
         let cancel = self.observer_cancel.clone();
         let observer=tokio::runtime::Handle::try_current().map_err(|error|error.to_string())?.spawn(async move {
+            let mut log = TransportObservationLog::default();
+            log.record(channel, epoch, &initial);
             loop {
                 let observed=tokio::select! {_=cancel.cancelled()=>break,changed=receiver.changed()=>changed};
                 // An observation change only wakes the original retention. It
                 // cannot grant physical completion, including a closed watch.
                 if let Some(root)=root.upgrade(){root.note_progress();}
+                let snapshot = if observed.is_err() {
+                    // 关闭watch的历史Ready不当作当前连接，也不补造Stopped/物理结算。
+                    echo_agent::channels::ChannelTransportSnapshot::unknown()
+                } else {
+                    receiver.borrow_and_update().clone()
+                };
+                log.record(channel, epoch, &snapshot);
                 if observed.is_err(){break;}
             }
         });
@@ -1331,6 +1351,76 @@ fn transport_evidence_name(evidence: ChannelTransportEvidence) -> &'static str {
     }
 }
 
+/// 原watch的有界日志游标，只保上一条语义键，不持有控制、恢复或连接权威。
+#[derive(Default)]
+struct TransportObservationLog {
+    previous: Option<(
+        ChannelTransportPhase,
+        Option<ChannelTransportEvidence>,
+        &'static str,
+    )>,
+}
+
+impl TransportObservationLog {
+    fn record(
+        &mut self,
+        channel: &'static str,
+        epoch: u64,
+        snapshot: &echo_agent::channels::ChannelTransportSnapshot,
+    ) -> bool {
+        let error_class = transport_error_class(snapshot.last_error.as_deref());
+        let key = (snapshot.phase, snapshot.evidence, error_class);
+        if self.previous == Some(key) {
+            return false;
+        }
+        self.previous = Some(key);
+        // 不输出last_error原文/账号/provider ID，也不继承caller span的敏感字段。
+        tracing::info!(
+            target: "echo_agent_app_core::channel_runtime::transport_observation",
+            parent: None,
+            channel,
+            mutation_epoch = epoch,
+            phase = ?snapshot.phase,
+            evidence = snapshot.evidence.map(transport_evidence_name).unwrap_or("none"),
+            error_class,
+            observed_at = %chrono::DateTime::<chrono::Utc>::from(snapshot.observed_at).to_rfc3339(),
+            "Original channel transport observation"
+        );
+        true
+    }
+}
+
+fn transport_error_class(error: Option<&str>) -> &'static str {
+    match error {
+        None => "none",
+        Some("Weixin poll failed (timeout); cursor unchanged") => "poll_timeout",
+        Some("Weixin poll failed (http); cursor unchanged") => "poll_http",
+        Some("Weixin poll failed (decode); cursor unchanged") => "poll_decode",
+        Some("Weixin poll failed (transport); cursor unchanged") => "poll_transport",
+        Some("Weixin poll failed (protocol); cursor unchanged") => "poll_protocol",
+        Some("Weixin poll failed; cursor unchanged") => "poll_failure",
+        Some(error) if error.starts_with("Weixin poll rejected (") => "poll_rejected",
+        Some(error) if error.starts_with("Weixin authorization expired (-14)") => {
+            "authorization_expired"
+        }
+        Some("Weixin poll business acceptance is unknown") => "poll_unknown",
+        Some(error) if error.starts_with("Weixin message admission failed (handler_rejected);") => {
+            "admission_handler_rejected"
+        }
+        Some(error)
+            if error.starts_with("Weixin message admission failed (invalid_peer_identity);") =>
+        {
+            "admission_invalid_peer"
+        }
+        Some(error)
+            if error.starts_with("Weixin message admission failed (context_preparation);") =>
+        {
+            "admission_context_preparation"
+        }
+        Some(_) => "other",
+    }
+}
+
 fn plugin_from_config(
     channel: ManagedChannel,
     config: &crate::config::ChannelsConfig,
@@ -1508,6 +1598,241 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct DiagnosticLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for DiagnosticLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| std::io::Error::other("diagnostic capture unavailable"))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for DiagnosticLog {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+    impl DiagnosticLog {
+        fn text(&self) -> anyhow::Result<String> {
+            let bytes = self
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("diagnostic capture unavailable"))?;
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        }
+        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+            // 与应用既有info默认directives相同；不扩大framework/debug可见范围。
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    "echo_agent_cli=info,echo_agent=info,echo_agent_app_core=info,tower_http=info",
+                )
+                .with_writer(self.clone())
+                .with_ansi(false)
+                .without_time()
+                .finish()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transport_observer_logs_initial_fact_without_starting_or_settling_owner()
+    -> anyhow::Result<()> {
+        let capture = DiagnosticLog::default();
+        let _subscriber = tracing::subscriber::set_default(capture.subscriber());
+        let (plugin, probe) = test_support::channel(false, false, false);
+        let runtime = ChannelRuntime::with_original_test_plugin(Weak::new(), plugin)
+            .map_err(anyhow::Error::msg)?;
+        let handle = runtime
+            .handle("qqbot")
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow::anyhow!("original handle absent"))?;
+        let before = handle.management_snapshot().await;
+        runtime
+            .watch_original_transport(&handle)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if capture
+                    .text()?
+                    .contains("Original channel transport observation")
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        // 即使原实现缺日志，也先归还原观察任务，不把失败遗留成后台reader。
+        runtime.observer_cancel.cancel();
+        let observers = std::mem::take(
+            &mut *runtime
+                .transport_observers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("original observers unavailable"))?,
+        );
+        for observer in observers {
+            observer.await?;
+        }
+        observed??;
+        let after = handle.management_snapshot().await;
+        assert_eq!(after.mutation_epoch, before.mutation_epoch);
+        assert_eq!(after.handler_attached, before.handler_attached);
+        assert_eq!(after.active_invocations, before.active_invocations);
+        assert_eq!(after.shutdown_settled, before.shutdown_settled);
+        assert_eq!(after.transport, before.transport);
+        assert_eq!(probe.stops.load(Ordering::SeqCst), 0);
+        let text = capture.text()?;
+        assert_eq!(
+            text.matches("Original channel transport observation")
+                .count(),
+            1
+        );
+        assert!(text.contains("phase=Unknown") && text.contains("error_class=\"none\""));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn default_info_filter_keeps_original_weixin_poll_shape_and_excludes_secrets()
+    -> anyhow::Result<()> {
+        use echo_agent::channels::weixin::{WeixinApi, WeixinCredentials};
+        let capture = DiagnosticLog::default();
+        let _subscriber = tracing::subscriber::set_default(capture.subscriber());
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = listener.local_addr()?;
+        let router = axum::Router::new().route(
+            "/ilink/bot/getupdates",
+            axum::routing::post(|| async {
+                axum::Json(
+                    serde_json::json!({"ret":0,"msgs":[],"get_updates_buf":"cursor-secret",
+                "errmsg":"response-secret","context":"context-secret","text":"body-secret"}),
+                )
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let api = WeixinApi::for_local_auth_fixture(address)?;
+        let credentials = WeixinCredentials {
+            account_id: "account-secret".into(),
+            bot_token: "token-secret".into(),
+            base_url: "https://example.invalid".into(),
+            user_id: "peer-secret".into(),
+            generation: "generation-secret".into(),
+        };
+        let parent = tracing::info_span!("private_parent", secret = "span-secret");
+        let _parent = parent.enter();
+        let first = api.poll(&credentials, "request-cursor-secret").await;
+        let second = api
+            .clone()
+            .poll(&credentials, "request-cursor-secret")
+            .await;
+        server.abort();
+        let _joined = server.await;
+        first?;
+        second?;
+        tracing::info!(target: "echo::weixin_poll_observation", "legacy-target-negative-control");
+        tracing::debug!(target: "echo_integration", "broad-debug-negative-control");
+        let text = capture.text()?;
+        assert_eq!(text.matches("Weixin poll protocol shape").count(), 1);
+        assert!(text.contains("echo_agent::channels::weixin::poll_observation"));
+        assert!(text.contains("http_status") && text.contains("200"));
+        for private in [
+            "account-secret",
+            "token-secret",
+            "peer-secret",
+            "generation-secret",
+            "cursor-secret",
+            "response-secret",
+            "context-secret",
+            "body-secret",
+            "span-secret",
+            "example.invalid",
+            "legacy-target-negative-control",
+            "broad-debug-negative-control",
+        ] {
+            assert!(
+                !text.contains(private),
+                "private or disabled field appeared: {private}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn transport_log_deduplicates_timestamp_and_private_error_text_but_keeps_meaningful_changes()
+    -> anyhow::Result<()> {
+        let capture = DiagnosticLog::default();
+        let _subscriber = tracing::subscriber::set_default(capture.subscriber());
+        let parent = tracing::info_span!("private_transport_parent", secret = "parent-secret");
+        let _parent = parent.enter();
+        let mut observed = TransportObservationLog::default();
+        let mut snapshot = echo_agent::channels::ChannelTransportSnapshot::unknown();
+        assert!(observed.record("weixin", 7, &snapshot));
+        snapshot.observed_at = std::time::SystemTime::UNIX_EPOCH;
+        assert!(!observed.record("weixin", 7, &snapshot));
+        snapshot.phase = ChannelTransportPhase::Ready;
+        snapshot.evidence = Some(ChannelTransportEvidence::WeixinAuthenticatedPoll);
+        assert!(observed.record("weixin", 7, &snapshot));
+        snapshot.last_error = Some("Weixin message admission failed (handler_rejected); provider message provider-secret; cursor and frontier retained".into());
+        assert!(observed.record("weixin", 7, &snapshot));
+        snapshot.last_error = Some("Weixin message admission failed (handler_rejected); provider message different-private-id; cursor and frontier retained".into());
+        assert!(!observed.record("weixin", 7, &snapshot));
+        snapshot.phase = ChannelTransportPhase::Disconnected;
+        snapshot.evidence = None;
+        snapshot.last_error = Some("Weixin poll failed (http); cursor unchanged".into());
+        assert!(observed.record("weixin", 7, &snapshot));
+        snapshot.last_error = Some("Weixin poll failed (timeout); cursor unchanged".into());
+        assert!(observed.record("weixin", 7, &snapshot));
+        snapshot.last_error = Some("token-secret QR-secret context-secret cursor-secret body-secret https://private.invalid/raw".into());
+        assert!(observed.record("weixin", 7, &snapshot));
+        snapshot.last_error = Some("different-untrusted-error".into());
+        assert!(!observed.record("weixin", 7, &snapshot));
+        snapshot.evidence = Some(ChannelTransportEvidence::WeixinAuthenticatedPoll);
+        assert!(
+            observed.record("weixin", 7, &snapshot),
+            "evidence本身的变化不能被丢失"
+        );
+        let text = capture.text()?;
+        assert_eq!(
+            text.matches("Original channel transport observation")
+                .count(),
+            7
+        );
+        for safe in [
+            "observed_at=",
+            "mutation_epoch=7",
+            "poll_http",
+            "poll_timeout",
+            "admission_handler_rejected",
+        ] {
+            assert!(text.contains(safe));
+        }
+        for private in [
+            "parent-secret",
+            "provider-secret",
+            "different-private-id",
+            "token-secret",
+            "QR-secret",
+            "context-secret",
+            "cursor-secret",
+            "body-secret",
+            "private.invalid",
+            "different-untrusted-error",
+            "last_error=",
+        ] {
+            assert!(
+                !text.contains(private),
+                "private transport field appeared: {private}"
+            );
+        }
+        Ok(())
+    }
     async fn state(temp: &std::path::Path) -> anyhow::Result<Arc<AppState>> {
         let agent = crate::agent_handle::AgentHandle::new(
             echo_agent::agent::ReactAgentBuilder::new()

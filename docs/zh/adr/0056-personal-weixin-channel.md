@@ -147,3 +147,24 @@ Ready 初始化把当前 live route 观察和从未 claim 的证明交回同一�
 该摘要可按既有 `eko-input:<原 durable input_id>:<ordinal>` 规则与原准入/执行记录关联；
 队列接纳、poll Ready、执行完成或没有错误日志都不能制造此观察，手机收件继续单独验收。
 验收时使用已有 app-core `info` 日志级别；该观察不改变配置或原发送结果。
+
+### 原传输状态的脱敏诊断（2026-11-08）
+
+21:25原账号手机消息未获回复时，已有日志无法区分poll、准入与执行边界；旧403或旧scope错误
+不能替代本轮证据。此后继只补诊断可见性，不声称已确定或修复此次微信业务根因。
+
+应用复用原transport watch及同一观察任务，首次记录原snapshot，随后仅在phase、evidence或
+固定error_class变化时记录；observed_at变化或同类别的不同原错误文本不刷日志。观察只保一条
+语义键，不新增控制平面、队列、状态权威或owner，不改变原progress唤醒、连接、取消或结算。
+关闭watch只记录Unknown，不把历史Ready当当前连接，也不推造Stopped或物理drain。
+
+日志只含固定渠道名、原epoch、phase、evidence、固定error_class和原observed_at，不输出
+last_error原文、账号、provider消息ID、token、QR、context、cursor、正文、URL或配置；事件
+不继承caller span。Framework的首个poll轮廓沿既有clone共享一次预算，改用应用默认info可见的
+`echo_agent::channels::weixin::poll_observation`窄域，不全开integration/debug。既有Io(TimedOut)
+和本HTTP producer的固定协议错误只投影为timeout/http/decode/transport/protocol类别，原错误、
+poll业务判定、两秒重试、cursor/frontier、FIFO、发送及认证语义均不变。
+
+默认过滤器下的真实回环poll、原观察者初始记录、语义变化/去重以及敏感字段与caller span排除
+纳入定向回归。源码与测试定义不是运行资格；中央在综合分支共同冻结后验证。最终只交综合
+验收包，由用户沿原账号一起确认；缺诊断或出现Ready均不能自动计作消息准入、Accepted或手机收件。
