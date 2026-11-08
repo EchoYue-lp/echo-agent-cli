@@ -1,5 +1,11 @@
 # echo-agent-cli(Eclip)AGENTS.md
 
+## 2026-11-09 本次整合交付范围
+
+用户要求全部既有开发成果合入本仓 `main`，交付时仅保留主分支；旧迭代保留 baseline 分支的限定由本次范围更新，固定历史 tag 和必要恢复证据保留。仍按框架 main 先行、任务分支适用本地门禁、PR squash、精确 main CI 的原流程交付；核对旧分支功能覆盖与最新远端 tip 后再清理。
+
+本次不扩张任何精确依赖风险接受，不覆盖原数据或用户正在运行的 App，不授权自动 GUI 操作；GUI、真实 Provider 和手机收发结果与源码、构建、main CI 分别记录。
+
 ## 当前 GUI 产品名称：Eclip
 
 用户于 2026-11-06 明确纠正：GUI 产品名称为 **Eclip**。对外界面、弹窗、产品说明、默认助手身份和应用 HTTP User-Agent 均使用 Eclip；后文 EKO 仅为历史产品称呼，既有规则仍约束同一应用。`echo-agent-cli`、`EkoConfig`、`EKO_*` 环境变量、`.eko` 数据目录和既有 bundle identifier 是技术标识，不因品牌修正而另建数据或自动迁移。通用 `echo-agent` 框架不硬编码 Eclip 品牌，产品身份由应用注入。
