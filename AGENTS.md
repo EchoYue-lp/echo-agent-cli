@@ -6,6 +6,24 @@
 
 本文件是 AI agent 在本仓库工作时的**最高优先级约束**(优先级高于 agent 默认行为和任何技能),请严格遵守。本仓库可独立检出使用,本文件即完整约束,不依赖外部 superproject。
 
+## 2026-11-08 CLI 源码的本次精确绑定
+
+用户直接回答本次具体问题：“同意，仅本次精确绑定（推荐）”。原问题、原回答及范围保存在主根 `.echo-semantic/local/dependency-exact-binding-20261108-r01/authorization.json`，SHA256 `ad2267dc75aaec224777c4133a00c1c54277906fc6f0152f1a31b9486c24bae1`。
+
+本次仅将CLI原五项完整风险身份绑定到已验证源码提交 `efbf200c0d2ff9c4ff20ba567e2660fa0200e248` 的consumer `43ed071e6471d4ab627520a74843fdd8c3524a023b30c85205270176257c3143`（283个输入），锁仍为 `48eece730daaa9eff539e416861454441c23c54abf02bacaa2c3bdb375bd6329`（769包）。policy只变consumer字段，collector、checker、原五项name/version/source/checksum/advisory/kind和原8项控制保持；采用后仍须原actual-lock及canonical-origin默认fresh正式门禁实际通过，并分别保留scanner与gate出口。
+
+上述原8项控制及两项默认fresh正式门禁已实际通过：每个scanner自然1、精确gate／caller自然0，0漏洞、原5项warning、769包，noFetch=false、无过滤。完整回执为主根 `.echo-semantic/local/dependency-exact-binding-20261108-r01/fresh-formal-r08/execution.json`（SHA256 `d37d2107d27c33064242880ffebdfb63b2c36054ff0969b0b829f1611d42820b`）。早先网络失败与受控中断仍保留，不追改为自然成功；临时进程连接转发已停止，未关闭TLS、fetch或yanked检查，未修改系统网络配置。
+
+本节仅更新下方11月5日consumer42a的当前时态，不改历史授权或失败，也不向Framework/SDK继承。原五项风险仍未修复，不是零warning审计；不预授未来任何新源码、锁、版本、来源或风险。GUI/手机、完整工程与main CI继续单独验收，推送、合并及发布不由此次风险答复授权。对应顶层AGENTS同步维护。
+
+## 2026-11-05 新锁的用户精确裁决（历史切点）
+
+用户在当前协调会话直接回答：“同意本次 Framework 8fb62e 与 CLI 48eece 新锁的精确绑定，不自动接受后续新风险。”原文回执为主根 `.echo-semantic/local/dependency-exact-binding-20261105-r01/authorization.json`，SHA256 `a2e324628e7ad1c11dc737405a48cb46a36e8333f109e15f66b4836810815a62`。
+
+本仓仅接受锁 `48eece730daaa9eff539e416861454441c23c54abf02bacaa2c3bdb375bd6329`（769包），consumer仍为 `42a1dd0dd843ee8629ff12dc20d238dc9356c7b35d29e4bd3b353c0b72d53f42`。`.cargo/accepted-dependency-risks.json`只更新lock字段；原五项完整风险身份、collector和checker不变，原8控制只机械更新包数量及对应负控。仍须默认fresh actual-lock和canonical-origin两gate实际通过，完整保存官方输出；scanner真实出口与独立精确gate分别记录。
+
+本节更新下方历史绑定的当前时态，不改旧授权和失败事实。原五风险未修复，scanner1不是零warning审计；不新增ignore/allow/过滤，不关闭fetch/yanked，不预授未来锁、版本、来源、consumer或新风险，不向Framework/SDK继承。完整工程、App及main CI继续分别验收；不授权GUI、提交、推送、合并或发布。
+
 ## 本次 EKO 迭代的开发目录
 
 用户指定唯一开发根 `/Users/ls/MyWork/code/ylp_agent_learn/lp-agent`。本仓在该根的 `echo-agent-cli/` 内开发；源码、工程文档、构建产物、回执与恢复材料均写在主根内，不创建外部 worktree。已有外部工作树只作冻结迁移来源，备份、哈希回读和依赖核对完成后按授权回收。同一主根多会话按文件划分单一写权；验证期间冻结对应源码及依赖。后文 worktree 规则仅用于维护既有工作树，不取消本轮目录限制。
@@ -208,3 +226,32 @@ checker要求当前固定五项完整warning集合，4/6/少项/重复/字段/se
 ### 2026-11-01 IM/cron 历史与前台续接呈现的当前精确风险绑定
 
 本后继只记录 Root 已具体审定的源码修复和原合同下的实际绑定，不新增人类风险接受，不改旧 525f 及更早阶段的事实。CLI 原 collector 的 274 输入当前两读 `7441191402e2350ea32fdf72052c0a5f68c3ce0431f326608b37a3988b54bf74`，锁 `399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f`／768，policy `c1993eb7f64c36e81f18eec7768d08fb0045f16d0e74d11fcbcec5a10a5c0b9c`；机器 policy 仅 consumer 字段改变，原五完整风险身份和人类六项原话／退役后五项严格子集保持。八个既有 Rust 输入的具名增量及两审结论见当前风险决定；新增依赖／feature／GTK／glib 宏或通知 D-Bus 调用面为零。原八项控制实际自然 0，默认 fresh actual-lock 与 canonical-origin 官方 scanner 均自然 1、零漏洞、恰原五项 warning，独立精确 gate／caller 均自然 0，原 raw／FP／来源与失败保留。源码、锁、身份、warning 或 settings 再变仍需具体复核，不新增 ignore 或 no-fetch，不向 Framework／SDK 继承，也不替代 Rust／原生／main CI／完整 Goal 验收。
+
+
+## 2026-11-03 async-executor 去 yank 的精确新锁授权
+
+人类对 Root 原问题 `call_6ffdc346972249549e7c242af391e0b2`／question0 直接回答“允许采用最小修复（推荐）”，明确同意 async-executor 1.14.0 → 1.14.1 单包修复和原五项风险合同的新锁绑定。Root 精票 SHA256 为 `3e3d76e70001c9bf9d6d5552559cebac2718ee2b5a387bc8c3cbd4c8861ea44f`；本条只覆盖这一具体来源，不更改旧授权/失败事实，不预授未来锁或 consumer。
+
+当前 CLI Cargo.lock SHA256 为 `d542c37ea3d32ca9a8064f0ef473fa3e2fd7175c0576c8e97d4564db09ed39e1`（768包）；仅 async-executor 的 version/checksum 改变，其余767个完整package表不变。原 collector 当前 consumer 实际两读仍为 `d5a9668f203ab76633df87eddb1fa4f111b78c30fb85a3599ec1d2477d71660c`（274输入）。`.cargo/accepted-dependency-risks.json` 仅改 lock_sha256，完整 SHA256 为 `f6a42b3ccf90ada2dc639b9999fc2bc70551c2e4f83cce00c2e87347bdde5950`；原五项完整风险身份、decision路径及其余policy字节不变，不接受第六项/yanked，不增ignore、过滤或no-fetch，不向Framework/SDK继承。
+
+人类批准和正式采用不等于工程门禁通过。本正式切点原controls8/8自然0；fresh actual首轮/一次有界网络复试、fresh canonical均在原RustSec fetch阶段自然1、未输出有效审计JSON，当前fresh双gate0仍缺。候选两scanner的零漏洞/原五warning/零yanked结果、旧exact-policy两gate1、r04新yanked及历史网络失败全部保留，不改称正式新gate0。恢复后仍须原actual/canonical默认fresh扫描与精确gate，scanner自然1和独立gate0分列；任何新风险、身份、来源、settings或输入漂移仍阻断。完整事实与人类来源见原风险决定文档的本日后继。Rust、native、main CI、GUI和发布资格继续独立；本条不授NoRun或绕过资源窗口。
+
+
+## 2026-11-03 正式 d542/f6/d5 的 fresh 双 gate 已取得
+
+本条为前段fetch失败的时间后继，不改写旧失败或e804原件。Root在当前正式CLI锁 `d542c37ea3d32ca9a8064f0ef473fa3e2fd7175c0576c8e97d4564db09ed39e1`（768包）、policy `f6a42b3ccf90ada2dc639b9999fc2bc70551c2e4f83cce00c2e87347bdde5950`、原collector consumer `d5a9668f203ab76633df87eddb1fa4f111b78c30fb85a3599ec1d2477d71660c`（274输入）上取得新fresh actual/canonical exact gate和caller各自然0。两个原官方scanner自然1，DB263a4d951a0867d4bddc29dddd6d59427c78f9a7/1402，零漏洞、恰原五完整风险warning、零yanked、noFetch=false、ignore=[]；原URL/设置/预算/代理/工具未改。本线只复用Root同raw/receipt并核验完整身份，未重跑scans或8controls。
+
+Root acceptance SHA256为 `0970aa37689ed74530cd4daef28130c5a7199fd1308f6ea1629d736d0364c22b`，完整原件及执行时间见原风险决定的本日后继。人类3e3d精确新锁授权保持充分，本双0只签当前锁/consumer/五身份；旧fetch1/空audit、r04新yanked、候选旧policy两gate1和静态PENDING包全保，不追成旧时通过。原五风险并未修复，scanner1不是零warning审计，不扩第六风险、ignore/过滤或未来输入自动续期，不向Framework/SDK继承。
+
+正常Source/Final仅按两doc新bytes复核，globalClosure不宣称已查。当前仍无CLI Rust/NoRun/GUI/提交GO，SDK独占重型窗；后续publication RED→原684→实际后继consumer/fresh gate→GREEN仍须Root明确资源派窗，不改原tests087、预算或执行ID，也不改ADR0057 76d和原生产patch。
+
+
+## 2026-11-03 publication 真实验证后的19ec精确来源
+
+本条追加原publication流水线及test-only Clippy修复后的当前时态，不改写早先d5/77d资格、真实RED、Clippy101或任何fetch/yanked/旧policy失败。Root55c391先以真实publication RED为前提采用原684三生产文件，原collector实际两读77d/274、仅3输入变化后才机械绑定policy550675并取得新77d双fresh gate0；同原tests087行为GREEN、executor79/79和6原exact回归随后通过。原tests087 Clippy101因replace_box，按首个未知失败要求停报。
+
+Root74650另行具名批准独审C0/I0/M0的原负控Box就地替换，构造器/identity/sequence/parent/payload/Result/断言/预算/场景不变，不加allow或skip；tests当前精SHA为 `4f495651c40e9b0e77ff56b9be28c9c98af74c60bedbc504625cdc13c31a4766`。原collector采用后实际两读恰 `19ecac5f16256d4141540f528ae1e9e3c604a77b7be7d42676d77dd1ffc31cc4`／274，仅tests一输入变化、无增删，policy仅consumer字段后继为 `b94bbfefeffa523df850299db7a32e5a4e9efa13594c214d52694ab58ce53e05`。锁保持人类3e3d精许的 `d542c37ea3d32ca9a8064f0ef473fa3e2fd7175c0576c8e97d4564db09ed39e1`／768包，原五完整风险及其它policy字节保持；这两个consumer后继来自Root具体Source复评，不是锁许可自动续未来来源。
+
+19ec新cut原controls8/8自然0，fresh actual/canonical两gate和caller自然0；两个原scanner自然1、DB263a4d/1402、零漏洞、恰原五完整warning、零yanked、noFetch=false、ignore=[]。新NoRun自然0/W0/E0，features=[]、test opt0/debug0、j2/inc0与原frozen1.99/private RUSTUP保持，新实际程序2f99d595…取得两目标各exact1P和整个executor79P/0F/0I。六额外回归仅明确复用77d的各exact1P原件，不冒充19ec新程序执行。targeted lib/tests/no-default Clippy -Dwarnings及fmt write/check均自然0，格式化源码差量零；当前Source/Final按最终bytes另有回执，globalClosure不宣称已查。
+
+当前仅具备受控合成Model经过原unattended/RunTurn/Driver/sink/shared log/strict FileStore history的Rust消费者资格；GUI/App/native/外部provider/R03/NodeFull/三语/mainCI/发布未重跑。原五风险未修复，scanner1不是零warning审计；不新增风险、ignore/过滤/no-fetch或跨仓继承，不预授其它源码/锁。程序/完整FP/u64/.d/raw先T外保全，reader0后仍等Root准确clean票；本writer不自行清target或stage/commit/push。
