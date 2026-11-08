@@ -16,6 +16,137 @@ type LocalChannel = fn(WeixinConfig, SocketAddr) -> echo_agent::error::Result<We
 const BUSINESS_REPLY: &str = "已恢复🙂";
 const LONG_REPLY_PREFIX: &str = "ORIGINAL_LONG_REPLY:";
 
+const REPLY_OBSERVATION_TARGET: &str =
+    "echo_agent_app_core::channel_runtime::weixin_reply_observation";
+
+#[derive(Default, Clone)]
+struct ReplyReceiptFields {
+    values: std::collections::BTreeMap<String, String>,
+    overflow: bool,
+    explicit_root: bool,
+}
+
+impl ReplyReceiptFields {
+    fn record(&mut self, field: &tracing::field::Field, value: &str) {
+        if self.values.len() >= 8 || value.chars().count() > 256 {
+            self.overflow = true;
+            return;
+        }
+        self.values
+            .insert(field.name().to_string(), value.to_string());
+    }
+}
+
+impl tracing::field::Visit for ReplyReceiptFields {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.record(field, &value.to_string());
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.record(field, value);
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        // This target contains only a fixed message, SHA256, ordinal and enum label.
+        self.record(field, &format!("{value:?}"));
+    }
+}
+
+#[derive(Clone, Default)]
+struct ReplyReceiptCapture {
+    events: Arc<std::sync::Mutex<Vec<ReplyReceiptFields>>>,
+    failed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ReplyReceiptCapture {
+    fn snapshot(&self) -> anyhow::Result<Vec<ReplyReceiptFields>> {
+        anyhow::ensure!(
+            !self.failed.load(Ordering::SeqCst),
+            "reply receipt capture overflowed"
+        );
+        let events = self
+            .events
+            .lock()
+            .map_err(|_| anyhow::anyhow!("reply capture unavailable"))?;
+        anyhow::ensure!(
+            events.iter().all(|event| !event.overflow),
+            "reply fields exceeded retained bounds"
+        );
+        Ok(events.clone())
+    }
+
+    fn verify(&self, client_ids: &[&str]) -> anyhow::Result<()> {
+        let events = self.snapshot()?;
+        anyhow::ensure!(
+            events.len() == client_ids.len(),
+            "actual accepted observation count mismatch"
+        );
+        for (event, client_id) in events.iter().zip(client_ids) {
+            anyhow::ensure!(
+                event.explicit_root,
+                "receipt observation inherited a caller span"
+            );
+            let keys: Vec<_> = event.values.keys().map(String::as_str).collect();
+            anyhow::ensure!(
+                keys == [
+                    "local_client_id_sha256",
+                    "message",
+                    "outcome",
+                    "reply_ordinal"
+                ],
+                "accepted observation leaked an extra field or lost correlation"
+            );
+            anyhow::ensure!(
+                event.values.get("local_client_id_sha256")
+                    == Some(&format!(
+                        "{:x}",
+                        <sha2::Sha256 as sha2::Digest>::digest(client_id.as_bytes())
+                    )),
+                "accepted observation did not retain the original receipt identity"
+            );
+            anyhow::ensure!(
+                event.values.get("outcome").map(String::as_str) == Some("accepted"),
+                "receipt was reclassified"
+            );
+            anyhow::ensure!(
+                event.values.get("message").map(String::as_str)
+                    == Some("Weixin original reply received its platform acknowledgement"),
+                "accepted observation included non-canonical text"
+            );
+            let ordinal = client_id
+                .rsplit(':')
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("receipt ordinal missing"))?;
+            anyhow::ensure!(
+                event.values.get("reply_ordinal").map(String::as_str) == Some(ordinal),
+                "receipt ordinal changed"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ReplyReceiptCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() != REPLY_OBSERVATION_TARGET {
+            return;
+        }
+        let mut fields = ReplyReceiptFields {
+            explicit_root: event.is_root(),
+            ..ReplyReceiptFields::default()
+        };
+        event.record(&mut fields);
+        match self.events.lock() {
+            Ok(mut events) if events.len() < 8 => events.push(fields),
+            _ => self.failed.store(true, Ordering::SeqCst),
+        }
+    }
+}
+
 // 仅延迟本机provider的HTTP回执；不持有或释放App/Framework执行owner。
 struct HeldSend {
     request: tokio::sync::watch::Sender<Option<Value>>,
@@ -1732,6 +1863,12 @@ async fn original_manager_reconnect_and_exact_abandon_drive_network_inputs_once(
 async fn managed_long_stop_case() -> anyhow::Result<()> {
     use crate::conversation_input::{ConversationInputFact, FrozenChannelContext};
     use echo_agent::channels::{ChannelError, ChatType, OutboundMessage, ReactError};
+    use tracing_subscriber::layer::SubscriberExt;
+    let accepted_observations = ReplyReceiptCapture::default();
+    // This phase runs only in the existing isolated single-test child process.
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry().with(accepted_observations.clone()),
+    )?;
     let temporary = tempfile::tempdir()?;
     let account = account("managed-long-stop");
     let pages = Arc::new(Pages {
@@ -1822,6 +1959,8 @@ async fn managed_long_stop_case() -> anyhow::Result<()> {
         anyhow::ensure!(provider.observed.borrow().sends.iter().all(|request|
             request.pointer("/msg/item_list/0/text_item/text").and_then(Value::as_str)
                 != chunks.first().map(String::as_str)), "unanswered HTTP was already called Accepted");
+        observation_step = "accepted-before-http-receipt";
+        anyhow::ensure!(accepted_observations.snapshot()?.is_empty(), "queued/unanswered send was falsely recorded Accepted");
         observation_step = "stop-held-http";
         let stopping_channels = channels.clone();
         let stopping_state = state.clone();
@@ -1850,6 +1989,9 @@ async fn managed_long_stop_case() -> anyhow::Result<()> {
         let handle = channels.handle("weixin").map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow::anyhow!("original channel handle missing"))?;
         anyhow::ensure!(handle.management_snapshot().await.shutdown_settled, "Stop lacked original physical settlement");
+        observation_step = "accepted-after-original-http";
+        let old_client_id = held_request.pointer("/msg/client_id").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("original accepted client identity missing"))?;
+        accepted_observations.verify(&[old_client_id])?;
         let before_reconnect = provider.observed.borrow().clone();
         let old_count = before_reconnect.sends.iter().filter(|request|
             request.pointer("/msg/client_id").and_then(Value::as_str).is_some_and(|id| id.starts_with(&old_prefix))).count();
@@ -1904,6 +2046,10 @@ async fn managed_long_stop_case() -> anyhow::Result<()> {
             request.pointer("/msg/client_id").and_then(Value::as_str).is_some_and(|id| id.starts_with(&new_prefix))
             && request.pointer("/msg/item_list/0/text_item/text").and_then(Value::as_str) == Some(BUSINESS_REPLY)).count() == 1,
             "new input lacked its own exactly-once original reply identity");
+        observation_step = "accepted-after-new-http";
+        let new_client_id = after.sends.iter().find(|request| request.pointer("/msg/client_id").and_then(Value::as_str).is_some_and(|id| id.starts_with(&new_prefix)))
+            .and_then(|request| request.pointer("/msg/client_id")).and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("new accepted client identity missing"))?;
+        accepted_observations.verify(&[old_client_id, new_client_id])?;
         observation_step = "late-old-fence";
         let new_delivery = channels.weixin_delivery.lock()
             .map_err(|_| anyhow::anyhow!("current delivery slot unavailable"))?
@@ -1916,6 +2062,7 @@ async fn managed_long_stop_case() -> anyhow::Result<()> {
             "new accepting delivery did not reject the real old template with typed StaleDelivery");
         anyhow::ensure!(provider.observed.borrow().send_requests == sends_before_stale,
             "late original fence reached HTTP");
+        accepted_observations.verify(&[old_client_id, new_client_id])?;
         anyhow::ensure!(llm.call_count() == 6, "Stop/reconnect ran another model attempt");
         observation_step = "final-stop";
         control_original(&channels, &state, ChannelControlAction::Stop).await?;
@@ -1965,7 +2112,9 @@ async fn managed_long_stop_case() -> anyhow::Result<()> {
         serde_json::json!({"phase":"managed-long-stop","model_calls":llm.call_count(),
         "long_chunks_planned":chunks.len(),"real_http_business_replies":actual_provider.business_reply_count(),
         "real_http_send_requests":actual_provider.send_requests,"protocol_errors":actual_provider.protocol_errors,
-        "original_stop_physically_joined":true,"late_old_fence_reached_http":false}),
+        "original_stop_physically_joined":true,"late_old_fence_reached_http":false,
+        "accepted_receipt_observations":accepted_observations.snapshot()?.len(),
+        "accepted_receipt_fields_redacted":true}),
     )?;
     Ok(())
 }
@@ -2004,7 +2153,15 @@ async fn original_manager_stop_during_long_reply_reconnects_without_old_incarnat
             && receipt
                 .get("late_old_fence_reached_http")
                 .and_then(Value::as_bool)
-                == Some(false),
+                == Some(false)
+            && receipt
+                .get("accepted_receipt_observations")
+                .and_then(Value::as_u64)
+                == Some(2)
+            && receipt
+                .get("accepted_receipt_fields_redacted")
+                .and_then(Value::as_bool)
+                == Some(true),
         "long-send original child lacked required owner/HTTP/fence evidence"
     );
     anyhow::ensure!(

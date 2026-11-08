@@ -1720,7 +1720,18 @@ async fn drive_deferred_weixin_reply(
             .send_with_context(message, context.as_ref(), &client_id)
             .await
         {
-            Ok(WeixinSendOutcome::Accepted { .. }) => {}
+            Ok(WeixinSendOutcome::Accepted { client_id, .. }) => {
+                // 只观察原发送future返回的业务回执；不拥有恢复/重试，也不证明手机收件。
+                // 原始client_id、账号、context和正文均不进入日志，只保留可关联的摘要。
+                tracing::info!(
+                    target: "echo_agent_app_core::channel_runtime::weixin_reply_observation",
+                    parent: None,
+                    local_client_id_sha256 = %format!("{:x}", Sha256::digest(client_id.as_bytes())),
+                    reply_ordinal = ordinal,
+                    outcome = "accepted",
+                    "Weixin original reply received its platform acknowledgement"
+                );
+            }
             Ok(WeixinSendOutcome::Rejected { .. }) => {
                 sending = false;
                 tracing::warn!(

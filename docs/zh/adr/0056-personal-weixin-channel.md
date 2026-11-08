@@ -137,3 +137,13 @@ Ready 初始化把当前 live route 观察和从未 claim 的证明交回同一�
 会话物理 journal 按工作空间和会话寻址，正常包含 DATA、普通 turn 及多个控制 root。控制适配器在原锁内读取真实物理前缀并先做完整记录校验，只向原严格 reducer 投影准确的控制 root；checkpoint 记录该次扫描的真实物理 head。其它 root 的合法事实不属于该控制投影，物理损坏、当前 root 的类型错误或缺失前缀仍拒绝；不新增 journal 或持久化权威。
 
 长控制的公共校验和分支选择保持原顺序，各私有执行分支返回 boxed future，由原调用链直接 await，避免未选中分支的巨大 future 聚合到公共分派帧。原 coordinator、foreground、控制 claim/effect、冻结 context、发送回执及关闭 join 继续持有原效果；不增加线程、队列、调度器或提早 ACK。该两项实现已静态审查，epoch12 的默认栈、原13项消费者与新增混合日志回归仍待执行，不把框架或扫码的局部通过用于结算这些范围。
+
+### 原回复发送回执的脱敏观察
+
+普通 IM 回复只在原 `send_with_context` 返回 typed `Accepted` 后，向既有应用日志写入
+`weixin_reply_observation` 观察：包含原回执 client ID 的 SHA256、回复 ordinal 和 accepted
+结果。它不输出原始 ID、账号、凭据、context 或正文，不增加任务日志权威、恢复或重试入口。
+事件显式不继承 caller span，避免既有 span 的附带字段进入这条观察；关联仅使用安全摘要。
+该摘要可按既有 `eko-input:<原 durable input_id>:<ordinal>` 规则与原准入/执行记录关联；
+队列接纳、poll Ready、执行完成或没有错误日志都不能制造此观察，手机收件继续单独验收。
+验收时使用已有 app-core `info` 日志级别；该观察不改变配置或原发送结果。
