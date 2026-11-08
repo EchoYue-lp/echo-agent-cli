@@ -114,3 +114,16 @@ Rust被测源码、实际编译cwd、profile与binary是一层来源，执行cap
 quiet租约已于北京时间2026-10-31 21:19:54.581至21:21:34.462实际取得并释放（原字段为UTC `13:19:54.581Z` 至 `13:21:34.462Z`）。103次周期观察未命中原named-heavy分类，但仍观察到Codex Renderer 108.9%、cc-switch 94.9%、fseventsd 77.3%、aTrustXtunnel 59.2%等背景峰值；周期top8不证明整机solo、持续低CPU或优化因果。整进程wait4资源只适用于child及其等待的后代，0／0 block操作不等于无I/O，不能摊成每次操作成本。
 
 旧before1000在原300秒超时，仅留14行partial、`accepted_samples=false`，不是有效分位数或速度比baseline；本次source／dataset／root亦有变化，未做A/B comparison或因果加速宣称。原错误、准入拒绝、partial和不同来源均保持。完整原件在顶层ignored目录 `.echo-semantic/local/parallel-executors-20261027/performance/source-snapshot-reader-candidate-20261031-r01/actual-after-runs1000-hot-r02/`；`result.json` SHA为 `cf39292a9367121cdd1030fe67d74492c1e11d6e3f66d5373a4320ffcd1d081d`，原Node `run/summary.json` SHA为 `5ec66bc906cab8e25cc615319c32218f4dd6aa927adc63da4ddabb1a7325c460`。这些本地原件和来源范围不因后继正式脚本提交而晋升；examples／官网不发布这组局部数值或增加产品API。
+
+
+## 2026-11-08：无 retention 工作时的派生调度后继
+
+App仅在需要裁剪或收敛cleanup时由safe-point推进派生投影；普通native读取仍沿原API自动
+追平。此为ADR0057的应用调度后继，未改变journal/atomic checkpoint确认、pins、默认retention、
+批次、预算或性能资格。没有实测就不报告收益。
+
+seed在原producer完成后、追加unprojected tail或超限Flush-only负载之前，显式调用原usage
+reader物化合法基点；该准备在计时外，随后missing仍真实删除派生目录，tail仍保原未追平尾部。
+validate及测量后的correctness检查不能补物化来伪造已完成的测量。特别是safe-point输入在
+计时前仍须超过默认max_segments；被测append必须完成原durability、coverage和真实prune，
+其结果在后置pub oracle前核对，不能提前读取而裁剪输入，也不跳过degraded失败。

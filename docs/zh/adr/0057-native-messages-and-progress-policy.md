@@ -314,3 +314,35 @@ owner 的 journal、作用域校验与发布路径保存；它不能补造执行
 
 本单元覆盖原始事件经 owned sink、journal 冷读及前端历史重投影的路径；实际模型、真实 SSH、
 GUI 重开和最终 App 仍须按免安装 SSH 运维计划分别验收，不以本地夹具替代。
+
+
+### 2026-11-08：按实际 retention 工作调度派生投影
+
+本节是上文“每次safe-point或查询”调度表述的明确后继。原实现对尚未需要裁剪的小stream，
+也在每次确认的safe-point上推进并持久保存派生coverage，给输入准入与结算增加同步写。
+本次取舍只调整Eclip应用的派生投影何时调度，不改变Framework checkpoint、原journal、
+输入身份、确认状态或持久化合同。
+
+本后继参考[Martin Fowler的Event Sourcing](https://martinfowler.com/eaaDev/EventSourcing.html)，
+仅采用事件事实为权威、派生状态可从事件重建的分层原则。本项目固定原head、读前有界追平、
+裁剪前耐久projection/pin确认及foreign/degraded拒绝仍由本地journal、reader和barrier合同
+证明，不用泛化的eventual consistency代替这些约束。因此这里调整App调度，不削弱Framework
+原子checkpoint确认，也不从外部模式推导20秒用例或时延收益。
+
+候选中，按through等于head及state未变化省略coverage.save无法确认上次可见rename后的
+父目录barrier是否成功，不采用。最终采用既有retention guard前置：当段数不超过原max_segments
+且cleanup_pending=false时，maintain_retention保留完整原journal并返回；正常读取仍用原API
+在同一owner/generation和固定head下自动有界追平，不能把Pending、Gap、foreign/corrupt或
+取消变成空结果、成功或换owner重试。代价是派生文件可能首次在读取时生成，冷读承担原先
+预付的派生工作；未取得实测前不宣称收益或时延SLA。
+
+需要裁剪或cleanup_pending时仍先同步原journal、逐键保存投影并最后确认coverage，再由
+原pins约束prune。projection失败或未追平仍保原段；journal的SyncData/barrier_pending重试、
+checkpoint可见但barrier未确认时的resave、pin恢复与外代拒读保持。不新增内存缓存、Store、
+后台owner、运行时状态、预算或Framework API。
+
+foreign反控只在注入前调用原reader物化各自合法generation；后续foreign字节、不覆盖和拒读
+断言不减少。GUI冷读及性能seed在追加未投影tail或超限Flush-only负载前物化原producer基点，
+后续仍真实删除派生目录、执行原cold-first及默认prune。超限safe-point的完整durability、
+coverage和物理裁剪必须由被测调用完成，不能由后置oracle补完。既有from-1覆盖、旧缺coverage
+的typed Gap、固定head、原publications/usage/presentation、degraded及pin验收均继续适用。

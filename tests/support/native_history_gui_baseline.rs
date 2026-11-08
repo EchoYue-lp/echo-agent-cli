@@ -395,6 +395,8 @@ async fn seed(root: &Path) -> anyhow::Result<()> {
         &fixture.log_path,
         ChatEventRetention::default(),
     )?);
+    // seed计时外仅物化原producer基点；不能在超限Flush负载后读而提前prune。
+    log.conversation_usage(&workspace, &conversation)?;
     if case == "native-history-safe-point" || target == 0 {
         anyhow::ensure!(
             variant == "valid" && tail == 0,

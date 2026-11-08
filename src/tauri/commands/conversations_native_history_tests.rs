@@ -3159,7 +3159,14 @@ mod resource_chain_acceptance {
     // 只观察同一个真实source在既有默认journal保留/回放之后的历史；不造terminal。
     fn source_retention_loader_baseline(
         fixture: &StatuslessPublicationFixture,
-    ) -> anyhow::Result<(StoredMessage, serde_json::Value, serde_json::Value)> {
+    ) -> anyhow::Result<(
+        StoredMessage,
+        serde_json::Value,
+        (
+            serde_json::Value,
+            core::chat_event_log::NativePresentationSupplement,
+        ),
+    )> {
         let final_row = fixture
             .seed
             .rows
@@ -3199,10 +3206,114 @@ mod resource_chain_acceptance {
         assert_eq!(progress.assistant_blocks.as_ref().map(Vec::len), Some(2));
         assert!(!progress.final_answer_confirmed);
         assert!(final_view.final_answer_confirmed && final_view.content.is_some());
+        // publication基线原值不变；presentation仅由这个受控source的原工具事实构造。
+        use echo_agent_app_core::api::chat_event_log::{
+            NativeJournalCursor, NativePresentationPayload, NativePresentationRecord,
+            NativePresentationScope, NativePresentationSupplement,
+        };
+        let source = final_view.turn_source.clone().context("原final缺source")?;
+        assert_eq!(progress.turn_source.as_ref(), Some(&source));
+        assert!(progress.native_presentation.is_none() && final_view.native_presentation.is_none());
+        let calls: Vec<_> = fixture
+            .journal
+            .iter()
+            .filter_map(|event| match &event.payload {
+                ChatDriverEvent::Agent(native) => match &native.payload {
+                    echo_agent::agent::AgentEvent::ToolCall {
+                        call_id,
+                        invocation,
+                    } => Some((event, native, call_id, invocation)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "受控ResourceChain原source必须恰有一次工具调用"
+        );
+        let (event, native, call_id, invocation) =
+            calls.first().copied().context("原tool call缺失")?;
+        assert_eq!(call_id.as_str(), "resource-chain-call");
+        assert_eq!(invocation.name, TOOL);
+        assert_eq!(event.workspace_id, source.workspace_id);
+        assert_eq!(
+            event.conversation_id.as_deref(),
+            Some(source.conversation_id.as_str())
+        );
+        assert_eq!(event.root_turn_id, source.root_turn_id);
+        assert_eq!(event.turn_id, source.turn_id);
+        assert_eq!(event.message_id, source.root_turn_id);
+        assert_eq!(
+            native.execution_id.as_ref().map(|id| id.as_str()),
+            Some(source.execution_id.as_str())
+        );
+        let record = NativePresentationRecord {
+            cursor: NativeJournalCursor {
+                stream_id: event.stream_id.clone(),
+                sequence: event.sequence,
+            },
+            event_id: event.event_id.clone(),
+            content_hash: event.content_hash.clone(),
+            timestamp: event.timestamp,
+            scope: NativePresentationScope {
+                workspace_id: event.workspace_id.clone(),
+                conversation_id: event.conversation_id.clone(),
+                root_turn_id: event.root_turn_id.clone(),
+                turn_id: event.turn_id.clone(),
+                message_id: event.message_id.clone(),
+            },
+            payload: NativePresentationPayload::ToolCall {
+                execution_id: native.execution_id.as_ref().map(ToString::to_string),
+                publication_event_id: native.event_id.to_string(),
+                call_id: call_id.clone(),
+                name: invocation.name.clone(),
+            },
+        };
+        // 只在producer完成、tail/prune负载尚未追加时，从原journal reader绑定generation/head。
+        // 不调用被测GUI consumer，不向canonical注入import，不在tail后预热presentation。
+        let source_head = fixture
+            .journal
+            .last()
+            .context("原source journal为空")?
+            .sequence;
+        let log = ChatEventLog::open(&fixture.log_path, ChatEventRetention::default())?;
+        let authority =
+            log.conversation_usage(fixture.workspace.id.as_str(), fixture.conversation)?;
+        assert_eq!(authority.workspace_id, source.workspace_id);
+        assert_eq!(authority.conversation_id, source.conversation_id);
+        assert_eq!(authority.through_sequence, source_head);
+        assert_eq!(authority.latest_sequence, source_head);
+        assert_eq!(authority.first_observed_sequence, Some(1));
+        assert!(authority.prefix_complete);
+        let replay = log.replay(
+            fixture.workspace.id.as_str(),
+            Some(fixture.conversation),
+            fixture.conversation,
+            0,
+        )?;
+        assert_eq!(replay.retained_earliest_cursor, Some(1));
+        assert!(!replay.truncated);
+        assert_eq!(
+            serde_json::to_value(replay.events)?,
+            serde_json::to_value(&fixture.journal)?
+        );
+        let expected_presentation = NativePresentationSupplement {
+            source,
+            journal_identity: authority
+                .journal_identity
+                .context("原journal generation缺失")?,
+            through_sequence: authority.through_sequence,
+            first_observed_sequence: authority.first_observed_sequence.context("原prefix缺失")?,
+            prefix_complete: authority.prefix_complete,
+            records: vec![record],
+        };
+        drop(log);
         Ok((
             final_row,
             serde_json::to_value(progress)?,
-            serde_json::to_value(final_view)?,
+            (serde_json::to_value(final_view)?, expected_presentation),
         ))
     }
 
@@ -3210,7 +3321,10 @@ mod resource_chain_acceptance {
         fixture: &StatuslessPublicationFixture,
         final_row: StoredMessage,
         baseline_progress: serde_json::Value,
-        baseline_final: serde_json::Value,
+        baseline_final: (
+            serde_json::Value,
+            core::chat_event_log::NativePresentationSupplement,
+        ),
         label: &str,
     ) -> anyhow::Result<()> {
         // 与get_conversation相同的真实批量consumer接线，不手动绕过05整合hunk。
@@ -3225,6 +3339,54 @@ mod resource_chain_acceptance {
             fixture.conversation,
             0,
         )?;
+        let (baseline_final, mut expected_presentation) = baseline_final;
+        let source_head = expected_presentation.through_sequence;
+        assert!(
+            replay.latest_cursor > source_head,
+            "该场景必须追加真实后继负载"
+        );
+        // 负载允许其它root的native进度，但不得改变原source的展示事实或owner。
+        for event in replay
+            .events
+            .iter()
+            .filter(|event| event.sequence > source_head)
+        {
+            assert_ne!(
+                event.root_turn_id,
+                expected_presentation.source.root_turn_id
+            );
+            if let ChatDriverEvent::Agent(native) = &event.payload {
+                assert_ne!(
+                    native.execution_id.as_ref().map(|id| id.as_str()),
+                    Some(expected_presentation.source.execution_id.as_str())
+                );
+            }
+        }
+        expected_presentation.through_sequence = replay.latest_cursor;
+        assert_eq!(expected_presentation.first_observed_sequence, 1);
+        assert!(expected_presentation.prefix_complete);
+        let source = serde_json::to_value(&expected_presentation.source)?;
+        assert_eq!(baseline_progress.get("turn_source"), Some(&source));
+        assert_eq!(baseline_final.get("turn_source"), Some(&source));
+        let supplement = serde_json::to_value(&expected_presentation)?;
+        let with_supplement =
+            |publication: &serde_json::Value| -> anyhow::Result<serde_json::Value> {
+                let mut expected = publication.clone();
+                let fields = expected
+                    .as_object_mut()
+                    .context("原publication DTO不是object")?;
+                anyhow::ensure!(
+                    !fields.contains_key("native_presentation"),
+                    "原publication基线不能预含补充"
+                );
+                fields.insert("native_presentation".into(), supplement.clone());
+                Ok(expected)
+            };
+        // 两种响应分别完整建模：final-only携带补充；batch由首个同source的progress携带。
+        // 不从下面的被测returned DTO提取任何expected，也不删除actual字段。
+        let expected_final_only = with_supplement(&baseline_final)?;
+        let expected_batch_progress = with_supplement(&baseline_progress)?;
+        let expected_batch_final = baseline_final.clone();
         // 批量consumer遇到progress缺页会短路；先独立走同consumer读取final行，保两种真实症状。
         let final_only = project_conversation_messages_with_native_history(
             vec![final_row.clone()],
@@ -3257,13 +3419,15 @@ mod resource_chain_acceptance {
             replay.latest_cursor,
             replay.truncated
         );
-        let single_final = final_only?
-            .into_iter()
-            .next()
-            .context("原consumer丢失独立final行")?;
+        let mut single_views = final_only?.into_iter();
+        let single_final = single_views.next().context("原consumer丢失独立final行")?;
+        assert!(
+            single_views.next().is_none(),
+            "final-only必须恰有一条原消息"
+        );
         assert_eq!(
             serde_json::to_value(single_final)?,
-            baseline_final,
+            expected_final_only,
             "{label}: 独立final确认也须保持，不被progress错误遮住"
         );
         let mut views = loaded
@@ -3278,12 +3442,12 @@ mod resource_chain_acceptance {
         assert!(views.next().is_none());
         assert_eq!(
             serde_json::to_value(progress)?,
-            baseline_progress,
+            expected_batch_progress,
             "{label}: 同一原source的批准进度和顺序应跨默认保留/回放保持"
         );
         assert_eq!(
             serde_json::to_value(final_view)?,
-            baseline_final,
+            expected_batch_final,
             "{label}: 同一原source最终确认与正文不能随日志窗口消失"
         );
         Ok(())
@@ -3439,6 +3603,8 @@ mod resource_chain_acceptance {
         target_records: u64,
     ) -> anyhow::Result<()> {
         let log = ChatEventLog::open(log_path, ChatEventRetention::default())?;
+        // 只在追加unprojected tail之前物化原producer基点；随后仍真实删除派生目录。
+        log.conversation_usage(workspace, conversation)?;
         let before = log.replay(workspace, Some(conversation), conversation, 0)?;
         anyhow::ensure!(
             before.latest_cursor < target_records,
@@ -3479,8 +3645,9 @@ mod resource_chain_acceptance {
     -> anyhow::Result<()> {
         for count in [4097_u64, 8193_u64] {
             let fixture = StatuslessPublicationFixture::real_source().await?;
-            source_retention_loader_baseline(&fixture)?;
-            let baseline = fixture
+            let (_, _, (_, mut expected_presentation)) =
+                source_retention_loader_baseline(&fixture)?;
+            let mut baseline = fixture
                 .seed
                 .rows
                 .iter()
@@ -3505,6 +3672,33 @@ mod resource_chain_acceptance {
                 ChatEventRetention::default(),
             )?);
             let cancel = echo_agent::agent::CancellationToken::new();
+            // head来自原journal而非被测响应；这里只replay，不在缺投影输入上预热native reader。
+            let fixed = log.replay(
+                fixture.workspace.id.as_str(),
+                Some(fixture.conversation),
+                fixture.conversation,
+                0,
+            )?;
+            assert_eq!(fixed.latest_cursor, count);
+            assert_eq!(fixed.retained_earliest_cursor, Some(1));
+            assert!(fixed.latest_cursor > expected_presentation.through_sequence);
+            expected_presentation.through_sequence = fixed.latest_cursor;
+            let mut carried = false;
+            for view in &mut baseline {
+                assert!(
+                    view.native_presentation.is_none(),
+                    "保留原publication基线，不注入canonical import"
+                );
+                if let Some(source) = view.turn_source.as_ref() {
+                    assert_eq!(source, &expected_presentation.source);
+                    assert!(!view.presentation_unavailable);
+                    if !carried {
+                        view.native_presentation = Some(expected_presentation.clone());
+                        carried = true;
+                    }
+                }
+            }
+            assert!(carried, "原source至少一行必须携带完整补充");
             // 全部canonical行的第一次正常GUI consumer调用；没有final探针预热，也没有用户重试。
             let actual = project_conversation_messages_with_native_history(
                 fixture.seed.rows.clone(),

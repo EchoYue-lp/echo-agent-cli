@@ -1912,6 +1912,78 @@ mod tests {
     }
 
     #[test]
+    fn native_history_no_prune_safe_point_defers_projection_but_preserves_original_journal()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let log = ChatEventLog::open(temp.path(), ChatEventRetention::default())
+            .map_err(|error| error.to_string())?;
+        let (message, event) = native_history_test_message()?;
+        let original = append_native_history_test_event(&log, 1, event)?;
+        #[cfg(feature = "test-utils")]
+        let observer = native_history_perf_io::Observation::begin(temp.path().to_path_buf())?;
+        let safe_point = log
+            .append(
+                "workspace-1",
+                Some("conversation-1"),
+                "turn-1",
+                ChatDriverEvent::TurnStatus {
+                    status: "completed".into(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        #[cfg(feature = "test-utils")]
+        {
+            let counts = observer.finish()?;
+            eprintln!(
+                "native-history no-prune I/O attempts/results: {}",
+                serde_json::to_string(&counts).map_err(|error| error.to_string())?
+            );
+            assert!(
+                counts
+                    .get("coverage_save")
+                    .is_none_or(|count| count.attempted == 0),
+                "无retention工作时不得为safe point保存派生coverage"
+            );
+        }
+        let stream = stream_id("workspace-1", Some("conversation-1"), "turn-1")
+            .map_err(|error| error.to_string())?;
+        assert!(
+            !log.stream_dir(&stream)
+                .join(NATIVE_HISTORY_DIRECTORY)
+                .exists(),
+            "未裁剪的原journal不依赖append后立即生成派生目录"
+        );
+        let original_records = vec![original.clone(), safe_point.clone()];
+        let live = log
+            .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(live.retained_earliest_cursor, Some(1));
+        assert_eq!(live.latest_cursor, safe_point.sequence);
+        assert_eq!(
+            serde_json::to_value(&live.events).map_err(|error| error.to_string())?,
+            serde_json::to_value(&original_records).map_err(|error| error.to_string())?
+        );
+        drop(log);
+        let cold = ChatEventLog::open(temp.path(), ChatEventRetention::default())
+            .map_err(|error| error.to_string())?;
+        let cold_records = cold
+            .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            serde_json::to_value(&cold_records.events).map_err(|error| error.to_string())?,
+            serde_json::to_value(&original_records).map_err(|error| error.to_string())?
+        );
+        let native = cold
+            .native_history_publications("workspace-1", "conversation-1", &message)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            serde_json::to_value(&native).map_err(|error| error.to_string())?,
+            serde_json::to_value(vec![original]).map_err(|error| error.to_string())?
+        );
+        Ok(())
+    }
+
+    #[test]
     fn native_history_checkpoint_preserves_exact_records_after_real_prune_and_cold_reopen()
     -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
@@ -2056,6 +2128,9 @@ mod tests {
         for log in &logs {
             append_native_history_test_event(log, 1, event.clone())?;
             append_status(log, "completed")?;
+            // 注入foreign/corrupt之前，由原reader物化各自generation的派生文件。
+            log.native_history_publications("workspace-1", "conversation-1", &message)
+                .map_err(|error| error.to_string())?;
         }
         let key = native_publication_fact_key(
             &logs
@@ -2290,6 +2365,11 @@ mod tests {
         append_status(&left, "completed")?;
         append_native_history_test_event(&right, 1, event.clone())?;
         append_status(&right, "completed")?;
+        // 原reader仅准备合法基点；后续foreign字节与不覆盖/拒读反控保持原样。
+        for log in [&left, &right] {
+            log.native_history_publications("workspace-1", "conversation-1", &message)
+                .map_err(|error| error.to_string())?;
+        }
         let key = native_publication_fact_key(&first)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "native key missing".to_string())?;

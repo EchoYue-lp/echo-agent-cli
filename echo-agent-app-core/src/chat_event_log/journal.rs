@@ -2147,6 +2147,13 @@ impl ChatEventLog {
     }
 
     fn maintain_retention(&self, authority: &mut StreamAuthority, stream_id: &str) {
+        // 无裁剪或cleanup工作时保留原journal，派生投影由原读取入口追平；
+        // 原append/barrier确认不变，有retention工作时仍先确认coverage再prune。
+        let metadata = authority.journal.retention_metadata();
+        let segments = authority.journal.segments();
+        if segments.len() <= self.retention.max_segments && !metadata.cleanup_pending {
+            return;
+        }
         // 原journal prune合同要求先耐久保存将被裁前缀。投影失败/追平未完时保原事实，
         // 不能重试已commit的append，也不能拿缺原pub的history冒成功。
         match advance_native_publication_projection(authority) {
