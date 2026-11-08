@@ -1,5 +1,7 @@
 export type GuiSlashTarget =
   | 'clear'
+  | 'goal'
+  | 'side'
   | 'tasks'
   | 'analysis'
   | 'research'
@@ -14,9 +16,26 @@ export interface SlashCommand {
   description: string;
   category: string;
   target: GuiSlashTarget;
+  acceptsArguments?: boolean;
 }
 
 export const SLASH_COMMANDS: SlashCommand[] = [
+  {
+    name: '/goal',
+    aliases: [],
+    description: '创建或管理当前目标，可附目标文本',
+    category: 'Session',
+    target: 'goal',
+    acceptsArguments: true,
+  },
+  {
+    name: '/side',
+    aliases: [],
+    description: '新建支线对话，可附要处理的问题',
+    category: 'Session',
+    target: 'side',
+    acceptsArguments: true,
+  },
   {
     name: '/clear',
     aliases: ['/cls'],
@@ -80,19 +99,28 @@ export const CATEGORY_META: Record<string, { order: number }> = {
   Workspace: { order: 1 },
 };
 
-export type GuiSlashHandlers = Record<GuiSlashTarget, () => void | Promise<void>>;
+export type GuiSlashHandlers = Record<GuiSlashTarget, (argument: string) => void | Promise<void>>;
+
+/** 仅命令 token 忽略大小写；参数保留原文，不把 /goalfoo 当作 /goal。 */
+export function parseGuiSlashCommand(input: string) {
+  const match = /^(\/\S+)(?:\s+([\s\S]*))?$/.exec(input.trim());
+  if (!match) return null;
+  const token = match[1]?.toLowerCase();
+  const argument = match[2]?.trim() ?? '';
+  const command = SLASH_COMMANDS.find(
+    (candidate) => candidate.name === token || candidate.aliases.includes(token ?? '')
+  );
+  return command && (!argument || command.acceptsArguments) ? { command, argument } : null;
+}
 
 /** Dispatch an exact command exposed by the GUI palette. */
 export async function dispatchGuiSlashCommand(
   input: string,
   handlers: GuiSlashHandlers
 ): Promise<boolean> {
-  const command = input.trim().toLowerCase();
-  const descriptor = SLASH_COMMANDS.find(
-    (candidate) => candidate.name === command || candidate.aliases.includes(command)
-  );
-  if (!descriptor) return false;
-  await handlers[descriptor.target]();
+  const parsed = parseGuiSlashCommand(input);
+  if (!parsed) return false;
+  await handlers[parsed.command.target](parsed.argument);
   return true;
 }
 

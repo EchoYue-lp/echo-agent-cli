@@ -37,7 +37,13 @@ import type { ConfiguredModel, ModelProviderView } from '../../generated';
 import { CONTEXT_RING_CIRCUMFERENCE, ringDashOffset } from './contextRing';
 import { computeContextUsage, estimateDraftTokens, type ContextUsageSource } from './contextUsage';
 import { isKnownThinkingLevel, thinkingLevelOptions } from './thinkingLevels';
-import { filterCommands, groupByCategory, type SlashCommand } from '../../lib/slashCommands';
+import {
+  filterCommands,
+  groupByCategory,
+  parseGuiSlashCommand,
+  type SlashCommand,
+} from '../../lib/slashCommands';
+import { CHAT_GUTTER } from '../../lib/layoutMetrics';
 import { AgentComposerFrame } from './AgentComposerFrame';
 import {
   PERMISSION_MODES,
@@ -780,7 +786,7 @@ export function ChatInput({
       (previous.revision === draftRevisionRef.current || sameDraftTarget(previous.target, target))
     )
       return;
-    if (!displayModel) {
+    if (!displayModel && !(files.length === 0 && parseGuiSlashCommand(trimmed))) {
       openModelSettings();
       useToastStore.getState().addToast('info', '请先添加 Provider 和模型');
       return;
@@ -930,6 +936,8 @@ export function ChatInput({
   // ── Keyboard handling ──
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // WebKit 可能先清除 isComposing；候选确认键不能启动命令。
+    if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
     // Palette navigation takes priority when palette is visible
     if (showPalette) {
       if (e.key === 'Escape') {
@@ -1036,7 +1044,7 @@ export function ChatInput({
 
   return (
     <div
-      className="w-full px-3 pb-3 sm:px-4"
+      className={`w-full pb-3 ${CHAT_GUTTER}`}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
@@ -1152,9 +1160,13 @@ export function ChatInput({
             ) : (
               <button
                 onClick={handleSend}
-                disabled={!hasContent || !displayModel || currentSubmissionPending}
-                aria-label={displayModel ? '发送' : '请先配置模型'}
-                title={displayModel ? '发送' : '请先配置模型'}
+                disabled={
+                  !hasContent ||
+                  (!displayModel && !(pendingFiles.length === 0 && parseGuiSlashCommand(text))) ||
+                  currentSubmissionPending
+                }
+                aria-label={displayModel || parseGuiSlashCommand(text) ? '发送' : '请先配置模型'}
+                title={displayModel || parseGuiSlashCommand(text) ? '发送' : '请先配置模型'}
                 className="absolute bottom-3 right-4 flex h-8 w-8 items-center justify-center rounded-full bg-[var(--accent)] text-[var(--text-on-accent)] transition-all hover:shadow-[var(--shadow-glow)] disabled:opacity-20 disabled:hover:shadow-none"
               >
                 <ArrowUp size={16} strokeWidth={2.5} />

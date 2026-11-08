@@ -4,11 +4,20 @@ import {
   type AgentCommunicationInput,
 } from '../../lib/agentCommunication';
 import { useAgentCommunicationInputs } from '../../hooks/useAgentCommunicationInputs';
-import { useRef, useEffect, useCallback, useState } from 'react';
+import {
+  useRef,
+  useEffect,
+  useCallback,
+  useState,
+  useImperativeHandle,
+  type RefObject,
+} from 'react';
 import { useChatStore } from '../../stores/chatStore';
 import { ConversationTimeline } from './ConversationTimeline';
 import { nativeAssistantBlockText } from './NativeMessageTimeline';
 import { ReplyForkDialog, type ReplyForkSource } from './ReplyForkDialog';
+import { SideConversationDialog } from './SideConversationDialog';
+import { Modal } from '../common/Modal';
 import { ExecutionStatus } from './ExecutionStatus';
 import { HitlDialog } from './HitlDialog';
 import { ChatInput } from './ChatInput';
@@ -18,6 +27,7 @@ import { productDataScope, sameProductDataScope } from '../../lib/productDataSco
 import { configuredModelPresentation, modelLabel } from '../../lib/modelPresentation';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { useConversationStore } from '../../stores/conversationStore';
+import type { SideConversationSource } from '../../stores/conversationStore';
 import { useToastStore } from '../../stores/toastStore';
 import { useSubagentRunStore } from '../../stores/subagentRunStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
@@ -38,16 +48,17 @@ import {
   Workflow,
   X,
 } from 'lucide-react';
-import { type ProductDataScope } from '../../api/endpoints';
+import { taskRuntimeApi, type ProductDataScope } from '../../api/endpoints';
 import type { Attachment, ChatMessage } from '../../types/api';
 import type { QueuedChatInput } from '../../hooks/useTauriChat';
 import { useContextPaneStore } from '../../stores/contextPaneStore';
 import { useWorkspaceViewStore } from '../../stores/workspaceViewStore';
 import { useUiStore } from '../../stores/uiStore';
 import { useToolExecutionStore } from '../../stores/toolExecutionStore';
-import { dispatchGuiSlashCommand } from '../../lib/slashCommands';
+import { dispatchGuiSlashCommand, parseGuiSlashCommand } from '../../lib/slashCommands';
 import { AgentPane } from './AgentPane';
 import { workspaceLocationLabel } from '../../lib/workspacePresentation';
+import { CHAT_GUTTER } from '../../lib/layoutMetrics';
 import type { ConfiguredModel, ModelProviderView, TaskRun } from '../../generated';
 
 // Tauri IPC is the only live transport. The WebSocket transport
@@ -58,6 +69,29 @@ function useChatTransport() {
 }
 
 const EMPTY_AGENT_INPUTS: AgentCommunicationInput[] = [];
+
+type GoalCommandSource = Omit<SideConversationSource, 'conversationId'> & {
+  conversationId: string | null;
+  requestId: string;
+  text: string;
+};
+
+function ownsCommandContext(source: GoalCommandSource | SideConversationSource) {
+  const workspace = useWorkspaceStore.getState();
+  const conversation = useConversationStore.getState();
+  return (
+    !workspace.isLoading &&
+    sameProductDataScope(source.scope, productDataScope(workspace.current)) &&
+    conversation.newConversationEpoch === source.conversationEpoch &&
+    useUiStore.getState().navigationEpoch === source.navigationEpoch
+  );
+}
+
+function ownsCommandSource(source: GoalCommandSource | SideConversationSource) {
+  return (
+    ownsCommandContext(source) && useConversationStore.getState().activeId === source.conversationId
+  );
+}
 
 export function ChatPanel() {
   const messages = useChatStore((s) => s.messages);
@@ -104,7 +138,25 @@ export function ChatPanel() {
   const [configuredModels, setConfiguredModels] = useState<ConfiguredModel[]>([]);
   const [modelProviders, setModelProviders] = useState<ModelProviderView[]>([]);
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
+  const [goalDraft, setGoalDraft] = useState<GoalCommandSource | null>(null);
+  const [sideDraft, setSideDraft] = useState<
+    (SideConversationSource & { requestId: string; text: string }) | null
+  >(null);
+  const goalControls = useRef<GoalBarControls | null>(null);
+  const navigationEpoch = useUiStore((state) => state.navigationEpoch);
   const workspaceMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (goalDraft && !ownsCommandSource(goalDraft)) setGoalDraft(null);
+    if (sideDraft && !ownsCommandSource(sideDraft)) setSideDraft(null);
+  }, [
+    goalDraft,
+    sideDraft,
+    currentWorkspace,
+    activeConversationId,
+    conversationEpoch,
+    navigationEpoch,
+  ]);
 
   // Reset failure toast dismiss when a new run starts (status changes)
   useEffect(() => {
@@ -332,6 +384,13 @@ export function ChatPanel() {
     )
       return false;
 
+    const parsed = parseGuiSlashCommand(text);
+    if (
+      attachments?.length &&
+      (parsed?.command.target === 'side' || parsed?.command.target === 'goal')
+    )
+      throw new Error('目标与支线命令暂不支持附件，请移除附件后重试');
+
     if (!attachments?.length) {
       if (
         submission &&
@@ -352,6 +411,91 @@ export function ChatPanel() {
       try {
         const command = dispatchGuiSlashCommand(text, {
           clear: clearCurrentChat,
+          goal: async (argument) => {
+            if (useWorkspaceStore.getState().isLoading || conversation.isLoading)
+              throw new Error('请等待当前会话加载完成');
+            const source: GoalCommandSource = {
+              scope: workspace,
+              conversationId: sourceConversationId,
+              conversationEpoch: sourceEpoch,
+              navigationEpoch: useUiStore.getState().navigationEpoch,
+              requestId: submission?.externalId ?? crypto.randomUUID(),
+              text: argument,
+            };
+            // 缓存缺失不等于没有目标；确认原后端记录后才能选择编辑或创建。
+            const recorded = await recordedCommandGoal(source);
+            const state = useTaskRuntimeStore.getState();
+            const current = state.activeRun;
+            if (recorded && !['completed', 'cancelled', 'failed'].includes(recorded.status)) {
+              if (
+                !current ||
+                !state.taskScope ||
+                !sameProductDataScope(workspace, state.taskScope) ||
+                current.run_id !== recorded.run_id ||
+                current.goal_revision !== recorded.goal_revision ||
+                current.goal_sha256 !== recorded.goal_sha256 ||
+                goalControls.current?.runId !== recorded.run_id
+              ) {
+                await state.loadByConversation(workspace.workspaceId, recorded.conversation_id);
+                throw new Error(
+                  useTaskRuntimeStore.getState().error ??
+                    '当前目标已重新加载，请再次提交命令；草稿已保留'
+                );
+              }
+              await goalControls.current.edit(argument);
+            } else if (argument) {
+              await requireCommandModel(source);
+              const latest = await recordedCommandGoal(source);
+              if (latest && !['completed', 'cancelled', 'failed'].includes(latest.status))
+                throw new Error('当前会话已有活动目标，请重新提交命令修改；草稿已保留');
+              const accepted = await sendMessage(
+                argument,
+                undefined,
+                submission?.payload.domainPlugin,
+                submission
+                  ? { ...submission, payload: { ...submission.payload, text: argument } }
+                  : undefined
+              );
+              if (!accepted) throw new Error('目标尚未被接受，草稿已保留，请核对错误后重试');
+            } else {
+              setGoalDraft(source);
+            }
+          },
+          side: async (argument) => {
+            if (
+              useWorkspaceStore.getState().isLoading ||
+              conversation.isLoading ||
+              !sourceConversationId
+            )
+              throw new Error('请先打开或保存一个主对话，再创建支线');
+            if (
+              conversation.sideConversations.some(
+                (entry) => entry.conversation_id === sourceConversationId
+              )
+            )
+              throw new Error('支线对话不能再创建嵌套支线，请返回主对话');
+            const source = {
+              scope: workspace,
+              conversationId: sourceConversationId,
+              conversationEpoch: sourceEpoch,
+              navigationEpoch: useUiStore.getState().navigationEpoch,
+              requestId: submission?.externalId ?? crypto.randomUUID(),
+              text: argument,
+            };
+            if (argument) {
+              await requireCommandModel(source);
+              await useConversationStore.getState().createSideConversation({
+                requestId: source.requestId,
+                prompt: argument,
+                source,
+                canProject: () => ownsCommandContext(source),
+                // 创建回执先确认旧草稿，再由原 store 打开子会话；迟到回执不能清新页面草稿。
+                onCreated: (canProject) => submission?.onDirectAccepted?.(canProject),
+              });
+            } else {
+              setSideDraft(source);
+            }
+          },
           tasks: openTasks,
           analysis: () => openPrimaryWorkbench('analysis'),
           research: () => openPrimaryWorkbench('research'),
@@ -505,7 +649,7 @@ export function ChatPanel() {
         }
         footer={
           <div className={messages.length === 0 ? 'pt-2' : 'pt-3'}>
-            <div className="w-full px-3 sm:px-4">
+            <div className={`w-full ${CHAT_GUTTER}`}>
               <HitlDialog
                 requests={pendingHitlRequests}
                 conversationLabel={pendingConversationLabel}
@@ -553,6 +697,7 @@ export function ChatPanel() {
                   run={activeTaskRun}
                   scope={taskScope}
                   conversationEpoch={conversationEpoch}
+                  controlsRef={goalControls}
                 />
               )}
             <ChatInput
@@ -566,14 +711,17 @@ export function ChatPanel() {
         }
       >
         {agentInputReadError && (
-          <div role="status" className="w-full px-3 pt-2 sm:px-4 text-xs text-[var(--color-error)]">
+          <div
+            role="status"
+            className={`w-full pt-2 text-xs text-[var(--color-error)] ${CHAT_GUTTER}`}
+          >
             跨会话消息读取失败，已有记录保留：{agentInputReadError}
           </div>
         )}
         {timelineMessages.length === 0 ? (
           <WelcomeScreen />
         ) : (
-          <div className="w-full px-3 sm:px-4">
+          <div className={`w-full ${CHAT_GUTTER}`}>
             <div className="space-y-1 pb-3 pt-2">
               <ConversationTimeline
                 messages={timelineMessages}
@@ -633,7 +781,191 @@ export function ChatPanel() {
         )}
       </AgentPane>
       {forkSource && <ReplyForkDialog source={forkSource} onClose={() => setForkSource(null)} />}
+      {goalDraft && (
+        <GoalCreationDialog
+          key={goalDraft.requestId}
+          source={goalDraft}
+          onClose={() =>
+            setGoalDraft((current) => (current?.requestId === goalDraft.requestId ? null : current))
+          }
+          onBind={(bound) =>
+            setGoalDraft((current) => (current?.requestId === bound.requestId ? bound : current))
+          }
+          onSend={sendMessage}
+        />
+      )}
+      {sideDraft && (
+        <SideConversationDialog
+          key={sideDraft.requestId}
+          isOpen
+          source={sideDraft}
+          initialPrompt={sideDraft.text}
+          onClose={() =>
+            setSideDraft((current) => (current?.requestId === sideDraft.requestId ? null : current))
+          }
+        />
+      )}
     </>
+  );
+}
+
+async function recordedCommandGoal(source: GoalCommandSource) {
+  const recorded = source.conversationId
+    ? await taskRuntimeApi.latestRunForConversation(
+        source.scope.workspaceId,
+        source.conversationId,
+        source.scope.workspaceGeneration
+      )
+    : null;
+  if (!ownsCommandSource(source) || useConversationStore.getState().isLoading)
+    throw new Error('目标所属会话或工作空间已变化');
+  if (
+    recorded &&
+    (recorded.workspace_id !== source.scope.workspaceId ||
+      recorded.conversation_id !== source.conversationId)
+  )
+    throw new Error('目标记录不属于当前会话，请刷新后重试');
+  return recorded;
+}
+
+async function requireCommandModel(source: GoalCommandSource | SideConversationSource) {
+  const response = await configuredModelPresentation();
+  if (!ownsCommandSource(source) || useConversationStore.getState().isLoading)
+    throw new Error('命令所属会话或工作空间已变化，请重新提交');
+  if (!response.models.some((model) => model.enabled))
+    throw new Error('请先配置可用模型，再创建目标或支线对话');
+}
+
+function GoalCreationDialog({
+  source,
+  onClose,
+  onSend,
+  onBind,
+}: {
+  source: GoalCommandSource;
+  onClose: () => void;
+  onSend: ReturnType<typeof useTauriChat>['sendMessage'];
+  onBind: (source: GoalCommandSource) => void;
+}) {
+  const [text, setText] = useState(source.text);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const mounted = useRef(false);
+  const pending = useRef(false);
+  const submitted = useRef<{ text: string; externalId: string } | null>(null);
+  const boundSource = useRef(source);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  const create = async () => {
+    const goal = text.trim();
+    if (!goal || pending.current) return;
+    const currentSource = boundSource.current;
+    if (!ownsCommandSource(currentSource) || useConversationStore.getState().isLoading) {
+      setError('目标所属会话或工作空间已变化，请保留草稿并重新打开');
+      return;
+    }
+    pending.current = true;
+    setBusy(true);
+    setError(null);
+    try {
+      await requireCommandModel(currentSource);
+      if (!mounted.current) return;
+      const recorded = await recordedCommandGoal(currentSource);
+      if (!mounted.current) return;
+      if (recorded && !['completed', 'cancelled', 'failed'].includes(recorded.status))
+        throw new Error('当前会话已有活动目标，请使用 /goal 修改；创建草稿已保留');
+      if (submitted.current?.text !== goal)
+        submitted.current = { text: goal, externalId: crypto.randomUUID() };
+      const intent = submitted.current;
+      let accepted = false;
+      const confirm = (canProject: () => boolean) => {
+        accepted = true;
+        if (mounted.current && canProject() && ownsCommandSource(boundSource.current)) onClose();
+      };
+      // 与普通输入共用原提交身份和准入路径；不另建后台 Task 或推测 Goal 已创建。
+      const sent = await onSend(goal, undefined, undefined, {
+        ...currentSource.scope,
+        conversationId: currentSource.conversationId,
+        newConversationEpoch: currentSource.conversationEpoch,
+        externalId: intent.externalId,
+        payload: { text: goal },
+        onDirectAccepted: confirm,
+        onPersisted: (_receipt, canProject) => confirm(canProject),
+        onConversationCreated: (address) => {
+          if (
+            !mounted.current ||
+            currentSource.conversationId !== null ||
+            address.workspace_id !== currentSource.scope.workspaceId ||
+            !ownsCommandSource(currentSource)
+          )
+            return;
+          const bound = { ...currentSource, conversationId: address.conversation_id };
+          boundSource.current = bound;
+          onBind(bound);
+        },
+      });
+      if (mounted.current && !accepted) {
+        setError(
+          sent
+            ? '输入已提交，目标状态等待后端确认；请从当前会话运行核对，勿重复创建。'
+            : '目标尚未被接受，草稿已保留，请核对错误后重试'
+        );
+      }
+    } catch (cause) {
+      if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      pending.current = false;
+      if (mounted.current) setBusy(false);
+    }
+  };
+  return (
+    <Modal
+      ariaLabel="创建目标"
+      initialFocusRef={inputRef}
+      onClose={() => {
+        if (!pending.current) onClose();
+      }}
+      className="w-[min(560px,calc(100vw-2rem))] rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] p-4 shadow-[var(--shadow-xl)]"
+    >
+      <h2 className="text-sm font-semibold text-[var(--text-primary)]">创建并开始目标</h2>
+      <p className="mt-2 text-xs text-[var(--text-secondary)]">
+        确认后在当前会话开始处理；目标状态以任务运行记录为准。
+      </p>
+      <label className="mt-3 block text-xs text-[var(--text-secondary)]">
+        目标内容
+        <textarea
+          ref={inputRef}
+          value={text}
+          onChange={(event) => setText(event.target.value)}
+          disabled={busy}
+          rows={5}
+          className="mt-1 w-full rounded border border-[var(--border-primary)] bg-[var(--bg-secondary)] p-2 text-sm text-[var(--text-primary)]"
+        />
+      </label>
+      {error && (
+        <p role="alert" className="mt-2 text-xs text-[var(--color-error)]">
+          {error}
+        </p>
+      )}
+      <div className="mt-3 flex justify-end gap-3 text-xs">
+        <button type="button" onClick={onClose} disabled={busy}>
+          取消
+        </button>
+        <button
+          type="button"
+          onClick={() => void create()}
+          disabled={busy || !text.trim()}
+          className="text-[var(--accent)]"
+        >
+          {busy ? '正在提交…' : '创建并开始'}
+        </button>
+      </div>
+    </Modal>
   );
 }
 
@@ -670,14 +1002,18 @@ export function completedReplyForks(messages: readonly ChatMessage[]): Map<strin
 const GOAL_WAIT_MILLISECONDS = 30_000;
 const GOAL_POLL_MILLISECONDS = 250;
 
+type GoalBarControls = { runId: string; edit: (text: string) => Promise<void> };
+
 function GoalBar({
   run,
   scope,
   conversationEpoch,
+  controlsRef,
 }: {
   run: TaskRun;
   scope: ProductDataScope;
   conversationEpoch: number;
+  controlsRef?: RefObject<GoalBarControls | null>;
 }) {
   const [editing, setEditing] = useState(false);
   const [goal, setGoal] = useState(run.goal);
@@ -690,6 +1026,10 @@ function GoalBar({
   } | null>(null);
   const mounted = useRef(false);
   const operation = useRef<symbol | null>(null);
+  const editInput = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (editing) editInput.current?.focus();
+  }, [editing]);
   useEffect(() => {
     mounted.current = true;
     return () => {
@@ -738,29 +1078,33 @@ function GoalBar({
     await useTaskRuntimeStore.getState().refresh(run.workspace_id, run.run_id);
     return readCurrent();
   };
-  const save = async () => {
-    const text = goal.trim();
-    if (!text || operation.current || !ownsView()) return;
+  const save = async (
+    draft = goal,
+    revision = editRevision,
+    changeReason = reason
+  ): Promise<boolean> => {
+    const text = draft.trim();
+    if (!text || operation.current || !ownsView()) return false;
     const token = Symbol('goal-save');
     operation.current = token;
     setNotice(null);
     const deadline = performance.now() + GOAL_WAIT_MILLISECONDS;
     try {
       let current = readCurrent(false);
-      if (current.goal_revision !== editRevision)
+      if (current.goal_revision !== revision)
         throw new Error('目标版本已变化，请保留草稿并重新核对后编辑');
       if (current.status !== 'paused') {
         setProgress('正在请求暂停任务…');
         const receipt = await useTaskRuntimeStore.getState().pause(target);
-        if (!ownsView()) return;
+        if (!ownsView()) return false;
         if (!receipt?.success || receipt.run_id !== run.run_id)
           throw new Error(useTaskRuntimeStore.getState().error ?? '暂停任务未被后端接受');
       }
       for (;;) {
-        if (!ownsView()) return;
+        if (!ownsView()) return false;
         setProgress('正在等待任务安全点…');
         current = await refreshCurrent();
-        if (current.goal_revision !== editRevision)
+        if (current.goal_revision !== revision)
           throw new Error('目标版本已变化，请保留草稿并重新核对后编辑');
         if (['completed', 'cancelled', 'failed'].includes(current.status))
           throw new Error('运行状态已变化，目标尚未更新');
@@ -777,9 +1121,9 @@ function GoalBar({
           try {
             accepted = await useTaskRuntimeStore
               .getState()
-              .updateGoal(target, editRevision, text, reason.trim() || '用户更新目标');
+              .updateGoal(target, revision, text, changeReason.trim() || '用户更新目标');
           } catch (error) {
-            if (!ownsView()) return;
+            if (!ownsView()) return false;
             // These exact rejections occur before any Goal write in the original CAS.
             // Do not retry conflicts, I/O failures, or an unconfirmed committed update.
             const message = error instanceof Error ? error.message : String(error);
@@ -793,18 +1137,18 @@ function GoalBar({
             if (!busyReasons.some((item) => message === prefix + item)) throw error;
             waitingForOwner = true;
           }
-          if (!ownsView()) return;
+          if (!ownsView()) return false;
           if (accepted) {
             setProgress('正在确认目标记录…');
             const updated = await refreshCurrent();
-            if (updated.goal_revision !== editRevision + 1 || updated.goal !== text)
+            if (updated.goal_revision !== revision + 1 || updated.goal !== text)
               throw new Error('目标提交后的记录尚未确认，请刷新核对；草稿已保留');
             setEditing(false);
             setNotice({
               text: '目标已更新；旧任务计划与证据已失效，需要重新校验。',
               failed: false,
             });
-            return;
+            return true;
           }
           if (!waitingForOwner)
             throw new Error(
@@ -821,6 +1165,7 @@ function GoalBar({
           text: error instanceof Error ? error.message : String(error),
           failed: true,
         });
+      return false;
     } finally {
       if (mounted.current && operation.current === token) {
         operation.current = null;
@@ -828,6 +1173,19 @@ function GoalBar({
       }
     }
   };
+  useImperativeHandle(controlsRef, () => ({
+    runId: run.run_id,
+    async edit(text) {
+      if (!ownsView() || operation.current) throw new Error('当前目标正在处理或已切换，请稍后重试');
+      setGoal(text || run.goal);
+      setEditRevision(run.goal_revision);
+      setReason('用户更新目标');
+      setNotice(null);
+      setEditing(true);
+      if (text && !(await save(text, run.goal_revision, '用户更新目标')))
+        throw new Error('目标尚未更新，请查看目标栏；草稿已保留');
+    },
+  }));
   const endGoal = async () => {
     if (operation.current || !ownsView()) return;
     const token = Symbol('goal-end');
@@ -862,7 +1220,7 @@ function GoalBar({
   };
   return (
     <section
-      className="mb-2 w-full px-3 text-xs sm:px-4"
+      className={`mb-2 w-full text-xs ${CHAT_GUTTER}`}
       aria-label="当前目标"
       aria-busy={!!progress}
     >
@@ -871,6 +1229,7 @@ function GoalBar({
         {editing ? (
           <>
             <input
+              ref={editInput}
               value={goal}
               onChange={(event) => setGoal(event.target.value)}
               disabled={!!progress}
@@ -1126,7 +1485,7 @@ function QueuedInputList({
     }
   };
   return (
-    <section className="mb-2 w-full px-3 sm:px-4" aria-label="Steer 队列">
+    <section className={`mb-2 w-full ${CHAT_GUTTER}`} aria-label="Steer 队列">
       <div className="mb-1 flex items-center justify-between px-1 text-[11px] text-[var(--text-tertiary)]">
         <span>Steer · {items.length} 条</span>
         <span>拖动或用上下移按钮调整顺序</span>

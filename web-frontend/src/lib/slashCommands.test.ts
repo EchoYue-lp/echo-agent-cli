@@ -9,6 +9,8 @@ import {
 function handlers() {
   return {
     clear: vi.fn(),
+    goal: vi.fn(),
+    side: vi.fn(),
     tasks: vi.fn(),
     analysis: vi.fn(),
     research: vi.fn(),
@@ -38,5 +40,17 @@ describe('GUI slash command registry', () => {
     const commandHandlers = handlers();
     await expect(dispatchGuiSlashCommand('/papers', commandHandlers)).resolves.toBe(true);
     expect(commandHandlers.research).toHaveBeenCalledOnce();
+  });
+
+  it('opens Goal and Side locally and preserves argument case and multiline text', async () => {
+    const commandHandlers = handlers();
+    await expect(dispatchGuiSlashCommand('/goal', commandHandlers)).resolves.toBe(true);
+    expect(commandHandlers.goal).toHaveBeenCalledWith('');
+    await expect(dispatchGuiSlashCommand('/SIDE 中文 Goal\n第二行', commandHandlers)).resolves.toBe(
+      true
+    );
+    expect(commandHandlers.side).toHaveBeenCalledWith('中文 Goal\n第二行');
+    await expect(dispatchGuiSlashCommand('/goalfoo text', commandHandlers)).resolves.toBe(false);
+    await expect(dispatchGuiSlashCommand('/tasks text', commandHandlers)).resolves.toBe(false);
   });
 });

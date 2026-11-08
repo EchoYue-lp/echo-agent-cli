@@ -127,9 +127,13 @@ describe('ContextPane', () => {
     render(<ContextPane />);
     act(() => useContextPaneStore.getState().openTasks());
 
+    // 1280 - 左栏 288 - 主栏最小 520 = 右栏实际 472，再向右缩小 24。
+    expect(screen.getByRole('complementary', { name: '任务运行上下文面板' }).style.width).toBe(
+      '472px'
+    );
     const resizeButton = screen.getByRole('button', { name: '调整上下文面板宽度' });
     fireEvent.keyDown(resizeButton, { key: 'ArrowRight' });
-    expect(useContextPaneStore.getState().width).toBe(472);
+    expect(useContextPaneStore.getState().width).toBe(448);
   });
   it('closes a task target when its existing workspace id gets a different product-data generation', () => {
     const workspace = {

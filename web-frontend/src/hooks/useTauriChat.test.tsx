@@ -1049,6 +1049,50 @@ describe('useTauriChat foreground turn recovery', () => {
     expect(useChatStore.getState().messages).toEqual(messages);
   });
 
+  it('reports only its exact created address before list refresh without treating it as message acceptance', async () => {
+    useConversationStore.setState({ activeId: null, workspaceId: 'global' });
+    const list = deferred<never[]>();
+    const admission = deferred<{ kind: string }>();
+    const bound: unknown[] = [];
+    const accepted = vi.fn();
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn') return null;
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'create_conversation') return { kind: 'primary', id: 'own-created' };
+      if (command === 'list_conversations') return list.promise;
+      if (command === 'list_queued_chat_inputs') return { queue_revision: 0, items: [] };
+      if (command === 'send_chat_message') return admission.promise;
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => expect(mocks.listeners.has('chat://event')).toBe(true));
+    let sending: Promise<boolean> | undefined;
+    act(() => {
+      sending = hook.result.current.sendMessage('new Goal', undefined, undefined, {
+        ...draftSubmission('new Goal'),
+        onDirectAccepted: accepted,
+        onConversationCreated: (address) =>
+          bound.push({ address, activeId: useConversationStore.getState().activeId }),
+      });
+    });
+    await waitFor(() => expect(bound).toHaveLength(1));
+    expect(bound).toEqual([
+      { address: { workspace_id: 'global', conversation_id: 'own-created' }, activeId: null },
+    ]);
+    expect(accepted).not.toHaveBeenCalled();
+    await act(async () => {
+      list.resolve([]);
+    });
+    await waitFor(() =>
+      expect(mocks.apiInvoke.mock.calls.some(([name]) => name === 'send_chat_message')).toBe(true)
+    );
+    await act(async () => {
+      admission.reject(new Error('admission failed'));
+      expect(await sending).toBe(false);
+    });
+    expect(accepted).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['create', 'Stop'],
     ['create', 'unmount'],

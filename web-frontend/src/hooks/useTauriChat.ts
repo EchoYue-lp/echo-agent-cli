@@ -7,7 +7,7 @@ import { useToastStore } from '../stores/toastStore';
 import { useToolExecutionStore } from '../stores/toolExecutionStore';
 import { useWorkspaceStore } from '../stores/workspaceStore';
 import { isTauri, apiInvoke, errorMessage } from '../lib/tauri-bridge';
-import { workspaceIdForView } from '../lib/viewAddress';
+import { workspaceIdForView, type ViewAddress } from '../lib/viewAddress';
 import { productDataScope, sameProductDataScope } from '../lib/productDataScope';
 import { handleChatEventEnvelope } from './chatEventHandler';
 import { ChatEventSequencer } from './chatEventSequencer';
@@ -64,6 +64,8 @@ export type ChatSendSubmission = {
   ) => void | Promise<void>;
   /** Ordinary admission proof, deliberately distinct from a durable input receipt. */
   readonly onDirectAccepted?: (canProject: () => boolean) => void | Promise<void>;
+  /** 原会话创建回执，仅绑定初次创建的 UI 地址；不代表消息或 Goal 已接纳。 */
+  readonly onConversationCreated?: (address: ViewAddress) => void;
 };
 
 type SendChatResult = {
@@ -692,7 +694,8 @@ export function useTauriChat() {
       attachments?: Attachment[],
       queued?: QueuedDispatch,
       domainPlugin?: string,
-      onDirectAccepted?: ChatSendSubmission['onDirectAccepted']
+      onDirectAccepted?: ChatSendSubmission['onDirectAccepted'],
+      onConversationCreated?: ChatSendSubmission['onConversationCreated']
     ) => {
       const store = useChatStore.getState();
       const displayAttachments = attachments?.map((a) => ({
@@ -790,6 +793,7 @@ export function useTauriChat() {
                 isOriginalView()
               ) {
                 admission.conversationId = address.conversation_id;
+                onConversationCreated?.(address);
               }
             }
           );
@@ -1206,7 +1210,8 @@ export function useTauriChat() {
         attachments,
         undefined,
         domainPlugin,
-        submission?.onDirectAccepted
+        submission?.onDirectAccepted,
+        submission?.onConversationCreated
       );
     },
     [captureInputProjection, dispatchMessage, refreshFrontier, steerConversationInput]

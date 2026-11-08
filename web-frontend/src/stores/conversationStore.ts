@@ -7,6 +7,7 @@ import {
   toolExecutionApi,
   type ConversationForkRequest,
   type ConversationForkReceipt,
+  type ProductDataScope,
 } from '../api/endpoints';
 import { useWorkspaceStore } from './workspaceStore';
 import { productDataScope, sameProductDataScope } from '../lib/productDataScope';
@@ -44,6 +45,14 @@ export interface ConversationMeta {
   workspaceId?: string;
   /** Archived in EKO's workspace-scoped conversation projection. */
   archived?: boolean;
+}
+
+/** 创建弹窗的来源快照只约束前端准入和导航；后端仍拥有支线关系与首轮生命周期。 */
+export interface SideConversationSource {
+  scope: ProductDataScope;
+  conversationId: string;
+  conversationEpoch: number;
+  navigationEpoch: number;
 }
 
 function conversationMeta(item: ConversationListItem, workspaceId: string): ConversationMeta {
@@ -99,6 +108,9 @@ interface ConversationState {
     prompt: string;
     title?: string;
     modelId?: string;
+    source?: SideConversationSource;
+    canProject?: () => boolean;
+    onCreated?: (canProject: () => boolean) => void | Promise<void>;
   }) => Promise<SideConversationEntry>;
   /** Update one child-local model; null means inherit the primary model. */
   updateSideConversationModel: (conversationId: string, modelId: string | null) => Promise<void>;
@@ -900,10 +912,35 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     }
   },
 
-  createSideConversation: async ({ requestId, prompt, title, modelId }) => {
+  createSideConversation: async ({
+    requestId,
+    prompt,
+    title,
+    modelId,
+    source,
+    onCreated,
+    canProject = () => true,
+  }) => {
     const parentConversationId = get().activeId;
     const workspaceId = get().workspaceId;
+    const scope = source?.scope ?? productDataScope(useWorkspaceStore.getState().current);
+    const epoch = source?.conversationEpoch ?? get().newConversationEpoch;
+    const sourceLoadGeneration = loadGeneration;
+    const ownsSource = () =>
+      get().workspaceId === workspaceId &&
+      get().activeId === parentConversationId &&
+      get().newConversationEpoch === epoch &&
+      !useWorkspaceStore.getState().isLoading &&
+      sameProductDataScope(scope, productDataScope(useWorkspaceStore.getState().current)) &&
+      canProject();
     if (!parentConversationId) throw new Error('A persisted primary conversation is required');
+    if (
+      get().isLoading ||
+      !ownsSource() ||
+      (source &&
+        (source.conversationId !== parentConversationId || scope.workspaceId !== workspaceId))
+    )
+      throw new Error('支线所属的主对话或工作空间已变化，请重新打开');
     if (get().sideConversations.some((entry) => entry.conversation_id === parentConversationId)) {
       throw new Error('Side Conversations cannot create nested Side Conversations');
     }
@@ -915,10 +952,34 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       title: title?.trim() || null,
       model_id: modelId?.trim() || null,
     });
+    // 创建事实仍返回调用者；迟到回执不能初始化另一 Workspace 或抢占新选择。
+    if (!ownsSource() || loadGeneration !== sourceLoadGeneration) return receipt.creation.entry;
+    try {
+      void Promise.resolve(onCreated?.(ownsSource)).catch((error) =>
+        console.warn('[conversationStore] 支线创建后的草稿同步失败:', error)
+      );
+    } catch (error) {
+      console.warn('[conversationStore] 支线创建后的草稿同步失败:', error);
+    }
     await get().init(workspaceId);
-    await get().loadConversation(receipt.creation.entry.conversation_id);
+    if (!ownsSource() || loadGeneration !== sourceLoadGeneration) return receipt.creation.entry;
+    const childId = receipt.creation.entry.conversation_id;
+    const selectionGeneration = loadGeneration + 1;
+    const opened = await get().loadConversation(
+      childId,
+      () => ownsSource() && loadGeneration === selectionGeneration
+    );
+    if (
+      !opened ||
+      get().activeId !== childId ||
+      get().newConversationEpoch !== epoch ||
+      get().workspaceId !== workspaceId ||
+      !sameProductDataScope(scope, productDataScope(useWorkspaceStore.getState().current)) ||
+      !canProject()
+    )
+      return receipt.creation.entry;
     projectSideInitialPrompt(
-      receipt.creation.entry.conversation_id,
+      childId,
       receipt.first_turn?.message_key ?? `side-start:${receipt.creation.entry.group_id}`,
       receipt.initial_prompt
     );

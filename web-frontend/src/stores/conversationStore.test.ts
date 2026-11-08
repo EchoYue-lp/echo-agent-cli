@@ -891,13 +891,23 @@ describe('conversation message identity', () => {
       sideConversations: [],
     });
 
+    let acknowledgement: unknown;
+    const onCreated = vi.fn((canProject: () => boolean) => {
+      acknowledgement = {
+        canProject: canProject(),
+        activeId: useConversationStore.getState().activeId,
+      };
+    });
     const created = await useConversationStore.getState().createSideConversation({
       requestId: 'request-1',
       prompt: 'Explore the test strategy',
       title: 'Explore tests',
       modelId: 'provider:model',
+      onCreated,
     });
 
+    expect(onCreated).toHaveBeenCalledOnce();
+    expect(acknowledgement).toEqual({ canProject: true, activeId: 'conversation-1' });
     expect(mocks.createSideConversation).toHaveBeenCalledWith(
       expect.objectContaining({
         workspace_id: 'workspace-1',
@@ -1030,6 +1040,36 @@ describe('conversation message identity', () => {
         .createSideConversation({ requestId: 'nested-request', prompt: 'nested' })
     ).rejects.toThrow('cannot create nested');
     expect(mocks.createSideConversation).not.toHaveBeenCalled();
+  });
+
+  it('keeps a late Side creation receipt from opening over a different selected conversation', async () => {
+    const onCreated = vi.fn();
+    const response = deferred<{
+      creation: { duplicate: boolean; entry: ReturnType<typeof sideEntry> };
+      first_turn: null;
+      initial_prompt: string;
+      launch_error: null;
+    }>();
+    mocks.createSideConversation.mockReturnValueOnce(response.promise);
+    useConversationStore.setState({ workspaceId: 'workspace-1', activeId: 'conversation-1' });
+    const creating = useConversationStore.getState().createSideConversation({
+      requestId: 'request-late-side',
+      prompt: '保留原支线意图',
+      onCreated,
+    });
+    useConversationStore.setState({ activeId: 'another-conversation' });
+    useChatStore.getState().addUserMessage('新页面内容');
+    response.resolve({
+      creation: { duplicate: false, entry: sideEntry() },
+      first_turn: null,
+      initial_prompt: '保留原支线意图',
+      launch_error: null,
+    });
+    await expect(creating).resolves.toMatchObject({ conversation_id: 'side-1' });
+    expect(useConversationStore.getState().activeId).toBe('another-conversation');
+    expect(useChatStore.getState().messages.at(-1)?.content).toBe('新页面内容');
+    expect(mocks.getConversation).not.toHaveBeenCalled();
+    expect(onCreated).not.toHaveBeenCalled();
   });
 
   it('reloads the active Side Conversation after changing its model', async () => {

@@ -2,6 +2,7 @@ import { useEffect, type ReactNode } from 'react';
 import { PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import { useUiStore } from '../../stores/uiStore';
 import { TerminalDrawer } from '../terminal/TerminalDrawer';
+import { LEFT_SIDEBAR_WIDTH } from '../../lib/layoutMetrics';
 
 export function AppLayout({
   left,
@@ -39,9 +40,11 @@ export function AppLayout({
         className={`shrink-0 overflow-hidden transition-all duration-200 ease-in-out
           max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-50
           ${leftSidebarOpen ? 'border-r border-[var(--border-primary)] bg-[var(--bg-sidebar)]' : ''}`}
-        style={{ width: leftSidebarOpen ? '264px' : '0px' }}
+        style={{ width: leftSidebarOpen ? LEFT_SIDEBAR_WIDTH : 0 }}
       >
-        <div className="h-full w-[264px]">{left}</div>
+        <div className="h-full" style={{ width: LEFT_SIDEBAR_WIDTH }}>
+          {left}
+        </div>
       </div>
 
       {/* Center + Terminal drawer */}
