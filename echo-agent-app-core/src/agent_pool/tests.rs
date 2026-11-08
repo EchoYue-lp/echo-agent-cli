@@ -3675,6 +3675,16 @@ mod tests {
         .map_err(|error| error.to_string())?;
         assert_eq!(outcome, crate::chat_driver::TurnOutcome::Completed);
         assert_eq!(client.call_count(), 3);
+        let run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&turn_id);
+        let snapshot = store
+            .get_run_state(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("domain RunCreated missing")?;
+        let binding = snapshot
+            .domain_binding
+            .as_ref()
+            .ok_or("domain binding missing")?;
+        binding.validate()?;
         let requests = client.all_calls();
         assert_eq!(
             requests
@@ -3694,13 +3704,19 @@ mod tests {
             requests
                 .iter()
                 .filter(|messages| {
-                    messages
-                        .last()
-                        .and_then(|message| message.content.as_text())
-                        .is_some_and(|text| {
-                            text.starts_with(&prepared.instruction)
-                                && text.contains("[bound_domain]")
+                    // 原指令和独立领域投影必须落在同一次真实请求内。
+                    messages.iter().any(|message| {
+                        message
+                            .content
+                            .as_text()
+                            .is_some_and(|text| text.starts_with(&prepared.instruction))
+                    }) && messages.iter().any(|message| {
+                        message.content.as_text().is_some_and(|text| {
+                            text.contains(
+                                crate::tasks::task_runtime::compact_context::DOMAIN_METHOD_MARKER,
+                            ) && text.contains(&binding.snapshot.method)
                         })
+                    })
                 })
                 .count(),
             1,
@@ -3712,11 +3728,6 @@ mod tests {
             "GUI prepare must not issue another counted token"
         );
         assert_eq!(pool.process_agent_execution.snapshot().active, 1);
-        let run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&turn_id);
-        let snapshot = store
-            .get_run_state(&run_id)
-            .map_err(|error| error.to_string())?
-            .ok_or("domain RunCreated missing")?;
         assert!(snapshot.domain_binding.is_some());
         assert_eq!(
             snapshot.run.status,
