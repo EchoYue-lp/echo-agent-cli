@@ -63,3 +63,14 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("__ts_rs")
 echo-agent = { version = "0.2", package = "echo_agent", path = "../../echo-agent", default-features = false, features = ["testing"] }
 # Activate only for consumer tests; use the existing echo-agent channel reexport.
 echo_integration = { version = "0.2", path = "../../echo-agent/echo-integration", default-features = false, features = ["channel-test-support"] }
+
+# 两个原耐久历史压力用例各占一个 target；完整 workspace 测试仍必须执行。
+[[test]]
+name = "native_presentation_retention"
+path = "tests/native_presentation_retention.rs"
+required-features = ["test-utils"]
+
+[[test]]
+name = "native_usage_retention"
+path = "tests/native_usage_retention.rs"
+required-features = ["test-utils"]

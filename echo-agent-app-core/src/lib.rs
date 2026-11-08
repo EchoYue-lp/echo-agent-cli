@@ -91,3 +91,18 @@ pub mod api;
 #[cfg(feature = "channels")]
 pub(crate) mod channel_runtime;
 pub(crate) mod text_commands;
+
+/// 仅供独立集成测试复用原历史用例；不暴露应用内部类型或稳定产品 API。
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub mod test_utils {
+    /// root 由测试 wrapper 创建并保有至原用例完成。
+    pub fn native_presentation_retention(root: &std::path::Path) -> Result<(), String> {
+        crate::chat_event_log::run_native_presentation_retention_case(root)
+    }
+
+    /// root 由测试 wrapper 创建并保有至原用例完成。
+    pub fn native_usage_retention(root: &std::path::Path) -> Result<(), String> {
+        crate::chat_event_log::run_native_usage_retention_case(root)
+    }
+}

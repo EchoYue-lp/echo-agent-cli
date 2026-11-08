@@ -215,15 +215,21 @@ fn original_usage_recovers_anchor_before_coverage_crash_cut() -> Result<(), Stri
     Ok(())
 }
 
+#[cfg(not(feature = "test-utils"))]
 #[test]
 fn original_usage_survives_more_than_4096_events_prune_and_cold_reopen() -> Result<(), String> {
     let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+    native_usage_retention_case(temp.path())
+}
+
+// 两种测试入口复用唯一原正文；root 由各 wrapper 的独立 TempDir 保有。
+pub(crate) fn native_usage_retention_case(root: &std::path::Path) -> Result<(), String> {
     let retention = ChatEventRetention {
         segment_rollover_bytes: 1,
         max_segments: 2,
         max_replay_events: 4,
     };
-    let log = ChatEventLog::open(temp.path(), retention).map_err(|error| error.to_string())?;
+    let log = ChatEventLog::open(root, retention).map_err(|error| error.to_string())?;
     configuration(&log)?;
     append(
         &log,
@@ -255,7 +261,7 @@ fn original_usage_survives_more_than_4096_events_prune_and_cold_reopen() -> Resu
     assert!(tail.retained_earliest_cursor.is_some_and(|floor| floor > 2));
     assert!(tail.events.len() <= 4);
     drop(log);
-    let cold = ChatEventLog::open(temp.path(), retention).map_err(|error| error.to_string())?;
+    let cold = ChatEventLog::open(root, retention).map_err(|error| error.to_string())?;
     let recovered = snapshot(&cold)?;
     assert_eq!(recovered.main.input_tokens, 1000);
     assert_eq!(recovered.main.cached_tokens, 800);
