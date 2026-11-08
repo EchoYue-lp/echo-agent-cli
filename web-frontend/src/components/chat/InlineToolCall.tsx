@@ -260,7 +260,7 @@ export const InlineToolCall = memo(function InlineToolCall({
   };
 
   return (
-    <div className="my-1 min-w-0 pl-2 font-mono text-[11px]">
+    <div className="my-0.5 min-w-0 pl-2 font-mono text-[11px]">
       <button
         type="button"
         onClick={() => setExpanded((value) => !value)}

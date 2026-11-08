@@ -245,22 +245,27 @@ export const MessageBubble = memo(function MessageBubble({
   // regeneration or Fork. Its key addresses this display row only.
   if (message.role === 'tool') {
     return (
-      <div className="animate-fade-up py-1.5">
+      <div className="animate-fade-up min-w-0 py-0.5">
         {message.internalAgent && (
           <span className="text-[10px] text-[var(--text-tertiary)]">Agent 内部工具记录</span>
         )}
-        <ToolExecutionGroup
-          toolIds={message.transcriptTools?.map((record) => record.id) ?? []}
-          transcriptTools={message.transcriptTools}
-        />
-        {message.content && (
-          <ActionButton
-            icon={<Copy size={13} />}
-            label="复制原记录"
-            onClick={() => copyToClipboard(message.content)}
-            copyMode
-          />
-        )}
+        {/* 原记录操作与摘要同排，避免每条工具记录额外占一个空白操作行。 */}
+        <div className="flex min-w-0 items-start gap-1">
+          <div className="min-w-0 flex-1">
+            <ToolExecutionGroup
+              toolIds={message.transcriptTools?.map((record) => record.id) ?? []}
+              transcriptTools={message.transcriptTools}
+            />
+          </div>
+          {message.content && (
+            <ActionButton
+              icon={<Copy size={13} />}
+              label="复制原记录"
+              onClick={() => copyToClipboard(message.content)}
+              copyMode
+            />
+          )}
+        </div>
       </div>
     );
   }
@@ -282,7 +287,7 @@ export const MessageBubble = memo(function MessageBubble({
   }
 
   return (
-    <div className={`animate-fade-up py-1.5 ${isUser ? 'ml-auto w-fit max-w-[85%]' : 'w-full'}`}>
+    <div className={`animate-fade-up py-1 ${isUser ? 'ml-auto w-fit max-w-[85%]' : 'w-full'}`}>
       {/* Content */}
       <div className="min-w-0 space-y-2">
         {/* Images */}
@@ -407,7 +412,7 @@ export const MessageBubble = memo(function MessageBubble({
             All peers in a single space-y container — no separate bordered
             sections. This is what makes it read as one continuous flow. */}
         {!isUser && (
-          <div className="w-full space-y-2">
+          <div className="w-full space-y-1">
             {showFailureReason && (
               <div
                 role="alert"
@@ -567,7 +572,7 @@ function ActionButton({
       onClick={handleClick}
       disabled={disabled}
       aria-label={label}
-      className={`flex items-center gap-1 rounded-md px-1.5 py-1 text-[11px] transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${done ? 'text-[var(--color-success)]' : 'text-[var(--text-tertiary)] hover:text-[var(--text-primary)]'}`}
+      className={`flex min-h-6 items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${done ? 'text-[var(--color-success)]' : 'text-[var(--text-tertiary)] hover:text-[var(--text-primary)]'}`}
       title={label}
     >
       {done ? <Check size={13} /> : icon}

@@ -132,11 +132,11 @@ export const ToolExecutionGroup = memo(function ToolExecutionGroup({
   });
   if (detailsOnly) return <div className="min-w-0">{details}</div>;
   return (
-    <div className="my-1 min-w-0 pl-2">
+    <div className="min-w-0 pl-2">
       <button
         type="button"
         onClick={() => setExpanded((value) => !value)}
-        className="flex min-h-7 w-full min-w-0 items-center gap-1.5 rounded-md px-1.5 py-0.5 -ml-1.5 text-left text-[12px] text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-secondary)]"
+        className="flex min-h-6 w-full min-w-0 items-center gap-1.5 rounded-md px-1.5 py-0.5 -ml-1.5 text-left text-[12px] text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-secondary)]"
         aria-expanded={expanded}
         aria-label={expanded ? '折叠工具执行过程' : '展开工具执行过程'}
       >
