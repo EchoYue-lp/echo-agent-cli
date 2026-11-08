@@ -15,6 +15,20 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_OUTPUT_BYTES: u64 = 1024 * 1024;
+const GROUP_RECEIPT_TAIL_BYTES: usize = 256;
+
+#[derive(Clone, Copy, Debug)]
+struct RemoteGroupReceipt {
+    exit_code: i32,
+    group_id: Option<u32>,
+}
+
+struct RemoteStderrCapture {
+    text: String,
+    bytes: u64,
+    truncated: bool,
+    receipt: Option<RemoteGroupReceipt>,
+}
 
 pub struct ProjectSshSandbox {
     connection: ConnectionSource,
@@ -98,14 +112,26 @@ impl ProjectSshSandbox {
         }
         // 期限监督在目标机器执行；本机预算到达/取消请求不等同于远端停止证明。
         let effective_deadline_secs = timeout_secs(&command, &limits);
-        let script = deadline_script(&command_script(&command)?, effective_deadline_secs)?;
-        let target = connection.effective_target().map_err(unavailable)?.clone();
-        let lease = connection.operation().map_err(unavailable)?;
         let timeout = limits
             .cpu_time_secs
             .map(Duration::from_secs)
             .map(|limit| limit.min(command.timeout))
             .unwrap_or(command.timeout);
+        if Instant::now().checked_add(timeout).is_none() {
+            return Err(unavailable(
+                "remote timeout exceeds the monotonic clock range",
+            ));
+        }
+        let closure_nonce = command
+            .require_physical_resource_ownership
+            .then(|| uuid::Uuid::new_v4().simple().to_string());
+        let payload = command_script(&command)?;
+        let script = match closure_nonce.as_deref() {
+            Some(nonce) => owned_group_deadline_script(&payload, timeout, nonce)?,
+            None => deadline_script(&payload, effective_deadline_secs)?,
+        };
+        let target = connection.effective_target().map_err(unavailable)?.clone();
+        let lease = connection.operation().map_err(unavailable)?;
         let output_limit = limits.max_output_bytes.unwrap_or(DEFAULT_OUTPUT_BYTES);
         let start = Instant::now();
         let physical_cancel = cancel.clone();
@@ -160,9 +186,10 @@ impl ProjectSshSandbox {
                     None => Err(std::io::Error::other("SSH stdout pipe was not prepared")),
                 }
             });
+            let require_group_receipt = closure_nonce.is_some();
             let stderr = tokio::spawn(async move {
                 match stderr {
-                    Some(stderr) => read_bounded(stderr, output_limit).await,
+                    Some(stderr) => read_stderr_bounded(stderr, output_limit, closure_nonce).await,
                     None => Err(std::io::Error::other("SSH stderr pipe was not prepared")),
                 }
             });
@@ -202,27 +229,55 @@ impl ProjectSshSandbox {
             resources
                 .test_local_exit_observed
                 .store(true, std::sync::atomic::Ordering::Release);
-            let exit_code = match status.code() {
-                Some(code) if code != 255 => code,
-                _ => {
-                    // Native OpenSSH cannot recover the lost remote exit
-                    // receipt. Local EOF, master check or reconnect is not a
-                    // stop proof for this original command. Keep this same
-                    // invocation on original-owner progress, not a fake task.
+            let group_receipt = stderr
+                .as_ref()
+                .ok()
+                .and_then(|result| result.as_ref().ok())
+                .and_then(|capture| capture.receipt);
+            let exit_code = if require_group_receipt {
+                let Some(receipt) = group_receipt else {
+                    // Root exit/EOF/non255 cannot replace a receipt from this original owned-group controller.
                     resources.mark_stop_unknown(
-                        "remote exit receipt was lost (SSH255 or no exit status)",
+                        "owned remote process-group closure receipt was missing or truncated",
                     );
                     resources.wait_for_settlement().await;
                     return Err(remote_failure(
-                        "original remote execution stop was unknown; verify its effects before retry",
+                        "original remote owned-group closure was unknown; verify its effects before retry",
+                        true,
+                    ));
+                };
+                resources.complete_with_proof();
+                if status.code() != Some(receipt.exit_code) {
+                    return Err(remote_failure(
+                        "remote group closure was proven but the original SSH exit observation disagreed",
                         true,
                     ));
                 }
+                if receipt.group_id.is_none() && receipt.exit_code == 125 {
+                    return Err(unavailable(
+                        "remote Python3/POSIX process-group ownership primitives are unavailable; payload was not started",
+                    ));
+                }
+                receipt.exit_code
+            } else {
+                match status.code() {
+                    Some(code) if code != 255 => code,
+                    _ => {
+                        resources.mark_stop_unknown(
+                            "remote exit receipt was lost (SSH255 or no exit status)",
+                        );
+                        resources.wait_for_settlement().await;
+                        return Err(remote_failure(
+                            "original remote execution stop was unknown; verify its effects before retry",
+                            true,
+                        ));
+                    }
+                }
             };
-            // A real non255 exit receipt proves command completion even when
-            // its contents/effects or a subsequent pipe observation failed.
-            // Do not make every Possible side effect a permanent stop debt.
-            resources.complete_with_proof();
+            // Legacy no-requirement path keeps its original exit receipt contract; Some requires the group proof above.
+            if !require_group_receipt {
+                resources.complete_with_proof();
+            }
             let (stdout, stdout_bytes, stdout_truncated) = stdout
                 .map_err(|error| {
                     remote_failure(
@@ -236,7 +291,12 @@ impl ProjectSshSandbox {
                         true,
                     )
                 })?;
-            let (stderr, stderr_bytes, stderr_truncated) = stderr
+            let RemoteStderrCapture {
+                text: stderr,
+                bytes: stderr_bytes,
+                truncated: stderr_truncated,
+                ..
+            } = stderr
                 .map_err(|error| {
                     remote_failure(
                         format!("SSH stderr observation failed after remote exit: {error}"),
@@ -409,6 +469,11 @@ impl SandboxExecutor for ProjectSshSandbox {
 
     fn isolation_level(&self) -> IsolationLevel {
         IsolationLevel::None
+    }
+
+    fn supports_physical_resource_ownership(&self) -> bool {
+        // 原 remote operation 保有 guard；255/丢回执保留 Unknown，真实 stop proof 才结算。
+        true
     }
 
     fn is_available(&self) -> BoxFuture<'_, bool> {
@@ -613,6 +678,147 @@ exit $eko_status"#
     ))
 }
 
+/// 有效 Some 使用同一个远端 controller 角色；原子建组、errno 与 monotonic 不依赖 shell 文本猜测。
+/// 它 exec 替换原 POSIX controller/watchdog，不叠第二 supervisor；无要求仍用旧路径。
+fn owned_group_deadline_script(script: &str, timeout: Duration, nonce: &str) -> Result<String> {
+    if nonce.chars().count() != 32
+        || !nonce.chars().all(|value| value.is_ascii_hexdigit())
+        || Instant::now().checked_add(timeout).is_none()
+    {
+        return Err(unavailable(
+            "invalid owned remote execution control metadata",
+        ));
+    }
+    let controller = r#"import sys
+# Controller-only isolation: payload environment remains inherited and unchanged.
+sys.path = [path for path in sys.path if path]
+nonce = sys.argv[3]
+receipt_attempted = [False]
+def receipt(kind, group, status):
+    receipt_attempted[0] = True
+    sys.stderr.write("\x1eEKO_OWNED_GROUP:%s:%s:%s:%s\x1f" % (nonce, kind, group, status))
+    sys.stderr.flush()
+try:
+    import time
+    started = time.monotonic()
+    import os, signal, subprocess, errno
+    needed = (os.killpg, os.getpgid, signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGKILL, signal.signal, time.monotonic, time.sleep, subprocess.Popen, subprocess.PIPE, subprocess.DEVNULL)
+    duration = float(sys.argv[2])
+    if sys.version_info[0] != 3 or not (0 <= duration < float("inf")):
+        raise ValueError("invalid owned controller runtime")
+except BaseException:
+    receipt("not_started", 0, 125)
+    sys.exit(125)
+deadline = started + duration
+stop_requested = [False]
+def request_stop(signum, frame):
+    stop_requested[0] = True
+try:
+    for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, request_stop)
+except BaseException:
+    receipt("not_started", 0, 125)
+    sys.exit(125)
+def absent(group):
+    try:
+        os.killpg(group, 0)
+        return False
+    except OSError as error:
+        # EPERM/other errors are not closure. The original controller remains the owner.
+        return error.errno == errno.ESRCH
+def send(group, signum):
+    try:
+        os.killpg(group, signum)
+    except OSError:
+        pass
+def closed(process, group, force_stop=False):
+    stop_at = None
+    killed = False
+    expired = False
+    while True:
+        now = time.monotonic()
+        status = process.poll()
+        if now >= deadline:
+            expired = True
+        if status is not None and absent(group):
+            return status, expired
+        if force_stop or stop_requested[0] or now >= deadline:
+            if now >= deadline:
+                expired = True
+            if stop_at is None:
+                stop_at = now
+                send(group, signal.SIGTERM)
+            # Cleanup never starts another execution budget or extends the original deadline.
+            if not killed and now >= min(deadline, stop_at + 5.0):
+                send(group, signal.SIGKILL)
+                killed = True
+        time.sleep(0.01)
+probe = None
+process = None
+status = 125
+group = 0
+try:
+    if time.monotonic() >= deadline or stop_requested[0]:
+        receipt("not_started", 0, 124)
+        sys.exit(124)
+    # Actual self-owned primitive probe before any user payload; a name/version is not a proof.
+    probe = subprocess.Popen([sys.executable, "-S", "-E", "-c", "import sys; sys.stdin.buffer.read(1)"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True)
+    probe_group = os.getpgid(probe.pid)
+    if probe_group != probe.pid:
+        raise RuntimeError("session/group primitive was not established")
+    os.killpg(probe_group, 0)
+    closed(probe, probe_group, True)
+    probe = None
+    if time.monotonic() >= deadline or stop_requested[0]:
+        receipt("not_started", 0, 124)
+        sys.exit(124)
+    # start_new_session uses the standard atomic child startup hook, not hand-written preexec code.
+    process = subprocess.Popen(["/bin/sh", "-c", sys.argv[1]], start_new_session=True)
+    group = process.pid
+    status, expired = closed(process, group)
+    if expired:
+        status = 124
+    elif status < 0:
+        status = 128 - status
+    receipt("closed", group, status)
+except SystemExit:
+    raise
+except BaseException:
+    if receipt_attempted[0]:
+        raise
+    if process is not None:
+        status, expired = closed(process, group, True)
+        status = 124 if expired else (128 - status if status < 0 else status)
+        receipt("closed", group, status)
+    else:
+        # Probe has no descendants/user workload; still reap its exact original child before refusal.
+        if probe is not None:
+            try:
+                probe.kill()
+            except OSError:
+                pass
+            probe.wait()
+        receipt("not_started", 0, 125)
+        status = 125
+sys.exit(status)
+"#;
+    let duration = format!("{}.{:09}", timeout.as_secs(), timeout.subsec_nanos());
+    let invocation = format!(
+        "exec python3 -S -E -c {} {} {} {}",
+        shell_quote(controller).map_err(unavailable)?,
+        shell_quote(script).map_err(unavailable)?,
+        shell_quote(&duration).map_err(unavailable)?,
+        shell_quote(nonce).map_err(unavailable)?
+    );
+    // No Python3 means an explicit no-payload receipt, not a transport EOF/ordinary exit assertion.
+    Ok(format!(
+        "if command -v python3 >/dev/null 2>&1; then {invocation}; fi\nprintf '\\036EKO_OWNED_GROUP:%s:not_started:0:125\\037' {} >&2\nexit 125",
+        shell_quote(nonce).map_err(unavailable)?
+    ))
+}
+
 fn command_script(command: &SandboxCommand) -> Result<String> {
     let cwd = command.working_dir.as_ref().ok_or_else(|| {
         unavailable("remote command requires its bound actual project/checkout directory")
@@ -673,6 +879,93 @@ fn command_script(command: &SandboxCommand) -> Result<String> {
     ))
 }
 
+/// 控制帧只在本次 nonce 匹配且为 EOF 的完整内部尾部时剥离；其它字节仍是 payload。
+fn parse_remote_group_receipt(tail: &[u8], nonce: &str) -> Option<(usize, RemoteGroupReceipt)> {
+    let prefix = format!("\u{1e}EKO_OWNED_GROUP:{nonce}:");
+    let start = tail
+        .windows(prefix.len())
+        .rposition(|value| value == prefix.as_bytes())?;
+    let frame = std::str::from_utf8(tail.get(start..)?).ok()?;
+    let body = frame.strip_prefix(&prefix)?.strip_suffix('\u{1f}')?;
+    let mut fields = body.split(':');
+    let kind = fields.next()?;
+    let group = fields.next()?.parse::<u32>().ok()?;
+    let status = fields.next()?.parse::<u8>().ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    let group_id = match kind {
+        "closed" if group > 1 => Some(group),
+        "not_started" if group == 0 && matches!(status, 124 | 125) => None,
+        _ => return None,
+    };
+    Some((
+        start,
+        RemoteGroupReceipt {
+            exit_code: i32::from(status),
+            group_id,
+        },
+    ))
+}
+
+async fn read_stderr_bounded(
+    mut reader: impl AsyncRead + Unpin,
+    limit: u64,
+    nonce: Option<String>,
+) -> std::io::Result<RemoteStderrCapture> {
+    let Some(nonce) = nonce else {
+        let (text, bytes, truncated) = read_bounded(reader, limit).await?;
+        return Ok(RemoteStderrCapture {
+            text,
+            bytes,
+            truncated,
+            receipt: None,
+        });
+    };
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let mut retained = Vec::new();
+    let mut tail = std::collections::VecDeque::new();
+    let mut payload_bytes = 0_u64;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        for byte in buffer.iter().take(count).copied() {
+            tail.push_back(byte);
+            if tail.len() > GROUP_RECEIPT_TAIL_BYTES
+                && let Some(payload) = tail.pop_front()
+            {
+                payload_bytes = payload_bytes.saturating_add(1);
+                if retained.len() < limit {
+                    retained.push(payload);
+                }
+            }
+        }
+    }
+    let tail: Vec<u8> = tail.into_iter().collect();
+    let parsed = parse_remote_group_receipt(&tail, &nonce);
+    let payload_tail = match parsed {
+        Some((start, _)) => tail.get(..start).unwrap_or_default(),
+        None => tail.as_slice(),
+    };
+    payload_bytes =
+        payload_bytes.saturating_add(u64::try_from(payload_tail.len()).unwrap_or(u64::MAX));
+    retained.extend(
+        payload_tail
+            .iter()
+            .take(limit.saturating_sub(retained.len()))
+            .copied(),
+    );
+    Ok(RemoteStderrCapture {
+        text: String::from_utf8_lossy(&retained).into_owned(),
+        bytes: payload_bytes,
+        truncated: payload_bytes > u64::try_from(retained.len()).unwrap_or(u64::MAX),
+        receipt: parsed.map(|(_, receipt)| receipt),
+    })
+}
+
 async fn read_bounded(
     mut reader: impl AsyncRead + Unpin,
     limit: u64,
@@ -701,6 +994,113 @@ async fn read_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn fixture_process_exists(target: i32, failures: &mut Vec<std::io::Error>) -> Option<bool> {
+        let probe = || -> std::io::Result<bool> {
+            if target.checked_abs().is_none_or(|target| target <= 1) {
+                return Err(std::io::Error::other("invalid self-owned fixture target"));
+            }
+            // 复用控制器测试已有的 Python 条件；只有 ESRCH 认作不存在，EPERM 等错误须失败。
+            let output = std::process::Command::new("python3")
+                .args([
+                    "-S",
+                    "-E",
+                    "-c",
+                    r#"import os, sys
+try:
+    os.kill(int(sys.argv[1]), 0)
+except ProcessLookupError:
+    sys.exit(3)
+except OSError as error:
+    print(error, file=sys.stderr)
+    sys.exit(4)
+"#,
+                ])
+                .arg(target.to_string())
+                .output()?;
+            match output.status.code() {
+                Some(0) => Ok(true),
+                Some(3) => Ok(false),
+                _ => Err(std::io::Error::other(format!(
+                    "self-owned fixture probe failed: {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                ))),
+            }
+        };
+        match probe() {
+            Ok(exists) => Some(exists),
+            Err(error) => {
+                // 延迟返回错误，先让原测试释放门闩、取消并收集自己启动的物理任务。
+                failures.push(error);
+                None
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn fixture_kill_group(group: i32) {
+        if group > 1 {
+            // 仅作自有本机夹具紧急回收；复用旧测试的 /bin/sh，不依赖可能失败的 Python 探针。
+            // 这个状态不提供远端停止证明，测试仍须观察原组 ESRCH 才能通过。
+            let _ = std::process::Command::new("/bin/sh")
+                .args(["-c", "kill -KILL \"$1\" 2>/dev/null", "owned-fixture"])
+                .arg(format!("-{group}"))
+                .status();
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_group_receipt_is_split_at_read_boundaries_without_retaining_unbounded_stderr()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let payload = format!("{}{}", "x".repeat(4096), "中🙂".repeat(40_000));
+        let frame = format!("\u{1e}EKO_OWNED_GROUP:{nonce}:closed:23456:101\u{1f}");
+        let bytes = format!("{payload}{frame}").into_bytes();
+        let (mut writer, reader) = tokio::io::duplex(17);
+        let send = tokio::spawn(async move {
+            for chunk in bytes.chunks(7) {
+                writer.write_all(chunk).await?;
+            }
+            Ok::<_, std::io::Error>(())
+        });
+        let capture = read_stderr_bounded(reader, 4096, Some(nonce)).await?;
+        send.await??;
+        assert_eq!(capture.text, "x".repeat(4096));
+        assert_eq!(capture.bytes, u64::try_from(payload.len())?);
+        assert!(capture.truncated);
+        let receipt = capture
+            .receipt
+            .ok_or("matching original group receipt lost behind output limit")?;
+        assert_eq!(receipt.group_id, Some(23456));
+        assert_eq!(receipt.exit_code, 101);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mismatched_missing_or_incomplete_group_receipts_do_not_strip_payload()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let other = uuid::Uuid::new_v4().simple().to_string();
+        for data in [
+            "stderr中文🙂".to_string(),
+            format!("stderr\u{1e}EKO_OWNED_GROUP:{other}:closed:23456:0\u{1f}"),
+            format!("stderr\u{1e}EKO_OWNED_GROUP:{nonce}:closed:23456:0"),
+            format!("stderr\u{1e}EKO_OWNED_GROUP:{nonce}:closed:23456:0\u{1f}later-payload"),
+            format!("stderr\u{1e}EKO_OWNED_GROUP:{nonce}:closed:0:0\u{1f}"),
+        ] {
+            let capture = read_stderr_bounded(data.as_bytes(), 4096, Some(nonce.clone())).await?;
+            assert!(capture.receipt.is_none());
+            assert_eq!(capture.text, data);
+            assert_eq!(capture.bytes, u64::try_from(data.len())?);
+        }
+        let legacy = format!("payload\u{1e}EKO_OWNED_GROUP:{nonce}:closed:23456:0\u{1f}");
+        let capture = read_stderr_bounded(legacy.as_bytes(), 4096, None).await?;
+        assert_eq!(capture.text, legacy);
+        assert!(capture.receipt.is_none());
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]
@@ -767,6 +1167,329 @@ mod tests {
             super::super::ProjectSshOwner::new(Arc::clone(&connection)),
         );
         Ok((service, connection))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owned_controller_proves_the_original_group_after_root_exit_for_normal_cancel_and_deadline()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        for mode in ["natural", "cancel", "deadline"] {
+            let directory = tempfile::tempdir()?;
+            let (service, connection) = fixture_connection()?;
+            let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let cancel = Arc::new(CancellationToken::new());
+            let timeout = if mode == "natural" {
+                Duration::from_secs(10)
+            } else {
+                Duration::from_secs(2)
+            };
+            let tail = if mode == "deadline" { "; sleep 1" } else { "" };
+            let payload = format!(
+                "echo $$ > leader.pid; sh -c 'while [ ! -e release ]; do sleep 0.02; done' >/dev/null 2>&1 & echo $! > descendant.pid{tail}"
+            );
+            let mut command = SandboxCommand::shell(payload)
+                .with_working_dir(directory.path())
+                .with_timeout(timeout)
+                .with_resource_guards(vec![echo_agent::tools::InvocationResourceGuard::new(
+                    GuardDrop(dropped.clone()),
+                )]);
+            command.require_physical_resource_ownership = true;
+            let control_group_file = directory.path().join("controller.pgid");
+            let diagnostic_hex: String = control_group_file
+                .to_str()
+                .ok_or("invalid controller fixture path")?
+                .as_bytes()
+                .iter()
+                .map(|value| format!("{value:02x}"))
+                .collect();
+            let owner = connection.clone();
+            let owner_cancel = cancel.clone();
+            let mut physical = tokio::spawn(async move {
+                ProjectSshSandbox::execute_with_launcher(owner, command, ResourceLimits::unrestricted(), Some(owner_cancel), move |_, script| {
+                    // 仅在原启动接缝记录实际 PGID，供夹具失败时回收；不修改终结／预算／凭据逻辑。
+                    let hook = format!("group = process.pid\n    with open(bytes.fromhex(\"{diagnostic_hex}\").decode(\"utf-8\"), \"w\") as group_record: group_record.write(str(group))");
+                    let observed = script.replace("group = process.pid", &hook);
+                    let mut command = tokio::process::Command::new("/bin/sh");
+                    command.args(["-c", &observed]);
+                    Ok(command)
+                }).await
+            });
+            let mut pids = None;
+            let mut payload_started = tokio::time::Instant::now();
+            for _ in 0..500 {
+                let leader = std::fs::read_to_string(directory.path().join("leader.pid"))
+                    .ok()
+                    .and_then(|value| value.trim().parse::<i32>().ok());
+                let descendant = std::fs::read_to_string(directory.path().join("descendant.pid"))
+                    .ok()
+                    .and_then(|value| value.trim().parse::<i32>().ok());
+                if let (Some(leader), Some(descendant)) = (leader, descendant) {
+                    pids = Some((leader, descendant));
+                    payload_started = tokio::time::Instant::now();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let Some((leader, descendant)) = pids else {
+                cancel.cancel();
+                let diagnostic_group = std::fs::read_to_string(&control_group_file)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<i32>().ok());
+                if let Some(group) = diagnostic_group.filter(|group| *group > 1) {
+                    // 仅回收这个启动接缝记录的自有组。
+                    fixture_kill_group(group);
+                }
+                let closing = tokio::time::timeout(Duration::from_secs(8), &mut physical).await;
+                if closing.is_ok() {
+                    service.close_project_ssh("fixture").await?;
+                }
+                return Err("owned controller did not reach a real payload; prerequisite/fixture failed, no target GREEN inferred".into());
+            };
+            let mut probe_failures = Vec::new();
+            for _ in 0..300 {
+                if fixture_process_exists(leader, &mut probe_failures) != Some(true) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let root_gone = fixture_process_exists(leader, &mut probe_failures) == Some(false);
+            let descendant_live =
+                fixture_process_exists(descendant, &mut probe_failures) == Some(true);
+            if !probe_failures.is_empty() {
+                cancel.cancel();
+            }
+            let guard_while_live = dropped.load(std::sync::atomic::Ordering::Acquire);
+            let early = tokio::time::timeout(Duration::from_millis(20), &mut physical)
+                .await
+                .ok();
+            let completed_while_live = early.is_some();
+            if !probe_failures.is_empty() || early.is_some() || mode == "natural" {
+                std::fs::write(directory.path().join("release"), "release")?;
+            } else if mode == "cancel" {
+                cancel.cancel();
+            } else {
+                tokio::time::sleep_until(
+                    payload_started
+                        .checked_add(Duration::from_millis(2200))
+                        .ok_or("fixture deadline overflow")?,
+                )
+                .await;
+                std::fs::write(directory.path().join("release"), "release")?;
+            }
+            let result = match early {
+                Some(result) => result,
+                None => match tokio::time::timeout(Duration::from_secs(8), &mut physical).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        // 唯一自有本机 controller fixture 的紧急回收，不是假远端 stop API。
+                        fixture_kill_group(leader);
+                        let _ = std::fs::write(directory.path().join("release"), "release");
+                        physical.await
+                    }
+                },
+            };
+            let mut group_closed = false;
+            for _ in 0..200 {
+                match fixture_process_exists(-leader, &mut probe_failures) {
+                    Some(false) => {
+                        group_closed = true;
+                        break;
+                    }
+                    Some(true) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    None => break,
+                }
+            }
+            if !group_closed {
+                fixture_kill_group(leader);
+                let _ = std::fs::write(directory.path().join("release"), "release");
+            }
+            eprintln!(
+                "owned SSH controller fixture: mode={mode}; root_gone={root_gone}; descendant_live={descendant_live}; guard_while_live={guard_while_live}; early={completed_while_live}; result={result:?}"
+            );
+            service.close_project_ssh("fixture").await?;
+            if let Some(error) = probe_failures.into_iter().next() {
+                return Err(error.into());
+            }
+            assert!(root_gone && descendant_live && group_closed);
+            assert_eq!(guard_while_live, 0);
+            assert!(
+                !completed_while_live,
+                "non255/root EOF falsely settled the owned group"
+            );
+            match mode {
+                "natural" => {
+                    let result = result??;
+                    assert!(result.success());
+                }
+                "cancel" => assert!(result?.is_err()),
+                _ => {
+                    let result = result??;
+                    assert!(
+                        result.timed_out,
+                        "controller reset its original budget after root exit"
+                    );
+                }
+            }
+            assert_eq!(dropped.load(std::sync::atomic::Ordering::Acquire), 1);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non255_without_original_group_receipt_keeps_the_original_unknown_owner()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let (service, connection) = fixture_connection()?;
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut command = fixture_command(&dropped).with_timeout(Duration::from_secs(10));
+        command.require_physical_resource_ownership = true;
+        let cwd = directory.path().to_path_buf();
+        let owner = connection.clone();
+        let mut physical = tokio::spawn(async move {
+            ProjectSshSandbox::execute_with_launcher(owner, command, ResourceLimits::unrestricted(), None, move |_, _script| {
+                // 故意模拟丢失控制凭据的transport：实际本机root退出0/EOF，原组后代仍活；不是正常controller输入。
+                let mut command = tokio::process::Command::new("/bin/sh");
+                command.args(["-c", "echo $$ > leader.pid; sh -c 'while [ ! -e release ]; do sleep 0.02; done' >/dev/null 2>&1 & echo $! > descendant.pid; exit 0"])
+                    .current_dir(cwd).process_group(0);
+                Ok(command)
+            }).await
+        });
+        for _ in 0..200 {
+            if directory.path().join("leader.pid").is_file()
+                && directory.path().join("descendant.pid").is_file()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let leader: i32 = std::fs::read_to_string(directory.path().join("leader.pid"))?
+            .trim()
+            .parse()?;
+        let descendant: i32 = std::fs::read_to_string(directory.path().join("descendant.pid"))?
+            .trim()
+            .parse()?;
+        let mut probe_failures = Vec::new();
+        let live = fixture_process_exists(descendant, &mut probe_failures) == Some(true);
+        let mut resource = None;
+        for _ in 0..200 {
+            resource = connection
+                .retained_children
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+                .find_map(|entry| match entry {
+                    super::super::RetainedSshResource::RemoteOperation(resource) => {
+                        Some(resource.clone())
+                    }
+                    _ => None,
+                });
+            if resource
+                .as_ref()
+                .is_some_and(|resource| resource.stop_is_unknown())
+                || physical.is_finished()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let held = resource
+            .as_ref()
+            .is_some_and(|resource| resource.stop_is_unknown() && !resource.is_settled())
+            && dropped.load(std::sync::atomic::Ordering::Acquire) == 0;
+        let early = tokio::time::timeout(Duration::from_millis(20), &mut physical)
+            .await
+            .ok();
+        let returned_while_live = early.is_some();
+        std::fs::write(directory.path().join("release"), "release")?;
+        let mut closed = false;
+        for _ in 0..200 {
+            match fixture_process_exists(-leader, &mut probe_failures) {
+                Some(false) => {
+                    closed = true;
+                    break;
+                }
+                Some(true) => tokio::time::sleep(Duration::from_millis(10)).await,
+                None => break,
+            }
+        }
+        if !closed {
+            // 紧急回收仅作用于本夹具原始自有组。
+            fixture_kill_group(leader);
+            return Err("self-owned missing-receipt fixture did not close its original group; no stop proof inferred".into());
+        }
+        // 唯一自有本机fixture已真正组闭合；不把此能力暴露为远端unknown恢复API。
+        if let Some(resource) = resource {
+            resource.complete_with_proof();
+        }
+        let result = match early {
+            Some(result) => result?,
+            None => tokio::time::timeout(Duration::from_secs(3), physical).await??,
+        };
+        service.close_project_ssh("fixture").await?;
+        assert!(live && held);
+        assert!(
+            !returned_while_live,
+            "non255/EOF was used as a substitute for the missing original group receipt"
+        );
+        assert!(result.is_err());
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::Acquire), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_runtime_or_actual_group_primitive_refuses_before_payload()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        for missing in ["runtime", "primitive"] {
+            let directory = tempfile::tempdir()?;
+            let (service, connection) = fixture_connection()?;
+            let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let marker = directory.path().join("must-not-run");
+            let mut command = SandboxCommand::shell("printf effect > must-not-run")
+                .with_working_dir(directory.path())
+                .with_timeout(Duration::from_secs(5))
+                .with_resource_guards(vec![echo_agent::tools::InvocationResourceGuard::new(
+                    GuardDrop(dropped.clone()),
+                )]);
+            command.require_physical_resource_ownership = true;
+            let result = ProjectSshSandbox::execute_with_launcher(
+                connection,
+                command,
+                ResourceLimits::unrestricted(),
+                None,
+                move |_, script| {
+                    let mut child = tokio::process::Command::new("/bin/sh");
+                    let script = if missing == "primitive" {
+                        // 实际Python仍在；只注入缺少POSIX primitive，不能靠名字/版本通过。
+                        script.replace(
+                            "needed = (os.killpg",
+                            "del os.killpg\n    needed = (os.killpg",
+                        )
+                    } else {
+                        script
+                    };
+                    child.args(["-c", &script]);
+                    if missing == "runtime" {
+                        child.env("PATH", "/nonexistent-controlled-path");
+                    }
+                    Ok(child)
+                },
+            )
+            .await;
+            let ran = marker.exists();
+            service.close_project_ssh("fixture").await?;
+            assert!(
+                matches!(result, Err(echo_agent::error::ReactError::Tool(error))
+                if matches!(error.as_ref(), echo_agent::error::ToolError::RemoteFailure { message, failure, .. }
+                    if message.contains("payload was not started")
+                        && failure.category == echo_agent::tools::ToolFailureCategory::Unavailable
+                        && failure.side_effect == echo_agent::tools::ToolSideEffect::None))
+            );
+            assert!(!ran);
+            assert_eq!(dropped.load(std::sync::atomic::Ordering::Acquire), 1);
+        }
+        Ok(())
     }
 
     #[cfg(unix)]

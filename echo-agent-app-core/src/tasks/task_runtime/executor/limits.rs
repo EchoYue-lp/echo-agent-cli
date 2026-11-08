@@ -42,9 +42,7 @@ use echo_agent::runtime::{
     AgentTurnDriver, EventSink, SinkControl, TurnMode, TurnOutcome, TurnReceipt, TurnRequest,
 };
 use echo_agent::subagent::{ContextTransferPolicy, SubagentInvocation};
-use echo_agent::tools::cell::{
-    CommandCellError, CommandCellResourceAdmission, CommandCellResourceLease,
-};
+use echo_agent::tools::cell::CommandCellResourceAdmission;
 use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard, Semaphore};
 
 /// Process-wide EKO resource ceiling shared by every workspace and TaskRun.
@@ -94,6 +92,15 @@ impl ProcessExecutionGovernor {
     /// `shell = 1` ceiling without making an admitted cell's receipt wait for a
     /// slot that a long-running command may hold for an hour.
     pub(crate) fn shell_admission(&self) -> Arc<dyn CommandCellResourceAdmission> {
+        echo_agent::tools::native_execution::command_cell_resource_admission(
+            self.native_shell_admission(),
+        )
+    }
+
+    /// 同一进程 shell 政策供所有 Agent 托管原生命令使用。
+    pub(crate) fn native_shell_admission(
+        &self,
+    ) -> Arc<dyn echo_agent::tools::NativeExecutionResourceAdmission> {
         Arc::new(ProcessShellResourceAdmission {
             shell: self.shell.clone(),
         })
@@ -137,28 +144,39 @@ struct ProcessShellResourceAdmission {
     shell: Arc<Semaphore>,
 }
 
-impl CommandCellResourceAdmission for ProcessShellResourceAdmission {
+impl ProcessShellResourceAdmission {
+    async fn acquire(
+        &self,
+        cancel: &CancellationToken,
+        deadline: std::time::Instant,
+    ) -> Result<
+        echo_agent::tools::InvocationResourceGuard,
+        echo_agent::tools::NativeExecutionAdmissionError,
+    > {
+        use echo_agent::tools::NativeExecutionAdmissionError;
+        let permit = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(NativeExecutionAdmissionError::Cancelled),
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => return Err(NativeExecutionAdmissionError::Deadline),
+            result = self.shell.clone().acquire_owned() => result.map_err(|_| NativeExecutionAdmissionError::Closed)?,
+        };
+        Ok(echo_agent::tools::InvocationResourceGuard::new(permit))
+    }
+}
+
+impl echo_agent::tools::NativeExecutionResourceAdmission for ProcessShellResourceAdmission {
     fn admit<'a>(
         &'a self,
-        _cell_id: &'a str,
         cancel: &'a CancellationToken,
         deadline: std::time::Instant,
-    ) -> futures::future::BoxFuture<'a, Result<CommandCellResourceLease, CommandCellError>> {
-        Box::pin(async move {
-            let acquire = self.shell.clone().acquire_owned();
-            tokio::pin!(acquire);
-            let permit = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(CommandCellError::Cancelled),
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                    return Err(CommandCellError::CapacityDeadline);
-                }
-                result = &mut acquire => result.map_err(|_| CommandCellError::Shutdown)?,
-            };
-            // The lease owns the permit: dropping it is the single release of
-            // the process-wide shell slot, after the cell's terminal drain.
-            Ok(CommandCellResourceLease::new(move || drop(permit)))
-        })
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<
+            echo_agent::tools::InvocationResourceGuard,
+            echo_agent::tools::NativeExecutionAdmissionError,
+        >,
+    > {
+        Box::pin(self.acquire(cancel, deadline))
     }
 }
 

@@ -4111,6 +4111,701 @@ Read the runtime path and found one missing branch.
         Ok(())
     }
 
+    #[derive(Default, Debug)]
+    struct VerificationBackgroundCapacityObservation {
+        requests: usize,
+        launches: usize,
+        searches: usize,
+        waits: usize,
+        last_wait_id: Option<String>,
+        receipt: Option<echo_agent::tools::cell::CommandCellLaunchReceipt>,
+        terminal: Option<echo_agent::tools::cell::CommandCellDelta>,
+        wait_deltas: Vec<echo_agent::tools::cell::CommandCellDelta>,
+        output: String,
+        shell_available_by_request: Vec<usize>,
+        final_answer_issued: bool,
+    }
+
+    #[derive(Default)]
+    struct VerificationBackgroundCapacityClient {
+        observation: std::sync::Mutex<VerificationBackgroundCapacityObservation>,
+    }
+
+    impl VerificationBackgroundCapacityClient {
+        fn next_script(
+            &self,
+            request: &echo_agent::llm::ChatRequest,
+        ) -> echo_agent::error::Result<echo_agent::testing::MockLlmClient> {
+            use echo_agent::error::ReactError;
+            use echo_agent::testing::MockLlmClient;
+            use echo_agent::tools::cell::{CommandCellDelta, CommandCellLaunchReceipt};
+
+            let mut observed = self.observation.lock().map_err(|error| {
+                ReactError::Other(format!("verification fixture observation lock: {error}"))
+            })?;
+            observed.requests = observed.requests.saturating_add(1);
+            observed
+                .shell_available_by_request
+                .push(PROCESS_EXECUTION_GOVERNOR.shell.available_permits());
+            let visible = request.tools.as_deref().unwrap_or_default();
+            let exposed = |name: &str| {
+                visible
+                    .iter()
+                    .any(|definition| definition.function.name == name)
+            };
+            let shell_result = request.messages.iter().rev().find(|message| {
+                matches!(message.role, echo_agent::llm::types::Role::Tool)
+                    && message.name.as_deref() == Some("shell")
+                    && message.tool_call_id.as_deref() == Some("verification-background-launch")
+            });
+            if let Some(message) = shell_result {
+                let content = message.text_content().ok_or_else(|| {
+                    ReactError::Other(
+                        "verification fixture: shell receipt text missing".to_string(),
+                    )
+                })?;
+                let receipt: CommandCellLaunchReceipt = serde_json::from_str(content.as_ref())
+                    .map_err(|error| {
+                        ReactError::Other(format!(
+                            "verification fixture: original shell receipt decode failed: {error}"
+                        ))
+                    })?;
+                if observed
+                    .receipt
+                    .as_ref()
+                    .is_some_and(|prior| prior != &receipt)
+                {
+                    return Err(ReactError::Other(
+                        "verification fixture: original cell receipt changed".to_string(),
+                    ));
+                }
+                observed.receipt = Some(receipt);
+            }
+            let wait_result = request.messages.iter().rev().find(|message| {
+                matches!(message.role, echo_agent::llm::types::Role::Tool)
+                    && message.name.as_deref() == Some("wait")
+                    && message
+                        .tool_call_id
+                        .as_deref()
+                        .is_some_and(|call_id| call_id.starts_with("verification-background-wait-"))
+            });
+            let mut cursor = 0;
+            if let Some(message) = wait_result {
+                let content = message.text_content().ok_or_else(|| {
+                    ReactError::Other("verification fixture: wait receipt text missing".to_string())
+                })?;
+                let delta: CommandCellDelta =
+                    serde_json::from_str(content.as_ref()).map_err(|error| {
+                        ReactError::Other(format!(
+                            "verification fixture: original wait receipt decode failed: {error}"
+                        ))
+                    })?;
+                let receipt = observed.receipt.as_ref().ok_or_else(|| {
+                    ReactError::Other(
+                        "verification fixture: wait preceded shell receipt".to_string(),
+                    )
+                })?;
+                if delta.snapshot.cell_id != receipt.cell_id {
+                    return Err(ReactError::Other(
+                        "verification fixture: wait returned a foreign cell".to_string(),
+                    ));
+                }
+                if observed.last_wait_id != message.tool_call_id {
+                    observed.wait_deltas.push(delta.clone());
+                    observed.output.push_str(&delta.new_output);
+                    observed.last_wait_id = message.tool_call_id.clone();
+                }
+                cursor = delta.next_cursor;
+                if delta.snapshot.phase.is_terminal() {
+                    observed.terminal = Some(delta);
+                    observed.final_answer_issued = true;
+                    return Ok(MockLlmClient::new().with_response("背景验证完成。"));
+                }
+            }
+
+            let desired = if observed.receipt.is_none() {
+                "shell"
+            } else {
+                "wait"
+            };
+            if !exposed(desired) {
+                if !exposed("tool_search") || observed.searches >= 3 {
+                    return Err(ReactError::Other(format!(
+                        "verification fixture: original tool exposure did not activate {desired}"
+                    )));
+                }
+                observed.searches = observed.searches.saturating_add(1);
+                return Ok(MockLlmClient::new().then_tool_call(
+                    format!("verification-background-search-{}", observed.searches),
+                    "tool_search",
+                    serde_json::json!({"query": desired, "limit": 1}).to_string(),
+                ));
+            }
+            if desired == "shell" {
+                if observed.launches != 0 {
+                    return Err(ReactError::Other(
+                        "verification fixture: launched shell has no original receipt".to_string(),
+                    ));
+                }
+                observed.launches = observed.launches.saturating_add(1);
+                return Ok(MockLlmClient::new().then_tool_call(
+                    "verification-background-launch",
+                    "shell",
+                    serde_json::json!({
+                        "command": "echo verification-background-cell-effect",
+                        "background": true,
+                        "timeout": 5
+                    })
+                    .to_string(),
+                ));
+            }
+            if observed.waits >= 8 {
+                return Err(ReactError::Other(
+                    "verification fixture: original cell never reached a terminal observation"
+                        .to_string(),
+                ));
+            }
+            let cell_id = observed
+                .receipt
+                .as_ref()
+                .map(|receipt| receipt.cell_id.clone())
+                .ok_or_else(|| {
+                    ReactError::Other("verification fixture: cell receipt missing".to_string())
+                })?;
+            observed.waits = observed.waits.saturating_add(1);
+            Ok(MockLlmClient::new().then_tool_call(
+                format!("verification-background-wait-{}", observed.waits),
+                "wait",
+                serde_json::json!({
+                    "cell_id": cell_id,
+                    "cursor": cursor,
+                    "yield_time_ms": if observed.waits == 1 { 0 } else { 6000 }
+                })
+                .to_string(),
+            ))
+        }
+    }
+
+    impl echo_agent::llm::LlmClient for VerificationBackgroundCapacityClient {
+        fn model_name(&self) -> &str {
+            "mock-model"
+        }
+
+        fn chat(
+            &self,
+            request: echo_agent::llm::ChatRequest,
+        ) -> BoxFuture<'_, echo_agent::error::Result<echo_agent::llm::ChatResponse>> {
+            let selected = self.next_script(&request);
+            Box::pin(async move {
+                let script = selected?;
+                echo_agent::llm::LlmClient::chat(&script, request).await
+            })
+        }
+
+        fn chat_stream(
+            &self,
+            request: echo_agent::llm::ChatRequest,
+        ) -> BoxFuture<
+            '_,
+            echo_agent::error::Result<
+                BoxStream<'static, echo_agent::error::Result<echo_agent::llm::ChatChunk>>,
+            >,
+        > {
+            let selected = self.next_script(&request);
+            Box::pin(async move {
+                let script = selected?;
+                echo_agent::llm::LlmClient::chat_stream(&script, request).await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn primary_verification_background_cell_runs_before_parent_releases_shell_slot()
+    -> Result<(), String> {
+        let fixture = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = Arc::new(
+            TaskRuntimeStore::open_for_workspace(fixture.path().join("tasks"), "ws_test")
+                .map_err(|error| error.to_string())?,
+        );
+        let _resource_scope = store.test_resource_scope();
+        let run_id = seed_run(
+            &store,
+            vec![PlanTask {
+                id: "verification-background-capacity".to_string(),
+                title: "验证实际父任务内的后台命令容量".to_string(),
+                description: "通过真实 shell(background=true) 启动一个 echo，消费原回执并 wait 到终态后结束。".to_string(),
+                kind: PlanTaskKind::Verification,
+                agent_role: "primary".to_string(),
+                allowed_tools: vec!["tool_search".to_string(), "shell".to_string(), "wait".to_string()],
+                ..Default::default()
+            }],
+        )?;
+        let execution_scope = crate::workspace::WorkspaceExecutionScope::workspace(
+            &crate::workspace::WorkspaceId::from_raw("ws_test".to_string()),
+            fixture.path(),
+        );
+        let run = store
+            .get_run(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "verification fixture run missing".to_string())?;
+        assert_eq!(store.active_workspace_id(), run.workspace_id);
+        assert_eq!(run.workspace_id, execution_scope.workspace_id());
+        let product_data_io = crate::product_data_io::ProductDataIoService::new();
+        let command_cells = super::super::command_cells::CommandCellRuntimeService::new(
+            Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox()),
+            Arc::new(
+                crate::chat_event_log::ChatEventLog::open(
+                    fixture.path().join("chat-events"),
+                    Default::default(),
+                )
+                .map_err(|error| error.to_string())?,
+            ),
+            product_data_io.clone(),
+        )?;
+        // 真实 factory 与 execute_run 负责父 Verification 的许可；测试不手工占槽、
+        // 不提前释放父许可。只有模型传输受控，shell/wait、sandbox 与所有权交接走原路径。
+        let created = crate::infra::create_agent_with_diagnostics(
+            &crate::infra::AgentCreateParams {
+                system_prompt: Some(
+                    "只执行本次受控背景 shell/wait 验证，不委派或修改任务。".to_string(),
+                ),
+                working_dir: Some(fixture.path().to_path_buf()),
+                workspace_data_root: Some(fixture.path().join("product-data")),
+                execution_scope: Some(execution_scope),
+                task_runtime_store: Some(store.clone()),
+                command_cell_runtime: Some(command_cells.clone()),
+                product_data_io: Some(product_data_io.clone()),
+                ..Default::default()
+            },
+            &crate::config::EkoConfig::default(),
+        )
+        .await?;
+        let client = Arc::new(VerificationBackgroundCapacityClient::default());
+        let mut agent = created.agent;
+        agent.set_llm_client(client.clone());
+        let agent = crate::agent_handle::AgentHandle::new(agent);
+        let cancel = CancellationToken::new();
+        let (execution, fixture_timed_out) = {
+            let pending = execute_run(
+                store.clone(),
+                Some(agent.clone()),
+                None,
+                None,
+                None,
+                None,
+                &run_id,
+                cancel.clone(),
+                super::super::memory_bridge::MemoryPolicy::None,
+                None,
+            );
+            tokio::pin!(pending);
+            match tokio::time::timeout(std::time::Duration::from_secs(20), pending.as_mut()).await {
+                Ok(result) => (result, false),
+                Err(_) => {
+                    cancel.cancel();
+                    let closing = command_cells.begin_shutdown();
+                    let settled = pending.await;
+                    closing?;
+                    (settled, true)
+                }
+            }
+        };
+        // 先结算原 owner，再检查目标断言；失败也不能给后续测试留下全局 shell 许可。
+        let command_shutdown = command_cells.shutdown().await;
+        drop(agent);
+        drop(created.model_consumers);
+        drop(created.command_cell_runtime);
+        drop(command_cells);
+        let io_shutdown = product_data_io.join_shutdown().await;
+        let available_after_parent = PROCESS_EXECUTION_GOVERNOR.shell.available_permits();
+        let observed = std::mem::take(
+            &mut *client
+                .observation
+                .lock()
+                .map_err(|error| error.to_string())?,
+        );
+        eprintln!(
+            "verification background capacity: observation={observed:?}; execution={execution:?}; parent_after={available_after_parent}; fixture_timeout={fixture_timed_out}"
+        );
+        command_shutdown?;
+        io_shutdown?;
+        if fixture_timed_out {
+            return Err(
+                "verification fixture exceeded20s; this is not the target capacity RED".to_string(),
+            );
+        }
+        if observed.receipt.is_none() || observed.waits == 0 || !observed.final_answer_issued {
+            return Err(
+                "verification fixture did not consume the original shell/wait receipts".to_string(),
+            );
+        }
+        let terminal = observed
+            .terminal
+            .ok_or_else(|| "verification fixture lacks a terminal cell receipt".to_string())?;
+        assert_eq!(observed.launches, 1);
+        assert_eq!(available_after_parent, 1);
+        assert_eq!(
+            terminal.snapshot.exit_code,
+            Some(0),
+            "original Verification parent prevented its background cell from executing before parent settlement"
+        );
+        assert!(
+            observed
+                .output
+                .contains("verification-background-cell-effect"),
+            "real sandbox effect was not observed before the parent verification returned"
+        );
+        assert!(matches!(
+            execution.map_err(|error| error.to_string())?,
+            RunOutcome::Completed
+        ));
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn final_factory_managers_share_one_physical_slot_across_workspace_shell_cell_and_code()
+    -> Result<(), String> {
+        use echo_agent::tools::cell::{
+            CommandCellDelta, CommandCellLaunchReceipt, CommandCellPhase,
+        };
+        use echo_agent::tools::{ToolContext, ToolParameters};
+        let fixture = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let cwd_a = fixture.path().join("workspace-a");
+        let cwd_b = fixture.path().join("workspace-b");
+        for path in [&cwd_a, &cwd_b] {
+            std::fs::create_dir(path).map_err(|error| error.to_string())?;
+        }
+        let store_a = Arc::new(
+            TaskRuntimeStore::open_for_workspace(
+                fixture.path().join("tasks-a"),
+                "mixed-workspace-a",
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        let store_b = Arc::new(
+            TaskRuntimeStore::open_for_workspace(
+                fixture.path().join("tasks-b"),
+                "mixed-workspace-b",
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        let _lifetime_a = store_a.test_resource_scope();
+        let _lifetime_b = store_b.test_resource_scope();
+        let scope_a = crate::workspace::WorkspaceExecutionScope::workspace(
+            &crate::workspace::WorkspaceId::from_raw("mixed-workspace-a".to_string()),
+            &cwd_a,
+        );
+        let scope_b = crate::workspace::WorkspaceExecutionScope::workspace(
+            &crate::workspace::WorkspaceId::from_raw("mixed-workspace-b".to_string()),
+            &cwd_b,
+        );
+        let io = crate::product_data_io::ProductDataIoService::new();
+        let occupancy_root = fixture.path().join("atomic-occupancy");
+        std::fs::create_dir(&occupancy_root).map_err(|error| error.to_string())?;
+        let mut manager = echo_agent::sandbox::SandboxManager::with_configs(
+            echo_agent::sandbox::LocalConfig {
+                allowed_write_paths: vec![occupancy_root.clone()],
+                ..Default::default()
+            },
+            None,
+            None,
+            echo_agent::sandbox::SandboxPolicy::local_os(),
+        );
+        manager.set_allow_fallback(false);
+        let sandbox: Arc<dyn echo_agent::sandbox::SandboxExecutor> = Arc::new(manager);
+        // 必须实际具备原 run_code 隔离；缺失时失败，不用假 capability 或降级执行代签。
+        if !sandbox
+            .is_available_at(echo_agent::sandbox::IsolationLevel::OsSandbox)
+            .await
+        {
+            return Err(
+                "mixed workspace fixture requires the actual OS-isolated local backend".to_string(),
+            );
+        }
+        let cells = super::super::command_cells::CommandCellRuntimeService::new(
+            sandbox.clone(),
+            Arc::new(
+                crate::chat_event_log::ChatEventLog::open(
+                    fixture.path().join("chat-events"),
+                    Default::default(),
+                )
+                .map_err(|error| error.to_string())?,
+            ),
+            io.clone(),
+        )?;
+        let created_a = crate::infra::create_agent_with_diagnostics(
+            &crate::infra::AgentCreateParams {
+                working_dir: Some(cwd_a.clone()),
+                workspace_data_root: Some(fixture.path().join("product-a")),
+                execution_scope: Some(scope_a),
+                task_runtime_store: Some(store_a),
+                command_cell_runtime: Some(cells.clone()),
+                product_data_io: Some(io.clone()),
+                sandbox_executor: Some(sandbox.clone()),
+                ..Default::default()
+            },
+            &crate::config::EkoConfig::default(),
+        )
+        .await?;
+        let created_b = crate::infra::create_agent_with_diagnostics(
+            &crate::infra::AgentCreateParams {
+                working_dir: Some(cwd_b.clone()),
+                workspace_data_root: Some(fixture.path().join("product-b")),
+                execution_scope: Some(scope_b.clone()),
+                task_runtime_store: Some(store_b.clone()),
+                command_cell_runtime: Some(cells.clone()),
+                product_data_io: Some(io.clone()),
+                sandbox_executor: Some(sandbox.clone()),
+                ..Default::default()
+            },
+            &crate::config::EkoConfig::default(),
+        )
+        .await?;
+        let registry_b = cells.scoped_with_executor(scope_b, Some(store_b), sandbox);
+        let manager_a = created_a.agent.tool_manager().clone();
+        let manager_b = created_b.agent.tool_manager().clone();
+        let cancel = Arc::new(CancellationToken::new());
+        let make_context = |cwd: &std::path::Path, id: &str| {
+            // 与普通 Chat 的原调用合同一致：本次根用户消息同时绑定 turn 与 message，
+            // 由 ShellTool 传入原 cell owner，不能在产品层免除根消息身份校验。
+            let root_message_id = format!("mixed-{id}-root-message");
+            ToolContext {
+                working_dir: Some(cwd.to_path_buf()),
+                conversation_id: Some(format!("mixed-{id}")),
+                turn_id: Some(root_message_id.clone()),
+                message_id: Some(root_message_id),
+                execution_id: Some(format!("mixed-{id}-execution")),
+                call_id: Some(format!("mixed-{id}-call")),
+                cancel: Some(cancel.clone()),
+                ..Default::default()
+            }
+        };
+        let quote_path =
+            |path: &std::path::Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+        let occupancy_path = quote_path(&occupancy_root.join("occupied"));
+        let overlap_path = quote_path(&occupancy_root.join("overlap"));
+        let payload = |id: &str| {
+            format!(
+                "occupancy={occupancy_path}; overlap={overlap_path}; if ! mkdir \"$occupancy\"; then printf overlap > \"$overlap\"; exit 91; fi; trap 'rmdir live-{id}; rmdir \"$occupancy\"' EXIT; mkdir live-{id} || exit 92; echo $$ > pid-{id}; printf started > started-{id}; while [ ! -e release-{id} ]; do sleep 0.01; done; printf mixed-{id}-effect"
+            )
+        };
+        let foreground_context = make_context(&cwd_a, "foreground");
+        let foreground_parameters: ToolParameters = serde_json::from_value(serde_json::json!({
+            "command": payload("foreground"), "timeout": 5,
+        }))
+        .map_err(|error| error.to_string())?;
+        // 本用例不请求模型；直接经过 factory 最终 ToolManager 与原工具/物理后端。
+        // 不注入 provider、不手动占槽或释放许可，不替换命令 executor。
+        let foreground = tokio::spawn(async move {
+            manager_a
+                .execute_tool_with_context("shell", foreground_parameters, &foreground_context)
+                .await
+                .map_err(|error| error.to_string())
+        });
+        let first_started = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !cwd_a.join("started-foreground").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let background_context = make_context(&cwd_b, "background");
+        let background_parameters: ToolParameters = serde_json::from_value(serde_json::json!({
+            "command": payload("background"), "background": true, "timeout": 5,
+        }))
+        .map_err(|error| error.to_string())?;
+        // 同一原 5 秒观察绝对期限只捕获一次；后续输出增量不会重启预算。
+        let cell_observation_deadline = tokio::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(5))
+            .ok_or("mixed cell observation deadline overflow")?;
+        let background_manager = manager_b.clone();
+        let mut background = tokio::spawn(async move {
+            background_manager
+                .execute_tool_with_context("shell", background_parameters, &background_context)
+                .await
+                .map_err(|error| error.to_string())
+        });
+        let code_context = make_context(&cwd_b, "code");
+        let code_parameters: ToolParameters = serde_json::from_value(serde_json::json!({
+            "language": "bash", "code": payload("code"), "timeout": 5,
+        }))
+        .map_err(|error| error.to_string())?;
+        let code = tokio::spawn(async move {
+            manager_b
+                .execute_tool_with_context("run_code", code_parameters, &code_context)
+                .await
+                .map_err(|error| error.to_string())
+        });
+        let background_early =
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut background).await;
+        let launch_returned_before_foreground_release = background_early.is_ok();
+        let background_result = background_early.ok();
+        let parse_early_receipt = || -> Result<CommandCellLaunchReceipt, String> {
+            let result = background_result
+                .as_ref()
+                .ok_or("background launch did not return while foreground held capacity")?
+                .as_ref()
+                .map_err(|error| error.to_string())?
+                .as_ref()
+                .map_err(Clone::clone)?;
+            if !result.success {
+                return Err(format!(
+                    "background launch returned failure, not a receipt: {result:?}"
+                ));
+            }
+            serde_json::from_value(
+                result
+                    .data
+                    .clone()
+                    .ok_or("background launch has no original receipt")?,
+            )
+            .map_err(|error| error.to_string())
+        };
+        let early_receipt = parse_early_receipt();
+        let receipt_before_foreground_release = early_receipt.is_ok();
+        let queued_before_release: Result<CommandCellDelta, String> = async {
+            let receipt = early_receipt.as_ref().map_err(Clone::clone)?;
+            registry_b
+                .wait(&receipt.cell_id, 0, 0)
+                .await
+                .map_err(|error| error.to_string())
+        }
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let initial_second_started =
+            cwd_b.join("started-background").exists() || cwd_b.join("started-code").exists();
+        let available_while_foreground_live = PROCESS_EXECUTION_GOVERNOR.shell.available_permits();
+        let operations = [
+            (&cwd_a, "foreground"),
+            (&cwd_b, "background"),
+            (&cwd_b, "code"),
+        ];
+        let observation = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                // live/started 只用于释放夹具门闩；峰值判据由负载自己的原子占用与永久冲突记录提供。
+                // 冲突直接记录并失败，绝不另排队以掩盖产品没有限制真实并发的问题。
+                for (cwd, id) in operations {
+                    if cwd.join(format!("started-{id}")).exists() {
+                        std::fs::write(cwd.join(format!("release-{id}")), "release")
+                            .map_err(|error| error.to_string())?;
+                    }
+                }
+                if operations
+                    .iter()
+                    .all(|(cwd, id)| cwd.join(format!("started-{id}")).exists())
+                {
+                    return Ok::<(), String>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        // 无论目标观察是否失败，先打开全部自有门闩并取消失败样本，再收集原任务和 cell owner。
+        let mut release_errors = Vec::new();
+        for (cwd, id) in operations {
+            if let Err(error) = std::fs::write(cwd.join(format!("release-{id}")), "release") {
+                release_errors.push(error.to_string());
+            }
+        }
+        if observation.is_err()
+            || observation.as_ref().is_ok_and(|result| result.is_err())
+            || !release_errors.is_empty()
+        {
+            cancel.cancel();
+        }
+        let foreground_result = foreground.await.map_err(|error| error.to_string());
+        let code_result = code.await.map_err(|error| error.to_string());
+        let background_result = match background_result {
+            Some(result) => result.map_err(|error| error.to_string()),
+            None => background.await.map_err(|error| error.to_string()),
+        };
+        let terminal: Result<(CommandCellDelta, String), String> = async {
+            let result = background_result
+                .as_ref()
+                .map_err(Clone::clone)?
+                .as_ref()
+                .map_err(Clone::clone)?;
+            let receipt: CommandCellLaunchReceipt = serde_json::from_value(
+                result
+                    .data
+                    .clone()
+                    .ok_or_else(|| format!("no original receipt: {result:?}"))?,
+            )
+            .map_err(|error| error.to_string())?;
+            tokio::time::timeout_at(cell_observation_deadline, async {
+                let mut cursor = 0;
+                let mut output = String::new();
+                loop {
+                    let remaining = cell_observation_deadline
+                        .saturating_duration_since(tokio::time::Instant::now());
+                    let yield_ms = u64::try_from(remaining.as_millis())
+                        .unwrap_or(u64::MAX)
+                        .min(5000);
+                    let delta = registry_b
+                        .wait(&receipt.cell_id, cursor, yield_ms)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    output.push_str(&delta.new_output);
+                    cursor = delta.next_cursor;
+                    if delta.snapshot.phase.is_terminal() {
+                        return Ok((delta, output));
+                    }
+                }
+            })
+            .await
+            .map_err(|_| "original background cell has no terminal receipt".to_string())?
+        }
+        .await;
+        let shutdown = cells.shutdown().await;
+        drop(created_a);
+        drop(created_b);
+        drop(registry_b);
+        drop(cells);
+        let io_shutdown = io.join_shutdown().await;
+        let available_after = PROCESS_EXECUTION_GOVERNOR.shell.available_permits();
+        eprintln!(
+            "mixed factory workspace: first_started={first_started}; launch_returned_before_release={launch_returned_before_foreground_release}; receipt_before_release={receipt_before_foreground_release}; early_receipt={early_receipt:?}; initial_second_started={initial_second_started}; queued={queued_before_release:?}; overlap={}; available_held={available_while_foreground_live}; available_after={available_after}; foreground={foreground_result:?}; code={code_result:?}; terminal={terminal:?}",
+            occupancy_root.join("overlap").exists()
+        );
+        shutdown?;
+        io_shutdown?;
+        observation.map_err(|_| {
+            "mixed payloads did not all start before the original command deadlines".to_string()
+        })??;
+        if !release_errors.is_empty() {
+            return Err(release_errors.join("; "));
+        }
+        let foreground_result = foreground_result??;
+        let code_result = code_result??;
+        let (terminal, background_output) = terminal?;
+        let queued_before_release = queued_before_release?;
+        assert!(first_started && receipt_before_foreground_release);
+        assert!(!initial_second_started);
+        assert_eq!(available_while_foreground_live, 0);
+        assert_eq!(
+            queued_before_release.snapshot.phase,
+            CommandCellPhase::Queued
+        );
+        assert!(
+            !occupancy_root.join("overlap").exists(),
+            "real gated payloads overlapped"
+        );
+        assert!(
+            !occupancy_root.join("occupied").exists(),
+            "original payload did not release its atomic occupancy"
+        );
+        assert_eq!(available_after, 1);
+        assert!(
+            foreground_result.success
+                && foreground_result.output.contains("mixed-foreground-effect")
+        );
+        assert!(code_result.success && code_result.output.contains("mixed-code-effect"));
+        assert_eq!(terminal.snapshot.exit_code, Some(0));
+        assert!(background_output.contains("mixed-background-effect"));
+        Ok(())
+    }
+
     #[derive(Clone, Debug)]
     struct PrimaryVerificationToolRequest {
         names: Vec<String>,

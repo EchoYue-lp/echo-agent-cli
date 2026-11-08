@@ -2298,6 +2298,10 @@ impl AgentPool {
         if let Some(ref tm) = self.shared.tool_manager {
             agent.set_tool_manager(tm.clone());
         }
+        agent.tool_manager().set_native_execution_admission(Some(
+            crate::tasks::task_runtime::executor::process_execution_governor()
+                .native_shell_admission(),
+        ));
         if let Some(ref hr) = self.shared.hook_registry {
             agent.set_hook_registry(hr.clone());
         }

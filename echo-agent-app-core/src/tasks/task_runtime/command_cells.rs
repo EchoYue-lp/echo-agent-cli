@@ -2723,7 +2723,15 @@ mod tests {
             .begin_owned_flow("command-cell test projection")
             .map_err(|error| error.to_string())?;
         Ok(Arc::new(CommandCellRuntimeService {
-            inner: Arc::new(BackgroundCommandManager::new(manager_config)?),
+            inner: Arc::new(BackgroundCommandManager::new_with_sandbox(
+                manager_config,
+                Arc::new(echo_agent::sandbox::LocalSandbox::new(
+                    echo_agent::sandbox::LocalConfig {
+                        enable_os_sandbox: false,
+                        ..Default::default()
+                    },
+                )),
+            )?),
             launch_observations: Mutex::new(HashMap::new()),
             run_cells: RwLock::new(HashMap::new()),
             chat_cells: RwLock::new(HashMap::new()),

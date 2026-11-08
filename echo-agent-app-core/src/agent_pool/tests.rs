@@ -1,6 +1,90 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn acquired_cached_and_future_pool_agents_keep_final_native_manager_policy() -> TestResult
+    {
+        use crate::infra::native_manager_runtime_contract::{Case, Fixture};
+        let fixture = Fixture::new().await?;
+        // 该 bootstrap 只有框架默认工具，不手工安装产品 provider；由原 pool 最终接线负责。
+        let primary = echo_agent::agent::ReactAgentBuilder::new()
+            .llm_client(Arc::new(echo_agent::testing::MockLlmClient::new()))
+            .enable_tools()
+            .working_dir(fixture.root.path().to_path_buf())
+            .build();
+        let mut primary = match primary {
+            Ok(primary) => primary,
+            Err(error) => {
+                let closed = fixture.finish().await;
+                return Err(format!(
+                    "pool bootstrap fixture failed: {error}; cleanup={closed:?}"
+                ));
+            }
+        };
+        primary.set_sandbox_executor(fixture.sandbox.clone());
+        let mut pool =
+            AgentPool::new_for_test(AgentHandle::new(primary), None, None, 3, false).await;
+        // 复用已有测试构造接缝，仅替换本地数据位置和原服务，不访问用户数据根。
+        pool.shared.workspace_data_root = Some(fixture.root.path().join("pool-product"));
+        pool.shared.command_cell_runtime = Some(fixture.cells.clone());
+        pool.shared.product_data_io = Some(fixture.io.clone());
+        pool.shared.sandbox_manager = Some(fixture.sandbox.clone());
+        pool.shared.local_skill_executor = Some(fixture.sandbox.clone());
+        pool.apply_working_dir(Some(fixture.root.path().to_path_buf()))
+            .await;
+        let outcome = async {
+            for (label, conversation) in [
+                ("pool-acquired", "native-first"),
+                ("pool-cached", "native-first"),
+                ("pool-future", "native-second"),
+            ] {
+                let case = Case::new(&fixture, label)?;
+                pool.set_llm_client_override_for_test(case.client.clone())
+                    .await;
+                let lease = pool
+                    .acquire(conversation)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                // 缓存实例的模型 transport 也沿原 handle 替换，provider/guard 从未注入测试值。
+                lease
+                    .agent()
+                    .write(|agent| {
+                        let original_owned_critic =
+                            agent.critic_owner() == Some(crate::infra::EKO_MODEL_CRITIC_OWNER);
+                        agent.set_llm_client(case.client.clone());
+                        // 缓存实例保有上一轮 Critic：沿既有 owned API 同步它的 Mock transport，真实 verifier/阈值不变。
+                        if original_owned_critic {
+                            agent.set_owned_critic(
+                                crate::infra::EKO_MODEL_CRITIC_OWNER,
+                                Arc::new(
+                                    echo_agent::agent::critic::LlmCritic::new(case.client.clone())
+                                        .with_pass_threshold(7.0),
+                                ),
+                            );
+                        }
+                    })
+                    .await;
+                let target: Arc<dyn echo_agent::agent::Agent> =
+                    Arc::from(lease.agent().to_boxed_agent().await);
+                let settled = case.run(&fixture, target).await;
+                drop(lease);
+                settled?;
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+        let pool_closed = pool.shutdown().await;
+        drop(pool);
+        let fixture_closed = fixture.finish().await;
+        eprintln!(
+            "final pool manager fixture cleanup: outcome={outcome:?}; pool={pool_closed:?}; fixture={fixture_closed:?}"
+        );
+        outcome?;
+        pool_closed?;
+        fixture_closed
+    }
     use echo_agent::agent::Agent;
 
     type TestResult<T = ()> = Result<T, String>;

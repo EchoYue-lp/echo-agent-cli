@@ -1544,6 +1544,10 @@ async fn register_default_subagents(
             Ok(mut subagent) => {
                 // Readonly is a capability projection, not a local target.
                 subagent.set_sandbox_executor(sandbox_manager.clone());
+                subagent.tool_manager().set_native_execution_admission(Some(
+                    crate::tasks::task_runtime::executor::process_execution_governor()
+                        .native_shell_admission(),
+                ));
                 subagent.set_default_skill_source(local_skill_source.clone());
                 let disabled_tools: std::collections::HashSet<String> = disabled_tools_projection
                     .read()
@@ -1750,6 +1754,10 @@ async fn register_default_subagents(
                                 )?
                             };
                             subagent.set_sandbox_executor(sandbox_manager.clone());
+                            subagent.tool_manager().set_native_execution_admission(Some(
+                                crate::tasks::task_runtime::executor::process_execution_governor()
+                                    .native_shell_admission(),
+                            ));
                             subagent.set_default_skill_source(local_skill_source);
                             let disabled_tools: std::collections::HashSet<String> =
                                 disabled_tools.read().await.clone().unwrap_or_default();
@@ -2037,6 +2045,9 @@ fn install_eko_shell_policy(
     sandbox_manager: Arc<dyn echo_agent::sandbox::SandboxExecutor>,
     command_cells: Arc<dyn echo_agent::tools::cell::CommandCellRegistry>,
 ) {
+    agent.tool_manager().set_native_execution_admission(Some(
+        crate::tasks::task_runtime::executor::process_execution_governor().native_shell_admission(),
+    ));
     // EKO is a local personal assistant. The application PermissionService is
     // the authority for automatic tool policy; retaining the framework's
     // generic fixed whitelist here would reject harmless full-auto commands

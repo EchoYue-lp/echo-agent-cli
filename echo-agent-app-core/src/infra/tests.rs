@@ -2134,3 +2134,479 @@ mod provider_identity_tests {
         Ok(())
     }
 }
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+pub(crate) mod native_manager_runtime_contract {
+    use super::*;
+    use echo_agent::agent::{Agent, AgentEvent, CancellationToken};
+    use echo_agent::testing::MockLlmClient;
+    use echo_agent::tools::{ToolContext, ToolParameters, ToolResult};
+    use futures::StreamExt;
+    use std::path::PathBuf;
+
+    fn failure_metadata(failure: &echo_agent::error::AgentFailure) -> String {
+        // 只输出稳定分类和已知固定错误的布尔诊断，禁止输出原 message/prompt/正文。
+        let missing_llm_client = failure
+            .message
+            .contains("has no LlmClient; inject an explicit LlmConfig or LlmClient");
+        format!(
+            "category={:?}, terminal={:?}, code={}, http_status={:?}, missing_llm_client={missing_llm_client}",
+            failure.category, failure.terminal_kind, failure.code, failure.http_status
+        )
+    }
+
+    fn run_error_metadata(error: &echo_agent::error::ReactError) -> String {
+        match echo_agent::error::AgentFailure::try_from(error) {
+            Ok(failure) => failure_metadata(&failure),
+            Err(_) => format!(
+                "unclassified_error_kind={:?}",
+                std::mem::discriminant(error)
+            ),
+        }
+    }
+
+    async fn collect_actual_shell(
+        target: Arc<dyn Agent>,
+        cancel: CancellationToken,
+    ) -> Result<ToolResult, String> {
+        let mut events = target
+            .execute_stream_with_cancel("执行本次受控 shell 并读取真实工具结果。", cancel)
+            .await
+            .map_err(|error| format!("stream creation failed: {}", run_error_metadata(&error)))?;
+        let mut shell = None;
+        let mut source_errors = Vec::new();
+        let mut statuses = Vec::new();
+        let mut tool_results = Vec::new();
+        while let Some(event) = events.next().await {
+            match event {
+                Err(error) => source_errors.push(run_error_metadata(&error)),
+                Ok(AgentEvent::Error {
+                    source, failure, ..
+                }) => {
+                    source_errors.push(format!("source={source}, {}", failure_metadata(&failure)));
+                }
+                Ok(AgentEvent::ExecutionStatus(status)) => {
+                    statuses.push(format!("{:?}/{:?}", status.phase, status.status));
+                    if status.status == echo_agent::agent::ExecutionStatusKind::Failed {
+                        source_errors.push("original execution status Failed".to_string());
+                    }
+                }
+                Ok(AgentEvent::ToolResult {
+                    name,
+                    call_id,
+                    result,
+                }) => {
+                    tool_results.push(format!(
+                        "name={name}, call_id={call_id}, success={}",
+                        result.success
+                    ));
+                    if name == "shell" && call_id == "native-manager-shell" {
+                        shell = Some(result);
+                    }
+                }
+                _ => {}
+            }
+        }
+        eprintln!(
+            "actual final Agent event metadata: statuses={statuses:?}; errors={source_errors:?}; tools={tool_results:?}"
+        );
+        if !source_errors.is_empty() {
+            return Err(format!(
+                "actual final Agent source failed: {source_errors:?}"
+            ));
+        }
+        shell.ok_or_else(|| format!("actual final Agent produced no typed shell result; statuses={statuses:?}; tools={tool_results:?}"))
+    }
+
+    pub(crate) struct Fixture {
+        pub(crate) root: tempfile::TempDir,
+        pub(crate) created: CreatedAgent,
+        pub(crate) sandbox: Arc<dyn echo_agent::sandbox::SandboxExecutor>,
+        pub(crate) cells: Arc<crate::tasks::task_runtime::command_cells::CommandCellRuntimeService>,
+        pub(crate) io: crate::product_data_io::ProductDataIoService,
+    }
+
+    impl Fixture {
+        pub(crate) async fn new() -> Result<Self, String> {
+            let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let sandbox: Arc<dyn echo_agent::sandbox::SandboxExecutor> =
+                Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox());
+            if !sandbox
+                .is_available_at(echo_agent::sandbox::IsolationLevel::OsSandbox)
+                .await
+            {
+                return Err(
+                    "final manager fixture requires the actual OS-isolated Local backend".into(),
+                );
+            }
+            let io = crate::product_data_io::ProductDataIoService::new();
+            let cells = crate::tasks::task_runtime::command_cells::CommandCellRuntimeService::new(
+                sandbox.clone(),
+                Arc::new(
+                    crate::chat_event_log::ChatEventLog::open(
+                        root.path().join("chat-events"),
+                        Default::default(),
+                    )
+                    .map_err(|error| error.to_string())?,
+                ),
+                io.clone(),
+            )?;
+            let created = create_agent_with_diagnostics(
+                &AgentCreateParams {
+                    working_dir: Some(root.path().to_path_buf()),
+                    workspace_data_root: Some(root.path().join("product-data")),
+                    command_cell_runtime: Some(cells.clone()),
+                    product_data_io: Some(io.clone()),
+                    sandbox_executor: Some(sandbox.clone()),
+                    ..Default::default()
+                },
+                &EkoConfig::default(),
+            )
+            .await;
+            let created = match created {
+                Ok(created) => created,
+                Err(error) => {
+                    let closed = cells.shutdown().await;
+                    drop(cells);
+                    let joined = io.join_shutdown().await;
+                    return Err(format!(
+                        "final manager factory failed: {error}; cleanup cells={closed:?}, io={joined:?}"
+                    ));
+                }
+            };
+            Ok(Self {
+                root,
+                created,
+                sandbox,
+                cells,
+                io,
+            })
+        }
+
+        pub(crate) async fn finish(self) -> Result<(), String> {
+            let Self {
+                root,
+                created,
+                sandbox,
+                cells,
+                io,
+            } = self;
+            let closed = cells.shutdown().await;
+            drop(created);
+            drop(cells);
+            drop(sandbox);
+            let joined = io.join_shutdown().await;
+            eprintln!("final manager fixture owner cleanup: cells={closed:?}; io={joined:?}");
+            drop(root);
+            closed?;
+            joined
+        }
+    }
+
+    pub(crate) struct Case {
+        directory: PathBuf,
+        cwd: PathBuf,
+        script: PathBuf,
+        pub(crate) client: Arc<MockLlmClient>,
+    }
+
+    fn quote(path: &std::path::Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+    }
+
+    impl Case {
+        pub(crate) fn new(fixture: &Fixture, name: &str) -> Result<Self, String> {
+            let directory = fixture.root.path().join(name);
+            std::fs::create_dir(&directory).map_err(|error| error.to_string())?;
+            let script = directory.join("payload.bash");
+            // 同一实际负载临界区的 mkdir 是原子判据；冲突立即失败并保留标记，不另排队。
+            std::fs::write(
+                &script,
+                r#"#!/bin/bash
+occupied="$1"
+overlap="$2"
+role="$3"
+release="$4"
+started="$5"
+if ! mkdir "$occupied"; then printf overlap > "$overlap"; exit 91; fi
+trap 'rmdir "$occupied"' EXIT
+printf started > "$started"
+while [ ! -e "$release" ]; do sleep 0.01; done
+printf 'native-manager-%s-effect' "$role"
+"#,
+            )
+            .map_err(|error| error.to_string())?;
+            std::fs::write(directory.join("release-target"), "release")
+                .map_err(|error| error.to_string())?;
+            let command = Self::command(&directory, &script, "target");
+            let client = Arc::new(MockLlmClient::new()
+                .then_tool_call("native-manager-search", "tool_search", serde_json::json!({"query":"shell", "limit":1}).to_string())
+                .then_tool_call("native-manager-shell", "shell", serde_json::json!({"command":command, "timeout":5}).to_string())
+                .with_response("受控执行已观察。")
+                // Pool 若保有产品 Critic，仍走真实 verifier，只替换它原本共享的模型传输。
+                .with_response(serde_json::json!({"score":10.0,"passed":true,"feedback":"受控传输已返回；物理执行另以 typed tool result 断言。","suggestions":[]}).to_string()));
+            Ok(Self {
+                directory,
+                cwd: fixture.root.path().to_path_buf(),
+                script,
+                client,
+            })
+        }
+
+        fn command(directory: &std::path::Path, script: &std::path::Path, role: &str) -> String {
+            format!(
+                "bash {} {} {} {} {} {}",
+                quote(script),
+                quote(&directory.join("occupied")),
+                quote(&directory.join("overlap")),
+                role,
+                quote(&directory.join(format!("release-{role}"))),
+                quote(&directory.join(format!("started-{role}")))
+            )
+        }
+
+        pub(crate) async fn run(
+            self,
+            fixture: &Fixture,
+            target: Arc<dyn Agent>,
+        ) -> Result<(), String> {
+            let root_manager = fixture.created.agent.tool_manager().clone();
+            let cancel = CancellationToken::new();
+            let context = ToolContext {
+                working_dir: Some(self.cwd.clone()),
+                cancel: Some(Arc::new(cancel.clone())),
+                ..Default::default()
+            };
+            let parameters: ToolParameters = serde_json::from_value(serde_json::json!({
+                "command": Self::command(&self.directory, &self.script, "root"), "timeout":5,
+            }))
+            .map_err(|error| error.to_string())?;
+            let observation_started = tokio::time::Instant::now();
+            let completion_deadline = observation_started
+                .checked_add(std::time::Duration::from_secs(5))
+                .ok_or("final manager completion observation deadline overflow")?;
+            let observation_deadline = observation_started
+                .checked_add(std::time::Duration::from_secs(3))
+                .ok_or("final manager observation deadline overflow")?;
+            let readiness_deadline = observation_deadline
+                .checked_sub(std::time::Duration::from_millis(40))
+                .ok_or("final manager observation reserve overflow")?;
+            let mut root_owner = tokio::spawn(async move {
+                root_manager
+                    .execute_tool_with_context_draining_started("shell", parameters, &context)
+                    .await
+                    .map_err(|error| error.to_string())
+            });
+            let first_started = tokio::time::timeout_at(readiness_deadline, async {
+                while !self.directory.join("started-root").exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok();
+            let target_cancel = cancel.clone();
+            let declared_names = target.tool_names();
+            let definitions = target.tool_definitions();
+            let definition_names: Vec<_> = definitions
+                .iter()
+                .map(|definition| definition.function.name.clone())
+                .collect();
+            let schema_bytes = serde_json::to_vec(&definitions)
+                .map(|bytes| bytes.len())
+                .unwrap_or(0);
+            eprintln!(
+                "actual final Agent startup metadata: model_name_empty={}; tools={declared_names:?}; definition_names={definition_names:?}; schema_bytes={schema_bytes}",
+                target.model_name().is_empty()
+            );
+            let mut executing = tokio::spawn(collect_actual_shell(target, target_cancel));
+            let model_reached_shell = tokio::time::timeout_at(readiness_deadline, async {
+                while self.client.call_count() < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok();
+            let early_deadline = tokio::time::Instant::now()
+                .checked_add(std::time::Duration::from_millis(40))
+                .map(|deadline| deadline.min(observation_deadline))
+                .unwrap_or(observation_deadline);
+            let early = tokio::time::timeout_at(early_deadline, &mut executing)
+                .await
+                .ok();
+            let returned_before_release = early.is_some();
+            let root_still_owned = !root_owner.is_finished();
+            let held = crate::tasks::task_runtime::executor::process_execution_governor()
+                .shell_semaphore()
+                .available_permits();
+            // 先放原真实 root 的门闩，再收集同一原工具/模型任务；失败不能遗留自己的进程。
+            let released = std::fs::write(self.directory.join("release-root"), "release")
+                .map_err(|error| error.to_string());
+            if !first_started || !model_reached_shell || released.is_err() {
+                cancel.cancel();
+            }
+            let mut observer_timed_out = false;
+            let release_owned_gates = || {
+                let root_release = std::fs::write(self.directory.join("release-root"), "release");
+                let target_release =
+                    std::fs::write(self.directory.join("release-target"), "release");
+                eprintln!(
+                    "final manager observation timeout cleanup: root_gate={root_release:?}; target_gate={target_release:?}"
+                );
+            };
+            let target_result = match early {
+                Some(result) => result.map_err(|error| error.to_string()),
+                None => match tokio::time::timeout_at(completion_deadline, &mut executing).await {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(_) => {
+                        observer_timed_out = true;
+                        cancel.cancel();
+                        release_owned_gates();
+                        // 只撤回同一 scope 的观察，仍 join 原任务；不 abort/drop owner 或伪造结算。
+                        executing.await.map_err(|error| error.to_string())
+                    }
+                },
+            };
+            let root_result =
+                match tokio::time::timeout_at(completion_deadline, &mut root_owner).await {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(_) => {
+                        observer_timed_out = true;
+                        cancel.cancel();
+                        release_owned_gates();
+                        root_owner.await.map_err(|error| error.to_string())
+                    }
+                };
+            eprintln!(
+                "actual model request metadata: calls={}; tool_schema_counts={:?}; queued_responses={}",
+                self.client.call_count(),
+                self.client.all_tool_counts(),
+                self.client.remaining()
+            );
+            let after = crate::tasks::task_runtime::executor::process_execution_governor()
+                .shell_semaphore()
+                .available_permits();
+            let overlap = self.directory.join("overlap").exists();
+            eprintln!(
+                "final manager real execution: case={}; root_started={first_started}; model_reached_shell={model_reached_shell}; returned_before_release={returned_before_release}; root_owned={root_still_owned}; held={held}; after={after}; atomic_overlap={overlap}; observer_timed_out={observer_timed_out}; root={root_result:?}; target={target_result:?}",
+                self.directory.display()
+            );
+            released?;
+            if observer_timed_out {
+                return Err("final manager absolute observation deadline elapsed; original scopes cancelled, gates released and tasks joined".into());
+            }
+            // target 的原 source 错误优先于为回收控制负载产生的 root cancel 次因。
+            let target_result: ToolResult = target_result??;
+            let root_result = root_result??;
+            if !first_started || !model_reached_shell || !root_still_owned {
+                return Err("final manager fixture did not reach real root ownership and the original shell model call".into());
+            }
+            if returned_before_release || overlap || held != 0 || after != 1 {
+                return Err("actual final manager bypassed shared global1 or failed to retire its original resource".into());
+            }
+            if !root_result.success
+                || !root_result.output.contains("native-manager-root-effect")
+                || root_result.metadata.get("exit_code").map(String::as_str) != Some("0")
+            {
+                return Err("original root shell lacks typed success/exit0/real output".into());
+            }
+            if !target_result.success
+                || !target_result
+                    .output
+                    .contains("native-manager-target-effect")
+                || target_result.metadata.get("exit_code").map(String::as_str) != Some("0")
+            {
+                return Err(
+                    "actual final Agent shell lacks typed success/exit0/real output".into(),
+                );
+            }
+            if self.directory.join("occupied").exists() {
+                return Err("actual payload did not retire its atomic occupancy".into());
+            }
+            // 错误以 Result 回传，外层先 join 原 I/O/cell owner，再让测试失败。
+            Ok(())
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn registered_child_and_real_fork_keep_final_native_manager_policy() -> Result<(), String>
+    {
+        // 原误接 Mock 的反例独占另一真实 registry；缓存和实例不能流入后面的阳性。
+        let negative_fixture = Fixture::new().await?;
+        let negative_outcome = async {
+            let registry = negative_fixture.created.agent.subagent_registry().clone();
+            let case = Case::new(&negative_fixture, "unconfigured-control")?;
+            let old_handle = negative_fixture.created.model_consumers.inherited_handle_for_test("implementer")
+                .ok_or("original built implementer handle missing")?;
+            old_handle.write(|agent| agent.set_llm_client(case.client.clone())).await;
+            if negative_fixture.created.model_consumers.inherited_generation.read().await.llm_client.is_some() {
+                return Err("missing-client negative fixture requires original unconfigured generation".to_string());
+            }
+            let unconfigured = registry.get_agent("implementer").await.ok_or("unconfigured registered factory control missing")?;
+            let negative_cancel = CancellationToken::new();
+            let mut negative = tokio::spawn(collect_actual_shell(unconfigured, negative_cancel.clone()));
+            let negative_result = match tokio::time::timeout(std::time::Duration::from_secs(3), &mut negative).await {
+                Ok(result) => result.map_err(|error| error.to_string())?,
+                Err(_) => {
+                    negative_cancel.cancel();
+                    let joined = negative.await.map_err(|error| error.to_string());
+                    return Err(format!("unconfigured factory control observation expired; original joined={joined:?}"));
+                }
+            };
+            eprintln!("original factory missing-client negative metadata: result={negative_result:?}; mock_calls={}", case.client.call_count());
+            if !matches!(negative_result, Err(ref error) if error.contains("missing_llm_client=true"))
+                || case.client.call_count() != 0 {
+                return Err("original factory control did not expose the expected missing-client source failure".to_string());
+            }
+            Ok::<(), String>(())
+        }.await;
+        let negative_closed = negative_fixture.finish().await;
+        negative_outcome?;
+        negative_closed?;
+
+        let fixture = Fixture::new().await?;
+        let outcome = async {
+            let registry = fixture.created.agent.subagent_registry().clone();
+            let registered_case = Case::new(&fixture, "registered-writer")?;
+            // 原注册路径以 factory 覆盖初始 handle；在首次 get_agent 前绑定实际 generation。
+            fixture
+                .created
+                .model_consumers
+                .inherited_generation
+                .write()
+                .await
+                .llm_client = Some(registered_case.client.clone());
+            let registered = registry
+                .get_agent("implementer")
+                .await
+                .ok_or("registered implementer missing")?;
+            registered_case.run(&fixture, registered).await?;
+            let fork_case = Case::new(&fixture, "fresh-writer")?;
+            fixture
+                .created
+                .model_consumers
+                .inherited_generation
+                .write()
+                .await
+                .llm_client = Some(fork_case.client.clone());
+            let fork = registry
+                .create_fresh_agent("implementer")
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or("actual implementer fork missing")?;
+            fork_case.run(&fixture, fork).await?;
+            let readonly = registry
+                .get_agent("reviewer")
+                .await
+                .ok_or("registered reviewer missing")?;
+            if readonly.tool_names().iter().any(|name| name == "shell") {
+                return Err("readonly child unexpectedly gained shell".to_string());
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+        let closed = fixture.finish().await;
+        outcome?;
+        closed
+    }
+}

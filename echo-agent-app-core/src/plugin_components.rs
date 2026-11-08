@@ -951,6 +951,9 @@ fn build_plugin_agent(
     if let Some(sandbox) = resources.sandbox.clone() {
         agent.set_sandbox_executor(sandbox);
     }
+    agent.tool_manager().set_native_execution_admission(Some(
+        crate::tasks::task_runtime::executor::process_execution_governor().native_shell_admission(),
+    ));
     agent.set_default_skill_source(resources.local_skill_source.clone());
     agent.use_tool_visibility_policy(resources.tool_visibility.clone());
     let disabled_tools = resources.tool_visibility.disabled_names();
@@ -981,6 +984,51 @@ fn build_plugin_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn registered_plugin_instances_and_real_forks_keep_final_native_manager_policy()
+    -> Result<(), String> {
+        use crate::infra::native_manager_runtime_contract::{Case, Fixture};
+        let mut fixture = Fixture::new().await?;
+        let outcome = async {
+            for (label, fresh) in [("plugin-initial", false), ("plugin-fork", true)] {
+                let case = Case::new(&fixture, label)?;
+                // 只替换模型传输；实际走原注册、实例/工厂、项目 adapter 与最终 manager。
+                fixture.created.agent.set_llm_client(case.client.clone());
+                let prepared = PreparedPluginAgent {
+                    plugin: "native-policy-contract".to_string(),
+                    definition: crate::subagent_loader::parse_subagent_md(
+                        &format!("---\nname: {label}\ndescription: controlled native policy contract\nreadonly: false\n---\n执行本次受控 shell。\n"), None,
+                    )?,
+                };
+                register_plugin_agents(&mut fixture.created.agent, &[prepared], Some(fixture.root.path().join("plugin-state"))).await?;
+                let registry = fixture.created.agent.subagent_registry().clone();
+                let target = if fresh {
+                    registry.create_fresh_agent(label).await.map_err(|error| error.to_string())?
+                } else {
+                    registry.get_agent(label).await
+                }.ok_or("actual registered Plugin agent missing")?;
+                case.run(&fixture, target).await?;
+            }
+            let prepared = PreparedPluginAgent {
+                plugin: "native-policy-contract".to_string(),
+                definition: crate::subagent_loader::parse_subagent_md(
+                    "---\nname: native-readonly\ndescription: readonly boundary\nreadonly: true\n---\n只读检查。\n", None,
+                )?,
+            };
+            register_plugin_agents(&mut fixture.created.agent, &[prepared], Some(fixture.root.path().join("plugin-state"))).await?;
+            let readonly = fixture.created.agent.subagent_registry().get_agent("native-readonly").await
+                .ok_or("actual registered readonly Plugin agent missing")?;
+            if readonly.tool_names().iter().any(|name| name == "shell") {
+                return Err("readonly Plugin unexpectedly gained shell".to_string());
+            }
+            Ok::<(), String>(())
+        }.await;
+        let closed = fixture.finish().await;
+        outcome?;
+        closed
+    }
 
     #[test]
     fn monitor_binding_keys_are_qualified_by_target_scope() {

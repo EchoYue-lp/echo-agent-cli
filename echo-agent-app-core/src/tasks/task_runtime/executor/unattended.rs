@@ -170,9 +170,10 @@ async fn execute_task(
     //   and EKO process Subagent permits are already held by the dispatcher.
     // - Write tasks (implementation/debugging) take the write permit.
     // - Verification tasks (shell/build/test) take the write permit + the shell
-    //   permit (default 1, plan §678-680 shell_concurrency = 1).
+    //   logical per-run permit. Physical process capacity belongs to each native command,
+    //   so an awaiting Verification parent cannot occupy its child command slot.
     let is_shell = matches!(task.kind, PlanTaskKind::Verification);
-    let (_process_write_permit, _write_permit, _process_shell_permit, _shell_permit) = if is_shell {
+    let (_process_write_permit, _write_permit, _shell_permit) = if is_shell {
         tracing::info!(
             run_id = %run_id,
             task_id = %task_id,
@@ -200,11 +201,6 @@ async fn execute_task(
             available = shell_sem.available_permits(),
             "task_runtime: waiting for shell permit"
         );
-        let process_sp = tokio::select! {
-            biased;
-            _ = task_cancel.cancelled() => return Err(TaskDispatchFailure::cancelled(task_id.clone(), "cancelled while waiting for process shell permit")),
-            p = PROCESS_EXECUTION_GOVERNOR.shell.acquire() => p.map_err(|e| TaskDispatchFailure::failed(task_id.clone(), e.to_string()))?,
-        };
         let sp = tokio::select! {
             biased;
             _ = task_cancel.cancelled() => return Err(TaskDispatchFailure::cancelled(task_id.clone(), "cancelled while waiting for shell permit")),
@@ -215,7 +211,7 @@ async fn execute_task(
             task_id = %task_id,
             "task_runtime: acquired shell permit"
         );
-        (Some(process_wp), Some(wp), Some(process_sp), Some(sp))
+        (Some(process_wp), Some(wp), Some(sp))
     } else if is_write {
         tracing::info!(
             run_id = %run_id,
@@ -238,9 +234,9 @@ async fn execute_task(
             task_id = %task_id,
             "task_runtime: acquired write permit"
         );
-        (Some(process_wp), Some(wp), None, None)
+        (Some(process_wp), Some(wp), None)
     } else {
-        (None, None, None, None)
+        (None, None, None)
     };
 
     // Physical safety net below the ownership-safe DAG wave: exact file owners
