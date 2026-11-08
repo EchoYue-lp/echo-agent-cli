@@ -245,7 +245,7 @@ export const MessageBubble = memo(function MessageBubble({
   // regeneration or Fork. Its key addresses this display row only.
   if (message.role === 'tool') {
     return (
-      <div className="animate-fade-up py-3">
+      <div className="animate-fade-up py-1.5">
         {message.internalAgent && (
           <span className="text-[10px] text-[var(--text-tertiary)]">Agent 内部工具记录</span>
         )}
@@ -282,7 +282,7 @@ export const MessageBubble = memo(function MessageBubble({
   }
 
   return (
-    <div className={`animate-fade-up py-3 ${isUser ? 'ml-auto w-fit max-w-[85%]' : 'w-full'}`}>
+    <div className={`animate-fade-up py-1.5 ${isUser ? 'ml-auto w-fit max-w-[85%]' : 'w-full'}`}>
       {/* Content */}
       <div className="min-w-0 space-y-2">
         {/* Images */}
@@ -396,7 +396,7 @@ export const MessageBubble = memo(function MessageBubble({
                 </div>
               </div>
             ) : (
-              <div className="rounded-lg bg-[var(--bg-user-bubble)] px-3 py-2.5 text-sm leading-relaxed text-[var(--text-primary)]">
+              <div className="rounded-lg bg-[var(--bg-user-bubble)] px-3 py-1.5 text-sm leading-normal text-[var(--text-primary)]">
                 <div className="whitespace-pre-wrap break-words">{message.content}</div>
               </div>
             )}
@@ -496,7 +496,7 @@ export const MessageBubble = memo(function MessageBubble({
                     </div>
                   </div>
                 ) : (
-                  <div className="text-sm leading-relaxed text-[var(--text-assistant-msg)]">
+                  <div className="text-sm leading-normal text-[var(--text-assistant-msg)]">
                     <MarkdownContent className="break-words" content={message.content} />
                     {message.isStreaming && (
                       <span className="ml-0.5 inline-block h-[14px] w-[3px] animate-pulse rounded-full bg-[var(--accent)] align-text-bottom" />
@@ -504,7 +504,7 @@ export const MessageBubble = memo(function MessageBubble({
                   </div>
                 )}
                 {!message.isStreaming && !editing && (
-                  <div className="mt-2 flex items-center gap-0.5 text-[var(--text-tertiary)]">
+                  <div className="mt-1 flex items-center gap-0.5 text-[var(--text-tertiary)]">
                     <ActionButton
                       icon={<Copy size={13} />}
                       label="复制"

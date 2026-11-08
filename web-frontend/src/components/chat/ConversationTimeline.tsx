@@ -91,7 +91,7 @@ function TurnTimeline({
       </>
     );
   return (
-    <section className="min-w-0 py-3" aria-label="助手轮次" data-turn-key={item.key}>
+    <section className="min-w-0 py-1" aria-label="助手轮次" data-turn-key={item.key}>
       <ExecutionProcessGroup
         completed={Boolean(qualifiedFinal)}
         statusLabel="最终结果已发布"
@@ -226,7 +226,7 @@ export function ConversationTimeline({
         return (
           <div key={item.key}>
             {separator && (
-              <div className="flex items-center gap-3 py-4">
+              <div className="flex items-center gap-3 py-2">
                 <div className="h-px flex-1 bg-[var(--border-secondary)]" />
                 <span className="text-xs text-[var(--text-tertiary)]">
                   {new Date(message.timestamp).toLocaleTimeString([], {

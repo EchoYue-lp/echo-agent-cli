@@ -29,7 +29,7 @@ export const ExecutionProcessGroup = memo(function ExecutionProcessGroup({
   if (!completed) return <>{children}</>;
 
   return (
-    <div className="my-1 min-w-0 border-l border-[var(--border-primary)] pl-3">
+    <div className="my-0.5 min-w-0 border-l border-[var(--border-primary)] pl-3">
       <button
         type="button"
         onClick={() => setCompletedExpanded((value) => !value)}

@@ -1036,13 +1036,13 @@ export function ChatInput({
 
   return (
     <div
-      className="w-full px-3 pb-4 sm:px-6"
+      className="w-full px-3 pb-3 sm:px-4"
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
       {/* Relative container so the absolute-positioned palette anchors here */}
-      <div className="relative mx-auto max-w-[980px]">
+      <div className="relative w-full">
         {/* ── Slash Command Palette ── */}
         {showPalette && (
           <CommandPalette

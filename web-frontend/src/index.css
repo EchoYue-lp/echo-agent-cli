@@ -464,8 +464,8 @@ body {
   margin: 0.4em 0 0.2em;
 }
 .md-content p {
-  margin: 0.4em 0;
-  line-height: 1.75;
+  margin: 0.25em 0;
+  line-height: 1.5;
 }
 .md-content ul,
 .md-content ol {
@@ -473,8 +473,8 @@ body {
   padding-left: 1.5em;
 }
 .md-content li {
-  margin: 0.15em 0;
-  line-height: 1.65;
+  margin: 0.1em 0;
+  line-height: 1.5;
 }
 .md-content strong {
   font-weight: 600;

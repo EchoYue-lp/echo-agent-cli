@@ -505,7 +505,7 @@ export function ChatPanel() {
         }
         footer={
           <div className={messages.length === 0 ? 'pt-2' : 'pt-3'}>
-            <div className="mx-auto w-full max-w-[980px] px-4 sm:px-6 lg:px-8">
+            <div className="w-full px-3 sm:px-4">
               <HitlDialog
                 requests={pendingHitlRequests}
                 conversationLabel={pendingConversationLabel}
@@ -566,18 +566,15 @@ export function ChatPanel() {
         }
       >
         {agentInputReadError && (
-          <div
-            role="status"
-            className="mx-auto max-w-[980px] px-4 pt-2 text-xs text-[var(--color-error)]"
-          >
+          <div role="status" className="w-full px-3 pt-2 sm:px-4 text-xs text-[var(--color-error)]">
             跨会话消息读取失败，已有记录保留：{agentInputReadError}
           </div>
         )}
         {timelineMessages.length === 0 ? (
           <WelcomeScreen />
         ) : (
-          <div className="mx-auto w-full max-w-[980px] px-4 sm:px-6 lg:px-8">
-            <div className="space-y-1 pb-6 pt-5">
+          <div className="w-full px-3 sm:px-4">
+            <div className="space-y-1 pb-3 pt-2">
               <ConversationTimeline
                 messages={timelineMessages}
                 targetScope={{
@@ -865,7 +862,7 @@ function GoalBar({
   };
   return (
     <section
-      className="mx-auto mb-2 w-full max-w-[980px] px-4 text-xs sm:px-6 lg:px-8"
+      className="mb-2 w-full px-3 text-xs sm:px-4"
       aria-label="当前目标"
       aria-busy={!!progress}
     >
@@ -1129,10 +1126,7 @@ function QueuedInputList({
     }
   };
   return (
-    <section
-      className="mx-auto mb-2 w-full max-w-[980px] px-4 sm:px-6 lg:px-8"
-      aria-label="Steer 队列"
-    >
+    <section className="mb-2 w-full px-3 sm:px-4" aria-label="Steer 队列">
       <div className="mb-1 flex items-center justify-between px-1 text-[11px] text-[var(--text-tertiary)]">
         <span>Steer · {items.length} 条</span>
         <span>拖动或用上下移按钮调整顺序</span>

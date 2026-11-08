@@ -319,7 +319,7 @@ function NativeProcessSegment({
       {expanded && (
         <div
           id={detailId}
-          className="ml-3 space-y-2 border-l border-[var(--border-primary)] py-1 pl-3"
+          className="ml-3 space-y-1 border-l border-[var(--border-primary)] py-1 pl-3"
         >
           {item.entries.map((entry) => (
             <div key={entry.key} data-process-entry={entry.key}>
@@ -395,7 +395,7 @@ export function NativeMessageTimeline({
     });
   };
   return (
-    <div className="space-y-2" aria-label="消息与工具时间线">
+    <div className="space-y-1" aria-label="消息与工具时间线">
       {items.map((item) => {
         if (item.type === 'process') {
           const known = item.entries.flatMap((entry) =>
@@ -429,7 +429,7 @@ export function NativeMessageTimeline({
           );
         }
         return (
-          <div key={item.key} className="text-sm leading-relaxed text-[var(--text-assistant-msg)]">
+          <div key={item.key} className="text-sm leading-normal text-[var(--text-assistant-msg)]">
             <MarkdownContent className="break-words" content={item.content} />
           </div>
         );
