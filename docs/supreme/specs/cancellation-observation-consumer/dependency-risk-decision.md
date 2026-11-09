@@ -1,5 +1,17 @@
 # Current CLI dependency risk decision
 
+## 2026-11-09 CLI consumer554 的本次精确绑定
+
+用户对本次具体问题直接回答：“同意，仅本次精确绑定（推荐）”。原问题与回答保存在主根 `.echo-semantic/local/dependency-exact-binding-20261109-r01/authorization.json`，SHA256 `b940901e6c755ea39725be1ad184c6713aa6c9c388f9c29e8d1b4d2ffd305733`。
+
+本次仅将 CLI 原五项完整风险身份绑定到 consumer `55413633c252b53cc79116b374a03d36fcdcfc3ec00dd093d159c91809e6eac4`（283 输入）和原锁 `48eece730daaa9eff539e416861454441c23c54abf02bacaa2c3bdb375bd6329`（769 包）。consumer 仅因微信诊断源码变化，原五项 name/version/source/checksum/advisory/kind、collector、checker、原8控制及扫描策略均不变；不增加 ignore 或过滤。policy 仅更新 consumer 字段，采用后原8控制和 actual-lock／canonical-origin 默认 fresh 正式门禁仍须实际通过，分别记录 scanner 与 gate 出口。
+
+原 glib0.18.5 unsound，以及 proc-macro-error1.0.4、zvariant5.13.1、zbus_names4.3.4、zvariant_derive5.14.0 unmaintained 风险仍未修复；本次不是零warning审计，不接受未来任何新源码、锁、版本、来源或风险，不向其它仓继承。GUI／手机、App和精确 main CI继续单独验收；整体提交合并仍按本次已授权整合目标与原门禁执行。下方旧43ed绑定和失败保留历史原义。
+
+原五项风险接触边界的独立复评、微信诊断实际RED/GREEN及完整本地Rust/GUI资格分别保全；本节先记录精确人类批准与采用，下段单列批准后本次正式原8项控制／两项fresh gate的实际结果。公共API、示例及官网产品行为未因本绑定新增；examples与官网无需为风险字段另改，官网最终来源摘要随最终main正常同步。
+
+批准后的原8项控制已实际自然0；两个原正式默认 fresh gate/caller均自然0，scanner各自然1、0漏洞、恰原5项完整warning、769包、ignore=[]、noFetch=false。数据库为 `7a40350e1b8ba5b656d909f88222a8059a83d88d`／1422条；两份独立原JSON均10795B／SHA256 `c89fea7b249432cbb925ea45458a3a12ad16c31a9634c22439b1b5e00dd301d9`。完整执行位于主根 `.echo-semantic/local/dependency-exact-binding-20261109-r01/formal-cli-r01/execution.json`，SHA256 `4490c6d7fd133485f256a24cc26c745681f8ebb23005343c92825cce12f68f4e`。283输入、policy和工具无漂移，临时转发与scanner均已停止；原五风险未修复，不以风险gate通过代替App、手机或精确main CI。
+
 ## 2026-11-08 用户批准本次43ed源码与48ee锁精确绑定
 
 用户对列出完整consumer、锁、283输入、769包与原五项未修复warning的具体问题直接回答：“同意，仅本次精确绑定（推荐）”。原问题与回答保存在主根 `.echo-semantic/local/dependency-exact-binding-20261108-r01/authorization.json`，SHA256 `ad2267dc75aaec224777c4133a00c1c54277906fc6f0152f1a31b9486c24bae1`。
