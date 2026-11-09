@@ -5958,7 +5958,46 @@ mod workspace_transition_tests {
         );
         let linked_project = temp.path().join("workspace-b-project");
         std::fs::create_dir_all(&linked_project).map_err(|error| error.to_string())?;
-        std::fs::create_dir(linked_project.join(".git")).map_err(|error| error.to_string())?;
+        {
+            // 真实 Git 准备不能借用夹具父目录中的仓库；在本目录初始化并核对根。
+            let directory = linked_project.as_path();
+            std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+            let initialized = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(directory)
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !initialized.status.success() {
+                return Err(format!(
+                    "fixture git init failed ({}): {}",
+                    initialized.status,
+                    String::from_utf8_lossy(&initialized.stderr),
+                ));
+            }
+            let toplevel = std::process::Command::new("git")
+                .args(["rev-parse", "--show-toplevel"])
+                .current_dir(directory)
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !toplevel.status.success() {
+                return Err(format!(
+                    "fixture git root discovery failed ({}): {}",
+                    toplevel.status,
+                    String::from_utf8_lossy(&toplevel.stderr),
+                ));
+            }
+            let reported_root =
+                String::from_utf8(toplevel.stdout).map_err(|error| error.to_string())?;
+            assert_eq!(
+                std::path::Path::new(reported_root.trim())
+                    .canonicalize()
+                    .map_err(|error| error.to_string())?,
+                directory
+                    .canonicalize()
+                    .map_err(|error| error.to_string())?,
+                "fixture git must use its own project root",
+            );
+        }
         std::fs::write(linked_project.join("same.txt"), "same bytes")
             .map_err(|error| error.to_string())?;
         let linked_skill = linked_project.join(".eko/skills/linked-review");

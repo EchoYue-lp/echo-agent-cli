@@ -135,7 +135,7 @@ impl SftpLanes {
         self.closing.store(false, Ordering::Release);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(super) async fn shutdown(&self) -> Result<()> {
         self.shutdown_before(tokio::time::Instant::now() + super::super::CLOSE_OBSERVATION_TIMEOUT)
             .await

@@ -2716,7 +2716,46 @@ mod tests {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let root = temp.path().join("shared-rule-projection");
         std::fs::create_dir_all(root.join(".eko")).map_err(|error| error.to_string())?;
-        std::fs::create_dir(root.join(".git")).map_err(|error| error.to_string())?;
+        {
+            // 真实 Git 准备不能借用夹具父目录中的仓库；在本目录初始化并核对根。
+            let directory = root.as_path();
+            std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+            let initialized = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(directory)
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !initialized.status.success() {
+                return Err(format!(
+                    "fixture git init failed ({}): {}",
+                    initialized.status,
+                    String::from_utf8_lossy(&initialized.stderr),
+                ));
+            }
+            let toplevel = std::process::Command::new("git")
+                .args(["rev-parse", "--show-toplevel"])
+                .current_dir(directory)
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !toplevel.status.success() {
+                return Err(format!(
+                    "fixture git root discovery failed ({}): {}",
+                    toplevel.status,
+                    String::from_utf8_lossy(&toplevel.stderr),
+                ));
+            }
+            let reported_root =
+                String::from_utf8(toplevel.stdout).map_err(|error| error.to_string())?;
+            assert_eq!(
+                std::path::Path::new(reported_root.trim())
+                    .canonicalize()
+                    .map_err(|error| error.to_string())?,
+                directory
+                    .canonicalize()
+                    .map_err(|error| error.to_string())?,
+                "fixture git must use its own project root",
+            );
+        }
         let root = root.canonicalize().map_err(|error| error.to_string())?;
         let workspace = Workspace {
             id: WorkspaceId::from_name("shared-rule-projection"),

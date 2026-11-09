@@ -914,7 +914,46 @@ mod tests {
         let old_skill_dir = old_project_root.join(".eko/skills/project-review");
         std::fs::create_dir_all(&workspace_root).map_err(|error| error.to_string())?;
         std::fs::create_dir_all(&old_skill_dir).map_err(|error| error.to_string())?;
-        std::fs::create_dir_all(project_root.join(".git")).map_err(|error| error.to_string())?;
+        {
+            // 真实 Git 准备不能借用夹具父目录中的仓库；在本目录初始化并核对根。
+            let directory = project_root.as_path();
+            std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+            let initialized = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(directory)
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !initialized.status.success() {
+                return Err(format!(
+                    "fixture git init failed ({}): {}",
+                    initialized.status,
+                    String::from_utf8_lossy(&initialized.stderr),
+                ));
+            }
+            let toplevel = std::process::Command::new("git")
+                .args(["rev-parse", "--show-toplevel"])
+                .current_dir(directory)
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !toplevel.status.success() {
+                return Err(format!(
+                    "fixture git root discovery failed ({}): {}",
+                    toplevel.status,
+                    String::from_utf8_lossy(&toplevel.stderr),
+                ));
+            }
+            let reported_root =
+                String::from_utf8(toplevel.stdout).map_err(|error| error.to_string())?;
+            assert_eq!(
+                std::path::Path::new(reported_root.trim())
+                    .canonicalize()
+                    .map_err(|error| error.to_string())?,
+                directory
+                    .canonicalize()
+                    .map_err(|error| error.to_string())?,
+                "fixture git must use its own project root",
+            );
+        }
         std::fs::create_dir_all(&skill_dir).map_err(|error| error.to_string())?;
         std::fs::write(project_root.join("AGENTS.md"), "LINKED_PROJECT_AGENT_RULE")
             .map_err(|error| error.to_string())?;
@@ -1414,27 +1453,36 @@ mod tests {
     #[tokio::test]
     async fn working_dir_applies_to_existing_and_future_pool_agents() -> Result<(), String> {
         let pool = create_test_pool(4, false).await?;
-        let existing = pool
-            .acquire("existing-working-dir")
-            .await
-            .map_err(|error| error.to_string())?;
-        let root = std::env::temp_dir().join("eko-pool-working-dir");
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let result = async {
+            let existing = pool
+                .acquire("existing-working-dir")
+                .await
+                .map_err(|error| error.to_string())?;
+            let root = temporary.path().to_path_buf();
 
-        pool.apply_working_dir(Some(root.clone())).await;
-        assert_eq!(
-            existing.agent().read(|agent| agent.working_dir()).await,
-            Some(root.clone())
-        );
+            pool.apply_working_dir(Some(root.clone())).await;
+            assert_eq!(
+                existing.agent().read(|agent| agent.working_dir()).await,
+                Some(root.clone())
+            );
 
-        let future = pool
-            .acquire("future-working-dir")
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(
-            future.agent().read(|agent| agent.working_dir()).await,
-            Some(root)
-        );
-        Ok(())
+            let future = pool
+                .acquire("future-working-dir")
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(
+                future.agent().read(|agent| agent.working_dir()).await,
+                Some(root)
+            );
+            Ok::<(), String>(())
+        }
+        .await;
+        // 原池关闭期间保留实际目录，且先释放 existing/future 的执行租约。
+        let closed = pool.shutdown().await;
+        drop(temporary);
+        result?;
+        closed
     }
 
     async fn assert_default_subagents_use_selected_pool_store(
@@ -1564,7 +1612,46 @@ mod tests {
     #[tokio::test]
     async fn global_pool_default_inherited_and_real_fork_keep_selected_store_owner() -> TestResult {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        std::fs::create_dir_all(temp.path().join(".git")).map_err(|error| error.to_string())?;
+        {
+            // 真实 Git 准备不能借用夹具父目录中的仓库；在本目录初始化并核对根。
+            let directory = temp.path();
+            std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+            let initialized = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(directory)
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !initialized.status.success() {
+                return Err(format!(
+                    "fixture git init failed ({}): {}",
+                    initialized.status,
+                    String::from_utf8_lossy(&initialized.stderr),
+                ));
+            }
+            let toplevel = std::process::Command::new("git")
+                .args(["rev-parse", "--show-toplevel"])
+                .current_dir(directory)
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !toplevel.status.success() {
+                return Err(format!(
+                    "fixture git root discovery failed ({}): {}",
+                    toplevel.status,
+                    String::from_utf8_lossy(&toplevel.stderr),
+                ));
+            }
+            let reported_root =
+                String::from_utf8(toplevel.stdout).map_err(|error| error.to_string())?;
+            assert_eq!(
+                std::path::Path::new(reported_root.trim())
+                    .canonicalize()
+                    .map_err(|error| error.to_string())?,
+                directory
+                    .canonicalize()
+                    .map_err(|error| error.to_string())?,
+                "fixture git must use its own project root",
+            );
+        }
         let selected = Arc::new(echo_agent::memory::InMemoryStore::new())
             as Arc<dyn echo_agent::memory::Store>;
         let other = Arc::new(echo_agent::memory::InMemoryStore::new())
@@ -1612,7 +1699,46 @@ mod tests {
         let mut runtimes = Vec::new();
         for name in ["memory-owner-workspace-a", "memory-owner-workspace-b"] {
             let root = temp.path().join(name);
-            std::fs::create_dir_all(root.join(".git")).map_err(|error| error.to_string())?;
+            {
+                // 真实 Git 准备不能借用夹具父目录中的仓库；在本目录初始化并核对根。
+                let directory = root.as_path();
+                std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+                let initialized = std::process::Command::new("git")
+                    .args(["init", "-q"])
+                    .arg(directory)
+                    .output()
+                    .map_err(|error| error.to_string())?;
+                if !initialized.status.success() {
+                    return Err(format!(
+                        "fixture git init failed ({}): {}",
+                        initialized.status,
+                        String::from_utf8_lossy(&initialized.stderr),
+                    ));
+                }
+                let toplevel = std::process::Command::new("git")
+                    .args(["rev-parse", "--show-toplevel"])
+                    .current_dir(directory)
+                    .output()
+                    .map_err(|error| error.to_string())?;
+                if !toplevel.status.success() {
+                    return Err(format!(
+                        "fixture git root discovery failed ({}): {}",
+                        toplevel.status,
+                        String::from_utf8_lossy(&toplevel.stderr),
+                    ));
+                }
+                let reported_root =
+                    String::from_utf8(toplevel.stdout).map_err(|error| error.to_string())?;
+                assert_eq!(
+                    std::path::Path::new(reported_root.trim())
+                        .canonicalize()
+                        .map_err(|error| error.to_string())?,
+                    directory
+                        .canonicalize()
+                        .map_err(|error| error.to_string())?,
+                    "fixture git must use its own project root",
+                );
+            }
             let now = chrono::Utc::now();
             let workspace = crate::workspace::Workspace {
                 id: crate::workspace::WorkspaceId::from_name(name),

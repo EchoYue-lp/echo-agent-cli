@@ -620,15 +620,18 @@ fn timeout_secs(command: &SandboxCommand, limits: &ResourceLimits) -> u64 {
 /// 更不证明被操作的服务已经停止。客户端仍须保留未知及原物理观察。
 fn deadline_script(script: &str, timeout_seconds: u64) -> Result<String> {
     let payload = shell_quote(script).map_err(unavailable)?;
-    // POSIX异步列表默认把stdin设为空；负载必须显式继承原输入。
+    // POSIX异步列表会先把fd0设为空；父shell须先保存原输入，
+    // 再从独立fd传给负载。<&0在dash里只会复制已置空的输入。
     // timer停止时必须kill+wait其原sleep子进程，再由parent wait timer。
     // 仅kill外层subshell会留下sleep持有输出管道，给每条快命令多加约1秒。
     // PID发布期间先记录停止请求，发布完成再回收，不能在spawn半途退出。
     Ok(format!(
         r#"eko_marker="${{TMPDIR:-/tmp}}/.eko-deadline-$$"
 rm -f "$eko_marker"
-sh -c {payload} <&0 &
+exec 3<&0
+sh -c {payload} <&3 3<&- &
 eko_child=$!
+exec 3<&-
 (
   eko_elapsed=0
   eko_timer=
@@ -1788,6 +1791,168 @@ except OSError as error:
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn wrapper_regression_none_descendant_pipes_keep_unknown_until_original_settlement()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (service, connection) = fixture_connection()?;
+        let directory = tempfile::tempdir()?;
+        let ready = directory.path().join("descendant-ready");
+        let release = directory.path().join("descendant-release");
+        let done = directory.path().join("descendant-done");
+        let _release = ReleaseLocalFixture(release.clone());
+        let descendant = format!(
+            "trap '' HUP TERM; printf started > {}; while [ ! -f {} ]; do /bin/sleep 0.01; done; printf descendant_stdout; printf descendant_stderr >&2; printf done > {}",
+            shell_quote(ready.to_str().ok_or("invalid fixture path")?)?,
+            shell_quote(release.to_str().ok_or("invalid fixture path")?)?,
+            shell_quote(done.to_str().ok_or("invalid fixture path")?)?,
+        );
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut command = fixture_command(&dropped);
+        command.kind =
+            CommandKind::Shell(format!("sh -c {} & wait \"$!\"", shell_quote(&descendant)?));
+        command.timeout = Duration::from_secs(1);
+        assert!(!command.require_physical_resource_ownership);
+        // 复用现有观察测试的2秒外层调度容差，生产预算仍为1秒+CLOSE的5秒。
+        let bound =
+            command.timeout + crate::terminal::CLOSE_OBSERVATION_TIMEOUT + Duration::from_secs(2);
+        let launch_directory = directory.path().to_path_buf();
+        let started = tokio::time::Instant::now();
+        let mut observer = tokio::spawn(ProjectSshSandbox::execute_with_launcher(
+            connection.clone(),
+            command,
+            ResourceLimits::unrestricted(),
+            None,
+            move |_, script| {
+                let mut command = tokio::process::Command::new("/bin/sh");
+                command
+                    .args(["-c", &script])
+                    .env("TMPDIR", launch_directory);
+                Ok(command)
+            },
+        ));
+        // 只等真实后代已进入自有门闩；不靠预先sleep猜测到期与管道状态。
+        let descendant_ready = tokio::time::timeout(Duration::from_secs(2), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let original = connection
+            .retained_children
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .find_map(|resource| match resource {
+                super::super::RetainedSshResource::RemoteOperation(resource) => {
+                    Some(Arc::clone(resource))
+                }
+                _ => None,
+            });
+        let observed = tokio::time::timeout_at(started + bound, &mut observer).await;
+        let returned_bounded = observed.is_ok();
+        let resource = wait_for_unknown(&connection).await;
+        let capture_retained = || {
+            resource.as_ref().is_ok_and(|resource| {
+                !resource.is_settled()
+                    && resource.stop_is_unknown()
+                    && !resource
+                        .test_local_exit_observed
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    && original
+                        .as_ref()
+                        .is_some_and(|original| Arc::ptr_eq(original, resource))
+            }) && dropped.load(std::sync::atomic::Ordering::Acquire) == 0
+                && connection
+                    .active_operations
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == 1
+                && !done.exists()
+        };
+        let retained_before_root_exit = capture_retained();
+        // 原root退出与调用方返回Unknown不是同一个时点；timer回收也须在
+        // 同一个started+bound绝对截止前观察，不能另给一轮等待预算。
+        // 只探测原spawn发布的正PID；不枚举、猜测或终止任何进程组。
+        let local_root = tokio::time::timeout_at(started + bound, async {
+            let pid = original
+                .as_ref()
+                .and_then(|resource| resource.child_id)
+                .ok_or_else(|| std::io::Error::other("fixture original PID was not published"))?;
+            loop {
+                let status = tokio::process::Command::new("/bin/sh")
+                    .args(["-c", "kill -0 \"$1\" 2>/dev/null", "owned-wrapper"])
+                    .arg(pid.to_string())
+                    .status()
+                    .await?;
+                if !status.success() {
+                    return Ok::<(), std::io::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let retained_after_root_exit =
+            local_root.as_ref().is_ok_and(|result| result.is_ok()) && capture_retained();
+        // 所有断言前先释放唯一自有门闩。不得complete_with_proof/abort或补发kill；
+        // 原wait和原stdout/stderr join须自行完成，并由原physical路径释放guard。
+        let released = std::fs::write(&release, b"release");
+        let settled = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if connection
+                    .active_operations
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == 0
+                    && dropped.load(std::sync::atomic::Ordering::Acquire) == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let result = match observed {
+            Ok(result) => result,
+            Err(_) => tokio::time::timeout(Duration::from_secs(5), &mut observer).await?,
+        };
+        let closed = service.close_project_ssh("fixture").await;
+        descendant_ready?;
+        released?;
+        settled?;
+        closed?;
+        let resource = resource?;
+        let error = result?
+            .err()
+            .ok_or("bounded unknown unexpectedly succeeded")?;
+        assert!(
+            returned_bounded,
+            "None observer exceeded its existing budget"
+        );
+        assert!(
+            retained_before_root_exit,
+            "Unknown must retain the original operation and guard"
+        );
+        local_root??;
+        assert!(
+            retained_after_root_exit,
+            "root exit must not settle the original pipes, operation or guard"
+        );
+        assert!(error.to_string().contains("停止观察期限已到"));
+        assert_eq!(
+            echo_agent::tools::ToolFailure::from_error(&error, false).side_effect,
+            echo_agent::tools::ToolSideEffect::Possible
+        );
+        assert!(done.exists());
+        assert!(resource.is_settled());
+        assert!(!resource.stop_is_unknown());
+        assert!(
+            resource
+                .test_local_exit_observed
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::Acquire), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn wrapper_regression_transport_loss_observation_is_bounded_and_keeps_unknown()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let (service, connection) = fixture_connection()?;
@@ -2119,7 +2284,7 @@ IFS= read -r ignored < "$EKO_TEST_TIMER_GATE"
     fn watchdog_terminates_payload_at_the_deadline()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let started = std::time::Instant::now();
-        let output = run_wrapped("sleep 30", 1)?;
+        let output = run_wrapped("exec sleep 30", 1)?;
         assert_eq!(output.status.code(), Some(124), "deadline must map to 124");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
