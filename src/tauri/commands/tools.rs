@@ -6,8 +6,14 @@ use crate::tauri::state::TauriState;
 #[tauri::command]
 pub async fn list_tools(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    workspace_generation: String,
 ) -> Result<Vec<echo_agent_app_core::api::types::ToolInfo>, IpcError> {
-    let runtime = current_tool_runtime(&state).await?;
+    let (_publication, runtime) = state
+        .app_state
+        .tool_control_runtime_for_scope(&workspace_id, &workspace_generation)
+        .await
+        .map_err(IpcError::Internal)?;
     let agent = runtime.primary_agent();
     state
         .app_state
@@ -19,9 +25,15 @@ pub async fn list_tools(
 #[tauri::command]
 pub async fn get_tool(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    workspace_generation: String,
     name: String,
 ) -> Result<echo_agent_app_core::api::types::ToolInfo, IpcError> {
-    let runtime = current_tool_runtime(&state).await?;
+    let (_publication, runtime) = state
+        .app_state
+        .tool_control_runtime_for_scope(&workspace_id, &workspace_generation)
+        .await
+        .map_err(IpcError::Internal)?;
     let agent = runtime.primary_agent();
     let infos = state
         .app_state
@@ -37,9 +49,15 @@ pub async fn get_tool(
 #[tauri::command]
 pub async fn enable_tool(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    workspace_generation: String,
     name: String,
 ) -> Result<echo_agent_app_core::api::tool_control::ToolControlReceipt, IpcError> {
-    let runtime = current_tool_runtime(&state).await?;
+    let (_publication, runtime) = state
+        .app_state
+        .tool_control_runtime_for_scope(&workspace_id, &workspace_generation)
+        .await
+        .map_err(IpcError::Internal)?;
     let agent = runtime.primary_agent();
     state
         .app_state
@@ -51,25 +69,21 @@ pub async fn enable_tool(
 #[tauri::command]
 pub async fn disable_tool(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    workspace_generation: String,
     name: String,
 ) -> Result<echo_agent_app_core::api::tool_control::ToolControlReceipt, IpcError> {
-    let runtime = current_tool_runtime(&state).await?;
+    let (_publication, runtime) = state
+        .app_state
+        .tool_control_runtime_for_scope(&workspace_id, &workspace_generation)
+        .await
+        .map_err(IpcError::Internal)?;
     let agent = runtime.primary_agent();
     state
         .app_state
         .set_tool_enabled(&agent, &name, false)
         .await
         .map_err(tool_control_error)
-}
-
-async fn current_tool_runtime(
-    state: &TauriState,
-) -> Result<echo_agent_app_core::api::state::ScopedChatRuntime, IpcError> {
-    state
-        .app_state
-        .current_control_runtime()
-        .await
-        .map_err(|error| IpcError::Internal(error.to_string()))
 }
 
 fn tool_control_error(error: echo_agent_app_core::api::tool_control::ToolControlError) -> IpcError {

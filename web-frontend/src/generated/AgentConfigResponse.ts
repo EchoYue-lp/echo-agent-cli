@@ -3,7 +3,6 @@
 export type AgentConfigResponse = {
   model: string;
   system_prompt: string;
-  max_iterations: number;
   token_limit: number;
   session_id: string | null;
   /**

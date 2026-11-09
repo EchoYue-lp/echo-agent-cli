@@ -1,5 +1,9 @@
-import { useEffect, useState, useCallback } from 'react';
-import { schedulerApi, type SchedulerTask } from '../../api/endpoints';
+import { useEffect, useState, useCallback, useRef } from 'react';
+import {
+  schedulerApi,
+  type SchedulerTask,
+  type SchedulerManualResponse,
+} from '../../api/endpoints';
 import {
   Plus,
   Play,
@@ -14,6 +18,8 @@ import {
   HelpCircle,
 } from 'lucide-react';
 import { useToastStore } from '../../stores/toastStore';
+import { SchedulerHistory, SchedulerRunLink } from './SchedulerHistory';
+import { WeixinNotificationConfiguration } from './WeixinNotification';
 
 // ── Cron helpers ───────────────────────────────────────────────────
 
@@ -77,14 +83,17 @@ export function SchedulerPanel() {
   const [refreshing, setRefreshing] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState({ name: '', cron_expr: '', prompt: '' });
-  const [runResult, setRunResult] = useState<{
-    id: string;
-    result?: string;
-    error?: string;
-  } | null>(null);
+  const [editing, setEditing] = useState<SchedulerTask | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [runResults, setRunResults] = useState<
+    Record<string, Partial<SchedulerManualResponse> & { pending: boolean }>
+  >({});
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
-  const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
+  const [busyTasks, setBusyTasks] = useState<Set<string>>(() => new Set());
+  const pendingTasks = useRef(new Set<string>());
+  const observer = useRef({ active: true });
+  const listRequest = useRef(0);
   const addToast = useToastStore((s) => s.addToast);
 
   const s = {
@@ -101,22 +110,50 @@ export function SchedulerPanel() {
   const cronError = form.cron_expr.trim() ? validateCron(form.cron_expr) : null;
 
   const fetchTasks = useCallback(async () => {
+    const current = observer.current;
+    const request = ++listRequest.current;
     setRefreshing(true);
     try {
       const data = await schedulerApi.list();
-      setTasks(data);
+      if (current.active && request === listRequest.current) setTasks(data);
     } catch (e) {
+      if (!current.active || request !== listRequest.current) return;
       console.error('Failed to fetch scheduler tasks:', e);
       addToast('error', `加载定时任务失败: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (current.active && request === listRequest.current) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
   }, [addToast]);
 
   useEffect(() => {
-    fetchTasks();
+    const current = { active: true };
+    observer.current = current;
+    void fetchTasks();
+    return () => {
+      // 页面只撤销观察；原 scheduler callback 仍由后台 owner 结算。
+      current.active = false;
+    };
   }, [fetchTasks]);
+
+  const beginTask = (id: string) => {
+    // ref 同步拒绝同一 task 的重复点击，React 下一次 render 前也不重复准入。
+    if (pendingTasks.current.has(id)) return false;
+    pendingTasks.current.add(id);
+    setBusyTasks((previous) => new Set(previous).add(id));
+    return true;
+  };
+  const finishTask = (id: string, current: { active: boolean }) => {
+    pendingTasks.current.delete(id);
+    if (current.active)
+      setBusyTasks((previous) => {
+        const next = new Set(previous);
+        next.delete(id);
+        return next;
+      });
+  };
 
   const handleCreate = async () => {
     if (!form.name.trim() || !form.cron_expr.trim() || !form.prompt.trim()) return;
@@ -125,69 +162,103 @@ export function SchedulerPanel() {
       addToast('warning', cronError);
       return;
     }
+    const current = observer.current;
     setSubmitting(true);
+    setSaveError(null);
     try {
-      await schedulerApi.create(form);
-      addToast('success', '定时任务已创建');
+      if (editing) {
+        const response = await schedulerApi.edit(editing, form);
+        if (!current.active) return;
+        if (!response.success) {
+          setSaveError(response.error ?? response.cause ?? '修改未确认');
+          addToast(
+            response.outcome_unknown ? 'warning' : 'error',
+            response.error ?? response.cause ?? '修改未确认'
+          );
+          return;
+        }
+      } else {
+        await schedulerApi.create(form);
+      }
+      if (!current.active) return;
+      addToast('success', editing ? '定时任务已修改' : '定时任务已创建');
+      setEditing(null);
       setForm({ name: '', cron_expr: '', prompt: '' });
       setShowAdd(false);
       await fetchTasks();
     } catch (e) {
+      if (!current.active) return;
       console.error('Failed to create task:', e);
-      addToast('error', `创建定时任务失败: ${e instanceof Error ? e.message : String(e)}`);
+      setSaveError(e instanceof Error ? e.message : String(e));
+      addToast('error', `保存定时任务失败: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
-      setSubmitting(false);
+      if (current.active) setSubmitting(false);
     }
   };
 
   const handleToggle = async (task: SchedulerTask) => {
+    if (!beginTask(task.id)) return;
+    const current = observer.current;
     const nextEnabled = task.status !== 'enabled';
-    setBusyTaskId(task.id);
     try {
       await schedulerApi.updateStatus(task.id, nextEnabled);
+      if (!current.active) return;
       addToast('success', nextEnabled ? '定时任务已启用' : '定时任务已禁用');
       await fetchTasks();
     } catch (e) {
+      if (!current.active) return;
       console.error('Failed to toggle task:', e);
       addToast('error', `更新定时任务状态失败: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
-      setBusyTaskId(null);
+      finishTask(task.id, current);
     }
   };
 
   const handleRun = async (id: string) => {
-    setRunResult({ id });
-    setBusyTaskId(id);
+    if (!beginTask(id)) return;
+    const current = observer.current;
+    setRunResults((previous) => ({ ...previous, [id]: { pending: true } }));
     try {
       const res = await schedulerApi.run(id);
-      setRunResult({ id, result: res.result, error: res.error });
-      if (res.error) {
-        addToast('error', `手动运行失败: ${res.error}`);
+      if (!current.active) return;
+      setRunResults((previous) => ({ ...previous, [id]: { ...res, pending: false } }));
+      if (!res.success) {
+        addToast(
+          res.outcome_unknown ? 'warning' : 'error',
+          `手动运行未确认: ${res.error ?? res.cause}`
+        );
       } else {
         addToast('success', '定时任务运行完成');
       }
       await fetchTasks();
     } catch (e) {
+      if (!current.active) return;
       const message = e instanceof Error ? e.message : String(e);
-      setRunResult({ id, error: message });
-      addToast('error', `手动运行失败: ${message}`);
+      setRunResults((previous) => ({
+        ...previous,
+        [id]: { pending: false, outcome_unknown: true, error: message },
+      }));
+      addToast('warning', `手动运行回执未确认: ${message}`);
     } finally {
-      setBusyTaskId(null);
+      finishTask(id, current);
     }
   };
 
   const handleDelete = async (id: string) => {
-    setBusyTaskId(id);
+    if (!beginTask(id)) return;
+    const current = observer.current;
     try {
       await schedulerApi.delete(id);
+      if (!current.active) return;
       addToast('success', '定时任务已删除');
       setConfirmDelete(null);
       await fetchTasks();
     } catch (e) {
+      if (!current.active) return;
       console.error('Failed to delete task:', e);
       addToast('error', `删除定时任务失败: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
-      setBusyTaskId(null);
+      finishTask(id, current);
     }
   };
 
@@ -219,7 +290,12 @@ export function SchedulerPanel() {
             <RefreshCw size={14} className={refreshing ? 'animate-spin' : ''} />
           </button>
           <button
-            onClick={() => setShowAdd(!showAdd)}
+            onClick={() => {
+              setEditing(null);
+              setSaveError(null);
+              setForm({ name: '', cron_expr: '', prompt: '' });
+              setShowAdd(!showAdd);
+            }}
             className="rounded-md p-1.5 transition-colors hover:opacity-80"
             style={{ color: showAdd ? s.accent : s.textTer }}
             title="添加任务"
@@ -229,12 +305,13 @@ export function SchedulerPanel() {
         </div>
       </div>
 
-      {/* Add Form */}
+      {/* Definition edits carry the original captured task snapshot. */}
       {showAdd && (
         <div
           className="rounded-lg border p-4 space-y-3"
           style={{ borderColor: s.border, background: s.bgCard }}
         >
+          {saveError && <p role="alert">{saveError}</p>}
           <input
             type="text"
             value={form.name}
@@ -301,7 +378,7 @@ export function SchedulerPanel() {
             className="flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium text-white transition-colors disabled:opacity-50"
             style={{ background: s.accent }}
           >
-            <Plus size={12} /> {submitting ? '创建中...' : '创建任务'}
+            <Plus size={12} /> {submitting ? '保存中...' : editing ? '保存修改' : '创建任务'}
           </button>
         </div>
       )}
@@ -315,6 +392,7 @@ export function SchedulerPanel() {
         <div className="space-y-2">
           {tasks.map((task) => {
             const enabled = task.status === 'enabled';
+            const runResult = runResults[task.id];
             return (
               <div
                 key={task.id}
@@ -337,7 +415,7 @@ export function SchedulerPanel() {
                   </span>
                   <button
                     onClick={() => handleToggle(task)}
-                    disabled={busyTaskId === task.id}
+                    disabled={busyTasks.has(task.id)}
                     className="transition-colors"
                     style={{ color: enabled ? 'var(--color-success, #22c55e)' : s.textTer }}
                     title={enabled ? '禁用' : '启用'}
@@ -388,18 +466,26 @@ export function SchedulerPanel() {
                 {/* Row 5: actions */}
                 <div className="flex items-center gap-2 pt-1">
                   <button
+                    aria-label={`编辑${task.name}`}
+                    onClick={() => {
+                      setEditing(task);
+                      setForm({ name: task.name, cron_expr: task.cron_expr, prompt: task.prompt });
+                      setSaveError(null);
+                      setShowAdd(true);
+                    }}
+                  >
+                    编辑
+                  </button>
+                  <button
                     onClick={() => handleRun(task.id)}
-                    disabled={busyTaskId === task.id}
+                    disabled={busyTasks.has(task.id)}
                     className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium transition-colors"
                     style={{
                       background: 'var(--action-run-bg)',
                       color: 'var(--action-run)',
                     }}
                   >
-                    {busyTaskId === task.id &&
-                    runResult?.id === task.id &&
-                    !runResult.result &&
-                    !runResult.error ? (
+                    {busyTasks.has(task.id) && runResult?.pending ? (
                       <RefreshCw size={11} className="animate-spin" />
                     ) : (
                       <Play size={11} />
@@ -416,7 +502,7 @@ export function SchedulerPanel() {
                       </span>
                       <button
                         onClick={() => handleDelete(task.id)}
-                        disabled={busyTaskId === task.id}
+                        disabled={busyTasks.has(task.id)}
                         className="rounded-md p-1 transition-colors"
                         style={{ color: 'var(--color-error, #ef4444)' }}
                       >
@@ -433,7 +519,7 @@ export function SchedulerPanel() {
                   ) : (
                     <button
                       onClick={() => setConfirmDelete(task.id)}
-                      disabled={busyTaskId === task.id}
+                      disabled={busyTasks.has(task.id)}
                       className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] transition-colors"
                       style={{ color: 'var(--color-error, #ef4444)' }}
                     >
@@ -442,8 +528,10 @@ export function SchedulerPanel() {
                   )}
                 </div>
 
+                <WeixinNotificationConfiguration task={task} />
+
                 {/* Run result */}
-                {runResult?.id === task.id && (
+                {runResult && (
                   <div
                     className="mt-1 rounded-lg border p-2 text-[11px]"
                     style={{
@@ -451,10 +539,25 @@ export function SchedulerPanel() {
                       background: runResult.error ? 'rgba(239,68,68,0.05)' : s.bgCard,
                     }}
                   >
-                    {!runResult.result && !runResult.error && (
+                    {runResult.pending && (
                       <div className="flex items-center gap-1.5" style={{ color: s.textSec }}>
                         <RefreshCw size={11} className="animate-spin" /> 运行中...
                       </div>
+                    )}
+                    {runResult.outcome_unknown && (
+                      <p role="alert">结算未知；请读取原运行历史，勿直接重试。</p>
+                    )}
+                    {runResult.occurrence && (
+                      <p>
+                        执行：{runResult.occurrence.occurrence_id} · 定义{' '}
+                        {runResult.occurrence.definition_id} · 尝试 {runResult.attempt_id}
+                      </p>
+                    )}
+                    {runResult.run_lookup?.run && (
+                      <SchedulerRunLink run={runResult.run_lookup.run} />
+                    )}
+                    {!runResult.pending && !runResult.run_lookup?.run && (
+                      <p>尚无可定位的 TaskRun</p>
                     )}
                     {runResult.error && (
                       <div
@@ -465,13 +568,16 @@ export function SchedulerPanel() {
                         <pre className="whitespace-pre-wrap">{runResult.error}</pre>
                       </div>
                     )}
-                    {runResult.result && (
+                    {runResult.result != null && (
                       <div className="space-y-1">
                         <div
                           className="flex items-center gap-1 font-medium"
-                          style={{ color: 'var(--color-success, #22c55e)' }}
+                          style={{
+                            color: runResult.success ? 'var(--color-success, #22c55e)' : s.textSec,
+                          }}
                         >
-                          <CheckCircle2 size={11} /> 运行完成
+                          <CheckCircle2 size={11} />{' '}
+                          {runResult.success ? '运行完成' : '已返回执行内容，结算未确认'}
                         </div>
                         <pre
                           className="whitespace-pre-wrap text-[10px]"
@@ -486,7 +592,7 @@ export function SchedulerPanel() {
                 )}
 
                 {/* Last run result from DB */}
-                {task.last_result && runResult?.id !== task.id && (
+                {task.last_result && !runResult && (
                   <details className="text-[11px]">
                     <summary className="cursor-pointer" style={{ color: s.textTer }}>
                       上次运行结果
@@ -504,6 +610,7 @@ export function SchedulerPanel() {
           })}
         </div>
       )}
+      <SchedulerHistory />
     </div>
   );
 }

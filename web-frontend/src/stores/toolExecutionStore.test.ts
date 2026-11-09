@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { RuntimeTaskEvent, TaskRun } from '../generated';
-import type { ToolExecution } from '../types/api';
+import {
+  transcriptToolExecution,
+  type ToolExecution,
+  type TranscriptToolRecord,
+} from '../types/api';
 import {
   ingestTaskRuntimeToolExecutions,
   mergeHydratedToolExecutions,
@@ -180,11 +184,9 @@ describe('TaskRuntime tool execution recovery', () => {
     };
     const stale: ToolExecution = {
       ...live,
-      id: 'detail-stale',
       status: 'succeeded',
       finished_at: 200,
       duration_ms: 100,
-      detail_ref: 'detail-stale',
     };
 
     expect(mergeHydratedToolExecutions([live], [stale])).toEqual([live]);
@@ -243,5 +245,244 @@ describe('TaskRuntime tool execution recovery', () => {
     expect(Object.values(useToolExecutionStore.getState().tools)).toEqual(
       expect.arrayContaining([background, restored])
     );
+  });
+});
+
+describe('tool recovery settlement identity', () => {
+  beforeEach(() => useToolExecutionStore.getState().clear());
+
+  function summary(overrides: Partial<ToolExecution> = {}): ToolExecution {
+    return {
+      id: 'detail-live',
+      workspace_id: 'workspace-1',
+      conversation_id: 'conversation-1',
+      run_id: null,
+      owner: { kind: 'chat', message_id: 'message-1' },
+      call_id: 'call-1',
+      name: 'read_file',
+      args_preview: 'src/main.rs',
+      status: 'failed',
+      started_at: 100,
+      finished_at: 200,
+      duration_ms: 100,
+      detail_ref: 'detail-live',
+      ...overrides,
+    };
+  }
+
+  it('does not reopen a failed live tool after a late start event', () => {
+    const terminal = summary();
+    const store = useToolExecutionStore.getState();
+    store.ingest(terminal);
+    store.ingest({ ...terminal, status: 'running', finished_at: null, duration_ms: null });
+    expect(Object.values(useToolExecutionStore.getState().tools)).toEqual([terminal]);
+  });
+
+  it('retains the newer terminal when an older terminal notification arrives late', () => {
+    const terminal = summary({ finished_at: 300, duration_ms: 200 });
+    const store = useToolExecutionStore.getState();
+    store.ingest(terminal);
+    store.ingest(summary({ status: 'succeeded' }));
+    expect(Object.values(useToolExecutionStore.getState().tools)).toEqual([terminal]);
+  });
+
+  it.each(['running', 'failed'] as const)(
+    'does not replace a known %s boundary with an unknown record without a finish',
+    (status) => {
+      const known = summary({
+        status,
+        finished_at: status === 'running' ? null : 200,
+        duration_ms: status === 'running' ? null : 100,
+      });
+      const unknown = summary({ status: 'unknown', finished_at: null, duration_ms: null });
+      expect(mergeHydratedToolExecutions([known], [unknown])).toEqual([known]);
+      useToolExecutionStore.getState().ingest(known);
+      useToolExecutionStore.getState().ingest(unknown);
+      expect(Object.values(useToolExecutionStore.getState().tools)).toEqual([known]);
+    }
+  );
+
+  it('settles a running orphan to the real backend Unknown terminal and rejects a late start', () => {
+    const running = summary({ status: 'running', finished_at: null, duration_ms: null });
+    const settled = summary({ status: 'unknown', finished_at: 300, duration_ms: 200 });
+    useToolExecutionStore.getState().ingest(running);
+    useToolExecutionStore.getState().ingest(settled);
+    expect(Object.values(useToolExecutionStore.getState().tools)).toEqual([settled]);
+    useToolExecutionStore.getState().ingest(running);
+    expect(Object.values(useToolExecutionStore.getState().tools)).toEqual([settled]);
+    expect(mergeHydratedToolExecutions([running], [settled])).toEqual([settled]);
+    const actualResult = summary({ status: 'succeeded', finished_at: 400, duration_ms: 300 });
+    useToolExecutionStore.getState().ingest(actualResult);
+    expect(Object.values(useToolExecutionStore.getState().tools)).toEqual([actualResult]);
+  });
+
+  it('does not replace an actual failure with a flattened orphan Unknown terminal', () => {
+    const failed = summary();
+    const orphan = summary({ status: 'unknown', finished_at: 400, duration_ms: 300 });
+    expect(mergeHydratedToolExecutions([failed], [orphan])).toEqual([failed]);
+  });
+
+  it('keeps duplicate canonical detail identities ambiguous after cold hydration', () => {
+    const first = summary();
+    const second = summary({
+      id: 'other-detail',
+      detail_ref: 'other-detail',
+      status: 'succeeded',
+      finished_at: 300,
+      duration_ms: 200,
+    });
+    const transcript = {
+      id: 'record-1',
+      workspaceId: 'workspace-1',
+      conversationId: 'conversation-1',
+      messageId: 'message-1',
+      callId: 'call-1',
+      name: 'read_file',
+    } as TranscriptToolRecord;
+    useToolExecutionStore.getState().ingest(first);
+    useToolExecutionStore.getState().ingest(second);
+    expect(
+      transcriptToolExecution(transcript, useToolExecutionStore.getState().tools)
+    ).toBeUndefined();
+    useToolExecutionStore.getState().clear();
+    useToolExecutionStore
+      .getState()
+      .hydrateConversation('workspace-1', 'conversation-1', [first, second]);
+    expect(Object.values(useToolExecutionStore.getState().tools)).toEqual([first, second]);
+    expect(
+      transcriptToolExecution(transcript, useToolExecutionStore.getState().tools)
+    ).toBeUndefined();
+    expect(mergeHydratedToolExecutions([first], [second])).toEqual([first, second]);
+  });
+
+  it('does not let a runtime fallback select one of several persisted Subagent details', () => {
+    const [boundary] = taskRuntimeToolExecutions(run, runtimeEvents());
+    if (!boundary) throw new Error('runtime boundary fixture is missing');
+    const first = {
+      ...boundary,
+      id: 'detail-1',
+      detail_ref: 'detail-1',
+      status: 'failed' as const,
+    };
+    const second = {
+      ...first,
+      id: 'detail-2',
+      detail_ref: 'detail-2',
+      status: 'succeeded' as const,
+    };
+    expect(mergeTaskRuntimeToolExecutions([first, second], [boundary])).toEqual([first, second]);
+    useToolExecutionStore.getState().replaceAll([first, second]);
+    ingestTaskRuntimeToolExecutions(run, runtimeEvents());
+    expect(Object.values(useToolExecutionStore.getState().tools)).toEqual([first, second]);
+  });
+
+  it('preserves interleaved persisted tool order and appends only runtime-only records', () => {
+    const [boundary] = taskRuntimeToolExecutions(run, runtimeEvents());
+    if (!boundary) throw new Error('runtime boundary fixture is missing');
+    const first = { ...boundary, id: 'detail-a1', detail_ref: 'detail-a1' };
+    const middle = { ...boundary, id: 'detail-b', detail_ref: 'detail-b', call_id: 'call-b' };
+    const last = { ...first, id: 'detail-a2', detail_ref: 'detail-a2' };
+    const runtimeOnly = { ...boundary, id: 'runtime-c', call_id: 'call-c' };
+    expect(mergeTaskRuntimeToolExecutions([first, middle, last], [])).toEqual([
+      first,
+      middle,
+      last,
+    ]);
+    expect(mergeTaskRuntimeToolExecutions([first, middle, last], [boundary, runtimeOnly])).toEqual([
+      first,
+      middle,
+      last,
+      runtimeOnly,
+    ]);
+  });
+
+  it('keeps an orphan unknown record unknown without inventing a running or terminal state', () => {
+    const unknown = summary({ status: 'unknown', finished_at: null, duration_ms: null });
+    useToolExecutionStore.getState().ingest(unknown);
+    expect(Object.values(useToolExecutionStore.getState().tools)).toEqual([unknown]);
+  });
+
+  it('deduplicates repeated notifications only for the same original detail id', () => {
+    const terminal = summary();
+    const store = useToolExecutionStore.getState();
+    store.ingest(terminal);
+    store.ingest({
+      ...terminal,
+      status: 'running',
+      finished_at: null,
+      duration_ms: null,
+    });
+    expect(Object.values(useToolExecutionStore.getState().tools)).toEqual([terminal]);
+    expect(useToolExecutionStore.getState().idsByOwner['chat:message-1']).toEqual(['detail-live']);
+  });
+
+  it('preserves different detail ids with duplicate call ids for the original ambiguity check', () => {
+    const first = summary();
+    const second = summary({ id: 'other-detail', detail_ref: 'other-detail' });
+    useToolExecutionStore.getState().ingest(first);
+    useToolExecutionStore.getState().ingest(second);
+    expect(Object.values(useToolExecutionStore.getState().tools)).toEqual([first, second]);
+  });
+
+  it('removes the old owner index when the same detail id gains a different original owner', () => {
+    const first = summary();
+    const rebound = summary({ owner: { kind: 'chat', message_id: 'message-2' } });
+    useToolExecutionStore.getState().ingest(first);
+    const sameOwnerIndex = useToolExecutionStore.getState().idsByOwner;
+    useToolExecutionStore.getState().ingest({ ...first, status: 'succeeded' });
+    expect(useToolExecutionStore.getState().idsByOwner).toBe(sameOwnerIndex);
+    useToolExecutionStore.getState().ingest(rebound);
+    expect(useToolExecutionStore.getState().idsByOwner['chat:message-1']).toEqual([]);
+    expect(useToolExecutionStore.getState().idsByOwner['chat:message-2']).toEqual(['detail-live']);
+    expect(useToolExecutionStore.getState().tools['detail-live']).toEqual(rebound);
+  });
+
+  it.each([{ conversation_id: 'conversation-2' }, { run_id: 'other-run' }])(
+    'does not merge reused chat message/call ids across scope %j',
+    (scope) => {
+      const first = summary();
+      const second = summary({ ...scope, id: 'other-detail', detail_ref: 'other-detail' });
+      expect(mergeHydratedToolExecutions([first], [second])).toEqual([first, second]);
+    }
+  );
+
+  it('does not reopen a completed Subagent tool during out-of-order durable replay', () => {
+    const [start, finish] = runtimeEvents();
+    expect(start).toBeDefined();
+    expect(finish).toBeDefined();
+    if (!start || !finish) throw new Error('runtime event fixture is incomplete');
+    expect(taskRuntimeToolExecutions(run, [finish, start])).toEqual([
+      expect.objectContaining({ status: 'succeeded', duration_ms: 1500 }),
+    ]);
+    ingestTaskRuntimeToolExecutions(run, [finish, start]);
+    expect(Object.values(useToolExecutionStore.getState().tools)).toEqual([
+      expect.objectContaining({ status: 'succeeded', duration_ms: 1500 }),
+    ]);
+    useToolExecutionStore.getState().clear();
+    ingestTaskRuntimeToolExecutions(run, [finish]);
+    ingestTaskRuntimeToolExecutions(run, [start]);
+    expect(Object.values(useToolExecutionStore.getState().tools)).toEqual([
+      expect.objectContaining({ status: 'succeeded', duration_ms: 1500 }),
+    ]);
+  });
+
+  it('hydrates only the requested conversation and preserves its foreign live owner', () => {
+    const current = summary();
+    const foreign = summary({
+      id: 'foreign-detail',
+      conversation_id: 'conversation-2',
+      detail_ref: 'foreign-detail',
+    });
+    const staleForeign = { ...foreign, status: 'succeeded' as const };
+    const otherWorkspace = summary({ id: 'other-workspace', workspace_id: 'workspace-2' });
+    useToolExecutionStore.getState().ingest(foreign);
+    useToolExecutionStore
+      .getState()
+      .hydrateConversation('workspace-1', 'conversation-1', [
+        current,
+        staleForeign,
+        otherWorkspace,
+      ]);
+    expect(Object.values(useToolExecutionStore.getState().tools)).toEqual([foreign, current]);
   });
 });

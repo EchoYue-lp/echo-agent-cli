@@ -4,10 +4,9 @@
 //! file-backed TaskRuntime store (via taskRuntimeStore), NOT from regex-scanned chat messages.
 //! Shows the run header, plan, live todo status, recovery actions, and artifacts.
 //!
-//! The compact panel is mounted inside RightRail; the full detail panel is
-//! mounted in the main chat/work area.
+//! RightRail mounts the run summary and plan; task details reuse the shared Modal.
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   CheckCircle2,
   Circle,
@@ -16,9 +15,7 @@ import {
   ListTodo,
   RefreshCw,
   Gauge,
-  Pencil,
   Trash2,
-  Plus,
   Play,
   Pause,
   RotateCcw,
@@ -30,9 +27,17 @@ import {
   Save,
 } from 'lucide-react';
 import { Card } from '../common/Card';
-import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
+import {
+  TaskRuntimeList,
+  taskTimestamp,
+  type TaskAction,
+  type TaskActionReceipt,
+} from './TaskRuntimeList';
+import './TaskRuntimePanel.css';
+import { useTaskRuntimeStore, taskRuntimePresentation } from '../../stores/taskRuntimeStore';
 import {
   useSubagentRunStore,
+  latestSubagentRunsByTask,
   type ExecutionEvent,
   type SubagentRunState,
 } from '../../stores/subagentRunStore';
@@ -219,20 +224,6 @@ export function todoShouldSpin(
     taskRunStatus === 'running' &&
     (!executionStatus || executionStatus === 'running')
   );
-}
-
-function kindLabel(kind: string): string {
-  const map: Record<string, string> = {
-    read_only_review: '审查',
-    investigation: '调研',
-    test_plan: '测试规划',
-    implementation: '实现',
-    debugging: '调试',
-    review: '复核',
-    summary: '总结',
-    verification: '验证',
-  };
-  return map[kind] ?? kind;
 }
 
 function uniqueValues(values: Array<string | null | undefined>): string[] {
@@ -528,9 +519,7 @@ function MetricCell({
 }
 
 function traceRunForTodo(todo: { task_id: string }, runs: SubagentRunState[]) {
-  return runs
-    .filter((run) => run.taskId === todo.task_id)
-    .sort((a, b) => b.startedAt - a.startedAt)[0];
+  return latestSubagentRunsByTask(runs).find((run) => run.taskId === todo.task_id);
 }
 
 export function traceRunsForTaskRun(
@@ -573,15 +562,23 @@ export function todoStatusDescription(
 
 export function TaskRuntimePanel() {
   const traceRuns = useSubagentRunStore((s) => s.runs);
+  const state = useTaskRuntimeStore();
   const {
     activeRun,
     plan,
     todos,
+    artifacts,
     recoveryBlockers,
     continuation,
     backgroundCells,
     completionGate,
     error,
+    hasMoreEvents,
+  } = useTaskRuntimeStore(taskRuntimePresentation);
+  const {
+    selectedRunId,
+    loadingEvents,
+    loadMoreEvents,
     refresh,
     cancel,
     pause,
@@ -591,15 +588,24 @@ export function TaskRuntimePanel() {
     retryBlockedTask,
     resolveRecoveryTask,
     skipGoalRequirement,
-  } = useTaskRuntimeStore();
+  } = state;
   const [tokenBudgetInput, setTokenBudgetInput] = useState('');
   const [timeBudgetInput, setTimeBudgetInput] = useState('');
   const [budgetError, setBudgetError] = useState<string | null>(null);
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const actionInFlight = useRef<symbol | null>(null);
+  const [actionReceipt, setActionReceipt] = useState<TaskActionReceipt | null>(null);
   const [goalInput, setGoalInput] = useState('');
   const [goalReasonInput, setGoalReasonInput] = useState('');
   const [goalError, setGoalError] = useState<string | null>(null);
   const [requirementSkipId, setRequirementSkipId] = useState<string | null>(null);
   const [requirementSkipReason, setRequirementSkipReason] = useState('');
+
+  useEffect(() => {
+    actionInFlight.current = null;
+    setPendingAction(null);
+    setActionReceipt(null);
+  }, [activeRun?.run_id, state.taskScope?.workspaceId, state.taskScope?.workspaceGeneration]);
 
   useEffect(() => {
     setTokenBudgetInput(continuation?.token_budget?.toString() ?? '');
@@ -626,41 +632,155 @@ export function TaskRuntimePanel() {
             // conversationId.
             .filter(
               (run) =>
-                run.runId === activeRun.run_id || run.conversationId === activeRun.conversation_id
+                run.runId === activeRun.run_id ||
+                (!selectedRunId && run.conversationId === activeRun.conversation_id)
             )
             .sort((a, b) => a.startedAt - b.startedAt)
         : [],
-    [activeRun, traceRuns]
+    [activeRun, traceRuns, selectedRunId]
   );
   const activeTaskTraceRuns = useMemo(
-    () => traceRunsForTaskRun(activeRun?.run_id ?? null, Object.values(traceRuns)),
-    [activeRun, traceRuns]
+    // A partial prefix can contain an old completed attempt followed by an unread retry.
+    // Keep canonical Todo facts visible without presenting that prefix as the latest execution.
+    () =>
+      hasMoreEvents ? [] : traceRunsForTaskRun(activeRun?.run_id ?? null, Object.values(traceRuns)),
+    [activeRun, traceRuns, hasMoreEvents]
   );
 
   if (!activeRun) return null;
 
   // Detailed execution timeline is now in ConversationTimeline (main panel).
-  // This right-rail panel serves as a compact status summary only.
+  // Keep the plan summary and task details on the original runtime projection.
   const runId = activeRun.run_id;
+  // The rendered target owns this token; a delayed click must not borrow a replacement host.
+  const controlTarget = {
+    workspace_id: activeRun.workspace_id,
+    run_id: runId,
+    workspace_generation:
+      state.taskScope?.workspaceId === activeRun.workspace_id
+        ? state.taskScope.workspaceGeneration
+        : '',
+  };
   const usageSummary = cacheUsageForRuns(visibleTraceRuns);
-  const completedCount = todos.filter((todo) => todo.status === ('completed' as TodoStatus)).length;
-  const executionCompletedCount = todos.filter((todo) => {
-    const trace = traceRunForTodo(todo, activeTaskTraceRuns);
-    return trace?.status === 'completed' || todo.status === ('completed' as TodoStatus);
-  }).length;
+  const planGoalCurrent =
+    plan?.goal_revision === activeRun.goal_revision && plan?.goal_sha256 === activeRun.goal_sha256;
+  // 独立IPC读取可能跨越Goal/计划提交；只有同run和同revision报告可标为当前验收。
+  const completionGateCurrent =
+    completionGate?.run_id === activeRun.run_id &&
+    completionGate.goal_revision === activeRun.goal_revision &&
+    completionGate.plan_revision === (plan?.revision ?? 0) &&
+    (!completionGate.ready || planGoalCurrent);
+  const completedCount = planGoalCurrent
+    ? todos.filter((todo) => todo.status === ('completed' as TodoStatus)).length
+    : 0;
+  const executionCompletedCount = planGoalCurrent
+    ? todos.filter((todo) => {
+        const trace = traceRunForTodo(todo, activeTaskTraceRuns);
+        return trace?.status === 'completed' || todo.status === ('completed' as TodoStatus);
+      }).length
+    : 0;
   const currentTurn = continuation?.active_turn ?? continuation?.last_turn;
   const activeCellCount = backgroundCells.filter((cell) =>
     ['prepared', 'queued', 'running'].includes(cell.phase)
   ).length;
   const budgetLabels = continuation?.enabled ? continuationBudgetLabels(continuation) : null;
-  const planGoalCurrent =
-    plan?.goal_revision === activeRun.goal_revision && plan?.goal_sha256 === activeRun.goal_sha256;
+  const visibleActionReceipt =
+    actionReceipt?.runId === runId &&
+    actionReceipt.workspaceId === controlTarget.workspace_id &&
+    actionReceipt.workspaceGeneration === controlTarget.workspace_generation
+      ? actionReceipt
+      : null;
+  const performAction: TaskAction = async (label, operation, taskId) => {
+    const ownsTarget = () => {
+      const current = useTaskRuntimeStore.getState();
+      const run = taskRuntimePresentation(current).activeRun;
+      return (
+        !!controlTarget.workspace_generation &&
+        current.taskScope?.workspaceId === controlTarget.workspace_id &&
+        current.taskScope.workspaceGeneration === controlTarget.workspace_generation &&
+        run?.run_id === runId &&
+        run.workspace_id === controlTarget.workspace_id
+      );
+    };
+    if (actionInFlight.current || !ownsTarget()) return false;
+    const operationToken = Symbol(label);
+    actionInFlight.current = operationToken;
+    // Capture the original target before awaiting; the selected detail may change meanwhile.
+    const receiptIdentity = {
+      runId,
+      taskId,
+      workspaceId: controlTarget.workspace_id,
+      workspaceGeneration: controlTarget.workspace_generation,
+    };
+    setPendingAction(label);
+    setActionReceipt(null);
+    // A→B→A仍是新的访问；同身份旧Promise不能替代新请求的回执。
+    const ownsAction = () => actionInFlight.current === operationToken && ownsTarget();
+    try {
+      const receipt = await operation();
+      const snapshot = taskRuntimePresentation(useTaskRuntimeStore.getState());
+      if (!ownsAction() || !snapshot.activeRun) return false;
+      if (snapshot.error) {
+        setActionReceipt({
+          ...receiptIdentity,
+          text: `${label}未确认：${snapshot.error}`,
+          failed: true,
+        });
+        return false;
+      }
+      let outcome = '请求已返回';
+      if (receipt && typeof receipt === 'object') {
+        if ('run_id' in receipt && receipt.run_id !== runId)
+          throw new Error('后端回执不属于原运行');
+        if (taskId && 'task_id' in receipt && receipt.task_id !== taskId)
+          throw new Error('后端回执不属于原任务');
+        if ('success' in receipt && receipt.success === false)
+          outcome = '无需重复执行（后端未改变运行）';
+        else if ('success' in receipt && receipt.success === true)
+          outcome = '后端已接受请求，结算以运行记录为准';
+        else if ('kind' in receipt) {
+          outcome =
+            receipt.kind === 'retry_scheduled'
+              ? '重试已排期'
+              : receipt.kind === 'recovery_retry_recorded'
+                ? '恢复重试已记录'
+                : receipt.kind === 'continuation_resumed'
+                  ? '继续请求已接受'
+                  : receipt.kind === 'resumed'
+                    ? '恢复请求已接受'
+                    : '后端回执已返回';
+        }
+      }
+      setActionReceipt({
+        ...receiptIdentity,
+        text: `${label}${outcome} · 当前运行${STATUS_LABEL[snapshot.activeRun.status] ?? snapshot.activeRun.status}`,
+        failed: false,
+      });
+      return true;
+    } catch (actionError) {
+      if (!ownsAction()) return false;
+      setActionReceipt({
+        ...receiptIdentity,
+        text: `${label}失败：${actionError instanceof Error ? actionError.message : String(actionError)}`,
+        failed: true,
+      });
+      return false;
+    } finally {
+      if (actionInFlight.current === operationToken) {
+        actionInFlight.current = null;
+        setPendingAction(null);
+      }
+    }
+  };
+
   const applyBudgets = async () => {
     try {
       const tokenBudget = parseContinuationBudgetInput(tokenBudgetInput, 'Token 预算');
       const timeBudget = parseContinuationBudgetInput(timeBudgetInput, '时间预算');
       setBudgetError(null);
-      await updateContinuationBudgets(runId, tokenBudget, timeBudget);
+      await performAction('更新预算', () =>
+        updateContinuationBudgets(controlTarget, tokenBudget, timeBudget)
+      );
     } catch (budgetInputError) {
       setBudgetError(
         budgetInputError instanceof Error ? budgetInputError.message : String(budgetInputError)
@@ -675,179 +795,114 @@ export function TaskRuntimePanel() {
       return;
     }
     setGoalError(null);
-    await updateGoal(runId, activeRun.goal_revision, goal, reason);
+    await performAction('更新目标', () =>
+      updateGoal(controlTarget, activeRun.goal_revision, goal, reason)
+    );
   };
   const confirmRequirementSkip = async () => {
     const reason = requirementSkipReason.trim();
-    if (!requirementSkipId || !reason) return;
-    await skipGoalRequirement(requirementSkipId, reason);
+    const requirementId = requirementSkipId;
+    if (!requirementId || !reason) return;
+    const succeeded = await performAction('确认跳过验收项', () =>
+      skipGoalRequirement(requirementId, reason, controlTarget)
+    );
+    if (!succeeded) return;
     setRequirementSkipId(null);
     setRequirementSkipReason('');
   };
 
   return (
-    <section className="border-b border-[var(--border-primary)] px-3 py-2.5">
-      <div className="mb-2 flex items-center justify-between">
-        <div className="flex min-w-0 items-center gap-1.5">
-          <ListTodo size={13} style={{ color: 'var(--accent)' }} />
-          <span className="truncate text-xs font-medium" style={{ color: 'var(--text-primary)' }}>
-            任务运行
+    <section className="eko-task-runtime">
+      {hasMoreEvents && (
+        <div className="eko-task-history-notice" role="status">
+          <span>执行记录尚有后续页，当前执行明细可能不完整。</span>
+          <button
+            type="button"
+            className="eko-task-button"
+            disabled={loadingEvents}
+            onClick={() => void loadMoreEvents()}
+          >
+            {loadingEvents ? '正在读取…' : '继续读取执行记录'}
+          </button>
+        </div>
+      )}
+      <div className="eko-task-run-summary">
+        <div className="eko-task-run-eyebrow">
+          <span>
+            <ListTodo size={14} /> 任务运行
+          </span>
+          <span className="eko-task-run-status" style={{ color: statusColor(activeRun.status) }}>
+            {STATUS_LABEL[activeRun.status] ?? activeRun.status}
           </span>
         </div>
-        <span
-          className="rounded-md px-1.5 py-0.5 text-[10px] font-medium"
-          style={{
-            color: statusColor(activeRun.status),
-            background: 'var(--bg-hover)',
-          }}
-        >
-          {STATUS_LABEL[activeRun.status] ?? activeRun.status}
-        </span>
-      </div>
-
-      <div
-        className="mb-2 rounded-md px-2 py-1.5 text-[11px]"
-        style={{ background: 'var(--bg-secondary)', color: 'var(--text-secondary)' }}
-        title={activeRun.goal}
-      >
-        <div className="line-clamp-2 break-words">{activeRun.goal}</div>
-        <div className="mt-0.5 text-[9px]" style={{ color: 'var(--text-tertiary)' }}>
-          Goal r{activeRun.goal_revision}
+        <h2>{activeRun.goal}</h2>
+        <div className="eko-task-run-meta">
+          <span>{activeRun.attended_mode === 'unattended' ? '后台触发' : '交互任务'}</span>
+          <span>更新于 {taskTimestamp(activeRun.updated_at)}</span>
         </div>
-      </div>
-
-      {activeRun.status === 'paused' && (
-        <form
-          className="mb-2 space-y-1"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void applyGoal();
-          }}
-        >
-          <label className="block">
-            <span className="sr-only">任务目标</span>
-            <textarea
-              rows={2}
-              value={goalInput}
-              onChange={(event) => setGoalInput(event.target.value)}
-              className="w-full resize-none rounded-md px-2 py-1.5 text-[10px] outline-none"
-              style={{
-                background: 'var(--bg-primary)',
-                border: '1px solid var(--border-primary)',
-                color: 'var(--text-primary)',
-              }}
-            />
-          </label>
-          <div className="grid grid-cols-[minmax(0,1fr)_28px] gap-1">
-            <label className="min-w-0">
-              <span className="sr-only">修改原因</span>
-              <input
-                value={goalReasonInput}
-                onChange={(event) => setGoalReasonInput(event.target.value)}
-                placeholder="修改原因"
-                className="h-7 w-full min-w-0 rounded-md px-2 text-[10px] outline-none"
-                style={{
-                  background: 'var(--bg-primary)',
-                  border: '1px solid var(--border-primary)',
-                  color: 'var(--text-primary)',
-                }}
-              />
-            </label>
-            <button
-              type="submit"
-              className="flex h-7 w-7 items-center justify-center rounded-md"
-              style={{ background: 'var(--bg-hover)', color: 'var(--text-primary)' }}
-              title="更新任务目标"
-              aria-label="更新任务目标"
-            >
-              <Save size={12} />
-            </button>
-          </div>
-          {goalError && <div style={{ color: 'var(--color-error)' }}>{goalError}</div>}
-          {!planGoalCurrent && (
-            <div className="text-[10px]" style={{ color: 'var(--color-warning)' }}>
-              任务图待绑定 Goal r{activeRun.goal_revision}
+        {planGoalCurrent ? (
+          <>
+            <div className="eko-task-progress-heading">
+              <span>
+                已提交完成 <strong>{completedCount}</strong>
+                <span> / {todos.length} 项</span>
+              </span>
+              <span>
+                {hasMoreEvents ? '执行记录尚未读完' : `执行完成 ${executionCompletedCount} 项`}
+              </span>
             </div>
-          )}
-        </form>
-      )}
-
-      {continuation?.enabled && (
-        <div className="mb-2 space-y-1 text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-            <span>第 {currentTurn?.ordinal ?? continuation.next_turn_ordinal} 轮</span>
-            <span>压缩 {continuation.compaction_count} 次</span>
-            {activeCellCount > 0 && <span>后台命令 {activeCellCount}</span>}
-          </div>
-          {budgetLabels && <div>{budgetLabels.tokens}</div>}
-          {budgetLabels && <div>{budgetLabels.time}</div>}
-          <form
-            className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_28px] gap-1 pt-1"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void applyBudgets();
-            }}
-          >
-            <label className="min-w-0">
-              <span className="sr-only">Token 预算</span>
-              <input
-                type="number"
-                min={1}
-                step={1}
-                inputMode="numeric"
-                value={tokenBudgetInput}
-                onChange={(event) => setTokenBudgetInput(event.target.value)}
-                placeholder="Token 不限"
-                className="h-7 w-full min-w-0 rounded-md px-1.5 text-[10px] outline-none"
-                style={{
-                  background: 'var(--bg-primary)',
-                  border: '1px solid var(--border-primary)',
-                  color: 'var(--text-primary)',
-                }}
-              />
-            </label>
-            <label className="min-w-0">
-              <span className="sr-only">时间预算（秒）</span>
-              <input
-                type="number"
-                min={1}
-                step={1}
-                inputMode="numeric"
-                value={timeBudgetInput}
-                onChange={(event) => setTimeBudgetInput(event.target.value)}
-                placeholder="秒数不限"
-                className="h-7 w-full min-w-0 rounded-md px-1.5 text-[10px] outline-none"
-                style={{
-                  background: 'var(--bg-primary)',
-                  border: '1px solid var(--border-primary)',
-                  color: 'var(--text-primary)',
-                }}
-              />
-            </label>
-            <button
-              type="submit"
-              className="flex h-7 w-7 items-center justify-center rounded-md"
-              style={{ background: 'var(--bg-hover)', color: 'var(--text-primary)' }}
-              title="应用任务预算"
-              aria-label="应用任务预算"
-            >
-              <Save size={12} />
-            </button>
-          </form>
-          {budgetError && <div style={{ color: 'var(--color-error)' }}>{budgetError}</div>}
-          {continuation.pause && (
-            <div style={{ color: 'var(--color-warning)' }}>
+            {todos.length > 0 ? (
+              <div
+                className="eko-task-progress-track"
+                aria-label={`已提交完成 ${completedCount} / ${todos.length} 项任务`}
+              >
+                <span style={{ width: `${(completedCount / todos.length) * 100}%` }} />
+              </div>
+            ) : (
+              <p className="eko-task-progress-unknown">任务尚未展开 · 进度待记录</p>
+            )}
+          </>
+        ) : plan ? (
+          <p role="status" className="eko-task-progress-unknown">
+            旧计划未绑定当前 Goal r{activeRun.goal_revision}，保留为历史记录，不计当前目标完成进度。
+          </p>
+        ) : (
+          <p className="eko-task-progress-unknown">任务尚未展开 · 进度待记录</p>
+        )}
+        {continuation?.pause && (
+          <div className="eko-task-wait-reason">
+            <Clock3 size={14} />
+            <span>
               {PAUSE_REASON_LABEL[continuation.pause.reason] ?? continuation.pause.reason}
               {continuation.pause.detail ? ` · ${continuation.pause.detail}` : ''}
-            </div>
-          )}
+            </span>
+          </div>
+        )}
+      </div>
+      {error && !visibleActionReceipt?.failed && (
+        <div role="alert" className="eko-task-action-receipt is-error">
+          {error}
         </div>
       )}
-
+      {visibleActionReceipt && (
+        <div
+          role={visibleActionReceipt.failed ? 'alert' : 'status'}
+          className={`eko-task-action-receipt ${visibleActionReceipt.failed ? 'is-error' : ''}`}
+        >
+          {visibleActionReceipt.text}
+        </div>
+      )}
+      {pendingAction && (
+        <div role="status" className="eko-task-action-receipt">
+          <Loader2 size={14} className="animate-spin" />
+          {pendingAction}请求处理中，等待运行记录返回…
+        </div>
+      )}
       {activeRun.status === 'running' && (
         <div className="mb-2 grid grid-cols-2 gap-1.5">
           <button
-            onClick={() => pause(runId)}
+            onClick={() => void performAction('暂停', () => pause(controlTarget))}
+            disabled={!!pendingAction}
             className="flex items-center justify-center gap-1 rounded-md px-2 py-1.5 text-[11px] font-medium"
             style={{ background: 'var(--bg-hover)', color: 'var(--text-primary)' }}
             title="暂停任务运行"
@@ -855,7 +910,8 @@ export function TaskRuntimePanel() {
             <Pause size={12} /> 暂停
           </button>
           <button
-            onClick={() => cancel(runId)}
+            onClick={() => void performAction('取消', () => cancel(controlTarget))}
+            disabled={!!pendingAction}
             className="flex items-center justify-center gap-1 rounded-md px-2 py-1.5 text-[11px] font-medium"
             style={{ background: 'var(--bg-hover)', color: 'var(--color-error)' }}
             title="取消任务运行"
@@ -868,8 +924,8 @@ export function TaskRuntimePanel() {
       {activeRun.status === 'paused' && recoveryBlockers.length === 0 && (
         <div className="mb-2">
           <button
-            onClick={() => resumeTaskRun()}
-            disabled={!planGoalCurrent}
+            onClick={() => void performAction('继续执行', () => resumeTaskRun(controlTarget))}
+            disabled={!planGoalCurrent || !!pendingAction}
             className="flex w-full items-center justify-center gap-1 rounded-md px-3 py-1.5 text-[11px] font-medium"
             style={{
               background: planGoalCurrent ? 'var(--accent)' : 'var(--bg-hover)',
@@ -882,315 +938,361 @@ export function TaskRuntimePanel() {
         </div>
       )}
 
-      {recoveryBlockers.length > 0 && (
-        <div
-          className="mb-2 space-y-2 rounded-md px-2 py-2"
-          style={{ background: 'var(--bg-hover)', border: '1px solid var(--color-warning)' }}
-        >
-          <div
-            className="flex items-center gap-1 text-[10px] font-medium"
-            style={{ color: 'var(--color-warning)' }}
-          >
-            <AlertTriangle size={11} /> 需要确认恢复操作
-          </div>
-          {recoveryBlockers.map((blocker) => {
-            const todo = todos.find((item) => item.task_id === blocker.task_id);
-            return (
-              <div key={blocker.task_id} className="space-y-1">
-                <div
-                  className="truncate text-[10px] font-medium"
-                  style={{ color: 'var(--text-primary)' }}
-                  title={todo?.title ?? blocker.task_id}
-                >
-                  {todo?.title ?? blocker.task_id}
-                </div>
-                <div className="text-[9px] leading-snug" style={{ color: 'var(--text-secondary)' }}>
-                  {blocker.reason}
-                  {blocker.tool_name ? ` · ${blocker.tool_name}` : ''}
-                </div>
-                <div className="grid grid-cols-2 gap-1">
-                  <button
-                    onClick={() => retryBlockedTask(blocker.task_id)}
-                    className="flex items-center justify-center gap-1 rounded-md px-2 py-1 text-[10px]"
-                    style={{ background: 'var(--bg-primary)', color: 'var(--text-primary)' }}
-                    title="确认工作区状态后重新执行"
-                  >
-                    <RotateCcw size={10} /> 重试
-                  </button>
-                  <button
-                    onClick={() => resolveRecoveryTask(blocker.task_id, 'skip')}
-                    className="flex items-center justify-center gap-1 rounded-md px-2 py-1 text-[10px]"
-                    style={{ background: 'var(--bg-primary)', color: 'var(--text-secondary)' }}
-                    title="保留当前工作区并跳过该任务"
-                  >
-                    <SkipForward size={10} /> 跳过
-                  </button>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
-
-      {completionGate && completionGate.requirements.length > 0 && (
-        <div className="mb-2 border-t border-[var(--border-primary)] pt-2">
-          <div className="mb-1 flex items-center justify-between text-[10px]">
-            <span className="font-medium" style={{ color: 'var(--text-tertiary)' }}>
-              Goal 验收 · r{completionGate.goal_revision}
-            </span>
-            <span
-              style={{
-                color: completionGate.ready ? 'var(--color-success)' : 'var(--color-warning)',
+      <TaskRuntimeList
+        controlTarget={controlTarget}
+        key={runId}
+        run={activeRun}
+        plan={plan}
+        todos={todos}
+        traceRuns={activeTaskTraceRuns}
+        artifacts={artifacts}
+        recoveryBlockers={recoveryBlockers}
+        pendingAction={pendingAction}
+        actionReceipt={visibleActionReceipt}
+        onAction={performAction}
+        describeTodo={(todo) =>
+          planGoalCurrent
+            ? todoStatusDescription(todo, activeTaskTraceRuns)
+            : `历史计划 · ${TODO_LABEL[todo.status] ?? todo.status}（不计当前目标）`
+        }
+        renderStatus={(todo) =>
+          planGoalCurrent ? (
+            <TodoIcon
+              status={todo.status}
+              executionStatus={traceRunForTodo(todo, activeTaskTraceRuns)?.status}
+              taskRunStatus={activeRun.status}
+            />
+          ) : (
+            <Clock3 size={14} aria-label="历史计划状态" style={{ color: 'var(--text-tertiary)' }} />
+          )
+        }
+      />
+      <details className="eko-task-runtime-settings">
+        <summary>
+          运行控制与验收 <span>Goal r{activeRun.goal_revision}</span>
+        </summary>
+        <div className="eko-task-runtime-settings-body">
+          {activeRun.status === 'paused' && (
+            <form
+              className="mb-2 space-y-1"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void applyGoal();
               }}
             >
-              {completionGate.ready ? '通过' : `${completionGate.blockers.length} 项阻塞`}
-            </span>
-          </div>
-          <div className="space-y-1" data-testid="completion-gate-requirements">
-            {completionGate.requirements.map((assessment) => {
-              const requirement = assessment.requirement;
-              const taskStatus = todos.find((todo) => todo.task_id === requirement.task_id)?.status;
-              const canConfirmSkip =
-                taskStatus === 'skipped' && assessment.status !== 'skipped' && planGoalCurrent;
-              const editingSkip = requirementSkipId === requirement.requirement_id;
-              return (
-                <div key={requirement.requirement_id} className="min-w-0 px-1 py-0.5">
-                  <div className="flex min-w-0 items-center gap-1">
-                    <span
-                      className="min-w-0 flex-1 truncate text-[10px]"
-                      style={{ color: 'var(--text-primary)' }}
-                      title={requirement.description}
-                    >
-                      {requirement.title}
-                    </span>
-                    <span className="shrink-0 text-[9px]" style={{ color: 'var(--text-tertiary)' }}>
-                      {REQUIREMENT_LABEL[assessment.status] ?? assessment.status}
-                    </span>
-                    {canConfirmSkip && !editingSkip && (
-                      <button
-                        type="button"
-                        className="rounded-md p-0.5 hover:bg-[var(--bg-hover)]"
-                        title="确认跳过该 Goal requirement"
-                        aria-label="确认跳过该 Goal requirement"
-                        onClick={() => {
-                          setRequirementSkipId(requirement.requirement_id);
-                          setRequirementSkipReason('');
-                        }}
-                      >
-                        <SkipForward size={10} style={{ color: 'var(--color-warning)' }} />
-                      </button>
-                    )}
-                  </div>
-                  {editingSkip && (
-                    <div className="mt-1 grid grid-cols-[minmax(0,1fr)_24px_24px] gap-1">
-                      <input
-                        autoFocus
-                        value={requirementSkipReason}
-                        onChange={(event) => setRequirementSkipReason(event.target.value)}
-                        placeholder="跳过原因"
-                        className="h-6 min-w-0 rounded-md px-1.5 text-[9px] outline-none"
-                        style={{
-                          background: 'var(--bg-primary)',
-                          border: '1px solid var(--border-primary)',
-                          color: 'var(--text-primary)',
-                        }}
-                      />
-                      <button
-                        type="button"
-                        disabled={!requirementSkipReason.trim()}
-                        className="flex h-6 w-6 items-center justify-center rounded-md"
-                        style={{ background: 'var(--bg-hover)', color: 'var(--text-primary)' }}
-                        title="保存跳过原因"
-                        aria-label="保存跳过原因"
-                        onClick={() => void confirmRequirementSkip()}
-                      >
-                        <Save size={10} />
-                      </button>
-                      <button
-                        type="button"
-                        className="flex h-6 w-6 items-center justify-center rounded-md"
-                        style={{ background: 'var(--bg-hover)', color: 'var(--text-tertiary)' }}
-                        title="取消"
-                        aria-label="取消"
-                        onClick={() => {
-                          setRequirementSkipId(null);
-                          setRequirementSkipReason('');
-                        }}
-                      >
-                        <X size={10} />
-                      </button>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
-      {error && (
-        <div className="mb-2 text-[10px] leading-snug" style={{ color: 'var(--color-error)' }}>
-          {error}
-        </div>
-      )}
-
-      <div className="mb-2">
-        <CacheUsageCard summary={usageSummary} compact />
-      </div>
-
-      {todos.length > 0 && (
-        <div className="mb-2">
-          <div className="mb-1 flex items-center justify-between">
-            <span className="text-[10px] font-medium" style={{ color: 'var(--text-tertiary)' }}>
-              任务列表{plan ? ` · r${plan.revision}` : ''}
-            </span>
-            <span className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
-              执行 {executionCompletedCount}/{todos.length} · 完成 {completedCount}/{todos.length}
-            </span>
-          </div>
-          <div className="space-y-0.5">
-            {todos.map((todo) => {
-              const task = plan?.tasks.find((t) => t.id === todo.task_id);
-              const execution = traceRunForTodo(todo, activeTaskTraceRuns);
-              const status = todo.status;
-              const statusDescription = todoStatusDescription(todo, activeTaskTraceRuns);
-              const canPatch = status === 'pending' || status === 'blocked';
-              const canRetry =
-                (status === 'blocked' || status === 'failed' || status === 'timed_out') &&
-                (activeRun?.status === 'paused' || activeRun?.status === 'failed') &&
-                todo.retry_count < todo.max_retries;
-              return (
-                <div
-                  key={todo.id}
-                  className="group/task flex items-start gap-1.5 rounded-md px-1.5 py-1 hover:bg-[var(--bg-hover)]"
-                  style={{ background: 'var(--bg-secondary)' }}
+              <label className="block">
+                <span className="sr-only">任务目标</span>
+                <textarea
+                  rows={2}
+                  value={goalInput}
+                  onChange={(event) => setGoalInput(event.target.value)}
+                  className="w-full resize-none rounded-md px-2 py-1.5 text-[10px] outline-none"
+                  style={{
+                    background: 'var(--bg-primary)',
+                    border: '1px solid var(--border-primary)',
+                    color: 'var(--text-primary)',
+                  }}
+                />
+              </label>
+              <div className="grid grid-cols-[minmax(0,1fr)_28px] gap-1">
+                <label className="min-w-0">
+                  <span className="sr-only">修改原因</span>
+                  <input
+                    value={goalReasonInput}
+                    onChange={(event) => setGoalReasonInput(event.target.value)}
+                    placeholder="修改原因"
+                    className="h-7 w-full min-w-0 rounded-md px-2 text-[10px] outline-none"
+                    style={{
+                      background: 'var(--bg-primary)',
+                      border: '1px solid var(--border-primary)',
+                      color: 'var(--text-primary)',
+                    }}
+                  />
+                </label>
+                <button
+                  type="submit"
+                  className="flex h-7 w-7 items-center justify-center rounded-md"
+                  style={{ background: 'var(--bg-hover)', color: 'var(--text-primary)' }}
+                  title="更新任务目标"
+                  aria-label="更新任务目标"
                 >
-                  <div className="mt-0.5">
-                    <TodoIcon
-                      status={status}
-                      executionStatus={execution?.status}
-                      taskRunStatus={activeRun.status}
-                    />
-                  </div>
-                  <div className="min-w-0 flex-1">
+                  <Save size={12} />
+                </button>
+              </div>
+              {goalError && <div style={{ color: 'var(--color-error)' }}>{goalError}</div>}
+              {!planGoalCurrent && (
+                <div className="text-[10px]" style={{ color: 'var(--color-warning)' }}>
+                  任务图待绑定 Goal r{activeRun.goal_revision}
+                </div>
+              )}
+            </form>
+          )}
+
+          {continuation?.enabled && (
+            <div className="mb-2 space-y-1 text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                <span>第 {currentTurn?.ordinal ?? continuation.next_turn_ordinal} 轮</span>
+                <span>压缩 {continuation.compaction_count} 次</span>
+                {activeCellCount > 0 && <span>后台命令 {activeCellCount}</span>}
+              </div>
+              {budgetLabels && <div>{budgetLabels.tokens}</div>}
+              {budgetLabels && <div>{budgetLabels.time}</div>}
+              <form
+                className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_28px] gap-1 pt-1"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void applyBudgets();
+                }}
+              >
+                <label className="min-w-0">
+                  <span className="sr-only">Token 预算</span>
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    inputMode="numeric"
+                    value={tokenBudgetInput}
+                    onChange={(event) => setTokenBudgetInput(event.target.value)}
+                    placeholder="Token 不限"
+                    className="h-7 w-full min-w-0 rounded-md px-1.5 text-[10px] outline-none"
+                    style={{
+                      background: 'var(--bg-primary)',
+                      border: '1px solid var(--border-primary)',
+                      color: 'var(--text-primary)',
+                    }}
+                  />
+                </label>
+                <label className="min-w-0">
+                  <span className="sr-only">时间预算（秒）</span>
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    inputMode="numeric"
+                    value={timeBudgetInput}
+                    onChange={(event) => setTimeBudgetInput(event.target.value)}
+                    placeholder="秒数不限"
+                    className="h-7 w-full min-w-0 rounded-md px-1.5 text-[10px] outline-none"
+                    style={{
+                      background: 'var(--bg-primary)',
+                      border: '1px solid var(--border-primary)',
+                      color: 'var(--text-primary)',
+                    }}
+                  />
+                </label>
+                <button
+                  type="submit"
+                  className="flex h-7 w-7 items-center justify-center rounded-md"
+                  style={{ background: 'var(--bg-hover)', color: 'var(--text-primary)' }}
+                  title="应用任务预算"
+                  aria-label="应用任务预算"
+                >
+                  <Save size={12} />
+                </button>
+              </form>
+              {budgetError && <div style={{ color: 'var(--color-error)' }}>{budgetError}</div>}
+              {continuation.pause && (
+                <div style={{ color: 'var(--color-warning)' }}>
+                  {PAUSE_REASON_LABEL[continuation.pause.reason] ?? continuation.pause.reason}
+                  {continuation.pause.detail ? ` · ${continuation.pause.detail}` : ''}
+                </div>
+              )}
+            </div>
+          )}
+
+          {recoveryBlockers.length > 0 && (
+            <div
+              className="mb-2 space-y-2 rounded-md px-2 py-2"
+              style={{ background: 'var(--bg-hover)', border: '1px solid var(--color-warning)' }}
+            >
+              <div
+                className="flex items-center gap-1 text-[10px] font-medium"
+                style={{ color: 'var(--color-warning)' }}
+              >
+                <AlertTriangle size={11} /> 需要确认恢复操作
+              </div>
+              {recoveryBlockers.map((blocker) => {
+                const todo = todos.find((item) => item.task_id === blocker.task_id);
+                return (
+                  <div key={blocker.task_id} className="space-y-1">
                     <div
-                      className="truncate text-[11px]"
+                      className="truncate text-[10px] font-medium"
                       style={{ color: 'var(--text-primary)' }}
-                      title={todo.title}
+                      title={todo?.title ?? blocker.task_id}
                     >
-                      {todo.title}
+                      {todo?.title ?? blocker.task_id}
                     </div>
                     <div
-                      className="flex min-w-0 items-center gap-1 text-[9px]"
-                      style={{ color: 'var(--text-tertiary)' }}
+                      className="text-[9px] leading-snug"
+                      style={{ color: 'var(--text-secondary)' }}
                     >
-                      {task && (
-                        <span className="rounded-md px-1" style={{ background: 'var(--bg-hover)' }}>
-                          {kindLabel(task.kind)}
-                        </span>
-                      )}
-                      {todo.owner_agent && <span className="truncate">· {todo.owner_agent}</span>}
-                      <span>· {statusDescription}</span>
+                      {blocker.reason}
+                      {blocker.tool_name ? ` · ${blocker.tool_name}` : ''}
+                    </div>
+                    <div className="grid grid-cols-2 gap-1">
+                      <button
+                        onClick={() =>
+                          void performAction('重试恢复任务', () =>
+                            retryBlockedTask(blocker.task_id, controlTarget)
+                          )
+                        }
+                        disabled={!!pendingAction}
+                        className="flex items-center justify-center gap-1 rounded-md px-2 py-1 text-[10px]"
+                        style={{ background: 'var(--bg-primary)', color: 'var(--text-primary)' }}
+                        title="确认工作区状态后重新执行"
+                      >
+                        <RotateCcw size={10} /> 重试
+                      </button>
+                      <button
+                        onClick={() =>
+                          void performAction('跳过恢复任务', () =>
+                            resolveRecoveryTask(blocker.task_id, 'skip', controlTarget)
+                          )
+                        }
+                        disabled={!!pendingAction}
+                        className="flex items-center justify-center gap-1 rounded-md px-2 py-1 text-[10px]"
+                        style={{ background: 'var(--bg-primary)', color: 'var(--text-secondary)' }}
+                        title="保留当前工作区并跳过该任务"
+                      >
+                        <SkipForward size={10} /> 跳过
+                      </button>
                     </div>
                   </div>
-                  {(canPatch || canRetry) && (
-                    <div className="flex gap-0.5">
-                      {canRetry && (
-                        <button
-                          className="rounded-md p-0.5 hover:bg-[var(--bg-active)]"
-                          title={`重试(当前 attempt ${todo.retry_count + 1}/${todo.max_retries + 1})`}
-                          onClick={() => {
-                            useTaskRuntimeStore.getState().retryBlockedTask(todo.task_id);
-                          }}
+                );
+              })}
+            </div>
+          )}
+
+          {completionGate && !completionGateCurrent && (
+            <p role="status" className="eko-task-history-notice">
+              验收报告尚未匹配当前运行、Goal或计划版本，请刷新后确认；旧通过状态不计当前完成。
+            </p>
+          )}
+          {completionGate && completionGateCurrent && completionGate.requirements.length > 0 && (
+            <div className="mb-2 border-t border-[var(--border-primary)] pt-2">
+              <div className="mb-1 flex items-center justify-between text-[10px]">
+                <span className="font-medium" style={{ color: 'var(--text-tertiary)' }}>
+                  Goal 验收 · r{completionGate.goal_revision}
+                </span>
+                <span
+                  style={{
+                    color: completionGate.ready ? 'var(--color-success)' : 'var(--color-warning)',
+                  }}
+                >
+                  {completionGate.ready ? '通过' : `${completionGate.blockers.length} 项阻塞`}
+                </span>
+              </div>
+              <div className="space-y-1" data-testid="completion-gate-requirements">
+                {completionGate.requirements.map((assessment) => {
+                  const requirement = assessment.requirement;
+                  const taskStatus = todos.find(
+                    (todo) => todo.task_id === requirement.task_id
+                  )?.status;
+                  const canConfirmSkip =
+                    taskStatus === 'skipped' && assessment.status !== 'skipped' && planGoalCurrent;
+                  const editingSkip = requirementSkipId === requirement.requirement_id;
+                  return (
+                    <div key={requirement.requirement_id} className="min-w-0 px-1 py-0.5">
+                      <div className="flex min-w-0 items-center gap-1">
+                        <span
+                          className="min-w-0 flex-1 truncate text-[10px]"
+                          style={{ color: 'var(--text-primary)' }}
+                          title={requirement.description}
                         >
-                          <RotateCcw size={10} style={{ color: 'var(--color-info)' }} />
-                        </button>
-                      )}
-                      {canPatch && (
-                        <>
+                          {requirement.title}
+                        </span>
+                        <span
+                          className="shrink-0 text-[9px]"
+                          style={{ color: 'var(--text-tertiary)' }}
+                        >
+                          {REQUIREMENT_LABEL[assessment.status] ?? assessment.status}
+                        </span>
+                        {canConfirmSkip && !editingSkip && (
                           <button
-                            className="rounded-md p-0.5 hover:bg-[var(--bg-active)]"
-                            title="编辑"
+                            type="button"
+                            className="rounded-md p-0.5 hover:bg-[var(--bg-hover)]"
+                            title="确认跳过该 Goal requirement"
+                            aria-label="确认跳过该 Goal requirement"
                             onClick={() => {
-                              const newTitle = prompt('新标题', todo.title);
-                              if (newTitle && newTitle !== todo.title) {
-                                useTaskRuntimeStore
-                                  .getState()
-                                  .updateTask(todo.task_id, { title: newTitle });
-                              }
-                            }}
-                          >
-                            <Pencil size={10} style={{ color: 'var(--text-tertiary)' }} />
-                          </button>
-                          <button
-                            className="rounded-md p-0.5 hover:bg-[var(--bg-active)]"
-                            title="跳过"
-                            onClick={() => {
-                              if (confirm(`确定跳过任务「${todo.title}」？`)) {
-                                useTaskRuntimeStore.getState().skipTask(todo.task_id);
-                              }
+                              setRequirementSkipId(requirement.requirement_id);
+                              setRequirementSkipReason('');
                             }}
                           >
                             <SkipForward size={10} style={{ color: 'var(--color-warning)' }} />
                           </button>
-                        </>
+                        )}
+                      </div>
+                      {editingSkip && (
+                        <div className="mt-1 grid grid-cols-[minmax(0,1fr)_24px_24px] gap-1">
+                          <input
+                            autoFocus
+                            value={requirementSkipReason}
+                            onChange={(event) => setRequirementSkipReason(event.target.value)}
+                            placeholder="跳过原因"
+                            className="h-6 min-w-0 rounded-md px-1.5 text-[9px] outline-none"
+                            style={{
+                              background: 'var(--bg-primary)',
+                              border: '1px solid var(--border-primary)',
+                              color: 'var(--text-primary)',
+                            }}
+                          />
+                          <button
+                            type="button"
+                            disabled={!requirementSkipReason.trim()}
+                            className="flex h-6 w-6 items-center justify-center rounded-md"
+                            style={{ background: 'var(--bg-hover)', color: 'var(--text-primary)' }}
+                            title="保存跳过原因"
+                            aria-label="保存跳过原因"
+                            onClick={() => void confirmRequirementSkip()}
+                          >
+                            <Save size={10} />
+                          </button>
+                          <button
+                            type="button"
+                            className="flex h-6 w-6 items-center justify-center rounded-md"
+                            style={{ background: 'var(--bg-hover)', color: 'var(--text-tertiary)' }}
+                            title="取消"
+                            aria-label="取消"
+                            onClick={() => {
+                              setRequirementSkipId(null);
+                              setRequirementSkipReason('');
+                            }}
+                          >
+                            <X size={10} />
+                          </button>
+                        </div>
                       )}
                     </div>
-                  )}
-                </div>
-              );
-            })}
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          <div className="mb-2">
+            {hasMoreEvents ? (
+              <p className="text-xs text-[var(--text-tertiary)]">
+                执行记录未读完，用量汇总待确认。
+              </p>
+            ) : (
+              <CacheUsageCard summary={usageSummary} compact />
+            )}
           </div>
-          {/* Add task button */}
-          {plan && !['completed', 'cancelled'].includes(activeRun.status) && (
+
+          {runId && (
             <button
-              className="mt-1 flex w-full items-center justify-center gap-1 rounded-md px-2 py-1 text-[10px] hover:bg-[var(--bg-hover)]"
-              style={{
-                color: 'var(--text-tertiary)',
-                border: '1px dashed var(--border-secondary)',
-              }}
-              onClick={() => {
-                const title = prompt('新任务标题');
-                if (title) {
-                  const lastTask = plan.tasks.at(-1);
-                  const sortOrder =
-                    plan.tasks.reduce((max, task) => Math.max(max, task.sort_order), 0) + 10;
-                  useTaskRuntimeStore.getState().insertTask(lastTask?.id ?? null, {
-                    id: `task_${Date.now()}`,
-                    title,
-                    description: `执行任务：${title}`,
-                    kind: 'implementation',
-                    agent_role: 'general-purpose',
-                    domain_profile: plan.domain_profile,
-                    depends_on: [],
-                    parallel_group: null,
-                    execution_target: null,
-                    files: [],
-                    allowed_tools: [],
-                    required_artifacts: [],
-                    execution_checks: [],
-                    acceptance_criteria: [],
-                    max_retries: 3,
-                    sort_order: sortOrder,
-                  });
-                }
-              }}
+              onClick={() =>
+                void performAction('刷新', () => refresh(activeRun.workspace_id, runId))
+              }
+              disabled={!!pendingAction}
+              className="ml-auto flex items-center gap-1 text-[10px]"
+              style={{ color: 'var(--text-tertiary)' }}
             >
-              <Plus size={10} /> 新增任务
+              <RefreshCw size={11} /> 刷新
             </button>
           )}
         </div>
-      )}
-
-      {runId && (
-        <button
-          onClick={() => refresh(activeRun.workspace_id, runId)}
-          className="ml-auto flex items-center gap-1 text-[10px]"
-          style={{ color: 'var(--text-tertiary)' }}
-        >
-          <RefreshCw size={11} /> 刷新
-        </button>
-      )}
+      </details>
     </section>
   );
 }

@@ -1,25 +1,17 @@
+import { AgentInputMessage } from './AgentInputMessage';
 import { useMemo, useState, memo } from 'react';
-import type { ChatMessage } from '../../types/api';
-import {
-  Bot,
-  Copy,
-  Check,
-  RefreshCw,
-  GitFork,
-  Pencil,
-  X,
-  ArrowUp,
-  File,
-  Download,
-} from 'lucide-react';
+import { transcriptToolExecution, type ChatMessage } from '../../types/api';
+import { Copy, Check, RefreshCw, GitFork, Pencil, X, ArrowUp, File, Download } from 'lucide-react';
 import MarkdownContent from '../common/MarkdownContent';
-import { ThinkingSegment } from './ThinkingSegment';
+import { NativeMessageTimeline, nativeTimelineItems } from './NativeMessageTimeline';
 import { ParallelExecutionBlock, visibleSubagentRuns } from './ParallelExecutionBlock';
 import { ToolExecutionGroup } from './ToolExecutionGroup';
 import { ExecutionProcessGroup } from './ExecutionProcessGroup';
+import { ChartCard } from './ChartCard';
 import { useSubagentRunStore } from '../../stores/subagentRunStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { useChatStore } from '../../stores/chatStore';
+import { useToolExecutionStore } from '../../stores/toolExecutionStore';
 
 interface MessageBubbleProps {
   message: ChatMessage;
@@ -27,6 +19,10 @@ interface MessageBubbleProps {
   onEditAndResend?: (messageId: string, newContent: string) => void;
   onFork?: (messageId: string) => void;
   forkDisabled?: boolean;
+  /** 轮次容器已呈现原过程时，复用本组件的最终正文/产物/操作。 */
+  hideProcess?: boolean;
+  hideBody?: boolean;
+  hideParallel?: boolean;
 }
 
 function formatFileSize(bytes: number): string {
@@ -64,17 +60,11 @@ function isImageFile(mime: string): boolean {
   return mime.startsWith('image/');
 }
 
-/** Project the persisted execution timeline into renderable steps. */
+/** 原生Reasoning由NativeMessageTimeline呈现；此投影只处理当前工具引用。 */
 interface FlatStep {
-  type: 'thinking' | 'tool';
-  thinkingContent?: string;
-  toolId?: string;
+  type: 'tool';
+  toolId: string;
   toolIndex: number;
-}
-
-interface ThinkingDisplayItem {
-  type: 'thinking';
-  content: string;
 }
 
 interface ToolDisplayItem {
@@ -82,87 +72,51 @@ interface ToolDisplayItem {
   toolIds: string[];
 }
 
-type ExecutionDisplayItem = ThinkingDisplayItem | ToolDisplayItem;
+type ExecutionDisplayItem = ToolDisplayItem;
 
 export function isExecutionProcessCompleted(
   messageIsStreaming: boolean | undefined,
   activeRunBelongsToMessage: boolean,
   activeRunStatus: string | null,
-  subagentStatuses: readonly string[]
+  subagentStatuses: readonly string[],
+  hasRunningTools = false
 ): boolean {
   if (messageIsStreaming) return false;
   if (activeRunBelongsToMessage) {
     // TaskRun is the authoritative lifecycle. A missing or delayed Subagent
-    // terminal event must not leave a completed task expanded forever.
+    // or tool terminal event must not leave a completed task expanded forever.
     return Boolean(
       activeRunStatus && ['completed', 'failed', 'cancelled'].includes(activeRunStatus)
     );
   }
-  return subagentStatuses.every((status) => status !== 'running');
+  return !hasRunningTools && subagentStatuses.every((status) => status !== 'running');
 }
 
-export function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkingTotal: number } {
+export function flattenSteps(message: ChatMessage): { steps: FlatStep[] } {
   const steps: FlatStep[] = [];
-  let thinkingTotal = 0;
-
-  if (message.executionSteps && message.executionSteps.length > 0) {
-    message.executionSteps.forEach((step) => {
-      if (step.type === 'thinking') {
-        const seg = message.thinkingSegments?.[step.index];
-        if (seg && seg.content.trim()) {
-          steps.push({ type: 'thinking', thinkingContent: seg.content, toolIndex: 0 });
-          thinkingTotal++;
-        }
-      } else if (step.type === 'tool') {
-        steps.push({ type: 'tool', toolId: step.callId, toolIndex: steps.length });
-      }
-    });
-  } else if (message.executionRounds && message.executionRounds.length > 0) {
-    // Older persisted conversations may only have round-level execution data.
-    message.executionRounds.forEach((round) => {
-      if (round.thinking && round.thinking.content.trim()) {
-        steps.push({ type: 'thinking', thinkingContent: round.thinking.content, toolIndex: 0 });
-        thinkingTotal++;
-      }
-      round.toolCallIds.forEach((callId) => {
-        steps.push({ type: 'tool', toolId: callId, toolIndex: steps.length });
-      });
-    });
-  } else {
-    // Fallback for messages without explicit execution order.
-    const segs = (message.thinkingSegments || []).filter((s) => s.content.trim());
-    segs.forEach((s) => {
-      steps.push({ type: 'thinking', thinkingContent: s.content, toolIndex: 0 });
-      thinkingTotal++;
-    });
-    if (thinkingTotal === 0 && message.thinkingContent) {
-      steps.push({ type: 'thinking', thinkingContent: message.thinkingContent, toolIndex: 0 });
-      thinkingTotal++;
-    }
+  for (const step of message.executionSteps ?? []) {
+    if (step.type === 'tool')
+      steps.push({ type: 'tool', toolId: step.callId, toolIndex: steps.length });
   }
-  return { steps, thinkingTotal };
+  return { steps };
 }
 
-/** Collapse each uninterrupted run of tool calls into one display item. */
+/** 无native块的工具视图仍沿canonical步骤顺序呈现。 */
 export function groupExecutionSteps(steps: FlatStep[]): ExecutionDisplayItem[] {
-  const items: ExecutionDisplayItem[] = [];
+  return steps.length ? [{ type: 'tools', toolIds: steps.map((step) => step.toolId) }] : [];
+}
 
-  for (const step of steps) {
-    if (step.type === 'thinking') {
-      items.push({ type: 'thinking', content: step.thinkingContent ?? '' });
-      continue;
-    }
-
-    if (!step.toolId) continue;
-    const previous = items.at(-1);
-    if (previous?.type === 'tools') {
-      previous.toolIds.push(step.toolId);
-    } else {
-      items.push({ type: 'tools', toolIds: [step.toolId] });
-    }
-  }
-
-  return items;
+/** Read only the tool facts already proved for each displayed reference. */
+function displayedToolStatuses(
+  message: ChatMessage,
+  items: ExecutionDisplayItem[],
+  tools: ReturnType<typeof useToolExecutionStore.getState>['tools']
+): (string | undefined)[] {
+  const ids = new Set(items.flatMap((item) => (item.type === 'tools' ? item.toolIds : [])));
+  return [...ids].map((id) => {
+    const record = message.transcriptTools?.find((entry) => entry.id === id);
+    return (record ? transcriptToolExecution(record, tools) : tools[id])?.status;
+  });
 }
 
 export const MessageBubble = memo(function MessageBubble({
@@ -171,6 +125,9 @@ export const MessageBubble = memo(function MessageBubble({
   onEditAndResend,
   onFork,
   forkDisabled,
+  hideProcess = false,
+  hideBody = false,
+  hideParallel = false,
 }: MessageBubbleProps) {
   const isUser = message.role === 'user' && !message.internalAgent;
   const [editing, setEditing] = useState(false);
@@ -197,8 +154,10 @@ export const MessageBubble = memo(function MessageBubble({
   const images = message.attachments?.filter((a) => isImageFile(a.mime_type)) ?? [];
   const files = message.attachments?.filter((a) => !isImageFile(a.mime_type)) ?? [];
 
-  const { steps, thinkingTotal } = flattenSteps(message);
+  const { steps } = flattenSteps(message);
   const executionItems = groupExecutionSteps(steps);
+  const hasNativeTimeline = !hideProcess && Boolean(message.assistantBlocks?.length);
+  const hasVisibleNativeContent = hasNativeTimeline && nativeTimelineItems(message).length > 0;
   const activeRun = useTaskRuntimeStore((state) => state.activeRun);
   const subagentRuns = useSubagentRunStore((state) => state.runs);
   const chatMessages = useChatStore((state) => state.messages);
@@ -212,40 +171,125 @@ export const MessageBubble = memo(function MessageBubble({
   const messageIds = useMemo(() => new Set(chatMessages.map((item) => item.id)), [chatMessages]);
   const visibleRuns = useMemo(
     () =>
-      visibleSubagentRuns(
-        Object.values(subagentRuns),
-        activeRun,
-        message.id,
-        lastAssistantMessageId,
-        messageIds
-      ),
-    [activeRun, lastAssistantMessageId, message.id, messageIds, subagentRuns]
+      hideParallel || message.role === 'tool'
+        ? []
+        : visibleSubagentRuns(
+            Object.values(subagentRuns),
+            activeRun,
+            message.id,
+            lastAssistantMessageId,
+            messageIds
+          ),
+    [
+      activeRun,
+      hideParallel,
+      lastAssistantMessageId,
+      message.id,
+      message.role,
+      messageIds,
+      subagentRuns,
+    ]
   );
   const activeRunBelongsToMessage = Boolean(
     activeRun &&
     (activeRun.root_message_id === message.id ||
       (!messageIds.has(activeRun.root_message_id) && message.id === lastAssistantMessageId))
   );
+  const hasRunningTools = useToolExecutionStore((state) =>
+    displayedToolStatuses(message, executionItems, state.tools).includes('running')
+  );
+  const toolFailureCount = useToolExecutionStore(
+    (state) =>
+      displayedToolStatuses(message, executionItems, state.tools).filter(
+        (status) => status === 'failed' || status === 'timed_out'
+      ).length
+  );
+  // Keep the existing action/turn lifecycle gate. Tool-summary knowledge only
+  // refines the process presentation and does not create another Run state.
   const executionCompleted = isExecutionProcessCompleted(
     message.isStreaming,
     activeRunBelongsToMessage,
     activeRun?.status ?? null,
     visibleRuns.map((run) => run.status)
   );
-  const hasExecutionProcess = executionItems.length > 0 || visibleRuns.length > 0;
-  let thinkingIndex = 0;
+  const processCompleted = isExecutionProcessCompleted(
+    message.isStreaming,
+    activeRunBelongsToMessage,
+    activeRun?.status ?? null,
+    visibleRuns.map((run) => run.status),
+    hasRunningTools
+  );
+  const hasExecutionProcess = !hideProcess && (executionItems.length > 0 || visibleRuns.length > 0);
+  const hasUnrestoredTranscript = useToolExecutionStore(
+    (state) =>
+      (message.transcriptTools?.some((record) => !transcriptToolExecution(record, state.tools)) ??
+        false) ||
+      displayedToolStatuses(message, executionItems, state.tools).some(
+        (status) => status == null || status === 'unknown' || status === 'interrupted'
+      )
+  );
+  const hasBody = !hideBody && Boolean(message.content.trim());
+  // 历史恢复沿原运行态保留失败原因；失败不是助手最终答案，也不能被空行过滤隐藏。
+  const failureReason =
+    message.failureNotice ??
+    (message.executionStatus?.status === 'failed' && message.executionStatus.reason?.trim()
+      ? message.executionStatus.reason
+      : null);
+  const showFailureReason = Boolean(
+    failureReason && (hideBody || !message.content.includes(failureReason))
+  );
+
+  if (message.role === 'user' && message.agentInput) return <AgentInputMessage message={message} />;
+
+  // A canonical tool record is not an assistant turn and cannot own Subagents,
+  // regeneration or Fork. Its key addresses this display row only.
+  if (message.role === 'tool') {
+    return (
+      <div className="animate-fade-up min-w-0 py-0.5">
+        {message.internalAgent && (
+          <span className="text-[10px] text-[var(--text-tertiary)]">Agent 内部工具记录</span>
+        )}
+        {/* 原记录操作与摘要同排，避免每条工具记录额外占一个空白操作行。 */}
+        <div className="flex min-w-0 items-start gap-1">
+          <div className="min-w-0 flex-1">
+            <ToolExecutionGroup
+              toolIds={message.transcriptTools?.map((record) => record.id) ?? []}
+              transcriptTools={message.transcriptTools}
+            />
+          </div>
+          {message.content && (
+            <ActionButton
+              icon={<Copy size={13} />}
+              label="复制原记录"
+              onClick={() => copyToClipboard(message.content)}
+              copyMode
+            />
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // Canonical history includes empty assistant rows for tool calls. Render only
+  // their visible projections; ChatPanel owns the single empty-stream status.
+  if (
+    !isUser &&
+    !hasBody &&
+    !hasVisibleNativeContent &&
+    !showFailureReason &&
+    images.length === 0 &&
+    files.length === 0 &&
+    !message.chartSpecs?.length &&
+    !hasExecutionProcess &&
+    !message.internalAgent
+  ) {
+    return null;
+  }
 
   return (
-    <div className="animate-fade-up flex gap-3 py-3.5">
-      {/* Avatar — assistant only; user messages are full-width rows (no bubble) */}
-      {!isUser && (
-        <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-[var(--accent-bg)] text-[var(--accent)] shadow-[var(--shadow-sm)]">
-          <Bot size={14} />
-        </div>
-      )}
-
+    <div className={`animate-fade-up py-1 ${isUser ? 'ml-auto w-fit max-w-[85%]' : 'w-full'}`}>
       {/* Content */}
-      <div className="min-w-0 flex-1 space-y-2">
+      <div className="min-w-0 space-y-2">
         {/* Images */}
         {images.length > 0 && (
           <div className={`grid gap-2 ${images.length === 1 ? 'grid-cols-1' : 'grid-cols-2'}`}>
@@ -313,7 +357,7 @@ export const MessageBubble = memo(function MessageBubble({
         {isUser && message.content && (
           <div className="group/msg relative w-full">
             {!editing && (
-              <div className="absolute -top-3 right-0 z-10 flex gap-0.5 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] px-1 py-0.5 opacity-0 shadow-[var(--shadow-md)] transition-all duration-200 group-hover/msg:opacity-100 group-hover/msg:-translate-y-0.5">
+              <div className="absolute -top-3 right-0 z-10 flex gap-0.5 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] px-1 py-0.5 opacity-0 shadow-[var(--shadow-md)] transition-all duration-200 group-hover/msg:opacity-100 group-focus-within/msg:opacity-100 group-hover/msg:-translate-y-0.5">
                 <ActionButton
                   icon={<Copy size={13} />}
                   label="复制"
@@ -357,7 +401,7 @@ export const MessageBubble = memo(function MessageBubble({
                 </div>
               </div>
             ) : (
-              <div className="rounded-lg bg-[var(--bg-user-bubble)] px-3 py-2.5 text-sm leading-relaxed text-[var(--text-primary)]">
+              <div className="rounded-lg bg-[var(--bg-user-bubble)] px-3 py-1.5 text-sm leading-normal text-[var(--text-primary)]">
                 <div className="whitespace-pre-wrap break-words">{message.content}</div>
               </div>
             )}
@@ -368,43 +412,60 @@ export const MessageBubble = memo(function MessageBubble({
             All peers in a single space-y container — no separate bordered
             sections. This is what makes it read as one continuous flow. */}
         {!isUser && (
-          <div className="w-full space-y-2">
+          <div className="w-full space-y-1">
+            {showFailureReason && (
+              <div
+                role="alert"
+                className="whitespace-pre-wrap break-words rounded-lg border border-[var(--color-error)] bg-[var(--bg-secondary)] px-3 py-2 text-sm text-[var(--text-primary)]"
+              >
+                本次处理失败：{failureReason}
+              </div>
+            )}
             {message.internalAgent && (
               <span className="inline-flex h-5 items-center rounded border border-[var(--border-primary)] px-1.5 text-[10px] font-medium text-[var(--text-tertiary)]">
                 Agent 内部消息
               </span>
             )}
-            {hasExecutionProcess ? (
-              <ExecutionProcessGroup completed={executionCompleted}>
-                {/* Thinking + tools */}
-                <div className="space-y-1">
-                  {executionItems.map((item, i) => {
-                    if (item.type === 'thinking') {
-                      thinkingIndex++;
+            {!hideProcess &&
+              (hasNativeTimeline && (hasVisibleNativeContent || visibleRuns.length > 0) ? (
+                <ExecutionProcessGroup
+                  completed={Boolean(message.finalAnswerConfirmed && hasBody)}
+                  statusLabel="最终结果已发布"
+                  unrestored={hasUnrestoredTranscript}
+                  toolFailureCount={toolFailureCount}
+                >
+                  <NativeMessageTimeline message={message} includeSubagents={false} />
+                  {!hideParallel && <ParallelExecutionBlock messageId={message.id} />}
+                </ExecutionProcessGroup>
+              ) : !hasNativeTimeline && hasExecutionProcess ? (
+                <ExecutionProcessGroup
+                  completed={processCompleted}
+                  unrestored={hasUnrestoredTranscript}
+                  toolFailureCount={toolFailureCount}
+                >
+                  {/* canonical工具引用 */}
+                  <div className="space-y-1">
+                    {executionItems.map((item, i) => {
                       return (
-                        <ThinkingSegment
-                          key={`think-${i}`}
-                          index={thinkingIndex}
-                          total={thinkingTotal}
-                          content={item.content}
-                          isStreaming={!executionCompleted}
+                        <ToolExecutionGroup
+                          key={`tools-${i}`}
+                          toolIds={item.toolIds}
+                          transcriptTools={message.transcriptTools}
                         />
                       );
-                    }
-                    return <ToolExecutionGroup key={`tools-${i}`} toolIds={item.toolIds} />;
-                  })}
-                </div>
+                    })}
+                  </div>
 
-                {/* Run-level Subagents remain independent rows inside the process. */}
-                <ParallelExecutionBlock messageId={message.id} />
-              </ExecutionProcessGroup>
-            ) : (
-              // No execution history exists for this assistant response.
-              <ParallelExecutionBlock messageId={message.id} />
-            )}
+                  {/* Run-level Subagents remain independent rows inside the process. */}
+                  {!hideParallel && <ParallelExecutionBlock messageId={message.id} />}
+                </ExecutionProcessGroup>
+              ) : (
+                // No execution history exists for this assistant response.
+                !hideParallel && <ParallelExecutionBlock messageId={message.id} />
+              ))}
 
             {/* Final text — no left border, plain markdown flow */}
-            {message.content && (
+            {hasBody && (
               <div className="group/msg relative">
                 {editing ? (
                   <div className="rounded-lg border-2 border-[var(--accent)] bg-[var(--bg-primary)] px-4 py-3 shadow-[var(--shadow-md)]">
@@ -440,7 +501,7 @@ export const MessageBubble = memo(function MessageBubble({
                     </div>
                   </div>
                 ) : (
-                  <div className="text-sm leading-relaxed text-[var(--text-assistant-msg)]">
+                  <div className="text-sm leading-normal text-[var(--text-assistant-msg)]">
                     <MarkdownContent className="break-words" content={message.content} />
                     {message.isStreaming && (
                       <span className="ml-0.5 inline-block h-[14px] w-[3px] animate-pulse rounded-full bg-[var(--accent)] align-text-bottom" />
@@ -448,7 +509,7 @@ export const MessageBubble = memo(function MessageBubble({
                   </div>
                 )}
                 {!message.isStreaming && !editing && (
-                  <div className="mt-2 flex items-center gap-0.5 text-[var(--text-tertiary)]">
+                  <div className="mt-1 flex items-center gap-0.5 text-[var(--text-tertiary)]">
                     <ActionButton
                       icon={<Copy size={13} />}
                       label="复制"
@@ -462,7 +523,7 @@ export const MessageBubble = memo(function MessageBubble({
                         onClick={() => onRegenerate(message.id)}
                       />
                     )}
-                    {onFork && !message.internalAgent && (
+                    {onFork && !message.internalAgent && message.finalAnswerConfirmed === true && (
                       <ActionButton
                         icon={<GitFork size={13} />}
                         label="分叉会话"
@@ -474,6 +535,9 @@ export const MessageBubble = memo(function MessageBubble({
                 )}
               </div>
             )}
+            {message.chartSpecs?.map((spec, index) => (
+              <ChartCard key={`${message.id}:chart:${index}`} spec={spec} />
+            ))}
           </div>
         )}
       </div>
@@ -508,7 +572,7 @@ function ActionButton({
       onClick={handleClick}
       disabled={disabled}
       aria-label={label}
-      className={`flex items-center gap-1 rounded-md px-1.5 py-1 text-[11px] transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${done ? 'text-[var(--color-success)]' : 'text-[var(--text-tertiary)] hover:text-[var(--text-primary)]'}`}
+      className={`flex min-h-6 items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${done ? 'text-[var(--color-success)]' : 'text-[var(--text-tertiary)] hover:text-[var(--text-primary)]'}`}
       title={label}
     >
       {done ? <Check size={13} /> : icon}

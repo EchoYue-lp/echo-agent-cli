@@ -2,7 +2,7 @@
 schema_version: 1
 id: evidence.cancellation-observation-consumer
 kind: evidence
-observed_at: source:a316119d3d822166fd260b6806ad05b2bf2762f349d47185e64a2bea4f964241
+observed_at: source:4726a37cc1350e66b30b281fd02e16cdd087cd7f44b58b28a0ba6ab09bfa0d46
 source_refs:
 - echo-agent-app-core/src/infra/factory.rs
 - echo-agent-app-core/src/agent_pool/tests.rs
@@ -14,10 +14,10 @@ source_refs:
 - echo-agent-app-core/src/tasks/task_runtime/executor/dispatch.rs
 - echo-agent-app-core/src/tasks/task_runtime/executor/run.rs
 - echo-agent-app-core/src/tasks/task_runtime/executor/tests.rs
-- src/cli/repl.rs
-- src/cli/channels.rs
+- echo-agent-app-core/src/foreground_turn.rs
+- echo-agent-app-core/src/channel_runtime.rs
 - src/tauri/commands/task_runtime.rs
-- src/tui/events.rs
+- src/tauri/commands/chat.rs
 - Cargo.toml
 - Cargo.lock
 - .github/workflows/rust-ci.yml
@@ -30,13 +30,12 @@ source_refs:
 - echo-agent-app-core/src/analysis.rs
 - echo-agent-app-core/src/chat_driver.rs
 - echo-agent-app-core/src/conversation_input.rs
-- echo-agent-app-core/src/foreground_turn.rs
 - echo-agent-app-core/src/product_data_io.rs
 - echo-agent-app-core/src/runtime.rs
 - echo-agent-app-core/src/run_driver.rs
 - echo-agent-app-core/src/tasks/task_runtime/executor/limits.rs
 - echo-agent-app-core/src/tasks/task_runtime/types.rs
-- src/cli/channels/input_pump.rs
+- echo-agent-app-core/src/channel_runtime/input_pump.rs
 - echo-agent-app-core/src/scheduler/runner.rs
 - echo-agent-app-core/src/tasks/task_runtime/continuation.rs
 - echo-agent-app-core/src/tasks/task_runtime/event_rebuild.rs
@@ -316,3 +315,22 @@ EKO 的执行、取消和恢复适配保留 framework physical receipt/claim CAS
 原件位于 ignored `local/cli-framework356-consumer/final-f7bac-clean8d-full8-runtime-20261022-02/`，汇总proof49106B/SHA bff031aefe5f421804c2f664a32352595df4866c94b6c5ee33c4578c45e22a9b；05 raw199415B/SHA b2c6438ab737825ad161844a0f18ed2dd5875fd44cd9a3db3b0321fb1f1fd8a2，08 raw25875B/SHA b08090e86173e49124498f2b112c00edcb30a82718c990d6bd78c31fa3110b45。末核C945/CF2332全SET/SHA/mode、PF、配置及政策锁一致；原4755保护清单不改，4745普通文件与2份new31实核，退休10通过已审lossless archive/member/index与actual journal承接，SDK/F49及Host2c/collector外置保护由已接受external successor继承。旧反例、custody、source refs及scanner失败不改，不以恢复表示冒原普通路径仍存在。末核无Cargo/Host/扫描进程。
 
 最终交付以精确合并main的CI/cold及累计文件必要性结果单列收据判定，不把源码冷可取当重新运行，不预设另一次doc-only ack PR。Rule needs_review、Audit stale、全仓inventory/behavior open保留各自原义；本任务局部工程与消费资格不扩为全EKO闭合。纯内部适配与风险规则不增加公共调用或产品入口，现有examples已由all-target链覆盖，官网只同步已有产品事实。
+
+## 2026-10-25 应用源码归位观察
+
+当前可读 channel helper 路径随原实现归位 app-core/channel_runtime；原 bin 入口只转发。此路径修正不续期本文件任何历史 Rust、Node、风险接受或 native 资格；历史观察和具名旧快照结论保持原范围。当前合流尚未 Cargo 编译。
+
+旧来源观察 `source:a316119d3d822166fd260b6806ad05b2bf2762f349d47185e64a2bea4f964241` 保留为历史。当前 observed_at 只绑定归位后的可读来源，不表示旧验证在新合流上续期。
+
+
+## 2026-10-29：退役后的前置路径导航维护
+
+本节只维护结构化源码/消费者引用的导航，不重新观察或续期旧运行资格。原观察 `source:4726a37cc1350e66b30b281fd02e16cdd087cd7f44b58b28a0ba6ab09bfa0d46`、上文历史原件、失败与限制、原 command/scenario/after revision 均保持原范围；本节不新增 matched、状态或 owner。
+
+| 原历史路径 | 当前实现或退役决定导航 |
+| --- | --- |
+| `src/cli/repl.rs` | `echo-agent-app-core/src/foreground_turn.rs` |
+| `src/cli/channels.rs` | `echo-agent-app-core/src/channel_runtime.rs` |
+| `src/tui/events.rs` | `src/tauri/commands/chat.rs` |
+
+旧路径身份与退出范围由既有退役资产/Finding和正式ADR0050/0057保留；源码历史可在 `pre-retirement-2026-10-24` 及后继具名Git保存点回读。新导航只指向现存原接管实现或退出决定，不能把旧observed_at解释成这些路径当时已经运行通过。unknown/needs_review、原动态/native/风险缺口不清；本候选没有执行Cargo或官方新Task校验，采用与真实来源绑定由EKO唯一writer按正常新Task合同完成。

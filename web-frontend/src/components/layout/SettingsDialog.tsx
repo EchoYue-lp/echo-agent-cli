@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import {
   X,
@@ -12,40 +12,79 @@ import {
   BookOpen,
   Brain,
   Cpu,
-  Database,
   Activity,
-  BrainCircuit,
   Sparkles,
   Package,
   Webhook,
   Timer,
   GitBranch,
-  Code2,
-  LayoutDashboard,
   ChevronDown,
   ChevronRight,
 } from 'lucide-react';
 import { useUiStore, type SettingsTabId } from '../../stores/uiStore';
-import { ConfigPanel } from '../config/ConfigPanel';
-import { SessionsPanel } from '../sessions/SessionsPanel';
-import { ArchivedConversationsPanel } from '../sessions/ArchivedConversationsPanel';
-import { AuditPanel } from '../audit/AuditPanel';
-import { CompressPanel } from '../compress/CompressPanel';
-import { ToolsPanel } from '../tools/ToolsPanel';
-import { McpPanel } from '../mcp/McpPanel';
-import { SkillsPanel } from '../skills/SkillsPanel';
-import { MemoryPanel } from '../memory/MemoryPanel';
-import { EvolutionPanel } from '../evolution/EvolutionPanel';
-import { ProviderPanel } from '../providers/ProviderPanel';
-import { PluginPanel } from '../plugins/PluginPanel';
-import { HooksPanel } from '../hooks/HooksPanel';
-import { SchedulerPanel } from '../scheduler/SchedulerPanel';
-import { WorktreePanel } from '../coding/WorktreePanel';
-import { ObservabilityPanel } from '../observability/ObservabilityPanel';
-import { SandboxPanel } from '../sandbox/SandboxPanel';
-import { LspPanel } from '../lsp/LspPanel';
 import { Modal } from '../common/Modal';
+import { ErrorBoundary } from '../common/ErrorBoundary';
+import './SettingsDialog.css';
 
+// Keep panel identities at module scope; closed settings should not eagerly load every screen.
+const ChannelsPanel = lazy(() =>
+  import('../channels/ChannelsPanel').then((module) => ({ default: module.ChannelsPanel }))
+);
+const ConfigPanel = lazy(() =>
+  import('../config/ConfigPanel').then((module) => ({ default: module.ConfigPanel }))
+);
+const SessionsPanel = lazy(() =>
+  import('../sessions/SessionsPanel').then((module) => ({ default: module.SessionsPanel }))
+);
+const ArchivedConversationsPanel = lazy(() =>
+  import('../sessions/ArchivedConversationsPanel').then((module) => ({
+    default: module.ArchivedConversationsPanel,
+  }))
+);
+const AuditPanel = lazy(() =>
+  import('../audit/AuditPanel').then((module) => ({ default: module.AuditPanel }))
+);
+const CompressPanel = lazy(() =>
+  import('../compress/CompressPanel').then((module) => ({ default: module.CompressPanel }))
+);
+const ToolsPanel = lazy(() =>
+  import('../tools/ToolsPanel').then((module) => ({ default: module.ToolsPanel }))
+);
+const McpPanel = lazy(() =>
+  import('../mcp/McpPanel').then((module) => ({ default: module.McpPanel }))
+);
+const SkillsPanel = lazy(() =>
+  import('../skills/SkillsPanel').then((module) => ({ default: module.SkillsPanel }))
+);
+const MemoryPanel = lazy(() =>
+  import('../memory/MemoryPanel').then((module) => ({ default: module.MemoryPanel }))
+);
+const EvolutionPanel = lazy(() =>
+  import('../evolution/EvolutionPanel').then((module) => ({ default: module.EvolutionPanel }))
+);
+const ProviderPanel = lazy(() =>
+  import('../providers/ProviderPanel').then((module) => ({ default: module.ProviderPanel }))
+);
+const PluginPanel = lazy(() =>
+  import('../plugins/PluginPanel').then((module) => ({ default: module.PluginPanel }))
+);
+const HooksPanel = lazy(() =>
+  import('../hooks/HooksPanel').then((module) => ({ default: module.HooksPanel }))
+);
+const SchedulerPanel = lazy(() =>
+  import('../scheduler/SchedulerPanel').then((module) => ({ default: module.SchedulerPanel }))
+);
+const WorktreePanel = lazy(() =>
+  import('../coding/WorktreePanel').then((module) => ({ default: module.WorktreePanel }))
+);
+const ObservabilityPanel = lazy(() =>
+  import('../observability/ObservabilityPanel').then((module) => ({
+    default: module.ObservabilityPanel,
+  }))
+);
+const SandboxPanel = lazy(() =>
+  import('../sandbox/SandboxPanel').then((module) => ({ default: module.SandboxPanel }))
+);
 interface SettingsItem {
   id: SettingsTabId;
   label: string;
@@ -56,34 +95,40 @@ interface SettingsItem {
 
 interface SettingsGroup {
   label: string;
-  icon: typeof Settings;
   tier: 'core' | 'advanced';
-  defaultOpen?: boolean;
   items: SettingsItem[];
 }
 
-const overviewItem: SettingsItem = {
-  id: 'overview',
-  label: '总览',
-  icon: LayoutDashboard,
+const defaultSettingsItem: SettingsItem = {
+  id: 'providers',
+  label: '模型',
+  icon: Cpu,
   maturity: 'core',
-  description: '核心工作流入口',
+  description: '模型、供应商和默认模型',
+};
+
+const channelsItem: SettingsItem = {
+  id: 'channels',
+  label: 'IM 渠道',
+  icon: Globe,
+  maturity: 'core',
+  description: '消息渠道配置、连接与收发',
 };
 
 const settingsGroups: SettingsGroup[] = [
   {
-    label: '核心工作流',
-    icon: Cpu,
+    label: '基础与扩展',
     tier: 'core',
-    defaultOpen: true,
     items: [
+      defaultSettingsItem,
       {
-        id: 'providers',
-        label: '模型',
-        icon: Cpu,
+        id: 'config',
+        label: '基础配置',
+        icon: Settings,
         maturity: 'core',
-        description: '模型、供应商和默认模型',
+        description: '智能体与常用应用配置',
       },
+      channelsItem,
       {
         id: 'tools',
         label: '工具',
@@ -92,7 +137,6 @@ const settingsGroups: SettingsGroup[] = [
         description: 'Agent 可用工具与权限',
       },
       { id: 'mcp', label: 'MCP', icon: Globe, maturity: 'core', description: '本地扩展服务连接' },
-      { id: 'lsp', label: 'LSP', icon: Code2, maturity: 'core', description: '项目语言服务' },
       {
         id: 'skills',
         label: '技能',
@@ -107,28 +151,11 @@ const settingsGroups: SettingsGroup[] = [
         maturity: 'core',
         description: '本地插件市场',
       },
-      {
-        id: 'hooks',
-        label: 'Hooks',
-        icon: Webhook,
-        maturity: 'core',
-        description: '事件钩子来源与规则',
-      },
-      {
-        id: 'observability',
-        label: '运行观测',
-        icon: Activity,
-        maturity: 'core',
-        description: 'Token、缓存、trace 与诊断',
-      },
-      { id: 'memory', label: '记忆', icon: Brain, maturity: 'live', description: '项目与用户记忆' },
     ],
   },
   {
-    label: '项目数据',
-    icon: Database,
+    label: '会话与记忆',
     tier: 'core',
-    defaultOpen: true,
     items: [
       {
         id: 'sessions',
@@ -144,14 +171,47 @@ const settingsGroups: SettingsGroup[] = [
         maturity: 'live',
         description: '恢复或永久删除归档会话',
       },
+      { id: 'memory', label: '记忆', icon: Brain, maturity: 'live', description: '项目与用户记忆' },
+      {
+        id: 'compress',
+        label: '压缩',
+        icon: Minimize2,
+        maturity: 'advanced',
+        description: '上下文压缩与摘要',
+      },
     ],
   },
   {
-    label: '治理',
-    icon: ShieldCheck,
+    label: '连接与自动化',
     tier: 'core',
-    defaultOpen: true,
     items: [
+      {
+        id: 'scheduler',
+        label: '定时任务',
+        icon: Timer,
+        maturity: 'advanced',
+        description: '后台计划任务',
+      },
+      {
+        id: 'hooks',
+        label: 'Hooks',
+        icon: Webhook,
+        maturity: 'core',
+        description: '事件钩子来源与规则',
+      },
+    ],
+  },
+  {
+    label: '运行与诊断',
+    tier: 'core',
+    items: [
+      {
+        id: 'observability',
+        label: '运行观测',
+        icon: Activity,
+        maturity: 'core',
+        description: 'Token、缓存、trace 与诊断',
+      },
       {
         id: 'audit',
         label: '审计',
@@ -169,37 +229,15 @@ const settingsGroups: SettingsGroup[] = [
     ],
   },
   {
-    label: '高级与实验',
-    icon: Sparkles,
+    label: '高级',
     tier: 'advanced',
     items: [
-      {
-        id: 'compress',
-        label: '压缩',
-        icon: Minimize2,
-        maturity: 'advanced',
-        description: '上下文压缩与摘要',
-      },
-      {
-        id: 'config',
-        label: '配置',
-        icon: Settings,
-        maturity: 'advanced',
-        description: '底层应用配置',
-      },
       {
         id: 'worktree',
         label: 'Worktree',
         icon: GitBranch,
         maturity: 'advanced',
         description: '并行开发工作区',
-      },
-      {
-        id: 'scheduler',
-        label: '定时任务',
-        icon: Timer,
-        maturity: 'advanced',
-        description: '后台计划任务',
       },
       {
         id: 'evolution',
@@ -212,18 +250,9 @@ const settingsGroups: SettingsGroup[] = [
   },
 ];
 
-const maturityLabel: Record<SettingsItem['maturity'], string> = {
-  core: '核心',
-  live: '可用',
-  advanced: '高级',
-  lab: '实验',
-};
-
 const panels: Record<SettingsTabId, React.FC> = {
-  overview: SettingsOverview,
   tools: ToolsPanel,
   mcp: McpPanel,
-  lsp: LspPanel,
   skills: SkillsPanel,
   memory: MemoryPanel,
 
@@ -239,108 +268,28 @@ const panels: Record<SettingsTabId, React.FC> = {
   plugins: PluginPanel,
   hooks: HooksPanel,
   scheduler: SchedulerPanel,
+  channels: ChannelsPanel,
   worktree: WorktreePanel,
 };
 
-function SettingsOverview() {
-  const setActiveSettingsTab = useUiStore((s) => s.setActiveSettingsTab);
-  const workflows: Array<{
-    title: string;
-    icon: typeof Settings;
-    items: SettingsItem[];
-  }> = [
-    {
-      title: '执行主链路',
-      icon: BrainCircuit,
-      items: [
-        settingsGroups[0].items.find((item) => item.id === 'observability') ?? overviewItem,
-        settingsGroups[2].items.find((item) => item.id === 'audit') ?? overviewItem,
-        settingsGroups[2].items.find((item) => item.id === 'sandbox') ?? overviewItem,
-      ],
-    },
-    {
-      title: '模型与工具',
-      icon: Cpu,
-      items: [
-        settingsGroups[0].items.find((item) => item.id === 'providers') ?? overviewItem,
-        settingsGroups[0].items.find((item) => item.id === 'tools') ?? overviewItem,
-        settingsGroups[0].items.find((item) => item.id === 'mcp') ?? overviewItem,
-        settingsGroups[0].items.find((item) => item.id === 'skills') ?? overviewItem,
-        settingsGroups[0].items.find((item) => item.id === 'plugins') ?? overviewItem,
-        settingsGroups[0].items.find((item) => item.id === 'hooks') ?? overviewItem,
-      ],
-    },
-    {
-      title: '上下文与历史',
-      icon: Database,
-      items: [
-        settingsGroups[0].items.find((item) => item.id === 'memory') ?? overviewItem,
-        settingsGroups[1].items.find((item) => item.id === 'sessions') ?? overviewItem,
-        settingsGroups[3].items.find((item) => item.id === 'compress') ?? overviewItem,
-      ],
-    },
-    {
-      title: '高级扩展',
-      icon: Sparkles,
-      items: [
-        settingsGroups[3].items.find((item) => item.id === 'scheduler') ?? overviewItem,
-        settingsGroups[3].items.find((item) => item.id === 'evolution') ?? overviewItem,
-      ],
-    },
-  ];
-
-  return (
-    <div className="grid gap-4 md:grid-cols-2">
-      {workflows.map((workflow) => (
-        <section
-          key={workflow.title}
-          className="rounded-lg border border-[var(--border-primary)] bg-[var(--bg-secondary)] p-4"
-        >
-          <div className="mb-3 flex items-center gap-2">
-            <workflow.icon size={16} className="text-[var(--text-secondary)]" />
-            <h3 className="text-sm font-semibold text-[var(--text-primary)]">{workflow.title}</h3>
-          </div>
-          <div className="space-y-2">
-            {workflow.items.map(({ id, label, icon: Icon, maturity, description }) => (
-              <button
-                key={`${workflow.title}-${id}`}
-                type="button"
-                onClick={() => setActiveSettingsTab(id)}
-                className="flex w-full items-start gap-3 rounded-md px-3 py-2 text-left transition-colors hover:bg-[var(--bg-hover)]"
-              >
-                <Icon size={15} className="mt-0.5 shrink-0 text-[var(--text-tertiary)]" />
-                <span className="min-w-0 flex-1">
-                  <span className="flex items-center gap-2">
-                    <span className="truncate text-sm font-medium text-[var(--text-primary)]">
-                      {label}
-                    </span>
-                    <span className="shrink-0 rounded-md bg-[var(--bg-hover)] px-1.5 py-0.5 text-[9px] text-[var(--text-tertiary)]">
-                      {maturityLabel[maturity]}
-                    </span>
-                  </span>
-                  <span className="mt-0.5 block truncate text-xs text-[var(--text-tertiary)]">
-                    {description}
-                  </span>
-                </span>
-              </button>
-            ))}
-          </div>
-        </section>
-      ))}
-    </div>
-  );
-}
-
 export function SettingsDialog() {
   const { settingsOpen, closeSettings, activeSettingsTab, setActiveSettingsTab } = useUiStore();
-  const allItems = useMemo(
-    () => [overviewItem, ...settingsGroups.flatMap((group) => group.items)],
-    []
-  );
-  const activeItem = allItems.find((i) => i.id === activeSettingsTab);
-  const effectiveSettingsTab = activeItem ? activeSettingsTab : 'overview';
-  const effectiveItem = activeItem ?? overviewItem;
+  const activeItem =
+    activeSettingsTab === 'channels'
+      ? channelsItem
+      : settingsGroups
+          .flatMap((group) => group.items)
+          .find((item) => item.id === activeSettingsTab);
+  // 旧选择只影响展示；仍沿用原设置 store 和按需加载的面板。
+  const effectiveItem = activeItem ?? defaultSettingsItem;
+  const effectiveSettingsTab = effectiveItem.id;
   const Panel = panels[effectiveSettingsTab];
+  const independentChannels = effectiveSettingsTab === 'channels';
+  const closeButton = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    // 基础页导航到独立渠道后，原链接已卸载，焦点留在现有弹窗的关闭控件。
+    if (settingsOpen && independentChannels) closeButton.current?.focus();
+  }, [settingsOpen, independentChannels]);
   const [expandedAdvanced, setExpandedAdvanced] = useState<Record<string, boolean>>({});
   const activeGroup = settingsGroups.find((group) =>
     group.items.some((item) => item.id === effectiveSettingsTab)
@@ -351,8 +300,8 @@ export function SettingsDialog() {
   return (
     <Modal
       onClose={closeSettings}
-      ariaLabelledBy="settings-dialog-title"
-      className="settings-dialog animate-scale-in flex h-[85vh] w-[92vw] max-w-6xl overflow-hidden rounded-xl border border-[var(--border-primary)] bg-[var(--settings-dialog-bg)] shadow-[var(--shadow-xl)] max-sm:h-screen max-sm:w-screen max-sm:max-w-none max-sm:rounded-none"
+      ariaLabelledBy={independentChannels ? 'channels-dialog-title' : 'settings-dialog-title'}
+      className="settings-dialog animate-scale-in flex h-[min(760px,88vh)] w-[92vw] max-w-[1080px] overflow-hidden rounded-xl border border-[var(--border-primary)] bg-[var(--settings-dialog-bg)] shadow-[var(--shadow-xl)] max-sm:h-screen max-sm:w-screen max-sm:max-w-none max-sm:rounded-none"
       style={
         {
           '--accent': 'var(--settings-accent)',
@@ -363,90 +312,70 @@ export function SettingsDialog() {
       }
     >
       {/* Left sidebar — settings nav */}
-      <div className="flex w-[220px] shrink-0 flex-col border-r border-[var(--border-primary)] bg-[var(--settings-sidebar-bg)]">
-        <div className="flex items-center justify-between border-b border-[var(--border-secondary)] px-5 py-4">
+      <div className="settings-navigation flex w-[196px] shrink-0 max-sm:w-[144px] flex-col border-r border-[var(--border-secondary)] bg-[var(--settings-sidebar-bg)]">
+        <div className="flex h-18 shrink-0 items-center px-5">
           <h2
             id="settings-dialog-title"
-            className="text-sm font-semibold text-[var(--text-primary)]"
+            className="text-base font-semibold text-[var(--text-primary)]"
           >
             设置
           </h2>
-          <button
-            onClick={closeSettings}
-            aria-label="关闭设置"
-            className="flex h-7 w-7 items-center justify-center rounded-lg text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-          >
-            <X size={15} />
-          </button>
         </div>
-        <nav className="flex-1 overflow-y-auto p-3 space-y-5">
-          <button
-            onClick={() => setActiveSettingsTab('overview')}
-            className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-all duration-150 ${
-              effectiveSettingsTab === 'overview'
-                ? 'bg-[var(--settings-active-bg)] text-[var(--text-primary)]'
-                : 'text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]'
-            }`}
-          >
-            <LayoutDashboard size={15} className="shrink-0" />
-            <span className="min-w-0 flex-1">
-              <span className="truncate text-[13px] font-medium">总览</span>
-              <span className="mt-0.5 block truncate text-[10px] font-normal text-[var(--text-tertiary)]">
-                核心工作流入口
-              </span>
-            </span>
-          </button>
+        <nav aria-label="设置分类" className="flex-1 space-y-4 overflow-y-auto px-3 pb-4">
           {settingsGroups.map((group) => (
-            <div key={group.label}>
-              {/* Group header */}
-              <button
-                type="button"
-                onClick={() => {
-                  if (group.tier === 'advanced') {
+            <div key={group.label} role="group" aria-label={group.label}>
+              {group.tier === 'advanced' ? (
+                <button
+                  type="button"
+                  aria-expanded={Boolean(
+                    expandedAdvanced[group.label] || activeGroup?.label === group.label
+                  )}
+                  onClick={() =>
                     setExpandedAdvanced((prev) => ({
                       ...prev,
                       [group.label]: !prev[group.label],
-                    }));
+                    }))
                   }
-                }}
-                className="flex w-full items-center gap-2 px-2.5 pb-2 text-left"
-              >
-                <group.icon size={12} className="text-[var(--text-tertiary)]" />
-                <span className="flex-1 text-[11px] font-semibold uppercase text-[var(--text-tertiary)]">
+                  className="mb-1 flex w-full items-center justify-between px-2 py-1 text-xs font-medium text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
+                >
                   {group.label}
-                </span>
-                {group.tier === 'advanced' &&
-                  (expandedAdvanced[group.label] || activeGroup?.label === group.label ? (
-                    <ChevronDown size={12} className="text-[var(--text-tertiary)]" />
+                  {expandedAdvanced[group.label] || activeGroup?.label === group.label ? (
+                    <ChevronDown size={12} />
                   ) : (
-                    <ChevronRight size={12} className="text-[var(--text-tertiary)]" />
-                  ))}
-              </button>
+                    <ChevronRight size={12} />
+                  )}
+                </button>
+              ) : (
+                <div className="mb-1 px-2 py-1 text-xs font-medium text-[var(--text-tertiary)]">
+                  {group.label}
+                </div>
+              )}
               {(group.tier === 'core' ||
-                group.defaultOpen ||
                 expandedAdvanced[group.label] ||
                 activeGroup?.label === group.label) &&
                 group.items.map(({ id, label, icon: Icon, maturity, description }) => (
                   <button
                     key={id}
+                    type="button"
+                    title={description}
+                    aria-current={effectiveSettingsTab === id ? 'page' : undefined}
                     onClick={() => setActiveSettingsTab(id)}
-                    className={`flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left transition-all duration-150
+                    className={`flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left transition-all duration-150
                     ${
                       effectiveSettingsTab === id
                         ? 'bg-[var(--settings-active-bg)] text-[var(--text-primary)]'
                         : 'text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]'
                     }`}
                   >
-                    <Icon size={15} className="mt-0.5 shrink-0" />
+                    <Icon size={15} className="shrink-0" />
                     <span className="min-w-0 flex-1">
                       <span className="flex min-w-0 items-center gap-2">
-                        <span className="truncate text-[13px] font-medium">{label}</span>
-                        <span className="shrink-0 rounded-md bg-[var(--bg-hover)] px-1.5 py-0.5 text-[9px] text-[var(--text-tertiary)]">
-                          {maturityLabel[maturity]}
-                        </span>
-                      </span>
-                      <span className="mt-0.5 block truncate text-[10px] font-normal text-[var(--text-tertiary)]">
-                        {description}
+                        <span className="truncate text-sm font-medium">{label}</span>
+                        {maturity === 'lab' && (
+                          <span className="shrink-0 rounded-md bg-[var(--bg-hover)] px-2 py-0.5 text-[11px] text-[var(--text-secondary)]">
+                            实验
+                          </span>
+                        )}
                       </span>
                     </span>
                   </button>
@@ -458,28 +387,80 @@ export function SettingsDialog() {
 
       {/* Content area */}
       <div className="flex flex-1 flex-col min-w-0 bg-[var(--settings-content-bg)]">
-        <div className="flex items-center justify-between border-b border-[var(--border-secondary)] bg-[var(--settings-panel-bg)] px-6 py-3.5">
+        <div className="flex min-h-18 shrink-0 items-center justify-between gap-4 border-b border-[var(--border-secondary)] px-7 py-4 max-sm:px-4">
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <span className="text-sm font-semibold text-[var(--text-primary)]">
-                {effectiveItem?.label}
+              <span
+                id={independentChannels ? 'channels-dialog-title' : undefined}
+                className="text-base font-semibold text-[var(--text-primary)]"
+              >
+                {effectiveItem.label}
               </span>
-              {effectiveItem && (
-                <span className="rounded-md bg-[var(--bg-hover)] px-1.5 py-0.5 text-[10px] text-[var(--text-tertiary)]">
-                  {maturityLabel[effectiveItem.maturity]}
+              {effectiveItem.maturity === 'lab' && (
+                <span className="rounded-md bg-[var(--bg-hover)] px-2 py-0.5 text-[11px] text-[var(--text-secondary)]">
+                  实验
                 </span>
               )}
             </div>
             {effectiveItem && (
-              <div className="mt-0.5 text-xs text-[var(--text-tertiary)]">
+              <div className="mt-1 text-xs text-[var(--text-secondary)]">
                 {effectiveItem.description}
               </div>
             )}
           </div>
+          <button
+            type="button"
+            onClick={closeSettings}
+            ref={closeButton}
+            aria-label={independentChannels ? '关闭IM渠道' : '关闭设置'}
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+          >
+            <X size={16} />
+          </button>
         </div>
         <div className="flex-1 overflow-y-auto">
-          <div className="animate-fade-up p-6">
-            <Panel />
+          <div
+            className={
+              independentChannels
+                ? 'animate-fade-up p-6 max-sm:p-4'
+                : 'settings-panel-content animate-fade-up mx-auto w-full max-w-[800px] px-7 py-6 max-sm:px-4'
+            }
+          >
+            {/* A failed optional screen must leave the workspace and settings navigation mounted. */}
+            <ErrorBoundary
+              key={effectiveSettingsTab}
+              fallback={
+                <div role="alert" className="space-y-3 text-sm text-[var(--text-secondary)]">
+                  <p>
+                    {independentChannels
+                      ? 'IM渠道页面加载失败。你可以关闭IM渠道，或刷新页面后再试。'
+                      : '此设置页面加载失败。你可以选择其他设置项、关闭设置，或刷新页面后再试。'}
+                  </p>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      onClick={() => window.location.reload()}
+                    >
+                      刷新页面
+                    </button>
+                  </div>
+                </div>
+              }
+            >
+              <Suspense
+                fallback={
+                  <div
+                    role="status"
+                    className="flex min-h-40 items-center justify-center text-sm text-[var(--text-secondary)]"
+                  >
+                    正在加载…
+                  </div>
+                }
+              >
+                <Panel />
+              </Suspense>
+            </ErrorBoundary>
           </div>
         </div>
       </div>

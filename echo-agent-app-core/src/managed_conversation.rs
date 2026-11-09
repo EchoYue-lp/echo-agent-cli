@@ -85,7 +85,8 @@ pub(crate) fn canonical_rows(
         .collect()
 }
 
-fn validate_import_history(conversation_id: &str, messages: &[StoredMessage]) -> Result<()> {
+/// 组合式 GUI 导入在任何 Git/Workspace 副作用之前复用同一历史校验。
+pub fn validate_import_history(conversation_id: &str, messages: &[StoredMessage]) -> Result<()> {
     let restored = restore_messages(messages)?;
     let digests = managed_import_projection_digests(conversation_id, messages)?;
     let projected = digests
@@ -110,7 +111,6 @@ fn validate_import_history(conversation_id: &str, messages: &[StoredMessage]) ->
                 context_only: None,
             }),
         )?,
-        current_plan: None,
         active_skills: Vec::new(),
         blocked_reason: None,
         working_dir: None,
@@ -245,7 +245,6 @@ async fn checkpoint_import(
                 context_only: None,
             }),
         )?,
-        current_plan: None,
         active_skills: previous
             .as_ref()
             .map(|checkpoint| checkpoint.active_skills.clone())
@@ -602,6 +601,7 @@ mod tests {
         let incomplete = echo_agent::memory::project_message(
             "invalid-history",
             &Message::assistant_with_tools(vec![ToolCall {
+                provider_source: None,
                 id: "call-1".to_string(),
                 call_type: "function".to_string(),
                 function: FunctionCall {
@@ -642,6 +642,7 @@ mod tests {
             Message::assistant("done".to_string()),
             Message::user("latest".to_string()),
             Message::assistant_with_tools(vec![ToolCall {
+                provider_source: None,
                 id: "call-1".to_string(),
                 call_type: "function".to_string(),
                 function: FunctionCall {
@@ -677,7 +678,6 @@ mod tests {
                 vec![Message::system("old prompt".to_string())],
                 None,
             )?,
-            current_plan: None,
             active_skills: Vec::new(),
             blocked_reason: None,
             working_dir: None,

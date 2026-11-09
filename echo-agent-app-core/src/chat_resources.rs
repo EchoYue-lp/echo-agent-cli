@@ -54,6 +54,24 @@ pub struct ChatResources {
     pub human_loop_provider: Option<Arc<dyn HumanLoopProvider>>,
 }
 
+impl ChatResources {
+    /// Called once when admitting a new lightweight execution. A real bound
+    /// TaskRun must instead read its original execution profile.
+    pub(crate) async fn new_execution_subagent_depth(
+        &self,
+    ) -> crate::subagent_policy::SubagentDepthLimit {
+        if let Some(store) = self.store.as_ref() {
+            return store.new_execution_subagent_depth();
+        }
+        if let Some(pool) = self.pool.as_ref() {
+            return pool.configured_subagent_depth().await;
+        }
+        // Minimal embedding/test resources have no application config owner.
+        // This is a new execution default, never recovery of historical work.
+        crate::subagent_policy::SubagentDepthLimit::default()
+    }
+}
+
 tokio::task_local! {
     /// The chat resources for the current turn, if any. `None` outside a
     /// `drive_chat` scope (e.g. cron, tests).

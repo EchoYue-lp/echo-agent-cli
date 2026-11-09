@@ -8,6 +8,7 @@ interface ThinkingSegmentProps {
   /** Total thinking segments in this message (for "思考 1/3" labeling) */
   total: number;
   content: string;
+  kind?: 'reasoning' | 'historical_execution';
   /** True while the parent message is still streaming */
   isStreaming?: boolean;
 }
@@ -21,11 +22,13 @@ export const ThinkingSegment = memo(function ThinkingSegment({
   index,
   total,
   content,
+  kind,
   isStreaming,
 }: ThinkingSegmentProps) {
   const [expanded, setExpanded] = useState(Boolean(isStreaming));
 
-  const label = total > 1 ? `思考 ${index}/${total}` : '思考';
+  const title = kind === 'reasoning' ? '思考' : '历史执行说明';
+  const label = total > 1 ? `${title} ${index}/${total}` : title;
 
   return (
     <div className="my-1 border-l border-[var(--border-primary)] pl-3">

@@ -16,6 +16,10 @@ use echo_agent_app_core::api::conversation_input::{
     ConversationInputOutcome, ConversationInputPhase, ConversationInputProjection,
     ConversationInputReceipt, ConversationInputSource, stable_scoped_input_id,
 };
+use echo_agent_app_core::api::hitl::{
+    HitlRequestIdentity, HitlRequestKind, HitlRequestScope, HitlScopeResolver,
+    PairedHumanLoopProvider, PairedHumanLoopRequest, pair_request,
+};
 use echo_agent_app_core::api::subagent_event_projection::JournaledExecutionProjector;
 use echo_agent_app_core::api::tasks::task_runtime::executor::ExecEvent;
 use echo_agent_app_core::api::tool_execution::{ToolExecutionRepository, ToolExecutionSummary};
@@ -31,6 +35,10 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 pub(crate) fn emit_chat_envelope(app: &tauri::AppHandle, envelope: &ChatEventEnvelope) -> bool {
+    // This is a backend durability fact, not a user conversation event.
+    if matches!(&envelope.payload, ChatDriverEvent::WeixinControlDelivery(_)) {
+        return true;
+    }
     if let Err(error) = app.emit("chat://event", envelope) {
         tracing::warn!(%error, "failed to emit canonical chat journal event");
         return false;
@@ -129,6 +137,8 @@ async fn settle_gui_input_attempt(
 pub struct SendChatMessageRequest {
     workspace_id: String,
     message: String,
+    #[serde(default)]
+    domain_plugin: Option<String>,
     conversation_id: Option<String>,
     message_key: Option<String>,
     attachments: Option<Vec<echo_agent_app_core::api::types::AttachmentData>>,
@@ -150,6 +160,7 @@ impl SendChatMessageRequest {
         Self {
             workspace_id,
             message,
+            domain_plugin: None,
             conversation_id: Some(conversation_id),
             message_key: Some(message_key),
             attachments: None,
@@ -245,6 +256,8 @@ static PENDING_RESPONSES: LazyLock<Arc<StdMutex<HashMap<String, PendingRequest>>
 
 struct PendingRequest {
     message_key: String,
+    identity: HitlRequestIdentity,
+    selection_options: Option<Vec<String>>,
     tx: oneshot::Sender<PendingResponse>,
 }
 
@@ -271,19 +284,25 @@ enum PendingResponse {
 /// dropped before a response or timeout consumes the entry.
 struct PendingResponseReservation {
     pending: Arc<StdMutex<HashMap<String, PendingRequest>>>,
-    request_id: String,
+    response_target: String,
+    identity: HitlRequestIdentity,
+    sink: Option<Arc<dyn ChatSink>>,
 }
 
 impl PendingResponseReservation {
     fn insert(
         pending: Arc<StdMutex<HashMap<String, PendingRequest>>>,
-        request_id: String,
+        response_target: String,
         request: PendingRequest,
+        sink: Option<Arc<dyn ChatSink>>,
     ) -> Self {
-        lock_std(&pending, "pending GUI HITL responses").insert(request_id.clone(), request);
+        let identity = request.identity.clone();
+        lock_std(&pending, "pending GUI HITL responses").insert(response_target.clone(), request);
         Self {
             pending,
-            request_id,
+            response_target,
+            identity,
+            sink,
         }
     }
 }
@@ -291,20 +310,34 @@ impl PendingResponseReservation {
 impl Drop for PendingResponseReservation {
     fn drop(&mut self) {
         let request =
-            lock_std(&self.pending, "pending GUI HITL responses").remove(&self.request_id);
+            lock_std(&self.pending, "pending GUI HITL responses").remove(&self.response_target);
         if let Some(request) = request {
             let _ = request.tx.send(PendingResponse::Cancelled {
                 reason: "HITL request owner was cancelled".to_string(),
             });
         }
+        if let Some(sink) = self.sink.as_ref() {
+            let _ = sink.on_event(ChatDriverEvent::HitlRequestReleased {
+                identity: self.identity.clone(),
+            });
+        }
     }
 }
 
-pub(crate) async fn cancel_pending_hitl(message_key: Option<&str>, reason: &str) -> usize {
+pub(crate) async fn cancel_pending_hitl(
+    workspace_id: &str,
+    conversation_id: &str,
+    message_key: Option<&str>,
+    reason: &str,
+) -> usize {
     let mut pending = lock_std(&PENDING_RESPONSES, "pending GUI HITL responses");
     let request_ids = pending
         .iter()
-        .filter(|(_, request)| message_key.is_none_or(|key| request.message_key == key))
+        .filter(|(_, request)| {
+            request.identity.scope.workspace_id.as_deref() == Some(workspace_id)
+                && request.identity.scope.conversation_id.as_deref() == Some(conversation_id)
+                && message_key.is_none_or(|key| request.message_key == key)
+        })
         .map(|(request_id, _)| request_id.clone())
         .collect::<Vec<_>>();
     let mut cancelled = 0usize;
@@ -325,6 +358,7 @@ fn deliver_hitl_request(
     waiting_status: &str,
     request: ChatDriverEvent,
     sink: &Arc<dyn ChatSink>,
+    fail_turn_on_delivery_error: bool,
 ) -> echo_agent::error::Result<()> {
     let status_delivered = sink.on_event(ChatDriverEvent::TurnStatus {
         status: waiting_status.to_string(),
@@ -333,12 +367,15 @@ fn deliver_hitl_request(
     if request_delivered {
         Ok(())
     } else {
-        let _ = sink.on_event(ChatDriverEvent::TurnStatus {
-            status: "failed".to_string(),
-        });
+        // A paired GUI observer cannot terminate the channel's canonical turn:
+        // its original IM provider may still deliver the effective human answer.
+        if fail_turn_on_delivery_error {
+            let _ = sink.on_event(ChatDriverEvent::TurnStatus {
+                status: "failed".to_string(),
+            });
+        }
         Err(echo_agent::error::ReactError::Other(
-            "GUI human-loop request could not reach the durable surface; request cancelled"
-                .to_string(),
+            "GUI human-loop request could not reach the durable surface".to_string(),
         ))
     }
 }
@@ -349,14 +386,76 @@ pub(crate) struct TauriHumanLoopHandler {
     sink: Arc<dyn ChatSink>,
     pending: Arc<StdMutex<HashMap<String, PendingRequest>>>,
     message_key: String,
+    scope: HitlRequestScope,
+    scope_resolver: Option<HitlScopeResolver>,
+}
+
+/// A live desktop only observes the already paired original channel request.
+/// Weak host/state links avoid a channel-manager -> AppHandle -> TauriState cycle.
+pub(crate) fn channel_gui_hitl_factory(
+    app: std::sync::Weak<tauri::AppHandle>,
+    state: std::sync::Weak<echo_agent_app_core::api::state::AppState>,
+) -> echo_agent_app_core::api::hitl::ChannelGuiHitlFactory {
+    Arc::new(move |scope, resolver| {
+        let unavailable = || {
+            echo_agent::error::ReactError::Other(
+                "Original desktop HITL observer unavailable".to_string(),
+            )
+        };
+        let app = app.upgrade().ok_or_else(unavailable)?;
+        let state = state.upgrade().ok_or_else(unavailable)?;
+        let workspace = scope.workspace_id.clone().ok_or_else(unavailable)?;
+        let conversation = scope.conversation_id.clone().ok_or_else(unavailable)?;
+        let root = scope.root_turn_id.clone().ok_or_else(unavailable)?;
+        let sink = tauri_chat_sink(
+            app.as_ref().clone(),
+            workspace,
+            root.clone(),
+            Some(conversation),
+            state.storage.tool_executions.clone(),
+            state.storage.chat_events.clone(),
+        );
+        Ok(Arc::new(
+            TauriHumanLoopHandler::new(sink, root, scope).with_scope_resolver(resolver),
+        ))
+    })
+}
+
+pub(crate) fn gui_hitl_scope_resolver(
+    state: &Arc<echo_agent_app_core::api::state::AppState>,
+    scope: HitlRequestScope,
+) -> HitlScopeResolver {
+    let observer = state.session.foreground_turns.downgrade();
+    Arc::new(move || {
+        scope.for_foreground_observer(
+            &observer,
+            echo_agent_app_core::api::foreground_turn::ForegroundTurnSurface::Gui,
+        )
+    })
 }
 
 impl TauriHumanLoopHandler {
-    pub(crate) fn new(sink: Arc<dyn ChatSink>, message_key: String) -> Self {
+    pub(crate) fn new(
+        sink: Arc<dyn ChatSink>,
+        message_key: String,
+        scope: HitlRequestScope,
+    ) -> Self {
         Self {
             sink,
             pending: PENDING_RESPONSES.clone(),
             message_key,
+            scope,
+            scope_resolver: None,
+        }
+    }
+    pub(crate) fn with_scope_resolver(mut self, resolver: HitlScopeResolver) -> Self {
+        self.scope_resolver = Some(resolver);
+        self
+    }
+    fn request_scope(&self) -> echo_agent::error::Result<HitlRequestScope> {
+        match self.scope_resolver.as_ref() {
+            Some(resolve) => resolve(),
+            None => Ok(self.scope.clone()),
         }
     }
 }
@@ -364,15 +463,50 @@ impl TauriHumanLoopHandler {
 impl HumanLoopProvider for TauriHumanLoopHandler {
     fn request(
         &self,
-        req: HumanLoopRequest,
+        request: HumanLoopRequest,
     ) -> BoxFuture<'_, echo_agent::error::Result<HumanLoopResponse>> {
-        let request_id = Uuid::new_v4().to_string();
+        Box::pin(async move {
+            let paired = pair_request(request, self.request_scope()?)?;
+            self.request_with_delivery(paired, true).await
+        })
+    }
+}
+
+impl PairedHumanLoopProvider for TauriHumanLoopHandler {
+    fn request_paired(
+        &self,
+        paired: PairedHumanLoopRequest,
+    ) -> BoxFuture<'_, echo_agent::error::Result<HumanLoopResponse>> {
+        self.request_with_delivery(paired, false)
+    }
+}
+
+impl TauriHumanLoopHandler {
+    fn request_with_delivery(
+        &self,
+        paired: PairedHumanLoopRequest,
+        fail_turn_on_delivery_error: bool,
+    ) -> BoxFuture<'_, echo_agent::error::Result<HumanLoopResponse>> {
         let (tx_response, rx_response) = oneshot::channel();
         let sink = self.sink.clone();
         let pending = self.pending.clone();
         let message_key = self.message_key.clone();
 
         Box::pin(async move {
+            paired.validate()?;
+            if !self.request_scope()?.accepts(&paired.identity.scope) {
+                return Err(echo_agent::error::ReactError::Other(
+                    "GUI HITL owner scope mismatch".to_string(),
+                ));
+            }
+            let identity = paired.identity;
+            let request_id = identity.request_id.clone();
+            let response_target = identity.response_target.clone();
+            let req = paired.request;
+            let timeout = req
+                .timeout
+                .unwrap_or(std::time::Duration::from_secs(300))
+                .min(std::time::Duration::from_secs(300));
             tracing::debug!(
                 request_id = %request_id,
                 message_key = %message_key,
@@ -385,19 +519,28 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                     let args = req.args.clone().unwrap_or(serde_json::Value::Null);
                     let event = ChatDriverEvent::ApprovalRequest {
                         request_id: request_id.clone(),
+                        identity: Some(identity.clone()),
                         tool_name,
                         args,
                         prompt: req.prompt.clone(),
                     };
                     let _reservation = PendingResponseReservation::insert(
                         pending.clone(),
-                        request_id.clone(),
+                        response_target.clone(),
                         PendingRequest {
                             message_key: message_key.clone(),
+                            identity: identity.clone(),
+                            selection_options: req.options.clone(),
                             tx: tx_response,
                         },
+                        Some(sink.clone()),
                     );
-                    deliver_hitl_request("waiting_approval", event, &sink)?;
+                    deliver_hitl_request(
+                        "waiting_approval",
+                        event,
+                        &sink,
+                        fail_turn_on_delivery_error,
+                    )?;
 
                     tokio::select! {
                         response = rx_response => {
@@ -417,13 +560,13 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                                     }
                                 }
                                 Ok(PendingResponse::Cancelled { reason }) => {
-                                    Ok(HumanLoopResponse::Rejected { reason: Some(reason) })
+                                    Err(echo_agent::error::ReactError::Other(reason))
                                 }
-                                _ => Ok(HumanLoopResponse::Timeout),
+                                _ => Err(echo_agent::error::ReactError::Other("GUI HITL response unavailable".to_string())),
                             }
                         }
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                            lock_std(&pending, "pending GUI HITL responses").remove(&request_id);
+                        _ = tokio::time::sleep(timeout) => {
+                            lock_std(&pending, "pending GUI HITL responses").remove(&response_target);
                             Ok(HumanLoopResponse::Timeout)
                         }
                     }
@@ -431,37 +574,47 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                 echo_agent::human_loop::HumanLoopKind::Input => {
                     let event = ChatDriverEvent::InputRequest {
                         request_id: request_id.clone(),
+                        identity: Some(identity.clone()),
                         prompt: req.prompt.clone(),
                     };
                     let _reservation = PendingResponseReservation::insert(
                         pending.clone(),
-                        request_id.clone(),
+                        response_target.clone(),
                         PendingRequest {
                             message_key: message_key.clone(),
+                            identity: identity.clone(),
+                            selection_options: req.options.clone(),
                             tx: tx_response,
                         },
+                        Some(sink.clone()),
                     );
-                    deliver_hitl_request("waiting_input", event, &sink)?;
+                    deliver_hitl_request(
+                        "waiting_input",
+                        event,
+                        &sink,
+                        fail_turn_on_delivery_error,
+                    )?;
 
                     tokio::select! {
                         response = rx_response => {
                             match response {
                                 Ok(PendingResponse::Input { text }) => Ok(HumanLoopResponse::Text(text)),
                                 Ok(PendingResponse::Cancelled { reason }) => {
-                                    Ok(HumanLoopResponse::Rejected { reason: Some(reason) })
+                                    Err(echo_agent::error::ReactError::Other(reason))
                                 }
-                                _ => Ok(HumanLoopResponse::Text(String::new())),
+                                _ => Err(echo_agent::error::ReactError::Other("GUI HITL response unavailable".to_string())),
                             }
                         }
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                            lock_std(&pending, "pending GUI HITL responses").remove(&request_id);
-                            Ok(HumanLoopResponse::Text(String::new()))
+                        _ = tokio::time::sleep(timeout) => {
+                            lock_std(&pending, "pending GUI HITL responses").remove(&response_target);
+                            Ok(HumanLoopResponse::Timeout)
                         }
                     }
                 }
                 echo_agent::human_loop::HumanLoopKind::Selection => {
                     let event = ChatDriverEvent::SelectionRequest {
                         request_id: request_id.clone(),
+                        identity: Some(identity.clone()),
                         prompt: req.prompt.clone(),
                         options: req.options.clone().unwrap_or_default(),
                         task_id: req.task_id.clone(),
@@ -470,13 +623,21 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                     };
                     let _reservation = PendingResponseReservation::insert(
                         pending.clone(),
-                        request_id.clone(),
+                        response_target.clone(),
                         PendingRequest {
                             message_key: message_key.clone(),
+                            identity: identity.clone(),
+                            selection_options: req.options.clone(),
                             tx: tx_response,
                         },
+                        Some(sink.clone()),
                     );
-                    deliver_hitl_request("waiting_input", event, &sink)?;
+                    deliver_hitl_request(
+                        "waiting_input",
+                        event,
+                        &sink,
+                        fail_turn_on_delivery_error,
+                    )?;
 
                     tokio::select! {
                         response = rx_response => {
@@ -485,13 +646,13 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                                     Ok(HumanLoopResponse::Selection { selection, instructions })
                                 }
                                 Ok(PendingResponse::Cancelled { reason }) => {
-                                    Ok(HumanLoopResponse::Rejected { reason: Some(reason) })
+                                    Err(echo_agent::error::ReactError::Other(reason))
                                 }
-                                _ => Ok(HumanLoopResponse::Timeout),
+                                _ => Err(echo_agent::error::ReactError::Other("GUI HITL response unavailable".to_string())),
                             }
                         }
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                            lock_std(&pending, "pending GUI HITL responses").remove(&request_id);
+                        _ = tokio::time::sleep(timeout) => {
+                            lock_std(&pending, "pending GUI HITL responses").remove(&response_target);
                             Ok(HumanLoopResponse::Timeout)
                         }
                     }
@@ -534,6 +695,7 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
     let SendChatMessageRequest {
         workspace_id,
         message,
+        domain_plugin,
         conversation_id,
         message_key,
         attachments,
@@ -584,11 +746,12 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
         let input_id = stable_scoped_input_id(&address, ConversationInputSource::Gui, &message_key)
             .map_err(|error| IpcError::Validation(error.to_string()))?;
         let receipt = input_service
-            .submit(
+            .submit_with_domain(
                 address.clone(),
                 input_id,
                 message,
                 attachments.unwrap_or_default(),
+                domain_plugin,
             )
             .await
             .map_err(|error| IpcError::Validation(error.to_string()))?;
@@ -634,6 +797,7 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
         .find(|item| item.receipt.identity == input_identity)
         .cloned()
         .ok_or_else(|| IpcError::Validation("queued input is no longer pending".to_string()))?;
+    require_gui_owned_input(&queued_input.payload)?;
     let dispatch_queue_revision = input_frontier.queue_revision;
     let ws_root = scoped_runtime.execution_scope().root().to_path_buf();
     // ── Persist attachments + build multimodal message (if any) ──────────
@@ -774,7 +938,7 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
     // receipt in the spawned turn until the shared driver and HITL reset have
     // both settled, so workspace publication cannot race an issued handle.
     let pool_execution = scoped_runtime
-        .agent_for(&conversation_id)
+        .agent_for_turn(&conversation_id)
         .await
         .map_err(|error| IpcError::Validation(error.to_string()))?;
     let agent_handle = pool_execution.agent();
@@ -812,10 +976,23 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
 
     // Attach a Tauri HITL handler to this specific agent. This keeps concurrent
     // GUI conversations isolated instead of racing through the global dispatcher.
-    let hitl_handler: Arc<dyn HumanLoopProvider> = Arc::new(TauriHumanLoopHandler::new(
-        sink.clone(),
-        message_key.clone(),
-    ));
+    let hitl_scope = HitlRequestScope {
+        workspace_id: Some(workspace_id.clone()),
+        host_generation: Some(
+            scoped_runtime
+                .workspace_io_receipt()
+                .host_generation()
+                .to_string(),
+        ),
+        conversation_id: Some(conversation_id.clone()),
+        root_turn_id: Some(message_key.clone()),
+        turn_id: Some(message_key.clone()),
+        ..Default::default()
+    };
+    let hitl_handler: Arc<dyn HumanLoopProvider> = Arc::new(
+        TauriHumanLoopHandler::new(sink.clone(), message_key.clone(), hitl_scope.clone())
+            .with_scope_resolver(gui_hitl_scope_resolver(&state.app_state, hitl_scope)),
+    );
     agent_handle
         .write_async(|agent| {
             let handler = hitl_handler.clone();
@@ -963,7 +1140,59 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
                 observed.map(|_| ())
             })
         });
-    // The durable attempt exists before the visible running projection.
+    let run_binding = queued_input.payload.domain_plugin.clone().map(|plugin| {
+        use echo_agent_app_core::api::tasks::task_runtime::{
+            RunTurnBinding, RunTurnOrigin, TurnVisibility,
+        };
+        RunTurnBinding {
+            domain_plugin: Some(plugin),
+            run_id: None,
+            turn_id: message_key.clone(),
+            root_message_id: message_key.clone(),
+            origin: RunTurnOrigin::User,
+            transcript_visibility: TurnVisibility::Visible,
+            expected_resume: None,
+        }
+    });
+    let (run_binding, input_source) = match state
+        .app_state
+        .bind_initial_user_input(
+            echo_agent_app_core::api::conversation_input::ConversationInputSource::Gui,
+            &started_input,
+            run_binding,
+        )
+        .await
+    {
+        Ok(bound) => bound,
+        Err(error) => {
+            let mut failures = vec![error.clone()];
+            if let Err(failure) = input_service
+                .recovery_required(input_attempt.clone(), error.clone())
+                .await
+            {
+                failures.push(failure.to_string());
+            }
+            if let Err(failure) = foreground_lease
+                .settle_after_observers(echo_agent_app_core::api::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message("input_admission", error),
+                ))
+                .await
+            {
+                failures.push(failure.to_string());
+            }
+            browser_approval_registration.close().await;
+            if let Err(failure) = prepared_turn.cleanup_resources(&spill_dir) {
+                failures.push(failure.to_string());
+            }
+            if let Some(batch) = staged_attachment_batch.take()
+                && let Err(failure) = batch.rollback()
+            {
+                failures.push(failure);
+            }
+            return Err(IpcError::Validation(failures.join("; ")));
+        }
+    };
+    // 固定原输入去向后才发布运行状态；TaskRuntime完整接受仍在原driver准入中。
     let _ = emit_gui_turn_status(&sink, "running");
     if let Some(batch) = staged_attachment_batch.take() {
         batch.commit();
@@ -983,12 +1212,15 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
         foreground_lease.retain_execution(held_execution.clone());
         let held_browser = Arc::new(tokio::sync::Mutex::new(Some(browser_approval_registration)));
         foreground_lease.retain(held_browser.clone());
-        let outcome =
-            echo_agent_app_core::api::foreground_turn::drive_foreground_chat_with_ingress(
+        let outcome = echo_agent_app_core::api::chat_driver::with_foreground_pool_execution(
+            Arc::downgrade(&held_execution),
+            echo_agent_app_core::api::foreground_turn::drive_foreground_chat_with_source_ingress(
                 foreground_lease,
                 &agent_handle_clone,
                 &prepared_turn,
                 res,
+                Some(run_binding),
+                Some(input_source),
                 input_observer,
                 move |outcome| {
                     let service = terminal_service.clone();
@@ -1010,8 +1242,9 @@ pub(crate) async fn send_chat_message_inner_with_side_admission(
                         Ok(())
                     }
                 },
-            )
-            .await;
+            ),
+        )
+        .await;
         if outcome
             .as_ref()
             .err()
@@ -1124,6 +1357,31 @@ pub async fn steer_chat_message(
         .find(|item| item.receipt.identity == identity)
         .cloned()
         .ok_or_else(|| IpcError::Validation("queued input is no longer pending".to_string()))?;
+    require_gui_owned_input(&queued.payload)?;
+    if let Some(selected) = queued.payload.domain_plugin.as_deref() {
+        let run_id = snapshot.run_id.as_deref().ok_or_else(|| {
+            IpcError::Validation("domain steer requires its original TaskRun identity".to_string())
+        })?;
+        let run = scoped_runtime
+            .task_runtime()
+            .ok_or_else(|| {
+                IpcError::Validation("domain steer requires its TaskRun owner".to_string())
+            })?
+            .get_run(run_id)
+            .map_err(|error| IpcError::Validation(error.to_string()))?
+            .ok_or_else(|| IpcError::Validation("domain steer TaskRun is missing".to_string()))?;
+        if run
+            .domain_binding
+            .as_ref()
+            .map(|binding| binding.plugin.plugin_id.as_str())
+            != Some(selected)
+        {
+            return Err(IpcError::Validation(
+                "a queued domain selection cannot change an active TaskRun; start a new turn"
+                    .to_string(),
+            ));
+        }
+    }
     let saved_attachments = queued.payload.attachments.clone();
     let ws_root = scoped_runtime.execution_scope().root();
     let uploads_dir = echo_agent_app_core::api::attachments::resolve_uploads_dir(Some(ws_root));
@@ -1162,7 +1420,6 @@ pub async fn steer_chat_message(
             return Err(IpcError::Validation(format!("{error}{suffix}")));
         }
     };
-    let steer_text = queued.payload.text.clone();
     let steer_message = match prepared.to_message() {
         Ok(message) => message,
         Err(error) => {
@@ -1173,7 +1430,7 @@ pub async fn steer_chat_message(
             return Err(IpcError::Validation(format!("{error}{suffix}")));
         }
     };
-    let agent_execution = match scoped_runtime.agent_for(&conversation_id).await {
+    let agent_execution = match scoped_runtime.agent_for_turn(&conversation_id).await {
         Ok(execution) => execution,
         Err(error) => {
             let cleanup = prepared.cleanup_resources(&spill_dir).err();
@@ -1252,7 +1509,7 @@ pub async fn steer_chat_message(
     let observer = async move {
         let result: Result<ConversationInputReceipt, String> = match steer_rx.await {
             Ok(steer_result) => match observer_service
-                .observe_steer_through_drain(observer_attempt.clone(), steer_result)
+                .observe_durable_steer_through_drain(observer_attempt.clone(), steer_result)
                 .await
             {
                 Ok(receipt) if receipt.drained => {
@@ -1360,10 +1617,18 @@ pub async fn steer_chat_message(
             .map_err(|error| IpcError::Internal(error.to_string()))?;
         return Ok(receipt);
     }
-    let steer_result = agent
-        .steer_input_tracked(Some(&expected_turn_id), steer_message)
+    let steer_text = started.payload.text.clone();
+    let steer_result = state
+        .app_state
+        .steer_user_input_for_active_turn(
+            &state.app_state.session.foreground_turns,
+            echo_agent_app_core::api::conversation_input::ConversationInputSource::Gui,
+            &started,
+            &agent,
+            steer_message,
+        )
         .await;
-    if steer_result.is_ok()
+    if matches!(&steer_result, Ok(Ok(_)))
         && let Err(error) = state
             .app_state
             .record_user_steer_for_active_turn(
@@ -1489,6 +1754,19 @@ pub async fn replay_chat_events(
     }
 }
 
+// This is an ownership boundary for local recovery, not an agent permission:
+// GUI dispatch/edit must not consume channel input without its original route.
+fn require_gui_owned_input(
+    payload: &echo_agent_app_core::api::conversation_input::ConversationInputPayload,
+) -> Result<(), IpcError> {
+    if payload.channel_binding.is_some() {
+        return Err(IpcError::Validation(
+            "channel input remains owned by its original channel runtime".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 async fn validate_queue_address(
     state: &TauriState,
     workspace_id: &str,
@@ -1515,6 +1793,10 @@ async fn validate_queue_address(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tauri injects state/app; this adapter preserves the established flat input address and payload"
+)]
 #[tauri::command]
 pub async fn queue_chat_input(
     state: tauri::State<'_, TauriState>,
@@ -1524,6 +1806,7 @@ pub async fn queue_chat_input(
     external_id: String,
     text: String,
     attachments: Option<Vec<echo_agent_app_core::api::types::AttachmentData>>,
+    domain_plugin: Option<String>,
 ) -> Result<ConversationInputReceipt, IpcError> {
     validate_queue_address(&state, &workspace_id, &conversation_id).await?;
     let address = conversation_input_address(&workspace_id, &conversation_id);
@@ -1535,11 +1818,12 @@ pub async fn queue_chat_input(
     let input_id = stable_scoped_input_id(&address, ConversationInputSource::Gui, &external_id)
         .map_err(|error| IpcError::Validation(error.to_string()))?;
     let receipt = service
-        .submit(
+        .submit_with_domain(
             address.clone(),
             input_id,
             text,
             attachments.unwrap_or_default(),
+            domain_plugin,
         )
         .await
         .map_err(|error| IpcError::Validation(error.to_string()))?;
@@ -1586,6 +1870,13 @@ pub async fn remove_queued_chat_input(
         .list(&identity.address)
         .await
         .map_err(|error| IpcError::Internal(error.to_string()))?;
+    if let Some(input) = before
+        .items
+        .iter()
+        .find(|input| input.receipt.identity == identity)
+    {
+        require_gui_owned_input(&input.payload)?;
+    }
     let receipt = service
         .cancel(identity.clone())
         .await
@@ -1597,6 +1888,51 @@ pub async fn remove_queued_chat_input(
         before.queue_revision,
     ) {
         record_gui_transport_debt("cancelled_input_lifecycle", error);
+    }
+    Ok(receipt)
+}
+
+/// Atomically replace one pending queued input while preserving its id/order.
+/// The journal increments the input revision and rejects stale or already
+/// executing identities; the UI never edits a local queue copy.
+#[tauri::command]
+pub async fn replace_queued_chat_input(
+    state: tauri::State<'_, TauriState>,
+    app: tauri::AppHandle,
+    identity: ConversationInputIdentity,
+    expected_queue_revision: u64,
+    text: String,
+    attachments: Vec<echo_agent_app_core::api::types::AttachmentData>,
+    domain_plugin: Option<String>,
+) -> Result<ConversationInputReceipt, IpcError> {
+    validate_queue_address(
+        &state,
+        &identity.address.workspace_id,
+        &identity.address.conversation_id,
+    )
+    .await?;
+    let service = state.app_state.conversation_inputs();
+    let before = service
+        .list(&identity.address)
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    let receipt = service
+        .replace(
+            identity.clone(),
+            expected_queue_revision,
+            text,
+            attachments,
+            domain_plugin,
+        )
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    if let Err(error) = emit_conversation_input_lifecycle_after(
+        &app,
+        state.app_state.storage.chat_events.as_ref(),
+        &identity.address,
+        before.queue_revision,
+    ) {
+        record_gui_transport_debt("replaced_input_lifecycle", error);
     }
     Ok(receipt)
 }
@@ -1679,37 +2015,6 @@ fn request_chat_cancel(
     }
 }
 
-async fn append_chat_projection(
-    state: &TauriState,
-    workspace_id: &str,
-    conversation_id: &str,
-    root_turn_id: &str,
-    event: ChatDriverEvent,
-) -> Result<(), IpcError> {
-    let runtime = state
-        .app_state
-        .chat_runtime_for_scope(workspace_id)
-        .await
-        .map_err(|error| IpcError::Internal(error.to_string()))?;
-    let workspace_receipt = runtime.workspace_io_receipt();
-    let chat_events = state.app_state.storage.chat_events.clone();
-    let workspace_id = workspace_id.to_string();
-    let conversation_id = conversation_id.to_string();
-    let root_turn_id = root_turn_id.to_string();
-    state
-        .app_state
-        .session
-        .product_data_io
-        .run("append GUI chat projection", move || {
-            let _workspace_receipt = workspace_receipt;
-            chat_events.append(&workspace_id, Some(&conversation_id), &root_turn_id, event)
-        })
-        .await
-        .map_err(|error| IpcError::Internal(error.to_string()))?
-        .map(|_| ())
-        .map_err(|error| IpcError::Internal(error.to_string()))
-}
-
 #[tauri::command]
 pub async fn cancel_chat(
     state: tauri::State<'_, TauriState>,
@@ -1747,7 +2052,13 @@ pub async fn cancel_chat(
 
     // Reject pending HITL before waiting so parked execution can reach its
     // terminal outcome. Ownership remains registered until that settlement.
-    cancel_pending_hitl(Some(&expected_root_turn_id), "cancelled by user").await;
+    cancel_pending_hitl(
+        &workspace_id,
+        &conversation_id,
+        Some(&expected_root_turn_id),
+        "cancelled by user",
+    )
+    .await;
     let settlement = waiter
         .wait()
         .await
@@ -1791,51 +2102,71 @@ fn validate_hitl_response_scope(
     }
 }
 
-async fn settle_orphaned_hitl_projection(
-    state: &TauriState,
-    workspace_id: &str,
-    conversation_id: &str,
-    root_turn_id: Option<&str>,
-) -> Result<(), IpcError> {
-    let Some(root_turn_id) = root_turn_id.filter(|value| !value.trim().is_empty()) else {
-        return Ok(());
-    };
-    if let Ok(snapshots) = state
-        .app_state
-        .session
-        .foreground_turns
-        .snapshots_for_conversation_scoped(workspace_id, conversation_id)
+// Validate the complete pair before removal. A stale reply never cancels
+// or settles another foreground owner as a side effect of validation.
+fn take_pending_hitl(
+    identity: &HitlRequestIdentity,
+    expected_kind: HitlRequestKind,
+    response: &PendingResponse,
+) -> Result<PendingRequest, IpcError> {
+    if identity.response_target.trim().is_empty()
+        || identity.request_id.trim().is_empty()
+        || identity.kind != expected_kind
     {
-        for snapshot in snapshots
-            .into_iter()
-            .filter(|snapshot| snapshot.root_turn_id == root_turn_id)
-        {
-            let _ = state
-                .app_state
-                .session
-                .foreground_turns
-                .request_root_cancel_scoped(
-                    workspace_id,
-                    snapshot.surface,
-                    conversation_id,
-                    root_turn_id,
-                );
-        }
+        return Err(IpcError::Validation(
+            "A matching HITL target, scope and kind are required".to_string(),
+        ));
     }
-    append_chat_projection(
-        state,
-        workspace_id,
-        conversation_id,
-        root_turn_id,
-        ChatDriverEvent::TurnStatus {
-            status: "failed".to_string(),
-        },
-    )
-    .await
+    let mut pending = lock_std(&PENDING_RESPONSES, "pending GUI HITL responses");
+    let request = pending
+        .get(&identity.response_target)
+        .ok_or_else(|| IpcError::NotFound("HITL response target is expired".to_string()))?;
+    if &request.identity != identity {
+        return Err(IpcError::Validation(
+            "HITL response does not match its original owner and kind".to_string(),
+        ));
+    }
+    let valid = match (expected_kind, response) {
+        (HitlRequestKind::Approval, PendingResponse::Approval { scope, .. }) => {
+            scope.as_deref().is_none_or(|scope| scope == "session_tool")
+        }
+        (HitlRequestKind::Input, PendingResponse::Input { text }) => !text.trim().is_empty(),
+        (HitlRequestKind::Selection, PendingResponse::Selection { selection, .. }) => request
+            .selection_options
+            .as_ref()
+            .is_some_and(|options| options.iter().any(|option| option == selection)),
+        _ => false,
+    };
+    if !valid {
+        return Err(IpcError::Validation(
+            "HITL answer does not match the original request constraints".to_string(),
+        ));
+    }
+    pending
+        .remove(&identity.response_target)
+        .ok_or_else(|| IpcError::NotFound("HITL response target is expired".to_string()))
 }
 
-// Tauri exposes these fields as individual IPC arguments; grouping them would
-// change the frontend wire contract rather than simplify internal logic.
+fn validate_reply_coordinates(
+    identity: &HitlRequestIdentity,
+    workspace_id: &str,
+    conversation_id: &str,
+    root: Option<&str>,
+    turn: Option<&str>,
+) -> Result<(), IpcError> {
+    if identity.scope.workspace_id.as_deref() != Some(workspace_id)
+        || identity.scope.conversation_id.as_deref() != Some(conversation_id)
+        || identity.scope.root_turn_id.as_deref() != root
+        || identity.scope.turn_id.as_deref() != turn
+    {
+        return Err(IpcError::Validation(
+            "HITL reply coordinates differ from the delivered scope".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+// Reply parameters are EKO IPC identity, outside framework and SDK protocols.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn send_approval_response(
@@ -1845,50 +2176,49 @@ pub async fn send_approval_response(
     expected_root_turn_id: Option<String>,
     expected_active_turn_id: Option<String>,
     request_id: String,
+    response_target: String,
+    request_scope: HitlRequestScope,
+    request_kind: HitlRequestKind,
     approved: bool,
     reason: Option<String>,
     scope: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    if let Err(error) = validate_hitl_response_scope(
+    let identity = HitlRequestIdentity {
+        request_id,
+        response_target,
+        scope: request_scope,
+        kind: request_kind,
+    };
+    validate_reply_coordinates(
+        &identity,
+        &workspace_id,
+        &conversation_id,
+        expected_root_turn_id.as_deref(),
+        expected_active_turn_id.as_deref(),
+    )?;
+    validate_hitl_response_scope(
         &state,
         &workspace_id,
         &conversation_id,
         expected_root_turn_id.as_deref(),
         expected_active_turn_id.as_deref(),
-    ) {
-        settle_orphaned_hitl_projection(
-            &state,
-            &workspace_id,
-            &conversation_id,
-            expected_root_turn_id.as_deref(),
-        )
-        .await?;
-        return Err(error);
-    }
-    let req = lock_std(&PENDING_RESPONSES, "pending GUI HITL responses").remove(&request_id);
-    if let Some(req) = req {
-        let _ = req.tx.send(PendingResponse::Approval {
-            approved,
-            reason,
-            scope,
-        });
-        Ok(serde_json::json!({"success": true}))
-    } else {
-        settle_orphaned_hitl_projection(
-            &state,
-            &workspace_id,
-            &conversation_id,
-            expected_root_turn_id.as_deref(),
-        )
-        .await?;
-        Err(IpcError::NotFound(format!(
-            "Approval request '{}' not found or expired",
-            request_id
-        )))
-    }
+    )?;
+    let response = PendingResponse::Approval {
+        approved,
+        reason,
+        scope,
+    };
+    let request = take_pending_hitl(&identity, HitlRequestKind::Approval, &response)?;
+    request
+        .tx
+        .send(response)
+        .map_err(|_| IpcError::NotFound("HITL response target is expired".to_string()))?;
+    // Submission is distinct from the original provider/dispatcher winner.
+    Ok(serde_json::json!({"submitted": true, "response_target": identity.response_target}))
 }
 
-/// Respond to an input request.
+// Reply parameters are EKO IPC identity, outside framework and SDK protocols.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn send_input_response(
     state: tauri::State<'_, TauriState>,
@@ -1897,45 +2227,42 @@ pub async fn send_input_response(
     expected_root_turn_id: Option<String>,
     expected_active_turn_id: Option<String>,
     request_id: String,
+    response_target: String,
+    request_scope: HitlRequestScope,
+    request_kind: HitlRequestKind,
     text: String,
 ) -> Result<serde_json::Value, IpcError> {
-    if let Err(error) = validate_hitl_response_scope(
+    let identity = HitlRequestIdentity {
+        request_id,
+        response_target,
+        scope: request_scope,
+        kind: request_kind,
+    };
+    validate_reply_coordinates(
+        &identity,
+        &workspace_id,
+        &conversation_id,
+        expected_root_turn_id.as_deref(),
+        expected_active_turn_id.as_deref(),
+    )?;
+    validate_hitl_response_scope(
         &state,
         &workspace_id,
         &conversation_id,
         expected_root_turn_id.as_deref(),
         expected_active_turn_id.as_deref(),
-    ) {
-        settle_orphaned_hitl_projection(
-            &state,
-            &workspace_id,
-            &conversation_id,
-            expected_root_turn_id.as_deref(),
-        )
-        .await?;
-        return Err(error);
-    }
-    let req = lock_std(&PENDING_RESPONSES, "pending GUI HITL responses").remove(&request_id);
-    if let Some(req) = req {
-        let _ = req.tx.send(PendingResponse::Input { text });
-        Ok(serde_json::json!({"success": true}))
-    } else {
-        settle_orphaned_hitl_projection(
-            &state,
-            &workspace_id,
-            &conversation_id,
-            expected_root_turn_id.as_deref(),
-        )
-        .await?;
-        Err(IpcError::NotFound(format!(
-            "Input request '{}' not found or expired",
-            request_id
-        )))
-    }
+    )?;
+    let response = PendingResponse::Input { text };
+    let request = take_pending_hitl(&identity, HitlRequestKind::Input, &response)?;
+    request
+        .tx
+        .send(response)
+        .map_err(|_| IpcError::NotFound("HITL response target is expired".to_string()))?;
+    // Submission is distinct from the original provider/dispatcher winner.
+    Ok(serde_json::json!({"submitted": true, "response_target": identity.response_target}))
 }
 
-/// Respond to a selection request.
-// Keep parity with the selection-response IPC schema consumed by all GUIs.
+// Reply parameters are EKO IPC identity, outside framework and SDK protocols.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn send_selection_response(
@@ -1945,45 +2272,43 @@ pub async fn send_selection_response(
     expected_root_turn_id: Option<String>,
     expected_active_turn_id: Option<String>,
     request_id: String,
+    response_target: String,
+    request_scope: HitlRequestScope,
+    request_kind: HitlRequestKind,
     selection: String,
     instructions: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    if let Err(error) = validate_hitl_response_scope(
+    let identity = HitlRequestIdentity {
+        request_id,
+        response_target,
+        scope: request_scope,
+        kind: request_kind,
+    };
+    validate_reply_coordinates(
+        &identity,
+        &workspace_id,
+        &conversation_id,
+        expected_root_turn_id.as_deref(),
+        expected_active_turn_id.as_deref(),
+    )?;
+    validate_hitl_response_scope(
         &state,
         &workspace_id,
         &conversation_id,
         expected_root_turn_id.as_deref(),
         expected_active_turn_id.as_deref(),
-    ) {
-        settle_orphaned_hitl_projection(
-            &state,
-            &workspace_id,
-            &conversation_id,
-            expected_root_turn_id.as_deref(),
-        )
-        .await?;
-        return Err(error);
-    }
-    let req = lock_std(&PENDING_RESPONSES, "pending GUI HITL responses").remove(&request_id);
-    if let Some(req) = req {
-        let _ = req.tx.send(PendingResponse::Selection {
-            selection,
-            instructions,
-        });
-        Ok(serde_json::json!({"success": true}))
-    } else {
-        settle_orphaned_hitl_projection(
-            &state,
-            &workspace_id,
-            &conversation_id,
-            expected_root_turn_id.as_deref(),
-        )
-        .await?;
-        Err(IpcError::NotFound(format!(
-            "Selection request '{}' not found or expired",
-            request_id
-        )))
-    }
+    )?;
+    let response = PendingResponse::Selection {
+        selection,
+        instructions,
+    };
+    let request = take_pending_hitl(&identity, HitlRequestKind::Selection, &response)?;
+    request
+        .tx
+        .send(response)
+        .map_err(|_| IpcError::NotFound("HITL response target is expired".to_string()))?;
+    // Submission is distinct from the original provider/dispatcher winner.
+    Ok(serde_json::json!({"submitted": true, "response_target": identity.response_target}))
 }
 
 /// Commits app-owned TaskRuntime events to the canonical chat journal before
@@ -2748,6 +3073,128 @@ mod chat_sink_contract_tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn unavailable_paired_gui_does_not_fail_the_original_channel_turn() -> anyhow::Result<()>
+    {
+        use echo_agent_app_core::api::hitl::{
+            ChannelGuiHitlFactory, ChannelHumanLoopEntry, ChannelHumanLoopProvider,
+            ChannelHumanLoopResolution, HitlScopeResolver,
+        };
+        for kind in [
+            echo_agent::human_loop::HumanLoopKind::Approval,
+            echo_agent::human_loop::HumanLoopKind::Input,
+            echo_agent::human_loop::HumanLoopKind::Selection,
+        ] {
+            let temp = TestDir::new()?;
+            let log = Arc::new(ChatEventLog::open(
+                temp.path().join("chat"),
+                ChatEventRetention::default(),
+            )?);
+            let repository = Arc::new(ToolExecutionRepository::open(temp.path().join("tools"))?);
+            let root = Uuid::new_v4().to_string();
+            let scope = HitlRequestScope {
+                workspace_id: Some("original-workspace".into()),
+                conversation_id: Some("original-conversation".into()),
+                root_turn_id: Some(root.clone()),
+                turn_id: Some(root.clone()),
+                channel_id: Some("qqbot".into()),
+                ..Default::default()
+            };
+            let original_scope = scope.clone();
+            let resolver: HitlScopeResolver = Arc::new(move || Ok(original_scope.clone()));
+            let renderer: Arc<dyn ChatSink> =
+                Arc::new(TauriChatSink::without_app(Arc::new(|_| false)));
+            let sink = bind_surface_chat_sink(
+                ChatSurface::Gui,
+                renderer,
+                log.clone(),
+                repository,
+                "original-workspace",
+                Some("original-conversation".into()),
+                &root,
+            );
+            let gui = Arc::new(
+                TauriHumanLoopHandler::new(sink, root.clone(), scope.clone())
+                    .with_scope_resolver(resolver.clone()),
+            );
+            let factory: ChannelGuiHitlFactory = Arc::new(move |_, _| Ok(gui.clone()));
+            let im =
+                Arc::new(ChannelHumanLoopProvider::new().with_scope_resolver(resolver.clone()));
+            let mut prompts = im.subscribe_prompts();
+            let entry = Arc::new(ChannelHumanLoopEntry::new(
+                im.clone(),
+                Arc::new(StdMutex::new(Some(factory))),
+                resolver,
+            ));
+            let (request, answer) = match kind {
+                echo_agent::human_loop::HumanLoopKind::Approval => (
+                    HumanLoopRequest::approval("read", serde_json::json!({})),
+                    "y",
+                ),
+                echo_agent::human_loop::HumanLoopKind::Input => {
+                    (HumanLoopRequest::input("中文🙂"), "中文🙂")
+                }
+                echo_agent::human_loop::HumanLoopKind::Selection => (
+                    HumanLoopRequest::selection("task", "choose", vec!["Continue".into()]),
+                    "1",
+                ),
+            };
+            let waiting = tokio::spawn(async move { entry.request(request).await });
+            let prompt =
+                tokio::time::timeout(std::time::Duration::from_secs(2), prompts.recv()).await??;
+            // Require the actual failed GUI delivery to have committed its
+            // original waiting projection before answering through the IM FIFO.
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let replay = log.replay(
+                        "original-workspace",
+                        Some("original-conversation"),
+                        &root,
+                        0,
+                    )?;
+                    if !replay.events.is_empty() {
+                        break Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await??;
+            let target = prompt
+                .split_whitespace()
+                .skip_while(|word| *word != "/reply")
+                .nth(1)
+                .ok_or_else(|| anyhow::anyhow!("original response target missing"))?;
+            assert!(matches!(
+                im.try_resolve_message(&format!("/reply {target} {answer}")),
+                ChannelHumanLoopResolution::Resolved(_)
+            ));
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), waiting).await???;
+            assert!(matches!(
+                (&kind, result),
+                (
+                    echo_agent::human_loop::HumanLoopKind::Approval,
+                    HumanLoopResponse::Approved
+                ) | (
+                    echo_agent::human_loop::HumanLoopKind::Input,
+                    HumanLoopResponse::Text(_)
+                ) | (
+                    echo_agent::human_loop::HumanLoopKind::Selection,
+                    HumanLoopResponse::Selection { .. }
+                )
+            ));
+            let replay = log.replay(
+                "original-workspace",
+                Some("original-conversation"),
+                &root,
+                0,
+            )?;
+            assert!(replay.events.iter().all(|event| !matches!(&event.payload,
+                ChatDriverEvent::TurnStatus { status } if status == "failed")));
+        }
+        Ok(())
+    }
+
     #[test]
     fn failed_durable_hitl_delivery_is_rejected_before_waiting()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2772,9 +3219,11 @@ mod chat_sink_contract_tests {
             "waiting_input",
             ChatDriverEvent::InputRequest {
                 request_id: "request-hitl".to_string(),
+                identity: None,
                 prompt: "input".to_string(),
             },
             &sink,
+            true,
         );
         assert!(result.is_err());
 
@@ -2802,6 +3251,289 @@ mod chat_sink_contract_tests {
 mod hitl_pending_tests {
     use super::*;
 
+    #[derive(Default)]
+    struct RequestSink(StdMutex<Vec<ChatDriverEvent>>);
+    impl ChatSink for RequestSink {
+        fn on_event(&self, event: ChatDriverEvent) -> bool {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(event);
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_gui_provider_pairs_each_kind_inside_its_original_future()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for kind in [
+            HitlRequestKind::Approval,
+            HitlRequestKind::Input,
+            HitlRequestKind::Selection,
+        ] {
+            let sink = Arc::new(RequestSink::default());
+            let root = Uuid::new_v4().to_string();
+            let scope = HitlRequestScope {
+                workspace_id: Some("workspace-original".to_string()),
+                host_generation: Some("host-original".to_string()),
+                conversation_id: Some("conversation-original".to_string()),
+                root_turn_id: Some(root.clone()),
+                turn_id: Some(root.clone()),
+                ..Default::default()
+            };
+            let provider = Arc::new(TauriHumanLoopHandler::new(
+                sink.clone(),
+                root,
+                scope.clone(),
+            ));
+            let mut request = match kind {
+                HitlRequestKind::Approval => {
+                    HumanLoopRequest::approval("read_file", serde_json::json!({"path":"x"}))
+                }
+                HitlRequestKind::Input => HumanLoopRequest::input("中文\n🙂"),
+                HitlRequestKind::Selection => {
+                    HumanLoopRequest::selection("task", "Choose", vec!["Continue".to_string()])
+                }
+            };
+            let original_id = Uuid::new_v4().to_string();
+            request.request_id = Some(original_id.clone());
+            request.timeout = Some(std::time::Duration::from_secs(1));
+            let actor = provider.clone();
+            let future = tokio::spawn(async move { actor.request(request).await });
+            let identity = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    let observed = sink
+                        .0
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .iter()
+                        .find_map(|event| match event {
+                            ChatDriverEvent::ApprovalRequest { identity, .. }
+                            | ChatDriverEvent::InputRequest { identity, .. }
+                            | ChatDriverEvent::SelectionRequest { identity, .. } => {
+                                identity.clone()
+                            }
+                            _ => None,
+                        });
+                    if let Some(identity) = observed {
+                        break identity;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            assert_eq!(identity.request_id, original_id);
+            assert!(!identity.response_target.is_empty());
+            assert_eq!(identity.kind, kind);
+            assert_eq!(identity.scope.workspace_id, scope.workspace_id);
+            assert_eq!(identity.scope.host_generation, scope.host_generation);
+            let answer = match kind {
+                HitlRequestKind::Approval => PendingResponse::Approval {
+                    approved: true,
+                    reason: None,
+                    scope: None,
+                },
+                HitlRequestKind::Input => PendingResponse::Input {
+                    text: "中文\n🙂".to_string(),
+                },
+                HitlRequestKind::Selection => PendingResponse::Selection {
+                    selection: "Continue".to_string(),
+                    instructions: None,
+                },
+            };
+            let pending = take_pending_hitl(&identity, kind, &answer)?;
+            pending.tx.send(answer).map_err(|_| "provider expired")?;
+            let response = future.await??;
+            assert!(matches!(
+                (kind, response),
+                (HitlRequestKind::Approval, HumanLoopResponse::Approved)
+                    | (HitlRequestKind::Input, HumanLoopResponse::Text(_))
+                    | (
+                        HitlRequestKind::Selection,
+                        HumanLoopResponse::Selection { .. }
+                    )
+            ));
+            assert!(sink.0.lock().unwrap_or_else(|error| error.into_inner()).iter().any(|event|
+                matches!(event, ChatDriverEvent::HitlRequestReleased { identity: released } if released == &identity)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_answers_leave_each_original_pending_request_available()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (kind, options, invalid, valid) in [
+            (
+                HitlRequestKind::Input,
+                None,
+                PendingResponse::Input {
+                    text: " \n\t".to_string(),
+                },
+                PendingResponse::Input {
+                    text: "中文\n🙂".to_string(),
+                },
+            ),
+            (
+                HitlRequestKind::Selection,
+                Some(vec!["Continue".to_string()]),
+                PendingResponse::Selection {
+                    selection: "foreign option".to_string(),
+                    instructions: None,
+                },
+                PendingResponse::Selection {
+                    selection: "Continue".to_string(),
+                    instructions: None,
+                },
+            ),
+            (
+                HitlRequestKind::Approval,
+                None,
+                PendingResponse::Approval {
+                    approved: true,
+                    reason: None,
+                    scope: Some("unknown".to_string()),
+                },
+                PendingResponse::Approval {
+                    approved: true,
+                    reason: None,
+                    scope: Some("session_tool".to_string()),
+                },
+            ),
+        ] {
+            let mut identity = test_identity(&Uuid::new_v4().to_string());
+            identity.kind = kind;
+            let (tx, mut receiver) = oneshot::channel();
+            let _reservation = PendingResponseReservation::insert(
+                PENDING_RESPONSES.clone(),
+                identity.response_target.clone(),
+                PendingRequest {
+                    message_key: identity.request_id.clone(),
+                    identity: identity.clone(),
+                    selection_options: options,
+                    tx,
+                },
+                None,
+            );
+            assert!(take_pending_hitl(&identity, kind, &invalid).is_err());
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            let original = take_pending_hitl(&identity, kind, &valid)?;
+            original
+                .tx
+                .send(valid)
+                .map_err(|_| "original pending receiver expired")?;
+            assert!(receiver.try_recv().is_ok());
+            assert!(take_pending_hitl(&identity, kind, &invalid).is_err());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_gui_input_timeout_is_not_empty_text()
+    -> Result<(), echo_agent::error::ReactError> {
+        let provider = TauriHumanLoopHandler::new(
+            Arc::new(RequestSink::default()),
+            "timeout".to_string(),
+            HitlRequestScope::default(),
+        );
+        let mut request = HumanLoopRequest::input("input");
+        request.timeout = Some(std::time::Duration::from_millis(1));
+        assert!(matches!(
+            provider.request(request).await?,
+            HumanLoopResponse::Timeout
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn old_target_foreign_scope_and_wrong_kind_do_not_remove_a_reused_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let id = Uuid::new_v4().to_string();
+        let mut original = test_identity(&id);
+        original.response_target = Uuid::new_v4().to_string();
+        let mut current = original.clone();
+        current.response_target = Uuid::new_v4().to_string();
+        let (tx, mut receiver) = oneshot::channel();
+        let _reservation = PendingResponseReservation::insert(
+            PENDING_RESPONSES.clone(),
+            current.response_target.clone(),
+            PendingRequest {
+                message_key: id,
+                identity: current.clone(),
+                selection_options: None,
+                tx,
+            },
+            None,
+        );
+        assert!(
+            take_pending_hitl(
+                &original,
+                HitlRequestKind::Input,
+                &PendingResponse::Input {
+                    text: "answer".to_string()
+                }
+            )
+            .is_err()
+        );
+        let mut foreign = current.clone();
+        foreign.scope.host_generation = Some("another-generation".to_string());
+        assert!(
+            take_pending_hitl(
+                &foreign,
+                HitlRequestKind::Input,
+                &PendingResponse::Input {
+                    text: "answer".to_string()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            take_pending_hitl(
+                &current,
+                HitlRequestKind::Approval,
+                &PendingResponse::Input {
+                    text: "answer".to_string()
+                }
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        let request = take_pending_hitl(
+            &current,
+            HitlRequestKind::Input,
+            &PendingResponse::Input {
+                text: "answer".to_string(),
+            },
+        )?;
+        request
+            .tx
+            .send(PendingResponse::Input {
+                text: "中文\n🙂".to_string(),
+            })
+            .map_err(|_| "receiver expired")?;
+        assert!(
+            matches!(receiver.try_recv()?, PendingResponse::Input { text } if text == "中文\n🙂")
+        );
+        Ok(())
+    }
+    fn test_identity(id: &str) -> HitlRequestIdentity {
+        HitlRequestIdentity {
+            request_id: id.to_string(),
+            response_target: id.to_string(),
+            kind: HitlRequestKind::Input,
+            scope: HitlRequestScope {
+                workspace_id: Some("test-workspace".to_string()),
+                conversation_id: Some("test-conversation".to_string()),
+                ..Default::default()
+            },
+        }
+    }
+
     #[test]
     fn dropping_reservation_removes_pending_request_and_cancels_sender()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2812,8 +3544,11 @@ mod hitl_pending_tests {
             "request-1".to_string(),
             PendingRequest {
                 message_key: "root-message".to_string(),
+                identity: test_identity("request-1"),
+                selection_options: None,
                 tx: sender,
             },
+            None,
         );
         assert_eq!(
             lock_std(&pending, "test pending GUI HITL responses").len(),
@@ -2838,15 +3573,23 @@ mod hitl_pending_tests {
         let message_key = format!("root-{}", Uuid::new_v4());
         let (sender, receiver) = oneshot::channel();
         lock_std(&PENDING_RESPONSES, "test pending GUI HITL responses").insert(
-            request_id,
+            request_id.clone(),
             PendingRequest {
                 message_key: message_key.clone(),
+                identity: test_identity(&request_id),
+                selection_options: None,
                 tx: sender,
             },
         );
 
         assert_eq!(
-            cancel_pending_hitl(Some(&message_key), "task run paused").await,
+            cancel_pending_hitl(
+                "test-workspace",
+                "test-conversation",
+                Some(&message_key),
+                "task run paused"
+            )
+            .await,
             1
         );
         assert!(matches!(

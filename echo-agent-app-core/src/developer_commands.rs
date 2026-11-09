@@ -1,4 +1,4 @@
-//! Shared terminal and LSP commands for every EKO interaction surface.
+//! Shared terminal and browser commands for every EKO interaction surface.
 
 use crate::terminal::TerminalService;
 use std::path::PathBuf;
@@ -23,14 +23,10 @@ pub struct DeveloperCommandRegistry {
 }
 
 impl DeveloperCommandRegistry {
-    pub const COMMANDS: [DeveloperCommandDescriptor; 3] = [
+    pub const COMMANDS: [DeveloperCommandDescriptor; 2] = [
         DeveloperCommandDescriptor {
             name: "terminal",
             summary: "Manage and attach to interactive terminal sessions",
-        },
-        DeveloperCommandDescriptor {
-            name: "lsp",
-            summary: "Inspect and manage workspace language servers",
         },
         DeveloperCommandDescriptor {
             name: "browser",
@@ -65,7 +61,10 @@ impl DeveloperCommandRegistry {
     ) -> Result<DeveloperCommandOutput, String> {
         match namespace {
             "terminal" | "term" => self.execute_terminal(args).await,
-            "lsp" => self.execute_lsp(args).await,
+            "lsp" => Err(
+                "LSP has been retired from EKO; language-server commands are unsupported"
+                    .to_string(),
+            ),
             "browser" => self.execute_browser(args).await,
             other => Err(format!("unknown developer command '{other}'")),
         }
@@ -81,7 +80,14 @@ impl DeveloperCommandRegistry {
                 }
                 let lines = sessions
                     .into_iter()
-                    .map(|session| format!("{} (pid {})", session.id, session.pid))
+                    .map(|session| {
+                        format!(
+                            "{} (pid {}, {})",
+                            session.id,
+                            session.pid,
+                            session.target.label()
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("\n");
                 Ok(output(lines))
@@ -139,20 +145,6 @@ impl DeveloperCommandRegistry {
             }
             _ => Err("usage: terminal <list|create|attach|write|resize|close> ...".to_string()),
         }
-    }
-
-    async fn execute_lsp(&self, args: &[&str]) -> Result<DeveloperCommandOutput, String> {
-        let state = self
-            .app_state
-            .as_ref()
-            .ok_or_else(|| "LSP runtime is not initialized".to_string())?;
-        let action = args.first().copied().unwrap_or("status");
-        state
-            .extension_control
-            .lsp_command(state, action, args.get(1).copied())
-            .await
-            .map(output)
-            .map_err(|error| error.to_string())
     }
 
     async fn execute_browser(&self, args: &[&str]) -> Result<DeveloperCommandOutput, String> {
@@ -231,10 +223,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lsp_registry_fails_closed_without_the_runtime() {
+    async fn retired_lsp_fails_without_constructing_a_runtime() {
         let registry = DeveloperCommandRegistry::new(TerminalService::new(), None);
         let error = registry.execute("lsp", &["status"]).await;
-        assert!(error.is_err_and(|error| error.contains("not initialized")));
+        assert!(error.is_err_and(|error| error.contains("retired")));
+        assert!(
+            !DeveloperCommandRegistry::commands()
+                .iter()
+                .any(|command| command.name == "lsp")
+        );
     }
 
     #[tokio::test]

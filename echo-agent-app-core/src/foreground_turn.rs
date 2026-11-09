@@ -162,6 +162,8 @@ struct ActiveForegroundTurn {
     root_turn_id: String,
     active_agent_turn_id: Mutex<String>,
     active_run_id: Mutex<Option<String>>,
+    // 原受控续接返回的前台呈现值；不持久化、不参与准入，也不改写有限回合receipt。
+    continuation_outcome: Mutex<Option<(String, TurnOutcome)>>,
     cancel: CancellationToken,
     settlement_tx: watch::Sender<Option<ForegroundTurnSettlement>>,
     terminal_debt_tx: watch::Sender<Option<ForegroundTerminalDebt>>,
@@ -310,6 +312,36 @@ tokio::task_local! {
 pub(crate) struct ForegroundTurnProgress(Arc<ActiveForegroundTurn>);
 
 impl ForegroundTurnProgress {
+    pub(crate) fn record_continuation_outcome(
+        &self,
+        run_id: &str,
+        outcome: TurnOutcome,
+    ) -> Result<(), String> {
+        if self.0.physical_result_observed.load(Ordering::Acquire)
+            || self.0.settlement_owner_started.load(Ordering::Acquire)
+            || (outcome == TurnOutcome::Completed && self.0.cancel.is_cancelled())
+        {
+            return Err(
+                "foreground continuation observation arrived after its owner stopped".to_string(),
+            );
+        }
+        let active_run = self
+            .0
+            .active_run_id
+            .lock()
+            .map_err(|_| "foreground run binding is unavailable".to_string())?;
+        if active_run.as_deref() != Some(run_id) {
+            return Err("foreground continuation does not own the bound run".to_string());
+        }
+        *self
+            .0
+            .continuation_outcome
+            .lock()
+            .map_err(|_| "foreground continuation projection is unavailable".to_string())? =
+            Some((run_id.to_string(), outcome));
+        Ok(())
+    }
+
     pub(crate) fn bind_run_turn(&self, run_id: &str, turn_id: &str) {
         if run_id.trim().is_empty() || turn_id.trim().is_empty() {
             return;
@@ -325,6 +357,13 @@ impl ForegroundTurnProgress {
             .active_run_id
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current_run.as_deref() != Some(run_id) {
+            *self
+                .0
+                .continuation_outcome
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
         *current_run = Some(run_id.to_string());
     }
 
@@ -448,6 +487,21 @@ pub struct ForegroundTurnControl {
     inner: Arc<ForegroundTurnControlInner>,
 }
 
+/// Weak observation of the same control. It owns no admission, settlement or
+/// mutable scope, and cannot keep an Agent/provider/control reference cycle alive.
+#[derive(Clone)]
+pub struct WeakForegroundTurnControl {
+    inner: std::sync::Weak<ForegroundTurnControlInner>,
+}
+
+impl WeakForegroundTurnControl {
+    pub(crate) fn upgrade(&self) -> Option<ForegroundTurnControl> {
+        self.inner
+            .upgrade()
+            .map(|inner| ForegroundTurnControl { inner })
+    }
+}
+
 /// Ordered generation receipts for one foreground execution. TaskRuntime is
 /// retained first; memory evolution is appended by the Memory integration;
 /// the pool receipt is held separately and released before this stack.
@@ -547,6 +601,12 @@ impl Drop for ForegroundConversationSuspension {
 }
 
 impl ForegroundTurnControl {
+    pub fn downgrade(&self) -> WeakForegroundTurnControl {
+        WeakForegroundTurnControl {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
     pub(crate) fn bind_lifecycle_retention(
         &self,
         root: &Arc<crate::runtime::ApplicationLifecycleRetention>,
@@ -739,6 +799,7 @@ impl ForegroundTurnControl {
             root_turn_id: turn_id.clone(),
             active_agent_turn_id: Mutex::new(turn_id),
             active_run_id: Mutex::new(None),
+            continuation_outcome: Mutex::new(None),
             cancel,
             settlement_tx,
             terminal_debt_tx,
@@ -1888,14 +1949,71 @@ where
     Settle: Fn(TurnOutcome) -> SettleFuture + Send + Sync + 'static,
     SettleFuture: std::future::Future<Output = Result<(), String>> + Send + 'static,
 {
+    drive_foreground_chat_with_bound_ingress(
+        lease,
+        agent,
+        turn,
+        resources,
+        None,
+        input_observer,
+        durable_terminal,
+    )
+    .await
+}
+
+/// The same foreground/ingress owner with an explicit initial TaskRun selection.
+/// The unbound wrapper above keeps every existing surface's default behavior.
+pub async fn drive_foreground_chat_with_bound_ingress<Settle, SettleFuture>(
+    lease: ForegroundTurnLease,
+    agent: &AgentHandle,
+    turn: &PreparedUserTurn,
+    resources: Arc<ChatResources>,
+    binding: Option<crate::tasks::task_runtime::types::RunTurnBinding>,
+    input_observer: crate::chat_driver::InputReceiptObserver,
+    durable_terminal: Settle,
+) -> Result<TurnOutcome, ChatTurnError>
+where
+    Settle: Fn(TurnOutcome) -> SettleFuture + Send + Sync + 'static,
+    SettleFuture: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
+    drive_foreground_chat_with_source_ingress(
+        lease,
+        agent,
+        turn,
+        resources,
+        binding,
+        None,
+        input_observer,
+        durable_terminal,
+    )
+    .await
+}
+
+/// 保留原foreground owner与终态观察，只增加应用原输入快照的薄参数。
+#[allow(clippy::too_many_arguments)]
+pub async fn drive_foreground_chat_with_source_ingress<Settle, SettleFuture>(
+    lease: ForegroundTurnLease,
+    agent: &AgentHandle,
+    turn: &PreparedUserTurn,
+    resources: Arc<ChatResources>,
+    binding: Option<crate::tasks::task_runtime::types::RunTurnBinding>,
+    input_source: Option<crate::conversation_input::BoundRunInput>,
+    input_observer: crate::chat_driver::InputReceiptObserver,
+    durable_terminal: Settle,
+) -> Result<TurnOutcome, ChatTurnError>
+where
+    Settle: Fn(TurnOutcome) -> SettleFuture + Send + Sync + 'static,
+    SettleFuture: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
     let (result, settlement_outcome) =
         run_foreground_chat_with(&lease, resources, |controlled_resources| async move {
-            crate::chat_driver::drive_chat_turn_with_input_observer(
+            crate::chat_driver::drive_chat_turn_with_input_source(
                 agent,
                 turn,
                 controlled_resources,
-                None,
+                binding,
                 Some(input_observer),
+                input_source,
             )
             .await
             .map(|receipt| receipt.outcome)
@@ -2097,12 +2215,39 @@ where
     });
     let memory_generation = resources.memory_generation.clone();
     lease.entry.driver_started.store(true, Ordering::Release);
-    let result = normalize_downstream_outcome(
-        CURRENT_FOREGROUND_TURN
-            .scope(Arc::clone(&lease.entry), execute(controlled_resources))
-            .await,
-        delivery.as_ref(),
-    );
+    // 同一原任务继续轮询；将大child future固定到堆，避免多层task-local按值叠加poll栈帧。
+    let result = CURRENT_FOREGROUND_TURN
+        .scope(
+            Arc::clone(&lease.entry),
+            Box::pin(execute(controlled_resources)),
+        )
+        .await
+        .and_then(|finite_outcome| {
+            let active_run = lease.entry.active_run_id.lock().map_err(|_| {
+                ChatTurnError::from("foreground run binding is unavailable".to_string())
+            })?;
+            lease
+                .entry
+                .continuation_outcome
+                .lock()
+                .map(|observed| {
+                    observed
+                        .as_ref()
+                        .filter(|(run_id, outcome)| {
+                            active_run.as_deref() == Some(run_id.as_str())
+                                && !(outcome == &TurnOutcome::Completed
+                                    && lease.entry.cancel.is_cancelled())
+                        })
+                        .map(|(_, outcome)| outcome.clone())
+                        .unwrap_or(finite_outcome)
+                })
+                .map_err(|_| {
+                    ChatTurnError::from(
+                        "foreground continuation projection is unavailable".to_string(),
+                    )
+                })
+        });
+    let result = normalize_downstream_outcome(result, delivery.as_ref());
     if let Some(error) = result.as_ref().err().filter(|error| error.is_observation()) {
         lease.entry.retain_observation(error.clone());
         return (result, None);
@@ -2131,6 +2276,121 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn continuation_projection_waits_for_owner_and_cannot_reach_a_later_slot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::Duration;
+        let control = ForegroundTurnControl::default();
+        let lease = control.begin_scoped(
+            "global",
+            ForegroundTurnSurface::Channel,
+            "projection-conversation",
+            "projection-root",
+        )?;
+        let resources = Arc::new(ChatResources {
+            execution_scope: crate::workspace::WorkspaceExecutionScope::global("."),
+            workspace_io_receipt: None,
+            pool: None,
+            store: None,
+            sink: Arc::new(ClosedSink),
+            webhook_emitter: None,
+            conv_id: Some("projection-conversation".into()),
+            root_message_id: "projection-root".into(),
+            attachments: Vec::new(),
+            cancel: lease.cancellation_token(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let driver = tokio::spawn(async move {
+            let (result, settlement) =
+                run_foreground_chat_with(&lease, resources, |_| async move {
+                    let progress = current_foreground_progress()
+                        .ok_or_else(|| "original foreground progress missing".to_string())?;
+                    progress.bind_run_turn("projection-run", "finite-turn");
+                    assert!(
+                        progress
+                            .record_continuation_outcome("foreign-run", TurnOutcome::Completed)
+                            .is_err()
+                    );
+                    progress
+                        .record_continuation_outcome("projection-run", TurnOutcome::Completed)?;
+                    ready_tx
+                        .send(progress)
+                        .map_err(|_| "original projection observer closed".to_string())?;
+                    release_rx
+                        .await
+                        .map_err(|_| "original driver release closed".to_string())?;
+                    Ok(TurnOutcome::Failed(
+                        echo_agent::error::AgentFailure::message(
+                            "first-finite",
+                            "原有限失败仍保留",
+                        ),
+                    ))
+                })
+                .await;
+            let outcome =
+                settlement.ok_or_else(|| "physical foreground result missing".to_string())?;
+            let receipt = lease
+                .settle_after_observers(outcome)
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(result?, TurnOutcome::Completed);
+            Ok::<_, ChatTurnError>(receipt.outcome)
+        });
+        let old_progress = tokio::time::timeout(Duration::from_secs(30), ready_rx).await??;
+        assert!(
+            !driver.is_finished(),
+            "投影值不能提前结束仍被持有的原driver"
+        );
+        assert!(
+            control
+                .snapshot_scoped(
+                    "global",
+                    ForegroundTurnSurface::Channel,
+                    "projection-conversation"
+                )
+                .is_some()
+        );
+        release_tx
+            .send(())
+            .map_err(|_| "driver release receiver closed")?;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), driver).await???,
+            TurnOutcome::Completed
+        );
+        assert!(
+            old_progress
+                .record_continuation_outcome("projection-run", TurnOutcome::Completed)
+                .is_err()
+        );
+        let next = control.begin_scoped(
+            "global",
+            ForegroundTurnSurface::Channel,
+            "projection-conversation",
+            "next-root",
+        )?;
+        assert!(
+            next.entry
+                .continuation_outcome
+                .lock()
+                .map_err(|_| "projection lock poisoned")?
+                .is_none()
+        );
+        let current = ForegroundTurnProgress(next.entry.clone());
+        current.bind_run_turn("next-run", "next-turn");
+        next.cancellation_token().cancel();
+        assert!(
+            current
+                .record_continuation_outcome("next-run", TurnOutcome::Completed)
+                .is_err()
+        );
+        next.settle_after_observers(TurnOutcome::Cancelled).await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn aggregate_foreground_exact_unknown_lease_does_not_hide_same_key_normal_work()
@@ -3029,6 +3289,154 @@ mod tests {
                 Ok::<(), ForegroundTurnError>(())
             })
             .await
+    }
+
+    #[tokio::test]
+    async fn real_react_hitl_stream_reads_original_owner_across_spawn_and_continuation()
+    -> anyhow::Result<()> {
+        use crate::hitl::{ChannelHumanLoopProvider, ChannelHumanLoopResolution, HitlRequestScope};
+        use echo_agent::agent::{Agent, ReactAgentBuilder};
+        use futures::StreamExt;
+
+        for surface in [ForegroundTurnSurface::Gui, ForegroundTurnSurface::Channel] {
+            let control = ForegroundTurnControl::default();
+            let lease =
+                control.begin_scoped("original-workspace", surface, "conversation", "root-turn")?;
+            let observer = control.downgrade();
+            let base = HitlRequestScope {
+                workspace_id: Some("original-workspace".to_string()),
+                host_generation: Some("original-host".to_string()),
+                conversation_id: Some("conversation".to_string()),
+                root_turn_id: Some("root-turn".to_string()),
+                turn_id: Some("root-turn".to_string()),
+                ..Default::default()
+            };
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let missing = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let recorded = observed.clone();
+            let missing_owner = missing.clone();
+            let provider = Arc::new(
+                ChannelHumanLoopProvider::new()
+                    .with_scope(base.clone())
+                    .with_scope_resolver(Arc::new(move || {
+                        // This callback runs inside the real framework stream task,
+                        // which intentionally does not carry EKO's task-locals.
+                        assert!(current_foreground_progress().is_none());
+                        assert!(crate::chat_resources::current_chat_resources().is_none());
+                        match base.for_foreground_observer(&observer, surface) {
+                            Ok(scope) => {
+                                recorded
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .push(scope.clone());
+                                Ok(scope)
+                            }
+                            Err(error) => {
+                                missing_owner.fetch_add(1, Ordering::SeqCst);
+                                Err(error)
+                            }
+                        }
+                    })),
+            );
+            let mut prompts = provider.subscribe_prompts();
+            let llm = Arc::new(
+                echo_agent::testing::MockLlmClient::new()
+                    .then_tool_call(
+                        "hitl-root",
+                        "human_in_loop",
+                        r#"{"reasoning":"root question","approval_type":"LLM"}"#,
+                    )
+                    .with_response("root answered")
+                    .then_tool_call(
+                        "hitl-next",
+                        "human_in_loop",
+                        r#"{"reasoning":"continuation question","approval_type":"LLM"}"#,
+                    )
+                    .with_response("continuation answered")
+                    .then_tool_call(
+                        "hitl-owner-missing",
+                        "human_in_loop",
+                        r#"{"reasoning":"expired owner","approval_type":"LLM"}"#,
+                    )
+                    .with_response("expired owner handled"),
+            );
+            let mut agent = ReactAgentBuilder::new()
+                .model("test-model")
+                .llm_client(llm)
+                .enable_human_in_loop()
+                .build()?;
+            agent.set_human_loop_provider_preserving_approvals(provider.clone());
+            CURRENT_FOREGROUND_TURN
+                .scope(lease.entry.clone(), async {
+                    for expected_turn in ["root-turn", "continuation-turn"] {
+                        let progress = current_foreground_progress()
+                            .ok_or_else(|| anyhow::anyhow!("foreground progress missing"))?;
+                        progress.bind_run_turn("original-run", expected_turn);
+                        let drain = async {
+                            let mut stream = agent.chat_stream("ask a question").await?;
+                            while let Some(event) = stream.next().await {
+                                event?;
+                            }
+                            Ok::<(), anyhow::Error>(())
+                        };
+                        let answer = async {
+                            let prompt = prompts.recv().await?;
+                            let scope = observed
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .last()
+                                .cloned()
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("HITL did not resolve its original owner")
+                                })?;
+                            assert_eq!(scope.turn_id.as_deref(), Some(expected_turn));
+                            assert_eq!(scope.root_turn_id.as_deref(), Some("root-turn"));
+                            assert_eq!(scope.host_generation.as_deref(), Some("original-host"));
+                            assert_eq!(scope.run_id.as_deref(), Some("original-run"));
+                            assert!(matches!(
+                                provider.try_resolve_message("/cancel"),
+                                ChannelHumanLoopResolution::Rejected(_)
+                            ));
+                            let target = prompt
+                                .split("Use /reply ")
+                                .nth(1)
+                                .and_then(|suffix| suffix.split_whitespace().next())
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("target-qualified prompt missing")
+                                })?;
+                            assert!(matches!(
+                                provider.try_resolve_message(&format!("/reply {target} 中文\n🙂")),
+                                ChannelHumanLoopResolution::Resolved(_)
+                            ));
+                            Ok::<(), anyhow::Error>(())
+                        };
+                        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                            tokio::try_join!(drain, answer).map(|_| ())
+                        })
+                        .await??;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await?;
+            lease.settle(TurnOutcome::Completed);
+            // Same real tool/provider after settlement must fail its original
+            // owner lookup, without a new request carrying empty coordinates.
+            let mut stream = agent.chat_stream("ask after owner ended").await?;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while let Some(event) = stream.next().await {
+                    event?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await??;
+            assert!(missing.load(Ordering::SeqCst) > 0);
+            assert!(matches!(
+                prompts.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ));
+            drop(control);
+        }
+        Ok(())
     }
 
     #[tokio::test]

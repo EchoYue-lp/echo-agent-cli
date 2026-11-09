@@ -26,7 +26,7 @@ use echo_agent::tools::{Tool, ToolParameters, ToolResult};
 use futures::future::BoxFuture;
 use tokio::sync::Mutex as TokioMutex;
 
-use super::executor::{RunOutcome, TaskRuntimeOperation, execute_run, preflight_unattended_plan};
+use super::executor::{RunOutcome, TaskRuntimeOperation, preflight_unattended_plan};
 use super::store::{StoreError, TaskRuntimeStore};
 use super::types::{
     AttendedMode, TaskExecutionSummary, TaskRunStatus, TodoItem, UnattendedWriteMode,
@@ -191,6 +191,21 @@ impl ExecuteTaskTool {
         &self,
         run_id: &str,
     ) -> Result<TaskExecutionAgent, crate::agent_pool::PoolError> {
+        let state = self
+            .store
+            .get_run_state(run_id)
+            .map_err(|error| crate::agent_pool::PoolError::AgentCreation(error.to_string()))?;
+        let domain_binding = state
+            .as_ref()
+            .and_then(|state| state.domain_binding.as_ref());
+        if state.as_ref().is_some_and(|state| {
+            state.domain_binding.is_none()
+                && state.run.domain_profile != super::types::DomainProfile::General
+        }) {
+            return Err(crate::agent_pool::PoolError::AgentCreation(
+                "historical professional run requires a new explicit plugin binding".to_string(),
+            ));
+        }
         let conversation_id = CURRENT_EXECUTION_CONVERSATION_ID
             .try_with(Clone::clone)
             .ok()
@@ -200,6 +215,24 @@ impl ExecuteTaskTool {
             conversation_id,
         ) && let Some(pool_execution) = pool.lease_existing(&conversation_id).await?
         {
+            if let Some(binding) = domain_binding {
+                pool.verify_domain_binding(&pool_execution, binding)
+                    .await
+                    .map_err(crate::agent_pool::PoolError::AgentCreation)?;
+            }
+            let invocation_resources = match domain_binding {
+                Some(binding) => {
+                    let registration = super::compact_context::task_runtime_projection_registry()
+                        .retain_for_invocation(run_id, self.store.clone())
+                        .map_err(crate::agent_pool::PoolError::AgentCreation)?;
+                    vec![
+                        pool_execution
+                            .domain_resource_guard(run_id, binding, Some(Arc::new(registration)))
+                            .map_err(crate::agent_pool::PoolError::AgentCreation)?,
+                    ]
+                }
+                None => Vec::new(),
+            };
             let agent = pool_execution.agent();
             let pool_receipt = pool.retain_for_supervised_run(conversation_id, pool_execution);
             let driver_context = CURRENT_EXECUTION_DRIVER_CONTEXT
@@ -216,7 +249,13 @@ impl ExecuteTaskTool {
             return Ok(TaskExecutionAgent {
                 agent,
                 pool_receipt,
+                invocation_resources,
             });
+        }
+        if domain_binding.is_some() {
+            return Err(crate::agent_pool::PoolError::AgentCreation(
+                "domain task execution requires its original live pool lease".to_string(),
+            ));
         }
         Ok(TaskExecutionAgent {
             agent: AgentHandle::from_arc(
@@ -225,6 +264,7 @@ impl ExecuteTaskTool {
                     .ok_or(crate::agent_pool::PoolError::ShuttingDown)?,
             ),
             pool_receipt: None,
+            invocation_resources: Vec::new(),
         })
     }
 
@@ -243,6 +283,7 @@ impl ExecuteTaskTool {
 struct TaskExecutionAgent {
     agent: AgentHandle,
     pool_receipt: Option<crate::agent_pool::OwnedRunPoolReceipt>,
+    invocation_resources: Vec<echo_agent::tools::InvocationResourceGuard>,
 }
 
 impl Tool for ExecuteTaskTool {
@@ -484,6 +525,8 @@ impl Tool for ExecuteTaskTool {
                 .agent
                 .read(|agent| agent.llm_client().cloned())
                 .await;
+            let mut invocation_resources = super::task_tools::current_invocation_resources();
+            invocation_resources.extend(std::mem::take(&mut execution_agent.invocation_resources));
             let retained_tool = match execution_agent.pool_receipt.take() {
                 Some(receipt) => self
                     .store
@@ -495,7 +538,7 @@ impl Tool for ExecuteTaskTool {
             };
             let outcome = super::task_tools::CURRENT_UNATTENDED_WRITE_MODE
                 .scope(write_mode, async {
-                    execute_run(
+                    super::executor::execute_run_with_resources(
                         self.store.clone(),
                         Some(execution_agent.agent.clone()),
                         reviewer_llm,
@@ -509,6 +552,7 @@ impl Tool for ExecuteTaskTool {
                         // (drive_run_async / resume_task_run), not this tool.
                         super::memory_bridge::MemoryPolicy::None,
                         super::task_tools::current_workspace_io(),
+                        invocation_resources,
                     )
                     .await
                 })
@@ -622,21 +666,31 @@ impl Tool for ExecuteTaskTool {
         Box::pin(async move {
             let conversation_id = ctx.conversation_id.clone();
             let driver_context = ctx.execution_id.clone();
-            let workspace_io = self
-                .workspace_io
-                .clone()
-                .or_else(|| crate::state::WorkspaceIoInvocation::from_context(ctx));
-            let result = super::task_tools::scoped_with_ctx_run_id(ctx, || {
-                super::task_tools::CURRENT_WORKSPACE_IO.scope(
-                    workspace_io,
-                    CURRENT_EXECUTION_CONVERSATION_ID.scope(
-                        conversation_id,
-                        CURRENT_EXECUTION_DRIVER_CONTEXT
-                            .scope(driver_context, self.execute(params)),
-                    ),
-                )
-            })
-            .await?;
+            let workspace_io = match self.workspace_io.as_ref() {
+                Some(scope) => {
+                    let owned_context = echo_agent::tools::ToolContext {
+                        resource_guards: scope.resource_guards(),
+                        ..Default::default()
+                    };
+                    self.store
+                        .workspace_io_from_tool_context(&owned_context)
+                        .map(|bound| bound.or_else(|| Some(scope.clone())))
+                }
+                None => self.store.workspace_io_from_tool_context(ctx),
+            }
+            .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
+            let result =
+                super::task_tools::scoped_with_ctx_run_id(ctx, workspace_io.clone(), || {
+                    super::task_tools::CURRENT_WORKSPACE_IO.scope(
+                        workspace_io,
+                        CURRENT_EXECUTION_CONVERSATION_ID.scope(
+                            conversation_id,
+                            CURRENT_EXECUTION_DRIVER_CONTEXT
+                                .scope(driver_context, self.execute(params)),
+                        ),
+                    )
+                })
+                .await?;
             compact_completed_task_result(ctx, result)
         })
     }
@@ -861,6 +915,8 @@ mod tests {
 
     fn one_task_plan(run_id: &str) -> TaskPlan {
         TaskPlan {
+            domain_binding: None,
+
             plan_id: format!("plan_{run_id}"),
             run_id: run_id.to_string(),
             revision: 1,
@@ -1023,6 +1079,8 @@ mod tests {
         };
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+
                 plan_id: "p1".to_string(),
                 run_id: "r1".to_string(),
                 revision: 1,

@@ -250,6 +250,22 @@ pub fn discover_subagents(
     project_root: Option<&Path>,
     user_home: Option<&Path>,
 ) -> Vec<SubagentDefinition> {
+    discover_subagents_with_file_system(
+        project_root,
+        user_home,
+        &echo_agent::tools::files::LocalFileSystem,
+    )
+    .unwrap_or_else(|error| {
+        tracing::warn!(%error, "project Subagent discovery failed");
+        discover_subagents(None, user_home)
+    })
+}
+
+pub fn discover_subagents_with_file_system(
+    project_root: Option<&Path>,
+    user_home: Option<&Path>,
+    files: &dyn echo_agent::tools::filesystem::FileSystem,
+) -> echo_agent::error::Result<Vec<SubagentDefinition>> {
     // name → definition, later inserts (lower priority) don't overwrite.
     let mut by_name: std::collections::HashMap<String, SubagentDefinition> =
         std::collections::HashMap::new();
@@ -279,7 +295,7 @@ pub fn discover_subagents(
     // 3. Project scope (<root>/.eko/subagents/) — highest priority, last.
     if let Some(root) = project_root {
         let project_dir = root.join(".eko").join("subagents");
-        merge_scope(&mut by_name, "project", &project_dir);
+        merge_scope_with_file_system(&mut by_name, "project", &project_dir, files)?;
     }
 
     // Preserve builtin order for stable registration, then append any
@@ -300,7 +316,7 @@ pub fn discover_subagents(
         }
     }
 
-    result
+    Ok(result)
 }
 
 /// Scan a scope directory and merge its parsed subagents into `by_name`,
@@ -312,11 +328,25 @@ fn merge_scope(
     scope: &str,
     dir: &Path,
 ) {
-    if !dir.is_dir() {
-        return;
+    let _ = merge_scope_with_file_system(
+        by_name,
+        scope,
+        dir,
+        &echo_agent::tools::files::LocalFileSystem,
+    );
+}
+
+fn merge_scope_with_file_system(
+    by_name: &mut std::collections::HashMap<String, SubagentDefinition>,
+    scope: &str,
+    dir: &Path,
+    files: &dyn echo_agent::tools::filesystem::FileSystem,
+) -> echo_agent::error::Result<()> {
+    if !files.is_dir(dir)? {
+        return Ok(());
     }
     let mut found = Vec::new();
-    scan_directory(dir, 0, &mut found);
+    scan_directory(dir, 0, &mut found, files)?;
     for (path, content) in found {
         match parse_subagent_md(&content, None) {
             Ok(mut def) => {
@@ -332,43 +362,39 @@ fn merge_scope(
             }
         }
     }
+    Ok(())
 }
 
 /// Recursively collect `*.md` files under `dir` up to `MAX_SCAN_DEPTH`.
-fn scan_directory(dir: &Path, depth: usize, out: &mut Vec<(PathBuf, String)>) {
+fn scan_directory(
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<(PathBuf, String)>,
+    files: &dyn echo_agent::tools::filesystem::FileSystem,
+) -> echo_agent::error::Result<()> {
     if depth > MAX_SCAN_DEPTH {
-        return;
+        return Ok(());
     }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::debug!(dir = %dir.display(), error = %e, "Cannot read subagents scope dir");
-            return;
-        }
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let file_type = match entry.file_type() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        if file_type.is_dir() {
-            // Skip well-known non-config directories.
-            if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && SKIP_DIRS.contains(&name)
+    for entry in files.read_dir(dir)? {
+        let path = entry.path;
+        if entry.file_type.is_dir() {
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| SKIP_DIRS.contains(&name))
             {
                 continue;
             }
-            scan_directory(&path, depth + 1, out);
-        } else if file_type.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
-            match std::fs::read_to_string(&path) {
-                Ok(content) => out.push((path, content)),
-                Err(e) => {
-                    tracing::debug!(path = %path.display(), error = %e, "Cannot read subagent .md");
-                }
-            }
+            scan_directory(&path, depth.saturating_add(1), out, files)?;
+        } else if entry.file_type.is_file()
+            && path.extension().and_then(|extension| extension.to_str()) == Some("md")
+        {
+            let content = String::from_utf8(files.read(&path)?)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            out.push((path, content));
         }
     }
+    Ok(())
 }
 
 /// Parse a subagent `.md` file into a [`SubagentDefinition`].

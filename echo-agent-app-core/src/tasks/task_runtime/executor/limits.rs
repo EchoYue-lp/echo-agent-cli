@@ -42,6 +42,7 @@ use echo_agent::runtime::{
     AgentTurnDriver, EventSink, SinkControl, TurnMode, TurnOutcome, TurnReceipt, TurnRequest,
 };
 use echo_agent::subagent::{ContextTransferPolicy, SubagentInvocation};
+use echo_agent::tools::cell::CommandCellResourceAdmission;
 use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard, Semaphore};
 
 /// Process-wide EKO resource ceiling shared by every workspace and TaskRun.
@@ -79,8 +80,30 @@ pub(crate) fn process_execution_governor() -> Arc<ProcessExecutionGovernor> {
 }
 
 impl ProcessExecutionGovernor {
+    #[cfg(test)]
     pub(crate) fn shell_semaphore(&self) -> Arc<Semaphore> {
         self.shell.clone()
+    }
+
+    /// Product resource policy for background command cells.
+    ///
+    /// The framework's cell runner awaits this in the Queued phase, after the
+    /// launch call has already returned its receipt. That keeps the process-wide
+    /// `shell = 1` ceiling without making an admitted cell's receipt wait for a
+    /// slot that a long-running command may hold for an hour.
+    pub(crate) fn shell_admission(&self) -> Arc<dyn CommandCellResourceAdmission> {
+        echo_agent::tools::native_execution::command_cell_resource_admission(
+            self.native_shell_admission(),
+        )
+    }
+
+    /// 同一进程 shell 政策供所有 Agent 托管原生命令使用。
+    pub(crate) fn native_shell_admission(
+        &self,
+    ) -> Arc<dyn echo_agent::tools::NativeExecutionResourceAdmission> {
+        Arc::new(ProcessShellResourceAdmission {
+            shell: self.shell.clone(),
+        })
     }
 
     fn snapshot(&self) -> ProcessExecutionResourceSnapshot {
@@ -110,6 +133,52 @@ use super::store::{
     TaskRuntimeStore,
 };
 use super::types::*;
+
+/// Product resource admission for one background command cell.
+///
+/// Eclip caps concurrent shells at one process-wide slot. The framework cell
+/// runner awaits this after the cell is accepted, so the launch receipt never
+/// waits for an unrelated long-running command, while the slot is still held
+/// until the admitted process drains.
+struct ProcessShellResourceAdmission {
+    shell: Arc<Semaphore>,
+}
+
+impl ProcessShellResourceAdmission {
+    async fn acquire(
+        &self,
+        cancel: &CancellationToken,
+        deadline: std::time::Instant,
+    ) -> Result<
+        echo_agent::tools::InvocationResourceGuard,
+        echo_agent::tools::NativeExecutionAdmissionError,
+    > {
+        use echo_agent::tools::NativeExecutionAdmissionError;
+        let permit = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(NativeExecutionAdmissionError::Cancelled),
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => return Err(NativeExecutionAdmissionError::Deadline),
+            result = self.shell.clone().acquire_owned() => result.map_err(|_| NativeExecutionAdmissionError::Closed)?,
+        };
+        Ok(echo_agent::tools::InvocationResourceGuard::new(permit))
+    }
+}
+
+impl echo_agent::tools::NativeExecutionResourceAdmission for ProcessShellResourceAdmission {
+    fn admit<'a>(
+        &'a self,
+        cancel: &'a CancellationToken,
+        deadline: std::time::Instant,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<
+            echo_agent::tools::InvocationResourceGuard,
+            echo_agent::tools::NativeExecutionAdmissionError,
+        >,
+    > {
+        Box::pin(self.acquire(cancel, deadline))
+    }
+}
 
 /// EKO product-resource limits. Only the Subagent cap is passed to the
 /// framework DAG kernel; write, shell, and LLM limits stay in the application.
@@ -449,11 +518,107 @@ pub async fn launch_task_run_resume(
     cancel: CancellationToken,
     workspace_io: Option<crate::state::WorkspaceIoInvocation>,
 ) -> Result<TaskRunResumeLaunch, StoreError> {
+    launch_task_run_resume_input(
+        store,
+        expected,
+        primary_agent,
+        pool_execution,
+        review_integration,
+        trace_sink,
+        cancel,
+        workspace_io,
+        None,
+    )
+    .await
+}
+
+/// 同一原launch owner额外携带输入历史，源接受与原expected CAS在原run锁内同batch完成。
+#[cfg(feature = "channels")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn launch_task_run_resume_with_input(
+    store: Arc<TaskRuntimeStore>,
+    expected: TaskRunResumeIdentity,
+    primary_agent: crate::agent_handle::AgentHandle,
+    pool_execution: Option<crate::agent_pool::AgentPoolExecutionLease>,
+    review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
+    trace_sink: Option<ExecSink>,
+    cancel: CancellationToken,
+    workspace_io: Option<crate::state::WorkspaceIoInvocation>,
+    turn_id: String,
+    input: super::types::RunInputSnapshot,
+) -> Result<TaskRunResumeLaunch, StoreError> {
+    launch_task_run_resume_input(
+        store,
+        expected,
+        primary_agent,
+        pool_execution,
+        review_integration,
+        trace_sink,
+        cancel,
+        workspace_io,
+        Some((turn_id, input)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn launch_task_run_resume_input(
+    store: Arc<TaskRuntimeStore>,
+    expected: TaskRunResumeIdentity,
+    primary_agent: crate::agent_handle::AgentHandle,
+    pool_execution: Option<crate::agent_pool::AgentPoolExecutionLease>,
+    review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
+    trace_sink: Option<ExecSink>,
+    cancel: CancellationToken,
+    workspace_io: Option<crate::state::WorkspaceIoInvocation>,
+    input: Option<(String, super::types::RunInputSnapshot)>,
+) -> Result<TaskRunResumeLaunch, StoreError> {
     let run_id = expected.run_id.clone();
     let admission = store.reserve_run_driver_admission(run_id.clone(), cancel.clone())?;
     let generation_lease = store.lease_active_workspace_generation()?;
     let registration =
         store.register_observed_run_driver::<RunOutcome>(admission, generation_lease)?;
+    if let Some(snapshot) = store.get_run_state(&run_id)? {
+        if let Some(binding) = snapshot.domain_binding.as_ref() {
+            let verification = match pool_execution.as_ref() {
+                Some(lease) if Arc::ptr_eq(primary_agent.inner(), lease.agent().inner()) => {
+                    lease.verify_domain_binding(binding).await
+                }
+                _ => Err(
+                    "domain resume requires its original target Agent and live pool lease"
+                        .to_string(),
+                ),
+            };
+            if let Err(error) = verification {
+                registration.reject(error.clone());
+                return Err(StoreError::InvalidPlan(error));
+            }
+        } else if snapshot.run.domain_profile != DomainProfile::General {
+            let error =
+                "historical professional run cannot resume without its original plugin binding"
+                    .to_string();
+            registration.reject(error.clone());
+            return Err(StoreError::InvalidPlan(error));
+        }
+    }
+    let invocation_resources = match (
+        store
+            .get_run_state(&run_id)?
+            .and_then(|state| state.domain_binding),
+        pool_execution.as_ref(),
+    ) {
+        (Some(binding), Some(execution)) => {
+            let projection = super::compact_context::task_runtime_projection_registry()
+                .retain_for_invocation(&run_id, store.clone())
+                .map_err(StoreError::InvalidPlan)?;
+            vec![
+                execution
+                    .domain_resource_guard(&run_id, &binding, Some(Arc::new(projection)))
+                    .map_err(StoreError::InvalidPlan)?,
+            ]
+        }
+        _ => Vec::new(),
+    };
     TaskRuntimeOperation::new(store.clone())
         .run_owned("prepare exact TaskRun resume", move || {
             let mut registration = registration;
@@ -483,7 +648,13 @@ pub async fn launch_task_run_resume(
             }
             let execution_profile = snapshot.execution_profile;
             let run_goal = snapshot.run.goal;
-            if let Err(error) = store.resume_task_run_expected(&expected) {
+            let resumed = match input.as_ref() {
+                Some((turn_id, input)) => {
+                    store.resume_task_run_expected_with_input(&expected, turn_id, input)
+                }
+                None => store.resume_task_run_expected(&expected),
+            };
+            if let Err(error) = resumed {
                 let detail = error.to_string();
                 if matches!(error, StoreError::ResumeOutcomeUnknown { .. }) {
                     registration.fail_preparation(detail);
@@ -509,7 +680,7 @@ pub async fn launch_task_run_resume(
                         let reviewer_llm = primary_agent
                             .read(|agent| agent.llm_client().cloned())
                             .await;
-                        return execute_run(
+                        return execute_run_with_resources(
                             preparation_store,
                             Some(primary_agent),
                             reviewer_llm,
@@ -520,12 +691,13 @@ pub async fn launch_task_run_resume(
                             cancel,
                             super::memory_bridge::MemoryPolicy::BestEffortSettled,
                             workspace_io,
+                            invocation_resources,
                         )
                         .await
                         .map_err(super::store::RunDriverFailure::from);
                     }
 
-                    drive_agent_run(
+                    drive_agent_run_with_resources(
                         preparation_store.clone(),
                         primary_agent,
                         &preparation_run_id,
@@ -537,6 +709,7 @@ pub async fn launch_task_run_resume(
                         execution_profile.plan_policy,
                         trace_sink,
                         workspace_io,
+                        invocation_resources,
                     )
                     .await
                     .map_err(super::store::RunDriverFailure::from)?;
@@ -686,5 +859,19 @@ impl From<ExecError> for super::store::RunDriverFailure {
             ExecError::Framework(source) => Self::from(source),
             other => Self::Error(other.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+impl ProcessExecutionGovernor {
+    /// 独立夹具模拟一个产品实例，复用真实默认政策与准入机制。
+    /// 同一实例内的 Chat/Run 仍共享容量 1；生产全局接线另走真实构造器验证。
+    pub(crate) fn isolated_for_test() -> Arc<Self> {
+        let limits = EkoExecutionLimits::default();
+        Arc::new(Self {
+            write: Arc::new(Semaphore::new(limits.max_concurrent_writes.max(1))),
+            shell: Arc::new(Semaphore::new(limits.max_concurrent_shells.max(1))),
+            llm: Arc::new(Semaphore::new(limits.max_parallel_llm_calls.max(1))),
+        })
     }
 }

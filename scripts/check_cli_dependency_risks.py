@@ -66,8 +66,8 @@ def verify_inputs(root: Path, policy: dict) -> list[dict]:
         raise ValueError("consumer inputs changed; human risk reassessment required")
     packages = tomllib.loads(lock.decode())["package"]
     risks = policy["accepted"]
-    if len(risks) != 6 or len({r["advisory"] for r in risks}) != 6:
-        raise ValueError("expected six distinct human-accepted risks")
+    if len(risks) != 5 or len({r["advisory"] for r in risks}) != 5:
+        raise ValueError("expected five distinct risks in the current exact binding")
     for risk in risks:
         matches = [p for p in packages if all(p.get(k) == risk[k] for k in IDENTITY_FIELDS)]
         if len(matches) != 1:
@@ -76,6 +76,9 @@ def verify_inputs(root: Path, policy: dict) -> list[dict]:
 
 
 def verify_report(report: dict, scanner_exit: int, policy: dict, package_count: int) -> list[str]:
+    risks = policy["accepted"]
+    if len(risks) != 5 or len({r["advisory"] for r in risks}) != 5:
+        raise ValueError("expected five distinct risks in the current exact binding")
     if set(report) != {"database", "lockfile", "settings", "vulnerabilities", "warnings"}:
         raise ValueError("unexpected cargo-audit report schema")
     if not isinstance(report["database"].get("advisory-count"), int) or report["database"]["advisory-count"] <= 0:
@@ -108,6 +111,9 @@ def verify_report(report: dict, scanner_exit: int, policy: dict, package_count: 
             if advisory["id"] in accepted:
                 raise ValueError("duplicate advisory finding")
             accepted.append(advisory["id"])
+    expected = {risk["advisory"] for risk in risks}
+    if set(accepted) != expected:
+        raise ValueError(f"exact warning set differs; missing={sorted(expected - set(accepted))}")
     if scanner_exit != (1 if accepted else 0):
         raise ValueError(f"scanner failed or exit/report disagree: {scanner_exit}")
     return sorted(accepted)

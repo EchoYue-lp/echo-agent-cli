@@ -109,9 +109,11 @@ Journal append 是 surface 交付边界。surface 接收 journaled event，而�
 ## ReAct Checkpoint 与 ConversationStore
 
 压缩预算与活动窗口由框架拥有；EKO 不复制 selector。TaskRuntime goal/recovery capsule
-是可替换的 protected projection，最近四条已记录 steer 按时间顺序保留完整有界 excerpt，
+按语义版本追加，只有最新动态版本 protected，旧版可由原压缩安全点回收；固定 Goal
+指令与动态预算分开。最近四条已记录 steer 按时间顺序保留完整有界 excerpt，
 压缩和刷新不依赖模型重新猜测约束。手动变换成功后的 ChatEventLog safe point 由 app-core
 owner 结算，取消或 caller drop 不丢弃已接受提交。见 [ADR 0048](../adr/0048-context-compression-product-policy.md)。
+动态来源和清除策略见 [ADR 0065](../adr/0065-cache-prefix-facts.md)。
 
 Workspace runtime 同时配置：
 
@@ -185,3 +187,9 @@ Trace 写入失败当前不会回滚 TaskRuntime 已提交事件，因此 Trace 
 - 普通 Chat Journal：`echo-agent-app-core/src/chat_event_log/journal.rs`
 - Observability projection：`echo-agent-app-core/src/observability/`
 - Workspace 文件布局：`echo-agent-app-core/src/workspace/layout.rs`
+
+## 后台回执与保存失败
+
+普通 Chat/TaskRun 的后台 shell 在原 cell 接纳后返回回执，产品全进程 shell=1 由原 Queued runner 获取。原 TaskTracker 保有启动到 terminal observer 的交接；完整调用身份可以重取原回执，新 call_id 才表示新的业务执行。Started/Finished 事实与 blocked/unknown 继续由原持久化路径维护，保存失败不触发命令重放。许可直到原观察 owner 结算后释放。详见 [ADR 0064](../adr/0064-background-cell-receipt-ownership.md)。
+
+启动登记与关机封口共用回执观察的原临界区；关机必须先等已通过关闭检查的调用登记 producer，再关闭原 TaskTracker 并等待结算。该临界区在 close 后立即释放，异步结算不持锁。

@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { LEFT_SIDEBAR_WIDTH } from '../lib/layoutMetrics';
 
 export type SubagentPaneTarget = {
   kind: 'subagent';
@@ -51,7 +52,7 @@ export function contextPaneWidthForViewport(
   const bounded = boundContextPaneWidth(preferredWidth);
   if (viewportWidth < 1280) return Math.min(bounded, Math.floor(viewportWidth * 0.94));
 
-  const leftSidebarWidth = leftSidebarOpen ? 264 : 0;
+  const leftSidebarWidth = leftSidebarOpen ? LEFT_SIDEBAR_WIDTH : 0;
   const available = viewportWidth - leftSidebarWidth - 520;
   return Math.max(380, Math.min(bounded, available));
 }

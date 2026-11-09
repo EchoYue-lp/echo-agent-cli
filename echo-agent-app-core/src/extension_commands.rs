@@ -126,7 +126,6 @@ pub enum ExtensionKind {
     Plugins,
     Mcp,
     Hooks,
-    Lsp,
     Browser,
 }
 
@@ -163,7 +162,6 @@ pub enum ExtensionCommand {
     Plugins(PluginCommand),
     Mcp(McpCommand),
     Hooks(HookCommand),
-    Lsp(LspCommand),
     Browser(BrowserCommand),
 }
 
@@ -174,7 +172,6 @@ impl ExtensionCommand {
             Self::Plugins(_) => ExtensionKind::Plugins,
             Self::Mcp(_) => ExtensionKind::Mcp,
             Self::Hooks(_) => ExtensionKind::Hooks,
-            Self::Lsp(_) => ExtensionKind::Lsp,
             Self::Browser(_) => ExtensionKind::Browser,
         }
     }
@@ -330,29 +327,6 @@ pub enum HookCommand {
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(tag = "action", rename_all = "snake_case")]
 #[ts(export)]
-pub enum LspCommand {
-    List,
-    Status,
-    Start { language: String },
-    Stop { language: String },
-    Restart { language: String },
-}
-
-impl LspCommand {
-    fn specialist_args(&self) -> (&'static str, Option<&str>) {
-        match self {
-            Self::List => ("list", None),
-            Self::Status => ("status", None),
-            Self::Start { language } => ("start", Some(language)),
-            Self::Stop { language } => ("stop", Some(language)),
-            Self::Restart { language } => ("restart", Some(language)),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
-#[serde(tag = "action", rename_all = "snake_case")]
-#[ts(export)]
 pub enum BrowserCommand {
     Status,
     Managed,
@@ -492,7 +466,12 @@ pub fn parse_extension_command(
         "/plugins" => parse_plugin_command(arguments).map(ExtensionCommand::Plugins),
         "/mcp" => parse_mcp_command(arguments).map(ExtensionCommand::Mcp),
         "/hooks" => parse_hook_command(arguments).map(ExtensionCommand::Hooks),
-        "/lsp" => parse_lsp_command(arguments).map(ExtensionCommand::Lsp),
+        "/lsp" => {
+            return Err(ExtensionCommandParseError::new(
+                None,
+                "LSP has been retired from EKO; language-server commands are unsupported",
+            ));
+        }
         "/browser" => parse_browser_command(arguments).map(ExtensionCommand::Browser),
         _ => return Ok(None),
     }?;
@@ -775,29 +754,6 @@ fn parse_hook_command(input: &str) -> Result<HookCommand, ExtensionCommandParseE
     }
 }
 
-fn parse_lsp_command(input: &str) -> Result<LspCommand, ExtensionCommandParseError> {
-    let (action, rest) = split_head(input).unwrap_or(("status", ""));
-    let language =
-        |usage: &str| required_argument(ExtensionKind::Lsp, rest, usage).map(str::to_string);
-    match action {
-        "" | "status" => Ok(LspCommand::Status),
-        "list" | "ls" => Ok(LspCommand::List),
-        "start" => Ok(LspCommand::Start {
-            language: language("/lsp start <language>")?,
-        }),
-        "stop" => Ok(LspCommand::Stop {
-            language: language("/lsp stop <language>")?,
-        }),
-        "restart" => Ok(LspCommand::Restart {
-            language: language("/lsp restart <language>")?,
-        }),
-        _ => Err(ExtensionCommandParseError::new(
-            Some(ExtensionKind::Lsp),
-            "/lsp [list|status|start|stop|restart] [language]",
-        )),
-    }
-}
-
 fn parse_browser_command(input: &str) -> Result<BrowserCommand, ExtensionCommandParseError> {
     let (action, rest) = split_head(input).unwrap_or(("status", ""));
     let error = |usage: &str| ExtensionCommandParseError::new(Some(ExtensionKind::Browser), usage);
@@ -983,10 +939,6 @@ pub enum ExtensionCommandReceipt {
         meta: ExtensionReceiptMeta,
         receipt: Option<HookCommandReceipt>,
     },
-    Lsp {
-        meta: ExtensionReceiptMeta,
-        receipt: Option<ExtensionMessageReceipt>,
-    },
     Browser {
         meta: ExtensionReceiptMeta,
         receipt: Option<ExtensionMessageReceipt>,
@@ -1004,7 +956,6 @@ impl ExtensionCommandReceipt {
             | Self::Plugins { meta, .. }
             | Self::Mcp { meta, .. }
             | Self::Hooks { meta, .. }
-            | Self::Lsp { meta, .. }
             | Self::Browser { meta, .. } => meta,
         }
     }
@@ -1066,10 +1017,6 @@ impl ExtensionCommandReceipt {
                 meta,
                 receipt: None,
             },
-            ExtensionKind::Lsp => Self::Lsp {
-                meta,
-                receipt: None,
-            },
             ExtensionKind::Browser => Self::Browser {
                 meta,
                 receipt: None,
@@ -1098,9 +1045,6 @@ impl ExtensionCommandReceipt {
             Self::Plugins { receipt, .. } => render_plugin_command(receipt.as_ref(), &mut lines),
             Self::Mcp { receipt, .. } => render_mcp_command(receipt.as_ref(), &mut lines),
             Self::Hooks { receipt, .. } => render_hook_command(receipt.as_ref(), &mut lines),
-            Self::Lsp { receipt, .. } => {
-                render_message_command("LSP", receipt.as_ref(), &mut lines)
-            }
             Self::Browser { receipt, .. } => {
                 render_message_command("Browser", receipt.as_ref(), &mut lines);
             }
@@ -1254,7 +1198,7 @@ fn render_plugin_command(receipt: Option<&PluginCommandReceipt>, lines: &mut Vec
         },
         Some(PluginCommandReceipt::Mutation { projection }) => {
             lines.push(format!(
-                "Plugin mutation plugin_id={} status={} total={} enabled={} skills={} hooks={} mcp={} agents={} lsp={} monitors={} themes={} output_styles={}",
+                "Plugin mutation plugin_id={} status={} total={} enabled={} skills={} hooks={} mcp={} agents={} monitors={} themes={} output_styles={}",
                 projection.plugin_id.as_deref().unwrap_or("none"),
                 projection.status.as_str(),
                 projection.summary.total,
@@ -1263,7 +1207,6 @@ fn render_plugin_command(receipt: Option<&PluginCommandReceipt>, lines: &mut Vec
                 projection.summary.hooks_registered,
                 projection.summary.mcp_connected,
                 projection.summary.agents_loaded,
-                projection.summary.lsp_languages_loaded,
                 projection.summary.monitors_loaded,
                 projection.summary.themes_loaded,
                 projection.summary.output_styles_loaded,
@@ -1644,7 +1587,6 @@ pub struct PluginReloadProjection {
     pub hooks_registered: usize,
     pub mcp_connected: usize,
     pub agents_loaded: usize,
-    pub lsp_languages_loaded: usize,
     pub monitors_loaded: usize,
     pub themes_loaded: usize,
     pub output_styles_loaded: usize,
@@ -2007,9 +1949,6 @@ async fn dispatch_owned(
         }
         ExtensionCommand::Hooks(command) => {
             dispatch_hook(&state, Some(&runtime), identity, scope, command).await
-        }
-        ExtensionCommand::Lsp(command) => {
-            dispatch_lsp(&state, Some(&runtime), identity, scope, command).await
         }
         ExtensionCommand::Browser(command) => {
             dispatch_browser(
@@ -2560,35 +2499,6 @@ async fn dispatch_hook(
     }
 }
 
-async fn dispatch_lsp(
-    state: &Arc<AppState>,
-    runtime: Option<&ScopedChatRuntime>,
-    identity: ExtensionCommandIdentity,
-    scope: ExtensionRequestScope,
-    command: LspCommand,
-) -> ExtensionCommandReceipt {
-    let (action, language) = command.specialist_args();
-    match state
-        .extension_control
-        .lsp_command_scoped(state, runtime, action, language)
-        .await
-    {
-        Ok(message) => ExtensionCommandReceipt::Lsp {
-            meta: success_meta(identity, scope, ExtensionCommandStatus::Settled),
-            receipt: Some(ExtensionMessageReceipt {
-                action: action.to_string(),
-                message: bounded_text(message),
-            }),
-        },
-        Err(error) => ExtensionCommandReceipt::failed_scoped(
-            ExtensionKind::Lsp,
-            identity,
-            scope,
-            error.to_string(),
-        ),
-    }
-}
-
 async fn dispatch_browser(
     state: &Arc<AppState>,
     runtime: Option<&ScopedChatRuntime>,
@@ -3001,7 +2911,6 @@ fn project_plugin_mutation(receipt: PluginMutationReceipt) -> PluginCommandRecei
                 hooks_registered: receipt.summary.hooks_registered,
                 mcp_connected: receipt.summary.mcp_connected,
                 agents_loaded: receipt.summary.agents_loaded,
-                lsp_languages_loaded: receipt.summary.lsp_languages_loaded,
                 monitors_loaded: receipt.summary.monitors_loaded,
                 themes_loaded: receipt.summary.themes_loaded,
                 output_styles_loaded: receipt.summary.output_styles_loaded,
@@ -3130,6 +3039,14 @@ mod tests {
     }
 
     #[test]
+    fn retired_lsp_commands_fail_before_runtime_and_are_not_deserializable() {
+        let parsed = parse_extension_command("/lsp status", ExtensionCommandIdentity::random());
+        assert!(parsed.is_err_and(|error| error.to_string().contains("retired")));
+        let request = serde_json::json!({"request_id":"old", "operation_id":"old", "extension":"lsp", "command":{"action":"status"}});
+        assert!(serde_json::from_value::<ExtensionCommandRequest>(request).is_err());
+    }
+
+    #[test]
     fn skill_receipt_status_preserves_settled_and_degraded() {
         let settled = SkillCommandReceipt::Enabled {
             settlement: skill_sync_receipt(SkillSettlementStatus::Settled),
@@ -3155,7 +3072,6 @@ mod tests {
             ("/plugins reload", ExtensionKind::Plugins),
             ("/mcp connect github", ExtensionKind::Mcp),
             ("/hooks reload", ExtensionKind::Hooks),
-            ("/lsp restart rust", ExtensionKind::Lsp),
             (
                 "/browser navigate https://example.com",
                 ExtensionKind::Browser,
@@ -3324,7 +3240,6 @@ mod tests {
                 hooks_registered: 0,
                 mcp_connected: 0,
                 agents_loaded: 0,
-                lsp_languages_loaded: 0,
                 monitors_loaded: 0,
                 themes_loaded: 0,
                 output_styles_loaded: 0,

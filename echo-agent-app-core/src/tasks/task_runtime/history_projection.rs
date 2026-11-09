@@ -12,13 +12,18 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::event_rebuild::{artifact_from_event, review_from_event};
-use super::types::{Artifact, ReviewResult, RuntimeTaskEvent};
+use super::types::{
+    Artifact, ReviewResult, RunInputSnapshot, RuntimeEventKind, RuntimeTaskEvent, TaskRun,
+};
+use echo_agent::state::journal::JournalIdentity;
 
 const HISTORY_SCHEMA: u8 = 1;
 const ARTIFACT_FILE: &str = "artifact-history.jsonl";
 const ARTIFACT_METADATA_FILE: &str = "artifact-history.meta.jsonl";
 const REVIEW_DIRECTORY: &str = "review-history";
 const CURSOR_FILE: &str = "history-cursor.json";
+const RAW_INPUT_FILE: &str = "raw-input-history.jsonl";
+const RAW_INPUT_METADATA_FILE: &str = "raw-input-history.meta.jsonl";
 const EMPTY_HASH_CHAIN: &str = "taskruntime-history-v1";
 const MAX_REVIEW_FALLBACK_TASKS: usize = 8;
 const MAX_REVIEW_FALLBACK_RECORDS: usize = 10_000;
@@ -33,7 +38,9 @@ pub(crate) enum HistoryProjectionApplyStatus {
 #[serde(deny_unknown_fields)]
 struct HistoryCursor {
     schema_version: u8,
+    journal_identity: String,
     through_sequence: u64,
+    raw_input_metadata: SegmentMetadata,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -49,6 +56,52 @@ struct ReviewRecord {
     source_sequence: u64,
     task_id: String,
     review: ReviewResult,
+}
+
+/// 同一journal的原始来源读模型；不解释意图，不合并接纳与投递事实。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInputRecord {
+    source_sequence: u64,
+    #[serde(serialize_with = "serialize_raw_source_event")]
+    event: RuntimeTaskEvent,
+}
+
+fn serialize_raw_source_event<S: serde::Serializer>(
+    event: &RuntimeTaskEvent,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let mut value = serde_json::to_value(event).map_err(<S::Error as serde::ser::Error>::custom)?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        <S::Error as serde::ser::Error>::custom("raw source event is not an object")
+    })?;
+    // 源时间是事实；不能让主机时区变化重写同一来源的字节/SHA/cursor。
+    object.insert(
+        "timestamp".to_string(),
+        serde_json::Value::String(
+            event
+                .timestamp
+                .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+        ),
+    );
+    value.serialize(serializer)
+}
+
+impl HistoryRecord for RawInputRecord {
+    fn source_sequence(&self) -> u64 {
+        self.source_sequence
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RawInputHistorySnapshot {
+    pub(crate) run_id: String,
+    pub(crate) journal_identity: String,
+    pub(crate) observed_through_sequence: u64,
+    pub(crate) last_source_sequence: u64,
+    pub(crate) source_records: u64,
+    pub(crate) inline_initial_text: Option<String>,
+    pub(crate) text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,10 +156,13 @@ impl HistoryRecord for ReviewRecord {
 
 pub(crate) struct HistoryProjection {
     run_id: String,
+    journal_identity: String,
     run_directory: PathBuf,
     through_sequence: u64,
     needs_full_rebuild: bool,
     artifact_metadata: Option<SegmentMetadata>,
+    raw_input_metadata: Option<SegmentMetadata>,
+    raw_input_through_sequence: u64,
     review_metadata: BTreeMap<String, SegmentMetadata>,
     artifact_fallback: Option<(u64, Vec<Artifact>)>,
     review_fallbacks: BTreeMap<String, CachedReviewFallback>,
@@ -127,20 +183,32 @@ pub(crate) struct HistoryProjection {
 }
 
 impl HistoryProjection {
-    pub(crate) fn open(run_id: &str, run_directory: &Path, journal_head: u64) -> Self {
+    pub(crate) fn open(
+        run_id: &str,
+        run_directory: &Path,
+        journal_head: u64,
+        journal_identity: &JournalIdentity,
+    ) -> Self {
         let cursor_path = run_directory.join(CURSOR_FILE);
         let cursor = std::fs::read(&cursor_path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<HistoryCursor>(&bytes).ok())
             .filter(|cursor| {
-                cursor.schema_version == HISTORY_SCHEMA && cursor.through_sequence <= journal_head
+                cursor.schema_version == HISTORY_SCHEMA
+                    && cursor.journal_identity == journal_identity.as_str()
+                    && cursor.through_sequence <= journal_head
             });
         Self {
             run_id: run_id.to_string(),
+            journal_identity: journal_identity.as_str().to_string(),
             run_directory: run_directory.to_path_buf(),
             through_sequence: cursor.as_ref().map_or(0, |cursor| cursor.through_sequence),
             needs_full_rebuild: cursor.is_none() && journal_head != 0,
             artifact_metadata: None,
+            raw_input_metadata: cursor
+                .as_ref()
+                .map(|cursor| cursor.raw_input_metadata.clone()),
+            raw_input_through_sequence: cursor.as_ref().map_or(0, |cursor| cursor.through_sequence),
             review_metadata: BTreeMap::new(),
             artifact_fallback: None,
             review_fallbacks: BTreeMap::new(),
@@ -200,6 +268,10 @@ impl HistoryProjection {
         events: &[RuntimeTaskEvent],
         through_sequence: u64,
     ) -> Result<(), String> {
+        if self.raw_input_through_sequence < self.through_sequence {
+            return Err("raw source family is behind the committed history cursor".to_string());
+        }
+        let raw_inputs = project_raw_input_records(events, &self.run_id)?;
         let mut artifacts = Vec::new();
         let mut reviews = BTreeMap::<String, Vec<ReviewRecord>>::new();
         for event in events {
@@ -222,6 +294,39 @@ impl HistoryProjection {
                         review,
                     });
             }
+        }
+
+        if !self.raw_input_path().exists() {
+            if self.through_sequence != 0 {
+                return Err("raw input history is missing behind its cursor".to_string());
+            }
+            self.raw_input_metadata = Some(replace_records::<RawInputRecord>(
+                &self.raw_input_path(),
+                &self.raw_input_metadata_path(),
+                &[],
+            )?);
+        }
+        if !raw_inputs.is_empty() {
+            let metadata = match self.raw_input_metadata.clone() {
+                Some(metadata) => metadata,
+                None => {
+                    read_validated_records::<RawInputRecord>(
+                        &self.raw_input_path(),
+                        &self.raw_input_metadata_path(),
+                    )?
+                    .1
+                }
+            };
+            let pending = raw_inputs
+                .iter()
+                .filter(|record| record.source_sequence > metadata.last_source_sequence)
+                .collect::<Vec<_>>();
+            self.raw_input_metadata = Some(append_records(
+                &self.raw_input_path(),
+                &self.raw_input_metadata_path(),
+                &pending,
+                metadata,
+            )?);
         }
 
         if !self.artifact_path().exists() {
@@ -307,6 +412,7 @@ impl HistoryProjection {
 
         self.write_cursor(through_sequence)?;
         self.through_sequence = through_sequence;
+        self.raw_input_through_sequence = through_sequence;
         self.needs_full_rebuild = false;
         Ok(())
     }
@@ -329,6 +435,7 @@ impl HistoryProjection {
     ) -> Result<(), String> {
         let artifacts = project_artifact_records(events)?;
         let reviews = project_review_records(events)?;
+        self.replace_raw_inputs(events, through_sequence)?;
         let review_directory = self.run_directory.join(REVIEW_DIRECTORY);
         match std::fs::remove_dir_all(&review_directory) {
             Ok(()) => {}
@@ -353,6 +460,7 @@ impl HistoryProjection {
         }
         self.write_cursor(through_sequence)?;
         self.through_sequence = through_sequence;
+        self.raw_input_through_sequence = through_sequence;
         self.needs_full_rebuild = false;
         self.artifact_fallback = None;
         self.review_fallbacks.clear();
@@ -476,6 +584,138 @@ impl HistoryProjection {
         ))
     }
 
+    fn raw_input_path(&self) -> PathBuf {
+        self.run_directory.join(RAW_INPUT_FILE)
+    }
+
+    fn raw_input_metadata_path(&self) -> PathBuf {
+        self.run_directory.join(RAW_INPUT_METADATA_FILE)
+    }
+
+    /// 仅替换可丢弃的来源族。失败时不能推进其覆盖序号，原journal不变。
+    pub(crate) fn replace_raw_inputs(
+        &mut self,
+        events: &[RuntimeTaskEvent],
+        through_sequence: u64,
+    ) -> Result<(), String> {
+        let records = project_raw_input_records(events, &self.run_id)?;
+        if records
+            .last()
+            .is_some_and(|record| record.source_sequence > through_sequence)
+        {
+            return Err("raw input history exceeds its journal cut".to_string());
+        }
+        self.raw_input_metadata = Some(replace_records(
+            &self.raw_input_path(),
+            &self.raw_input_metadata_path(),
+            &records,
+        )?);
+        self.raw_input_through_sequence = through_sequence;
+        Ok(())
+    }
+
+    pub(crate) fn raw_input_snapshot(
+        &mut self,
+        run: &TaskRun,
+        through_sequence: u64,
+    ) -> Result<RawInputHistorySnapshot, String> {
+        if run.run_id != self.run_id || through_sequence > self.raw_input_through_sequence {
+            return Err(
+                "raw input history is not qualified through this original journal cut".to_string(),
+            );
+        }
+        let (records, metadata) = read_validated_records::<RawInputRecord>(
+            &self.raw_input_path(),
+            &self.raw_input_metadata_path(),
+        )?;
+        validate_increasing(records.iter().map(|record| record.source_sequence))?;
+        if metadata.last_source_sequence > self.raw_input_through_sequence {
+            return Err("raw input metadata exceeds its qualified journal prefix".to_string());
+        }
+        // 全族cursor同时提交原文段的内容身份；不能以一个旧段的自洽CRC冒完整当前来源。
+        if self
+            .raw_input_metadata
+            .as_ref()
+            .is_some_and(|expected| expected != &metadata)
+        {
+            return Err(
+                "raw source segment does not match its qualified cursor identity".to_string(),
+            );
+        }
+        self.raw_input_metadata = Some(metadata);
+        let records = records
+            .into_iter()
+            .filter(|record| record.source_sequence <= through_sequence)
+            .collect::<Vec<_>>();
+        let mut previous_input = BTreeMap::<String, RunInputSnapshot>::new();
+        let mut inline_initial_text = None;
+        for record in &records {
+            validate_raw_input_record(record, &self.run_id)?;
+            if record.event.event_type == RuntimeEventKind::RunInputAccepted {
+                let input: RunInputSnapshot = serde_json::from_value(
+                    record
+                        .event
+                        .payload
+                        .get("input_snapshot")
+                        .cloned()
+                        .ok_or("raw input snapshot is missing")?,
+                )
+                .map_err(|error| error.to_string())?;
+                if input.identity.address.workspace_id != run.workspace_id
+                    || input.identity.address.conversation_id != run.conversation_id
+                {
+                    return Err("raw input address does not belong to the original Run".to_string());
+                }
+                let role: super::types::RunInputRole = serde_json::from_value(
+                    record
+                        .event
+                        .payload
+                        .get("role")
+                        .cloned()
+                        .ok_or("raw input role is missing")?,
+                )
+                .map_err(|error| error.to_string())?;
+                if role == super::types::RunInputRole::InitialGoal
+                    && input.payload.text.chars().count() <= crate::prepared_turn::PREVIEW_CHARS
+                {
+                    // 一个有界初始原文可直接呈现，短Goal/NoTools不应因派生索引新增reader义务。
+                    inline_initial_text = Some(input.payload.text.clone());
+                }
+                let key = input.key().map_err(|error| error.to_string())?;
+                if let Some(previous) = previous_input.get(&key)
+                    && (previous.source != input.source || previous.identity != input.identity)
+                {
+                    return Err("raw input identity has conflicting immutable payloads".to_string());
+                }
+                previous_input.insert(key, input);
+            }
+        }
+        let last_source_sequence = records.last().map_or(0, |record| record.source_sequence);
+        let source_records =
+            u64::try_from(records.len()).map_err(|_| "raw input source count overflow")?;
+        let mut text = serde_json::to_string(&serde_json::json!({
+            "kind": "original_input_history", "run_id": self.run_id,
+            "workspace_id": run.workspace_id, "conversation_id": run.conversation_id,
+            "journal_identity": self.journal_identity, "last_source_sequence": last_source_sequence,
+            "source_records": source_records,
+        }))
+        .map_err(|error| error.to_string())?;
+        text.push('\n');
+        for record in records {
+            text.push_str(&serde_json::to_string(&record).map_err(|error| error.to_string())?);
+            text.push('\n');
+        }
+        Ok(RawInputHistorySnapshot {
+            run_id: self.run_id.clone(),
+            journal_identity: self.journal_identity.clone(),
+            observed_through_sequence: through_sequence,
+            last_source_sequence,
+            source_records,
+            inline_initial_text,
+            text,
+        })
+    }
+
     fn artifact_path(&self) -> PathBuf {
         self.run_directory.join(ARTIFACT_FILE)
     }
@@ -506,7 +746,12 @@ impl HistoryProjection {
         }
         let bytes = serde_json::to_vec(&HistoryCursor {
             schema_version: HISTORY_SCHEMA,
+            journal_identity: self.journal_identity.clone(),
             through_sequence,
+            raw_input_metadata: self
+                .raw_input_metadata
+                .clone()
+                .unwrap_or_else(SegmentMetadata::initial),
         })
         .map_err(|error| error.to_string())?;
         echo_agent::utils::fs::atomic_write(&self.run_directory.join(CURSOR_FILE), &bytes)
@@ -902,6 +1147,86 @@ pub(crate) fn reviews_from_events(task_id: &str, events: &[RuntimeTaskEvent]) ->
         .collect()
 }
 
+fn is_raw_input_event(kind: RuntimeEventKind) -> bool {
+    matches!(
+        kind,
+        RuntimeEventKind::RunInputAccepted | RuntimeEventKind::RunSteerRecorded
+    )
+}
+
+fn validate_raw_input_record(record: &RawInputRecord, run_id: &str) -> Result<(), String> {
+    if record.event.run_id != run_id
+        || u64::try_from(record.event.seq).ok() != Some(record.source_sequence)
+        || !is_raw_input_event(record.event.event_type)
+    {
+        return Err("raw input history event identity mismatch".to_string());
+    }
+    match record.event.event_type {
+        RuntimeEventKind::RunInputAccepted => {
+            let _: super::types::RunInputRole = serde_json::from_value(
+                record
+                    .event
+                    .payload
+                    .get("role")
+                    .cloned()
+                    .ok_or("raw accepted input lacks its original role")?,
+            )
+            .map_err(|error| error.to_string())?;
+            let input: RunInputSnapshot = serde_json::from_value(
+                record
+                    .event
+                    .payload
+                    .get("input_snapshot")
+                    .cloned()
+                    .ok_or("raw accepted input lacks its original snapshot")?,
+            )
+            .map_err(|error| error.to_string())?;
+            input.validate()?;
+            if record
+                .event
+                .payload
+                .get("turn_id")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|turn| turn.trim().is_empty())
+            {
+                return Err("raw accepted input lacks its original turn".to_string());
+            }
+        }
+        RuntimeEventKind::RunSteerRecorded => {
+            if record
+                .event
+                .payload
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+            {
+                return Err("raw legacy steer lacks its original text".to_string());
+            }
+        }
+        _ => return Err("unexpected raw input event kind".to_string()),
+    }
+    Ok(())
+}
+
+fn project_raw_input_records(
+    events: &[RuntimeTaskEvent],
+    run_id: &str,
+) -> Result<Vec<RawInputRecord>, String> {
+    events
+        .iter()
+        .filter(|event| is_raw_input_event(event.event_type))
+        .map(|event| {
+            let record = RawInputRecord {
+                source_sequence: u64::try_from(event.seq)
+                    .map_err(|_| "raw input sequence overflow")?,
+                event: event.clone(),
+            };
+            validate_raw_input_record(&record, run_id)?;
+            Ok(record)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::types::ReviewOutcome;
@@ -910,7 +1235,7 @@ mod tests {
     #[test]
     fn review_segment_uses_exact_safe_identity_encoding() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let projection = HistoryProjection::open("run", temp.path(), 0);
+        let projection = HistoryProjection::open("run", temp.path(), 0, &JournalIdentity::new());
         let (_, review, _) = projection.paths_for_test("../review/\u{4e2d}\u{6587}/\u{1f600}");
         let review_directory = temp.path().join(REVIEW_DIRECTORY);
         if review.parent() != Some(review_directory.as_path()) {
@@ -931,7 +1256,8 @@ mod tests {
     #[test]
     fn oversized_review_fallback_is_not_cached() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let mut projection = HistoryProjection::open("run", temp.path(), 0);
+        let mut projection =
+            HistoryProjection::open("run", temp.path(), 0, &JournalIdentity::new());
         let review = ReviewResult {
             id: "review".to_string(),
             run_id: "run".to_string(),

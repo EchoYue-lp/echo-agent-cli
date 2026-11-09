@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Workspace, WorkspaceCreateAndSwitchResponse } from '../api/endpoints';
 
 const mocks = vi.hoisted(() => ({
   switchWorkspace: vi.fn(),
@@ -6,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   listWorkspaces: vi.fn(),
   currentWorkspace: vi.fn(),
   deleteWorkspace: vi.fn(),
+  exitWorkspace: vi.fn(),
   resetSession: vi.fn(),
   clearMessages: vi.fn(),
   initConversations: vi.fn(),
@@ -24,6 +26,7 @@ vi.mock('../api/endpoints', () => ({
     list: mocks.listWorkspaces,
     current: mocks.currentWorkspace,
     delete: mocks.deleteWorkspace,
+    exit: mocks.exitWorkspace,
   },
   sessionApi: {
     reset: mocks.resetSession,
@@ -71,8 +74,36 @@ vi.mock('./toastStore', () => ({
 
 import { useWorkspaceStore } from './workspaceStore';
 
-function workspace(id: string, name: string, generation: string) {
-  return { id, name, product_data_generation: generation };
+function workspace(id: string, name: string, generation: string): Workspace {
+  return {
+    id,
+    name,
+    product_data_generation: generation,
+    root: `/product-data/${id}`,
+    kind: { type: 'code' },
+    metadata: {
+      tags: [],
+      project_location: { kind: 'local' as const, path: `/product-data/${id}` },
+    },
+    created_at: '',
+    last_active: '',
+  };
+}
+
+function createdWorkspace(workspace: Workspace): WorkspaceCreateAndSwitchResponse {
+  return {
+    success: true,
+    created: true,
+    switched: true,
+    workspace,
+    transition: {
+      status: 'committed',
+      previous_workspace_id: null,
+      target_workspace_id: workspace.id,
+      target_root: workspace.root,
+      degraded_subsystems: [],
+    },
+  };
 }
 
 function deferred<T>() {
@@ -84,6 +115,36 @@ function deferred<T>() {
 }
 
 describe('workspaceStore file identity integration', () => {
+  it('keeps the source projection while a fenced native switch rejects a reopened target', async () => {
+    const source = workspace('source', 'Source', 'source-generation');
+    useWorkspaceStore.setState({ current: source });
+    mocks.switchWorkspace.mockRejectedValueOnce(new Error('stale workspace generation'));
+    mocks.currentWorkspace.mockResolvedValueOnce({ workspace: source, active: true });
+    await expect(
+      useWorkspaceStore.getState().switchTo('target', undefined, 'retired-generation')
+    ).rejects.toThrow('stale workspace generation');
+    expect(mocks.switchWorkspace).toHaveBeenCalledWith('target', undefined, 'retired-generation');
+    expect(useWorkspaceStore.getState().current).toBe(source);
+    expect(useWorkspaceStore.getState().isLoading).toBe(false);
+    expect(mocks.clearMessages).not.toHaveBeenCalled();
+    expect(mocks.detachConversations).not.toHaveBeenCalled();
+    expect(mocks.bindScope).not.toHaveBeenCalled();
+    expect(mocks.initConversations).not.toHaveBeenCalled();
+  });
+
+  it('refreshes registry rows without clearing or switching the source projection', async () => {
+    const source = workspace('source', 'Source', 'source-generation');
+    const actual = workspace('target', 'Real target', 'current-generation');
+    useWorkspaceStore.setState({ current: source });
+    mocks.listWorkspaces.mockResolvedValueOnce({ workspaces: [source, actual], count: 2 });
+    await useWorkspaceStore.getState().refreshList();
+    expect(useWorkspaceStore.getState().current).toBe(source);
+    expect(useWorkspaceStore.getState().workspaces).toEqual([source, actual]);
+    expect(mocks.clearMessages).not.toHaveBeenCalled();
+    expect(mocks.switchWorkspace).not.toHaveBeenCalled();
+    expect(mocks.bindScope).not.toHaveBeenCalled();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     useWorkspaceStore.setState({ current: null, workspaces: [], isLoading: false });
@@ -120,6 +181,7 @@ describe('workspaceStore file identity integration', () => {
     });
     mocks.resetSession.mockResolvedValue(undefined);
     mocks.deleteWorkspace.mockResolvedValue({ success: true });
+    mocks.exitWorkspace.mockResolvedValue({ success: true, transition: { status: 'committed' } });
     mocks.initConversations.mockResolvedValue(undefined);
     mocks.loadTree.mockResolvedValue(undefined);
     mocks.loadChanges.mockResolvedValue(undefined);
@@ -172,7 +234,8 @@ describe('workspaceStore file identity integration', () => {
     expect(mocks.createAndSwitchWorkspace).toHaveBeenCalledWith(
       'Workspace B',
       'code',
-      '/workspace-b'
+      '/workspace-b',
+      undefined
     );
     expect(mocks.switchWorkspace).not.toHaveBeenCalled();
     expect(mocks.bindScope).toHaveBeenCalledWith({
@@ -180,6 +243,86 @@ describe('workspaceStore file identity integration', () => {
       workspaceGeneration: 'generation-b',
     });
     expect(useWorkspaceStore.getState().current?.id).toBe('workspace-b');
+  });
+
+  it('首次创建 SSH 工作空间后同时发布当前选择和侧栏列表', async () => {
+    mocks.listWorkspaces.mockResolvedValueOnce({ workspaces: [], count: 0 });
+    mocks.currentWorkspace.mockResolvedValueOnce({ workspace: null, active: false });
+    await useWorkspaceStore.getState().init();
+    const remote: Workspace = {
+      ...workspace('ssh-test', 'ssh-test', 'ssh-generation'),
+      metadata: {
+        tags: [],
+        project_location: {
+          kind: 'ssh',
+          host: 'example.test',
+          user: 'ubuntu',
+          port: 22,
+          path: '/home/ubuntu/ssh-test',
+        },
+      },
+    };
+    mocks.createAndSwitchWorkspace.mockResolvedValueOnce(createdWorkspace(remote));
+    const projections: boolean[] = [];
+    const unsubscribe = useWorkspaceStore.subscribe((state) => {
+      if (state.current?.id === remote.id) {
+        projections.push(state.workspaces.some((item) => item === state.current));
+      }
+    });
+    try {
+      await useWorkspaceStore.getState().createAndSwitch('ssh-test');
+      expect(useWorkspaceStore.getState().workspaces).toEqual([remote]);
+      expect(projections.length).toBeGreaterThan(0);
+      expect(projections.every(Boolean)).toBe(true);
+      expect(mocks.listWorkspaces).toHaveBeenCalledTimes(1);
+      expect(mocks.createAndSwitchWorkspace).toHaveBeenCalledTimes(1);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('打开已有同 ID 工作空间时采用返回的新 generation 并保留其它列表项', async () => {
+    const other = workspace('workspace-a', 'Workspace A', 'generation-a');
+    const old = workspace('workspace-b', 'Old B', 'old-generation');
+    useWorkspaceStore.setState({ workspaces: [other, old] });
+    const result = await useWorkspaceStore.getState().createAndSwitch('Workspace B');
+    expect(useWorkspaceStore.getState().workspaces).toEqual([result, other]);
+    expect(useWorkspaceStore.getState().current).toBe(result);
+  });
+
+  it('创建前发起的迟到空列表不能抹掉刚创建的工作空间', async () => {
+    const list = deferred<{ workspaces: Workspace[]; count: number }>();
+    mocks.listWorkspaces.mockReturnValueOnce(list.promise);
+    mocks.currentWorkspace.mockResolvedValueOnce({ workspace: null, active: false });
+    const initializing = useWorkspaceStore.getState().init();
+    const result = await useWorkspaceStore.getState().createAndSwitch('Workspace B');
+    list.resolve({ workspaces: [], count: 0 });
+    await initializing;
+    expect(useWorkspaceStore.getState().workspaces).toEqual([result]);
+    expect(useWorkspaceStore.getState().current).toBe(result);
+  });
+
+  it('迟到的旧创建结果不能覆盖后继列表和选择', async () => {
+    const response = deferred<WorkspaceCreateAndSwitchResponse>();
+    mocks.createAndSwitchWorkspace.mockReturnValueOnce(response.promise);
+    const creating = useWorkspaceStore.getState().createAndSwitch('Workspace A');
+    await useWorkspaceStore.getState().init();
+    const latest = useWorkspaceStore.getState();
+    response.resolve(createdWorkspace(workspace('workspace-a', 'Workspace A', 'generation-a')));
+    await creating;
+    expect(useWorkspaceStore.getState().workspaces).toBe(latest.workspaces);
+    expect(useWorkspaceStore.getState().current).toBe(latest.current);
+    expect(mocks.initConversations).not.toHaveBeenCalled();
+  });
+
+  it('创建被拒绝时不捏造列表项', async () => {
+    mocks.createAndSwitchWorkspace.mockRejectedValueOnce(new Error('create rejected'));
+    mocks.currentWorkspace.mockResolvedValueOnce({ workspace: null, active: false });
+    await expect(useWorkspaceStore.getState().createAndSwitch('Rejected')).rejects.toThrow(
+      'create rejected'
+    );
+    expect(useWorkspaceStore.getState().workspaces).toEqual([]);
+    expect(useWorkspaceStore.getState().current).toBeNull();
   });
 
   it('does not issue a second switch when backend switching fails', async () => {
@@ -195,6 +338,10 @@ describe('workspaceStore file identity integration', () => {
       useWorkspaceStore.getState().createAndSwitch('Workspace B', 'code', '/workspace-b')
     ).rejects.toThrow('工作区已创建，但进入失败：runtime transition failed');
     expect(mocks.switchWorkspace).not.toHaveBeenCalled();
+    expect(useWorkspaceStore.getState().workspaces).toEqual([
+      workspace('workspace-b', 'Workspace B', 'generation-b'),
+    ]);
+    expect(useWorkspaceStore.getState().current).toBeNull();
   });
 
   it('ignores an older workspace transition that resolves after the newest focus', async () => {
@@ -248,5 +395,51 @@ describe('workspaceStore file identity integration', () => {
     expect(mocks.detachConversations).toHaveBeenCalledWith('workspace-b');
     expect(mocks.initConversations).toHaveBeenCalledWith('global');
     expect(useWorkspaceStore.getState().current).toBeNull();
+  });
+  it('projects the original exit as loading until the global handoff settles', async () => {
+    const response = deferred<{ success: boolean; transition: { status: string } }>();
+    mocks.exitWorkspace.mockReturnValue(response.promise);
+    useWorkspaceStore.setState({
+      current: {
+        ...workspace('workspace-a', 'Workspace A', 'generation-a'),
+        root: '/workspace-a',
+        kind: { type: 'code' },
+        metadata: { tags: [], project_location: { kind: 'local' as const, path: '/workspace-a' } },
+        created_at: '',
+        last_active: '',
+      },
+    });
+    const pending = useWorkspaceStore.getState().exit();
+    expect(useWorkspaceStore.getState().isLoading).toBe(true);
+    response.resolve({ success: true, transition: { status: 'committed' } });
+    await pending;
+    expect(useWorkspaceStore.getState().current).toBeNull();
+    expect(useWorkspaceStore.getState().isLoading).toBe(false);
+    expect(mocks.initConversations).toHaveBeenLastCalledWith('global');
+  });
+
+  it('clears the same exit busy projection and propagates its original failure', async () => {
+    mocks.exitWorkspace.mockRejectedValueOnce(new Error('original exit failed'));
+    await expect(useWorkspaceStore.getState().exit()).rejects.toThrow('original exit failed');
+    expect(useWorkspaceStore.getState().isLoading).toBe(false);
+  });
+
+  it('does not let a superseded exit clear a newer transition loading projection', async () => {
+    const exiting = deferred<{ success: boolean; transition: { status: string } }>();
+    const switching = deferred<unknown>();
+    mocks.exitWorkspace.mockReturnValue(exiting.promise);
+    mocks.switchWorkspace.mockReturnValue(switching.promise);
+    const first = useWorkspaceStore.getState().exit();
+    const next = useWorkspaceStore.getState().switchTo('workspace-b');
+    exiting.resolve({ success: true, transition: { status: 'committed' } });
+    await first;
+    expect(useWorkspaceStore.getState().isLoading).toBe(true);
+    switching.resolve({
+      workspace: workspace('workspace-b', 'Workspace B', 'generation-b'),
+      transition: { status: 'committed' },
+    });
+    await next;
+    expect(useWorkspaceStore.getState().current?.id).toBe('workspace-b');
+    expect(useWorkspaceStore.getState().isLoading).toBe(false);
   });
 });

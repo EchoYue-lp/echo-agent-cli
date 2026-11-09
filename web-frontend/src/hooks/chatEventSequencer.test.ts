@@ -39,6 +39,27 @@ const lifecycleEnvelope = (sequence: number, phase: 'persisted' | 'attempt_start
 describe('ChatEventSequencer', () => {
   beforeEach(resetChatEventCursorsForTest);
 
+  it('保留处理失败的原事件，后续输入可以重试并继续处理真实终态', () => {
+    const sequencer = new ChatEventSequencer();
+    const applied: number[] = [];
+    let fail = true;
+    const apply = (event: ChatEventEnvelope) => {
+      if (event.sequence === 2 && fail) throw new Error('投影暂时不可用');
+      applied.push(event.sequence);
+    };
+    sequencer.ingest(envelope(1), apply);
+    expect(() => sequencer.ingest(envelope(2), apply)).toThrow('投影暂时不可用');
+    expect(sequencer.cursor('conversation:one')).toBe(1);
+
+    fail = false;
+    sequencer.ingest(
+      { ...envelope(3), payload: { source: 'turn_status', event: { status: 'completed' } } },
+      apply
+    );
+    expect(applied).toEqual([1, 2, 3]);
+    expect(sequencer.cursor('conversation:one')).toBe(3);
+  });
+
   it('orders a live event that races ahead of replay and deduplicates it', () => {
     const sequencer = new ChatEventSequencer();
     const applied: number[] = [];
@@ -120,6 +141,31 @@ describe('ChatEventSequencer', () => {
       [4, 'input-attempt_started'],
       [5, 'turn-live'],
     ]);
+    expect(sequencer.cursor('conversation:one')).toBe(5);
+  });
+
+  it('旧轮保存观察持续投影，但旧轮正文仍不能覆盖当前轮', () => {
+    const sequencer = new ChatEventSequencer();
+    const applied: number[] = [];
+    const apply = (event: ChatEventEnvelope) => applied.push(event.sequence);
+    const oldSave = {
+      ...turnEnvelope(3, 'turn-a'),
+      payload: {
+        source: 'agent',
+        event: {
+          payload: {
+            type: 'transcript_projection_settlement',
+            data: { status: 'blocked', operation_id: 'original-operation' },
+          },
+        },
+      },
+    } as ChatEventEnvelope;
+    sequencer.ingest(turnEnvelope(1, 'turn-a'), apply);
+    sequencer.ingest(turnEnvelope(2, 'turn-b'), apply);
+    sequencer.ingest(oldSave, apply);
+    sequencer.ingest(turnEnvelope(4, 'turn-a'), apply);
+    sequencer.ingest(turnEnvelope(5, 'turn-b'), apply);
+    expect(applied).toEqual([1, 2, 3, 5]);
     expect(sequencer.cursor('conversation:one')).toBe(5);
   });
 

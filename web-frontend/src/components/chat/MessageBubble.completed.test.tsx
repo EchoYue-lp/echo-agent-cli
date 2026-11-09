@@ -9,16 +9,30 @@ describe('MessageBubble completed execution', () => {
     useSubagentRunStore.getState().clear();
   });
 
-  it('shows only the collapsed process summary before the final result', () => {
+  it('keeps native Reasoning collapsed before the confirmed final result', () => {
     const message: ChatMessage = {
       id: 'assistant-finished',
       role: 'assistant',
       content: '最终结果正文',
       timestamp: 1,
       isStreaming: false,
-      thinkingSegments: [{ content: '不应默认展开的思考' }],
+      assistantBlocks: [
+        {
+          block: {
+            block_id: 'reason',
+            request_id: 'native-request',
+            sequence: 0,
+            phase: 'reasoning',
+            delta: '不应默认展开的思考',
+            complete: true,
+            provider: null,
+            reasoning: null,
+          },
+          content: '不应默认展开的思考',
+        },
+      ],
       executionSteps: [
-        { type: 'thinking', index: 0 },
+        { type: 'assistant', index: 0 },
         { type: 'tool', callId: 'task-execute-call' },
       ],
     };
@@ -37,7 +51,8 @@ describe('MessageBubble completed execution', () => {
 
     const markup = renderToStaticMarkup(<MessageBubble message={message} />);
 
-    expect(markup).toContain('aria-label="展开执行过程"');
+    expect(markup).toContain('aria-label="展开中间过程"');
+    expect(markup).not.toContain('aria-label="展开思考"');
     expect(markup).toContain('最终结果正文');
     expect(markup).not.toContain('不应默认展开的思考');
     expect(markup).not.toContain('不应默认展开的 Subagent 结果');

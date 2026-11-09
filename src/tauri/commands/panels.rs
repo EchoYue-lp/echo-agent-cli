@@ -8,6 +8,7 @@ use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use echo_agent::sandbox::{IsolationLevel, SandboxCommand, SandboxExecutor};
 use echo_agent::tools::permission::{PermissionRule, RuleBehavior, RuleMatcher, RuleSource};
+use echo_agent_app_core::api::auto_memory::AUTO_MEMORY_ENABLED;
 use echo_agent_app_core::api::state::AuditDecision;
 use echo_agent_app_core::api::structured_extraction::{
     StructuredExtractionError, StructuredExtractionExample, StructuredExtractionOutcome,
@@ -134,7 +135,7 @@ pub async fn add_permission_rule(
         matcher: matcher.clone(),
         behavior,
         source,
-        description: Some("EKO application permission rule".to_string()),
+        description: Some("Eclip application permission rule".to_string()),
     };
     let permission_service = state
         .app_state
@@ -328,8 +329,7 @@ async fn auto_memory_config_status(
     IpcError,
 > {
     let config = echo_agent_app_core::api::auto_memory::AutoMemoryConfig {
-        enabled: crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
-            .load(std::sync::atomic::Ordering::Relaxed),
+        enabled: AUTO_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
         ..Default::default()
     };
     let messages = scoped_agent_messages(control).await;
@@ -344,8 +344,7 @@ fn commit_auto_memory_toggle_after_validation<T>(
     enabled: bool,
 ) -> Result<T, IpcError> {
     let validated = validation?;
-    crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
-        .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    AUTO_MEMORY_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
     Ok(validated)
 }
 
@@ -400,8 +399,7 @@ pub async fn extract_auto_memory(
     workspace_id: String,
 ) -> Result<serde_json::Value, IpcError> {
     let config = echo_agent_app_core::api::auto_memory::AutoMemoryConfig {
-        enabled: crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
-            .load(std::sync::atomic::Ordering::Relaxed),
+        enabled: AUTO_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
         ..Default::default()
     };
     let control = auto_memory_extract_control_after_validation(
@@ -452,8 +450,7 @@ pub async fn get_auto_memory_observations(
     workspace_id: String,
 ) -> Result<serde_json::Value, IpcError> {
     let config = echo_agent_app_core::api::auto_memory::AutoMemoryConfig {
-        enabled: crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
-            .load(std::sync::atomic::Ordering::Relaxed),
+        enabled: AUTO_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
         ..Default::default()
     };
     let control = auto_memory_control_for_workspace(&state, &workspace_id).await?;
@@ -548,7 +545,7 @@ pub async fn execute_workflow(
 
 /// Isolation floor every GUI sandbox entry point must clear.
 ///
-/// EKO is a local personal assistant on the user's own machine, so this floor is
+/// Eclip is a local personal assistant on the user's own machine, so this floor is
 /// **not** about separating tenants from each other. A process-only backend
 /// inherits the user's whole filesystem, network and credentials: if the framework
 /// mis-renders a command, mis-evaluates the policy, or a shell/code language is
@@ -594,7 +591,7 @@ fn eko_local_sandbox_backend_label(local_available: bool) -> &'static str {
 
 fn eko_local_sandbox_unavailable_message() -> &'static str {
     if cfg!(target_os = "windows") {
-        "Native Windows sandbox is not supported by EKO. Run EKO inside WSL2 so it can use Linux bubblewrap (bwrap)."
+        "Native Windows sandbox is not supported by Eclip. Run Eclip inside WSL2 so it can use Linux bubblewrap (bwrap)."
     } else {
         "Local sandbox backend is unavailable. On macOS this requires sandbox-exec; on Linux/WSL2 this requires bubblewrap (bwrap)."
     }
@@ -1515,18 +1512,32 @@ pub async fn activate_skill_draft(
 // Worktree
 // ════════════════════════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Serialize)]
-struct WorktreeInfo {
-    path: String,
-    branch: String,
-    managed: bool,
-    head: String,
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub(super) struct WorktreeInfo {
+    pub(super) path: String,
+    pub(super) branch: String,
+    pub(super) managed: bool,
+    pub(super) head: String,
+    pub(super) commit_oid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) lock_reason: Option<String>,
 }
 
 struct ScopedWorktreeControl {
-    _control: echo_agent_app_core::api::state::ScopedWorkspaceControl,
+    _global: Option<echo_agent_app_core::api::state::ScopedWorkspaceControl>,
+    _project: Option<echo_agent_app_core::api::state::ScopedProjectResources>,
     repo_root: PathBuf,
     store: Option<Arc<echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>>,
+    files: Arc<dyn echo_agent::tools::filesystem::FileSystem>,
+}
+
+impl ScopedWorktreeControl {
+    fn merge_lock(&self, root: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        match self.store.as_deref() {
+            Some(store) => store.project_worktree_lock(root),
+            None => echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(root),
+        }
+    }
 }
 
 async fn run_taskruntime_worktree_operation<T, E, F>(
@@ -1567,68 +1578,123 @@ where
 async fn worktree_control_for_workspace(
     state: &TauriState,
     workspace_id: &str,
+    workspace_generation: &str,
 ) -> Result<ScopedWorktreeControl, IpcError> {
-    let control = state
-        .app_state
-        .workspace_control_for_scope(workspace_id)
+    worktree_control_for_app(&state.app_state, workspace_id, workspace_generation).await
+}
+
+async fn worktree_control_for_app(
+    app_state: &Arc<echo_agent_app_core::api::AppState>,
+    workspace_id: &str,
+    workspace_generation: &str,
+) -> Result<ScopedWorktreeControl, IpcError> {
+    if workspace_id == "global" {
+        // Preserve only the explicit global local owner, never as a fallback.
+        let product = app_state
+            .workspace_control_for_generation(workspace_id, workspace_generation)
+            .await
+            .map_err(IpcError::from)?;
+        let control = app_state
+            .workspace_control_for_scope(workspace_id)
+            .await
+            .map_err(|error| IpcError::Validation(error.to_string()))?;
+        let repo_root = product.project_root();
+        return Ok(ScopedWorktreeControl {
+            store: control.runtime().task_runtime(),
+            _global: Some(control),
+            _project: None,
+            repo_root,
+            files: Arc::new(echo_agent::tools::files::LocalFileSystem),
+        });
+    }
+    let project = app_state
+        .project_resources_for_workspace(workspace_id, workspace_generation)
         .await
-        .map_err(|error| IpcError::Validation(error.to_string()))?;
-    let repo_root = control.project_root();
-    let store = control.runtime().task_runtime();
+        .map_err(IpcError::from)?;
+    let store = project.task_runtime().await.map_err(IpcError::from)?;
+    let repo_root = project.working_dir().to_path_buf();
+    let files = project.file_system();
     Ok(ScopedWorktreeControl {
-        _control: control,
+        _global: None,
+        _project: Some(project),
         repo_root,
-        store,
+        store: Some(store),
+        files,
     })
 }
 
-fn run_git(repo: &Path, args: &[&str]) -> Result<String, IpcError> {
+fn run_git(
+    store: Option<&echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore>,
+    repo: &Path,
+    args: &[&str],
+) -> Result<String, IpcError> {
+    if let Some(store) = store {
+        return store
+            .project_run_git(repo, args)
+            .map_err(|error| IpcError::Validation(error.to_string()));
+    }
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(args)
         .output()
-        .map_err(|e| IpcError::Internal(format!("Failed to run git: {e}")))?;
+        .map_err(|error| IpcError::Internal(format!("Failed to run git: {error}")))?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(IpcError::Validation(if stderr.is_empty() {
-            format!("git {:?} failed", args)
-        } else {
-            stderr
-        }))
+        Err(IpcError::Validation(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ))
     }
 }
 
-fn git_repo_root(start: &Path) -> Result<PathBuf, IpcError> {
-    let root = run_git(start, &["rev-parse", "--show-toplevel"])?;
-    Ok(PathBuf::from(root))
+fn git_repo_root(control: &ScopedWorktreeControl) -> Result<PathBuf, IpcError> {
+    match control.store.as_deref() {
+        Some(store) => store
+            .project_git_repo_root(&control.repo_root)
+            .map_err(|error| IpcError::Validation(error.to_string())),
+        None => {
+            run_git(None, &control.repo_root, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
+        }
+    }
 }
 
-async fn git_repo_root_async(start: PathBuf) -> Result<PathBuf, IpcError> {
-    tokio::task::spawn_blocking(move || git_repo_root(&start))
-        .await
-        .map_err(|error| IpcError::Internal(format!("Failed to join git root lookup: {error}")))?
+async fn git_repo_root_async(
+    control: ScopedWorktreeControl,
+) -> Result<(ScopedWorktreeControl, PathBuf), IpcError> {
+    tokio::task::spawn_blocking(move || {
+        let root = git_repo_root(&control)?;
+        Ok((control, root))
+    })
+    .await
+    .map_err(|error| IpcError::Internal(format!("Failed to join git root lookup: {error}")))?
 }
 
 fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
-    let canonical_repo = repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let canonical_repo = repo_root.to_path_buf();
     let mut items = Vec::new();
     let mut current_path: Option<PathBuf> = None;
     let mut current_head = String::new();
     let mut current_branch = String::new();
+    let mut current_lock_reason: Option<String> = None;
+    let mut current_has_head = false;
+    let mut current_has_branch = false;
+    let mut current_bare = false;
+    let mut current_invalid = false;
 
     let flush = |items: &mut Vec<WorktreeInfo>,
                  path: &mut Option<PathBuf>,
                  head: &mut String,
-                 branch: &mut String| {
+                 branch: &mut String,
+                 lock_reason: &mut Option<String>,
+                 has_head: &mut bool,
+                 has_branch: &mut bool,
+                 bare: &mut bool,
+                 invalid: &mut bool| {
         let Some(path_buf) = path.take() else {
             return;
         };
-        let canonical = path_buf.canonicalize().unwrap_or_else(|_| path_buf.clone());
+        let canonical = path_buf.clone();
         let display_branch = if branch.is_empty() {
             "(detached)".to_string()
         } else {
@@ -1637,23 +1703,49 @@ fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
                 .unwrap_or(branch.as_str())
                 .to_string()
         };
+        if *invalid || (!*bare && !*has_head) {
+            head.clear();
+            branch.clear();
+            lock_reason.take();
+            *has_head = false;
+            *has_branch = false;
+            *bare = false;
+            *invalid = false;
+            return;
+        }
         items.push(WorktreeInfo {
             path: path_buf.to_string_lossy().to_string(),
             branch: display_branch,
             managed: canonical != canonical_repo,
             head: head.chars().take(12).collect(),
+            commit_oid: head.clone(),
+            lock_reason: lock_reason.take(),
         });
         head.clear();
         branch.clear();
+        *has_head = false;
+        *has_branch = false;
+        *bare = false;
+        *invalid = false;
     };
 
-    for line in output.lines() {
-        if line.trim().is_empty() {
+    // 真实 producer 唯一使用 --porcelain -z；缺少终止符的旧文本或截断数据不构成列表事实。
+    if !output.is_empty() && !output.ends_with('\0') {
+        return items;
+    }
+    let fields = output.split('\0');
+    for line in fields {
+        if line.is_empty() {
             flush(
                 &mut items,
                 &mut current_path,
                 &mut current_head,
                 &mut current_branch,
+                &mut current_lock_reason,
+                &mut current_has_head,
+                &mut current_has_branch,
+                &mut current_bare,
+                &mut current_invalid,
             );
             continue;
         }
@@ -1663,12 +1755,29 @@ fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
                 &mut current_path,
                 &mut current_head,
                 &mut current_branch,
+                &mut current_lock_reason,
+                &mut current_has_head,
+                &mut current_has_branch,
+                &mut current_bare,
+                &mut current_invalid,
             );
             current_path = Some(PathBuf::from(path));
         } else if let Some(head) = line.strip_prefix("HEAD ") {
+            if current_has_head {
+                current_invalid = true;
+            }
+            current_has_head = true;
             current_head = head.to_string();
         } else if let Some(branch) = line.strip_prefix("branch ") {
+            if current_has_branch {
+                current_invalid = true;
+            }
+            current_has_branch = true;
             current_branch = branch.to_string();
+        } else if line == "bare" {
+            current_bare = true;
+        } else if let Some(reason) = line.strip_prefix("locked ") {
+            current_lock_reason = Some(reason.to_string());
         }
     }
     flush(
@@ -1676,11 +1785,20 @@ fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
         &mut current_path,
         &mut current_head,
         &mut current_branch,
+        &mut current_lock_reason,
+        &mut current_has_head,
+        &mut current_has_branch,
+        &mut current_bare,
+        &mut current_invalid,
     );
     items
 }
 
-fn validate_branch_name(repo: &Path, branch: &str) -> Result<(), IpcError> {
+fn validate_branch_name(
+    control: &ScopedWorktreeControl,
+    repo: &Path,
+    branch: &str,
+) -> Result<(), IpcError> {
     if branch.trim().is_empty() {
         return Err(IpcError::Validation("Branch name cannot be empty".into()));
     }
@@ -1689,7 +1807,12 @@ fn validate_branch_name(repo: &Path, branch: &str) -> Result<(), IpcError> {
             "Branch name cannot start with '-' or contain whitespace".into(),
         ));
     }
-    run_git(repo, &["check-ref-format", "--branch", branch]).map(|_| ())
+    run_git(
+        control.store.as_deref(),
+        repo,
+        &["check-ref-format", "--branch", branch],
+    )
+    .map(|_| ())
 }
 
 fn default_worktree_path(repo_root: &Path, branch: &str) -> Result<PathBuf, IpcError> {
@@ -1713,25 +1836,34 @@ fn default_worktree_path(repo_root: &Path, branch: &str) -> Result<PathBuf, IpcE
     Ok(parent.join(format!("{repo_name}-{safe_branch}")))
 }
 
-fn validate_worktree_target(repo_root: &Path, target: &Path) -> Result<(), IpcError> {
+fn validate_worktree_target(
+    files: &dyn echo_agent::tools::filesystem::FileSystem,
+    repo_root: &Path,
+    target: &Path,
+) -> Result<(), IpcError> {
     let repo_parent = repo_root
         .parent()
         .ok_or_else(|| IpcError::Validation("Repository root has no parent directory".into()))?
-        .canonicalize()
-        .map_err(|e| IpcError::Validation(format!("Cannot resolve repository parent: {e}")))?;
+        .to_path_buf();
+    let repo_parent = files
+        .canonicalize(&repo_parent)
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
     let target_parent = target
         .parent()
         .ok_or_else(|| IpcError::Validation("Worktree path has no parent directory".into()))?;
-    let canonical_parent = target_parent
-        .canonicalize()
-        .map_err(|e| IpcError::Validation(format!("Cannot resolve worktree parent: {e}")))?;
+    let canonical_parent = files.canonicalize(target_parent).map_err(|error| {
+        IpcError::Validation(format!("Cannot resolve worktree parent: {error}"))
+    })?;
     if !canonical_parent.starts_with(&repo_parent) {
         return Err(IpcError::Validation(format!(
             "Worktree path must stay under repository parent: {}",
             repo_parent.display()
         )));
     }
-    if target.exists() {
+    if files
+        .exists(target)
+        .map_err(|error| IpcError::Validation(error.to_string()))?
+    {
         return Err(IpcError::Validation(format!(
             "Worktree path already exists: {}",
             target.display()
@@ -1744,115 +1876,378 @@ fn validate_worktree_target(repo_root: &Path, target: &Path) -> Result<(), IpcEr
 pub async fn list_worktrees(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
+    workspace_generation: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
-    let start = control.repo_root.clone();
-    let worktrees = tokio::task::spawn_blocking(move || {
-        let repo_root = git_repo_root(&start)?;
-        let output = run_git(&repo_root, &["worktree", "list", "--porcelain"])?;
-        Ok::<Vec<WorktreeInfo>, IpcError>(parse_worktree_list(&output, &repo_root))
-    })
-    .await
-    .map_err(|error| IpcError::Internal(format!("Failed to join worktree listing: {error}")))??;
-    drop(control);
+    let control =
+        worktree_control_for_workspace(&state, &workspace_id, &workspace_generation).await?;
+    let worktrees = state
+        .app_state
+        .session
+        .product_data_io
+        .run("list project worktrees", move || {
+            let repo_root = git_repo_root(&control)?;
+            let output = run_git(
+                control.store.as_deref(),
+                &repo_root,
+                &["worktree", "list", "--porcelain", "-z"],
+            )?;
+            Ok::<Vec<WorktreeInfo>, IpcError>(parse_worktree_list(&output, &repo_root))
+        })
+        .await
+        .map_err(super::product_data::blocking_error)??;
     Ok(json!(worktrees))
+}
+
+/// Snapshot Git in the exact original project environment. A commit OID also
+/// supports detached HEAD, while unborn/non-Git projects fail before creation.
+pub(super) async fn prepare_reply_worktree(
+    app_state: &Arc<echo_agent_app_core::api::AppState>,
+    workspace_id: &str,
+    workspace_generation: &str,
+    branch: String,
+) -> Result<(String, String, String), IpcError> {
+    let control = worktree_control_for_app(app_state, workspace_id, workspace_generation).await?;
+    app_state
+        .session
+        .product_data_io
+        .run("prepare reply worktree", move || {
+            let root = git_repo_root(&control)?;
+            validate_branch_name(&control, &root, &branch)?;
+            let head = run_git(
+                control.store.as_deref(),
+                &root,
+                &["rev-parse", "--verify", "HEAD^{commit}"],
+            )?;
+            let path = default_worktree_path(&root, &branch)?;
+            Ok((
+                root.to_string_lossy().to_string(),
+                head,
+                path.to_string_lossy().to_string(),
+            ))
+        })
+        .await
+        .map_err(super::product_data::blocking_error)?
+}
+
+/// Resource facts survive a successful add followed by a failed list. The
+/// native Git lock reason is the operation receipt; no second registry/store.
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct WorktreeCreation {
+    pub(super) created: bool,
+    pub(super) observed: bool,
+    pub(super) path: String,
+    pub(super) head: String,
+    pub(super) descriptor: Option<WorktreeInfo>,
+    pub(super) error: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_worktree_in_control(
+    control: &ScopedWorktreeControl,
+    repo_root: &Path,
+    branch: &str,
+    base_ref: &str,
+    path: Option<String>,
+    lock_reason: Option<&str>,
+) -> Result<WorktreeCreation, IpcError> {
+    validate_branch_name(control, repo_root, branch)?;
+    let target = path
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                repo_root.join(path)
+            }
+        })
+        .unwrap_or(default_worktree_path(repo_root, branch)?);
+    let target_str = target.to_string_lossy().to_string();
+    let head = run_git(
+        control.store.as_deref(),
+        repo_root,
+        &["rev-parse", "--verify", &format!("{base_ref}^{{commit}}")],
+    )?;
+    // The listing is read before every mutation. A matching native receipt is
+    // required; a directory/branch with the same name is never adopted.
+    if let Some(reason) = lock_reason {
+        let output = run_git(
+            control.store.as_deref(),
+            repo_root,
+            &["worktree", "list", "--porcelain", "-z"],
+        )?;
+        if let Some(existing) = parse_worktree_list(&output, repo_root)
+            .into_iter()
+            .find(|item| item.path == target_str)
+        {
+            if existing.branch != branch
+                || existing.commit_oid != head
+                || existing.lock_reason.as_deref() != Some(reason)
+            {
+                return Err(IpcError::Validation(
+                    "Worktree 已被其它操作占用，保留原目录且不会覆盖".into(),
+                ));
+            }
+            return Ok(WorktreeCreation {
+                created: true,
+                observed: true,
+                path: target_str,
+                head,
+                descriptor: Some(existing),
+                error: None,
+            });
+        }
+    }
+    validate_worktree_target(control.files.as_ref(), repo_root, &target)?;
+    let mut args = vec!["worktree", "add"];
+    if let Some(reason) = lock_reason {
+        args.extend(["--lock", "--reason", reason]);
+    }
+    args.extend(["-b", branch, &target_str, &head]);
+    let add = run_git(control.store.as_deref(), repo_root, &args);
+    let mut receipt = WorktreeCreation {
+        created: add.is_ok(),
+        observed: false,
+        path: target_str.clone(),
+        head,
+        descriptor: None,
+        error: add.err().map(|error| error.to_string()),
+    };
+    // Even an unconfirmed Git execution is observed first. Never replay add on
+    // an error and never force-remove a user directory to manufacture rollback.
+    match run_git(
+        control.store.as_deref(),
+        repo_root,
+        &["worktree", "list", "--porcelain", "-z"],
+    ) {
+        Ok(output) => {
+            if let Some(item) = parse_worktree_list(&output, repo_root)
+                .into_iter()
+                .find(|item| item.path == target_str)
+            {
+                let matches = item.branch == branch
+                    && item.commit_oid == receipt.head
+                    && lock_reason.is_none_or(|reason| item.lock_reason.as_deref() == Some(reason));
+                if matches {
+                    receipt.created = true;
+                    receipt.observed = true;
+                    receipt.descriptor = Some(item);
+                } else {
+                    receipt.error =
+                        Some("Git 目录已存在但资源身份不匹配；请从 Worktree 列表检查".into());
+                }
+            } else if receipt.error.is_none() {
+                receipt.error =
+                    Some("Git add 已返回，但未能在原 Worktree 列表确认目标；保留创建事实".into());
+            }
+        }
+        Err(error) => {
+            receipt.error = Some(match receipt.error {
+                Some(primary) => format!("{primary}; Worktree 重读失败: {error}"),
+                None => format!("Worktree 已创建，列表重读失败: {error}"),
+            })
+        }
+    }
+    Ok(receipt)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn create_worktree_for_app(
+    app_state: &Arc<echo_agent_app_core::api::AppState>,
+    workspace_id: &str,
+    workspace_generation: &str,
+    branch: String,
+    base: String,
+    path: Option<String>,
+    lock_reason: Option<String>,
+) -> Result<WorktreeCreation, IpcError> {
+    let control = worktree_control_for_app(app_state, workspace_id, workspace_generation).await?;
+    let (control, repo_root) = git_repo_root_async(control).await?;
+    let merge_guard = control.merge_lock(&repo_root).lock_owned().await;
+    app_state
+        .session
+        .product_data_io
+        .run("create project worktree", move || {
+            let _merge_guard = merge_guard;
+            create_worktree_in_control(
+                &control,
+                &repo_root,
+                &branch,
+                &base,
+                path,
+                lock_reason.as_deref(),
+            )
+        })
+        .await
+        .map_err(super::product_data::blocking_error)?
 }
 
 #[tauri::command]
 pub async fn create_worktree(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
+    workspace_generation: String,
     branch: String,
     base: Option<String>,
     path: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
-    let start = control.repo_root.clone();
-    let branch = branch.trim().to_string();
-    let base_ref = base
-        .and_then(|s| {
-            let trimmed = s.trim().to_string();
-            (!trimmed.is_empty()).then_some(trimmed)
-        })
-        .unwrap_or_else(|| "HEAD".to_string());
-    let repo_root = git_repo_root_async(start).await?;
-    let merge_lock =
-        echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
-    let _merge_guard = merge_lock.lock().await;
-    let created = tokio::task::spawn_blocking(move || {
-        validate_branch_name(&repo_root, &branch)?;
-        let target = path
-            .filter(|value| !value.trim().is_empty())
-            .map(PathBuf::from)
-            .unwrap_or(default_worktree_path(&repo_root, &branch)?);
-        validate_worktree_target(&repo_root, &target)?;
-        let target_str = target.to_string_lossy().to_string();
-        run_git(
-            &repo_root,
-            &["worktree", "add", "-b", &branch, &target_str, &base_ref],
+    let base = base
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "HEAD".into());
+    let receipt = create_worktree_for_app(
+        &state.app_state,
+        &workspace_id,
+        &workspace_generation,
+        branch.trim().to_string(),
+        base,
+        path,
+        None,
+    )
+    .await?;
+    if let Some(error) = receipt.error {
+        return Err(IpcError::Internal(error));
+    }
+    receipt
+        .descriptor
+        .map(|item| json!(item))
+        .ok_or_else(|| IpcError::Internal("Created worktree was not found in git output".into()))
+}
+
+/// 复用原 Git 删除约束；任何失败都不 force、不重建目录。
+fn remove_worktree_in_control(
+    control: &ScopedWorktreeControl,
+    repo_root: &Path,
+    path: &str,
+) -> Result<(), IpcError> {
+    let target = PathBuf::from(path);
+    if target.as_os_str().is_empty() {
+        return Err(IpcError::Validation("Worktree path cannot be empty".into()));
+    }
+    let canonical_repo = control
+        .files
+        .canonicalize(repo_root)
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let canonical_target = control
+        .files
+        .canonicalize(&target)
+        .map_err(|error| IpcError::Validation(format!("Cannot resolve worktree path: {error}")))?;
+    if canonical_target == canonical_repo {
+        return Err(IpcError::Validation(
+            "Refusing to remove the primary repository worktree".into(),
+        ));
+    }
+    let output = run_git(
+        control.store.as_deref(),
+        repo_root,
+        &["worktree", "list", "--porcelain", "-z"],
+    )?;
+    let known = parse_worktree_list(&output, repo_root)
+        .into_iter()
+        .find(|worktree| {
+            control
+                .files
+                .canonicalize(&PathBuf::from(&worktree.path))
+                .map(|path| path == canonical_target)
+                .unwrap_or(false)
+        });
+    let known = known
+        .ok_or_else(|| IpcError::Validation("Path is not a registered git worktree".into()))?;
+    let target_str = target.to_string_lossy().to_string();
+    let reply_lock = known
+        .lock_reason
+        .as_deref()
+        .filter(|reason| reason.starts_with("eko-reply-fork:"));
+    if reply_lock.is_some() {
+        // Local data-loss protection still comes from Git's ordinary
+        // remove check; no --force is used after unlocking our receipt.
+        let dirty = run_git(
+            control.store.as_deref(),
+            &target,
+            &["status", "--porcelain"],
         )?;
-        let output = run_git(&repo_root, &["worktree", "list", "--porcelain"])?;
-        parse_worktree_list(&output, &repo_root)
-            .into_iter()
-            .find(|worktree| worktree.path == target_str)
-            .ok_or_else(|| {
-                IpcError::Internal("Created worktree was not found in git output".into())
-            })
-    })
-    .await
-    .map_err(|error| IpcError::Internal(format!("Failed to join worktree create: {error}")))??;
-    drop(control);
-    Ok(json!(created))
+        if !dirty.is_empty() {
+            return Err(IpcError::Validation(
+                "Worktree 含未提交文件，保留原目录与分叉回执".into(),
+            ));
+        }
+        run_git(
+            control.store.as_deref(),
+            repo_root,
+            &["worktree", "unlock", &target_str],
+        )?;
+    }
+    let removal = run_git(
+        control.store.as_deref(),
+        repo_root,
+        &["worktree", "remove", &target_str],
+    );
+    if let Err(primary) = removal {
+        // 用户可能在 status 后写入。普通 remove 失败时仍保数据，
+        // 并重读真实 Git 登记再恢复本请求锁，避免丢失重试身份。
+        if let Some(reason) = reply_lock {
+            let restored = (|| -> Result<(), IpcError> {
+                let listing = run_git(
+                    control.store.as_deref(),
+                    repo_root,
+                    &["worktree", "list", "--porcelain", "-z"],
+                )?;
+                let present = parse_worktree_list(&listing, repo_root)
+                    .into_iter()
+                    .find(|item| {
+                        item.path == known.path
+                            && item.branch == known.branch
+                            && item.commit_oid == known.commit_oid
+                    })
+                    .ok_or_else(|| {
+                        IpcError::Validation("删除失败后无法确认原 Worktree 身份；保留资源".into())
+                    })?;
+                if present.lock_reason.as_deref() == Some(reason) {
+                    return Ok(());
+                }
+                if present.lock_reason.is_some() {
+                    return Err(IpcError::Validation(
+                        "Worktree 已被其它 owner 锁定，未覆盖".into(),
+                    ));
+                }
+                run_git(
+                    control.store.as_deref(),
+                    repo_root,
+                    &["worktree", "lock", "--reason", reason, &target_str],
+                )
+                .map(|_| ())
+            })();
+            if let Err(restore) = restored {
+                return Err(IpcError::Internal(format!(
+                    "{primary}; 分叉锁回执恢复失败: {restore}"
+                )));
+            }
+        }
+        return Err(primary);
+    }
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn remove_worktree(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
+    workspace_generation: String,
     path: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
-    let start = control.repo_root.clone();
-    let repo_root = git_repo_root_async(start).await?;
-    let merge_lock =
-        echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
-    let _merge_guard = merge_lock.lock().await;
-    tokio::task::spawn_blocking(move || {
-        let target = PathBuf::from(path.trim());
-        if target.as_os_str().is_empty() {
-            return Err(IpcError::Validation("Worktree path cannot be empty".into()));
-        }
-        let canonical_repo = repo_root
-            .canonicalize()
-            .unwrap_or_else(|_| repo_root.clone());
-        let canonical_target = target.canonicalize().map_err(|error| {
-            IpcError::Validation(format!("Cannot resolve worktree path: {error}"))
-        })?;
-        if canonical_target == canonical_repo {
-            return Err(IpcError::Validation(
-                "Refusing to remove the primary repository worktree".into(),
-            ));
-        }
-        let output = run_git(&repo_root, &["worktree", "list", "--porcelain"])?;
-        let known = parse_worktree_list(&output, &repo_root)
-            .into_iter()
-            .any(|worktree| {
-                PathBuf::from(worktree.path)
-                    .canonicalize()
-                    .map(|path| path == canonical_target)
-                    .unwrap_or(false)
-            });
-        if !known {
-            return Err(IpcError::Validation(
-                "Path is not a registered git worktree".into(),
-            ));
-        }
-        let target_str = target.to_string_lossy().to_string();
-        run_git(&repo_root, &["worktree", "remove", &target_str]).map(|_| ())
-    })
-    .await
-    .map_err(|error| IpcError::Internal(format!("Failed to join worktree removal: {error}")))??;
-    drop(control);
+    let control =
+        worktree_control_for_workspace(&state, &workspace_id, &workspace_generation).await?;
+    let (control, repo_root) = git_repo_root_async(control).await?;
+    let merge_guard = control.merge_lock(&repo_root).lock_owned().await;
+    state
+        .app_state
+        .session
+        .product_data_io
+        .run("remove project worktree", move || {
+            let _merge_guard = merge_guard;
+            remove_worktree_in_control(&control, &repo_root, &path)
+        })
+        .await
+        .map_err(super::product_data::blocking_error)??;
     Ok(json!({"success": true}))
 }
 
@@ -1860,19 +2255,21 @@ pub async fn remove_worktree(
 pub async fn list_unattended_worktrees(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
+    workspace_generation: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
-    let repo_root = git_repo_root_async(control.repo_root.clone()).await?;
+    let control =
+        worktree_control_for_workspace(&state, &workspace_id, &workspace_generation).await?;
+    let (control, repo_root) = git_repo_root_async(control).await?;
     let store = control.store.clone();
 
     let unattended =
         run_taskruntime_worktree_operation(store, "list unattended worktrees", move |store| {
+            let _scope = control;
             echo_agent_app_core::api::tasks::task_runtime::worktree::list_unattended_worktrees(
                 &repo_root, store,
             )
         })
         .await?;
-    drop(control);
 
     let result: Vec<serde_json::Value> = unattended
         .into_iter()
@@ -1901,10 +2298,12 @@ pub async fn list_unattended_worktrees(
 pub async fn merge_unattended_worktree(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
+    workspace_generation: String,
     run_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
-    let repo_root = git_repo_root_async(control.repo_root.clone()).await?;
+    let control =
+        worktree_control_for_workspace(&state, &workspace_id, &workspace_generation).await?;
+    let (control, repo_root) = git_repo_root_async(control).await?;
     let store = control.store.clone();
     if let Some(store) = store.as_ref() {
         let lookup_run_id = run_id.clone();
@@ -1925,12 +2324,12 @@ pub async fn merge_unattended_worktree(
             "TaskRuntime store is unavailable for unattended worktree merge".to_string(),
         ));
     }
-    let merge_lock =
-        echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
-    let _merge_guard = merge_lock.lock().await;
+    let merge_guard = control.merge_lock(&repo_root).lock_owned().await;
     let run_id_for_merge = run_id.clone();
     let outcome =
         run_taskruntime_worktree_operation(store, "merge unattended worktree", move |store| {
+            let _scope = control;
+            let _merge_guard = merge_guard;
             echo_agent_app_core::api::tasks::task_runtime::worktree::merge_unattended_worktree(
                 &repo_root,
                 &run_id_for_merge,
@@ -1938,7 +2337,6 @@ pub async fn merge_unattended_worktree(
             )
         })
         .await?;
-    drop(control);
 
     Ok(json!({
         "success": true,
@@ -1955,16 +2353,18 @@ pub async fn merge_unattended_worktree(
 pub async fn discard_unattended_worktree(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
+    workspace_generation: String,
     run_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
-    let repo_root = git_repo_root_async(control.repo_root.clone()).await?;
+    let control =
+        worktree_control_for_workspace(&state, &workspace_id, &workspace_generation).await?;
+    let (control, repo_root) = git_repo_root_async(control).await?;
     let store = control.store.clone();
-    let merge_lock =
-        echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
-    let _merge_guard = merge_lock.lock().await;
+    let merge_guard = control.merge_lock(&repo_root).lock_owned().await;
     let run_id_for_discard = run_id.clone();
     run_taskruntime_worktree_operation(store, "discard unattended worktree", move |store| {
+        let _scope = control;
+        let _merge_guard = merge_guard;
         echo_agent_app_core::api::tasks::task_runtime::worktree::discard_unattended_worktree(
             &repo_root,
             &run_id_for_discard,
@@ -1972,7 +2372,6 @@ pub async fn discard_unattended_worktree(
         )
     })
     .await?;
-    drop(control);
 
     Ok(json!({"success": true, "discarded": run_id}))
 }
@@ -1981,21 +2380,22 @@ pub async fn discard_unattended_worktree(
 pub async fn cleanup_unattended_worktrees(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
+    workspace_generation: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
-    let repo_root = git_repo_root_async(control.repo_root.clone()).await?;
+    let control =
+        worktree_control_for_workspace(&state, &workspace_id, &workspace_generation).await?;
+    let (control, repo_root) = git_repo_root_async(control).await?;
     let store = control.store.clone();
-    let merge_lock =
-        echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
-    let _merge_guard = merge_lock.lock().await;
+    let merge_guard = control.merge_lock(&repo_root).lock_owned().await;
     let result =
         run_taskruntime_worktree_operation(store, "clean unattended worktrees", move |store| {
+            let _scope = control;
+            let _merge_guard = merge_guard;
             echo_agent_app_core::api::tasks::task_runtime::worktree::cleanup_unattended_worktrees(
                 &repo_root, store,
             )
         })
         .await?;
-    drop(control);
 
     Ok(json!({
         "removed": result.removed,
@@ -2046,16 +2446,14 @@ mod scoped_control_tests {
 
     #[test]
     fn invalid_auto_memory_scope_does_not_commit_global_toggle() {
-        let previous = crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let previous = AUTO_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
         let result = commit_auto_memory_toggle_after_validation::<()>(
             Err(IpcError::Validation("workspace was deleted".to_string())),
             !previous,
         );
         assert!(result.is_err());
         assert_eq!(
-            crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
-                .load(std::sync::atomic::Ordering::Relaxed),
+            AUTO_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
             previous
         );
     }
@@ -2070,6 +2468,478 @@ mod scoped_control_tests {
             result,
             Err(IpcError::Validation(message)) if message == "workspace was deleted"
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn project_worktree_commands_use_bound_store_and_original_unattended_algorithm()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tauri::commands::files::tests::{ProjectGitExecutor, namespaced_files};
+        let host = tempfile::tempdir()?;
+        let target = tempfile::tempdir()?;
+        let journal = tempfile::tempdir()?;
+        let visible = host.path().canonicalize()?;
+        let actual = target.path().canonicalize()?;
+        let git = |args: &[&str]| -> Result<(), Box<dyn std::error::Error>> {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&actual)
+                .output()?;
+            if !output.status.success() {
+                return Err(std::io::Error::other(
+                    String::from_utf8_lossy(&output.stderr).to_string(),
+                )
+                .into());
+            }
+            Ok(())
+        };
+        git(&["init", "-q"])?;
+        std::fs::write(actual.join("notes.txt"), "target initial\n")?;
+        std::fs::write(visible.join("notes.txt"), "host not a Git repo\n")?;
+        git(&["add", "--", "notes.txt"])?;
+        git(&[
+            "-c",
+            "user.name=Eclip Test",
+            "-c",
+            "user.email=eko@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "target initial",
+        ])?;
+        let files = Arc::new(namespaced_files(&visible, &actual));
+        let store = Arc::new(echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore::new_in_memory_with_shadow_root(journal.path().join("tasks"))?);
+        store.bind_project_environment(
+            &store.active_workspace_id(),
+            echo_agent_app_core::api::workspace::ProjectLocation::Local {
+                path: visible.clone(),
+            },
+            1,
+            files.clone(),
+            Arc::new(ProjectGitExecutor {
+                files: files.clone(),
+            }),
+        )?;
+        let control = ScopedWorktreeControl {
+            _global: None,
+            _project: None,
+            repo_root: visible.clone(),
+            store: Some(store.clone()),
+            files,
+        };
+        let (control, repo) = git_repo_root_async(control).await?;
+        assert_eq!(repo, visible);
+        assert!(Arc::ptr_eq(
+            &control.merge_lock(&repo),
+            &store.project_worktree_lock(&repo)
+        ));
+        let operation_store = store.clone();
+        run_taskruntime_worktree_operation(Some(store), "test target worktree route", move |store| {
+            let _scope = control;
+            let output = run_git(store, &repo, &["worktree", "list", "--porcelain", "-z"])?;
+            let listed = parse_worktree_list(&output, &repo);
+            assert!(listed.first().is_some_and(|entry| entry.path == repo.to_string_lossy() && !entry.managed));
+            let unattended = echo_agent_app_core::api::tasks::task_runtime::worktree::list_unattended_worktrees(&repo, store).map_err(|error| IpcError::Internal(error.to_string()))?;
+            assert!(unattended.is_empty());
+            // A wrong local fallback cannot pass: the visible host directory
+            // contains no .git, while the actual provider target does.
+            assert_eq!(operation_store.project_git_repo_root(&repo).map_err(|error| IpcError::Internal(error.to_string()))?, repo);
+            Ok::<(), IpcError>(())
+        }).await?;
+        assert!(!visible.join(".git").exists());
+        assert_eq!(
+            std::fs::read_to_string(visible.join("notes.txt"))?,
+            "host not a Git repo\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn worktree_observer_cancel_keeps_original_lock_until_physical_closure_settles()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let lock =
+            echo_agent_app_core::api::tasks::task_runtime::worktree::repo_merge_lock(root.path());
+        let guard = lock.clone().lock_owned().await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+        let observer = tokio::spawn(run_taskruntime_worktree_operation(
+            None,
+            "test scoped worktree cancellation",
+            move |_| {
+                let retained_guard = guard;
+                let _ = entered_tx.send(());
+                release_rx.recv().map_err(|error| error.to_string())?;
+                drop(retained_guard);
+                let _ = settled_tx.send(());
+                Ok::<(), String>(())
+            },
+        ));
+        entered_rx.await?;
+        observer.abort();
+        assert!(observer.await.is_err());
+        assert!(lock.try_lock().is_err());
+        release_tx.send(())?;
+        settled_rx.await?;
+        assert!(lock.try_lock().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn worktree_projection_does_not_canonicalize_target_paths_on_host() {
+        let target = Path::new("/remote/不存在的项目🙂");
+        let output = "worktree /remote/不存在的项目🙂\0HEAD abcdef1234567890\0branch refs/heads/main\0\0worktree /remote/不存在的项目🙂-review\0HEAD 1234567890abcdef\0branch refs/heads/review\0\0";
+        let listed = parse_worktree_list(output, target);
+        assert_eq!(listed.len(), 2);
+        assert!(listed.first().is_some_and(|entry| !entry.managed));
+        assert!(listed.get(1).is_some_and(|entry| entry.managed && entry.path == "/remote/不存在的项目🙂-review"));
+    }
+
+    #[test]
+    fn worktree_projection_accepts_bare_record_without_head() {
+        let rows = parse_worktree_list("worktree /remote/bare.git\0bare\0\0", Path::new("/source"));
+        assert!(
+            rows.first()
+                .is_some_and(|entry| entry.commit_oid.is_empty() && entry.branch == "(detached)")
+        );
+    }
+
+    #[test]
+    fn worktree_projection_rejects_non_bare_missing_or_duplicate_identity() {
+        let root = Path::new("/source");
+        assert!(
+            parse_worktree_list("worktree /remote/missing\0branch refs/heads/main\0\0", root)
+                .is_empty()
+        );
+        assert!(
+            parse_worktree_list("worktree /remote/duplicate\0HEAD abc\0HEAD def\0\0", root)
+                .is_empty()
+        );
+        assert!(
+            parse_worktree_list(
+                "worktree /remote/duplicate\0HEAD abc\0branch main\0branch other\0\0",
+                root
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn worktree_projection_rejects_text_or_truncated_non_nul_input() {
+        let root = Path::new("/project");
+        assert!(parse_worktree_list("worktree /project\nHEAD abc\n", root).is_empty());
+        assert!(parse_worktree_list("worktree /project\0HEAD abc", root).is_empty());
+    }
+
+    #[test]
+    fn reply_fork_worktree_is_head_only_and_reenters_using_native_receipt() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let repo = temporary.path().join("source");
+        std::fs::create_dir(&repo)?;
+        run_git(None, &repo, &["init"])?;
+        std::fs::write(repo.join("tracked.txt"), "提交原文🙂")?;
+        std::fs::write(repo.join(".gitignore"), "ignored.txt\n")?;
+        run_git(None, &repo, &["add", "tracked.txt", ".gitignore"])?;
+        run_git(
+            None,
+            &repo,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Eclip Fixture",
+                "-c",
+                "user.email=fixture@eko.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        )?;
+        let head = run_git(None, &repo, &["rev-parse", "HEAD"])?;
+        // Detached source heads are valid commit authorities.
+        run_git(None, &repo, &["checkout", "--detach", &head])?;
+        std::fs::write(repo.join("tracked.txt"), "未提交🙂")?;
+        std::fs::write(repo.join("untracked.txt"), "未跟踪🙂")?;
+        std::fs::write(repo.join("ignored.txt"), "忽略🙂")?;
+        let before = ["tracked.txt", "untracked.txt", "ignored.txt"]
+            .into_iter()
+            .map(|name| std::fs::read(repo.join(name)).map(|bytes| (name, bytes)))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let control = ScopedWorktreeControl {
+            _global: None,
+            _project: None,
+            repo_root: repo.clone(),
+            store: None,
+            files: Arc::new(echo_agent::tools::files::LocalFileSystem),
+        };
+        let target = temporary.path().join("支线🙂\n尾部 ");
+        let reason = "eko-reply-fork:fixture-identity";
+        let created = create_worktree_in_control(
+            &control,
+            &repo,
+            "eko/fork-fixture",
+            &head,
+            Some(target.to_string_lossy().to_string()),
+            Some(reason),
+        )?;
+        assert!(created.created && created.observed && created.error.is_none());
+        assert_eq!(run_git(None, &target, &["rev-parse", "HEAD"])?, head);
+        assert_eq!(
+            std::fs::read_to_string(target.join("tracked.txt"))?,
+            "提交原文🙂"
+        );
+        assert!(!target.join("untracked.txt").exists());
+        assert!(!target.join("ignored.txt").exists());
+        for (name, bytes) in before {
+            assert_eq!(std::fs::read(repo.join(name))?, bytes);
+        }
+        let resumed = create_worktree_in_control(
+            &control,
+            &repo,
+            "eko/fork-fixture",
+            &head,
+            Some(target.to_string_lossy().to_string()),
+            Some(reason),
+        )?;
+        assert!(resumed.observed && resumed.error.is_none());
+        let listing = run_git(None, &repo, &["worktree", "list", "--porcelain", "-z"])?;
+        assert_eq!(parse_worktree_list(&listing, &repo).len(), 2);
+        assert!(
+            create_worktree_in_control(
+                &control,
+                &repo,
+                "eko/fork-fixture",
+                &head,
+                Some(target.to_string_lossy().to_string()),
+                Some("eko-reply-fork:other-request")
+            )
+            .is_err()
+        );
+        std::fs::write(target.join("user-later.txt"), "保留后续用户文件")?;
+        assert!(
+            run_git(
+                None,
+                &repo,
+                &["worktree", "remove", target.to_string_lossy().as_ref()]
+            )
+            .is_err()
+        );
+        assert!(target.join("user-later.txt").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn reply_fork_rejects_unborn_and_non_git_without_creating_a_directory() -> anyhow::Result<()> {
+        const NAME: &str = "tauri::commands::panels::scoped_control_tests::reply_fork_rejects_unborn_and_non_git_without_creating_a_directory";
+        let Some(directory) = std::env::var_os("EKO_REPLY_FORK_NONREPO_FIXTURE") else {
+            let temporary = tempfile::tempdir()?;
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", NAME, "--nocapture"])
+                .env("EKO_REPLY_FORK_NONREPO_FIXTURE", temporary.path())
+                .env("GIT_CEILING_DIRECTORIES", temporary.path())
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        };
+        let directory = std::path::PathBuf::from(directory);
+        let repo = directory.join("source");
+        std::fs::create_dir(&repo)?;
+        let control = ScopedWorktreeControl {
+            _global: None,
+            _project: None,
+            repo_root: repo.clone(),
+            store: None,
+            files: Arc::new(echo_agent::tools::files::LocalFileSystem),
+        };
+        assert!(git_repo_root(&control).is_err());
+        run_git(None, &repo, &["init"])?;
+        let target = directory.join("branch");
+        assert!(
+            create_worktree_in_control(
+                &control,
+                &repo,
+                "eko/fork-unborn",
+                "HEAD",
+                Some(target.to_string_lossy().to_string()),
+                Some("eko-reply-fork:unborn")
+            )
+            .is_err()
+        );
+        assert!(!target.exists());
+        Ok(())
+    }
+
+    struct ReplyForkFaultExecutor {
+        inner: crate::tauri::commands::files::tests::ProjectGitExecutor,
+        fail_after_add: std::sync::atomic::AtomicBool,
+        pending_list_failure: std::sync::atomic::AtomicBool,
+        late_write: std::sync::Mutex<Option<PathBuf>>,
+        adds: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SandboxExecutor for ReplyForkFaultExecutor {
+        fn name(&self) -> &str {
+            "reply-fork-native-git-fault-fixture"
+        }
+        fn isolation_level(&self) -> IsolationLevel {
+            IsolationLevel::None
+        }
+        fn is_available(&self) -> futures::future::BoxFuture<'_, bool> {
+            Box::pin(async { true })
+        }
+        fn execute(
+            &self,
+            command: SandboxCommand,
+        ) -> futures::future::BoxFuture<
+            '_,
+            echo_agent::error::Result<echo_agent::sandbox::ExecutionResult>,
+        > {
+            Box::pin(async move {
+                use std::sync::atomic::Ordering;
+                let echo_agent::sandbox::CommandKind::Program { program, args } = &command.kind
+                else {
+                    return Err(std::io::Error::other("expected actual native Git program").into());
+                };
+                if program != "git" {
+                    return Err(std::io::Error::other("expected actual Git").into());
+                }
+                let worktree = args.first().is_some_and(|arg| arg == "worktree");
+                let action = args.get(1).map(String::as_str);
+                if worktree
+                    && action == Some("list")
+                    && self.pending_list_failure.swap(false, Ordering::AcqRel)
+                {
+                    return Err(std::io::Error::other("injected post-add list failure").into());
+                }
+                if worktree && action == Some("remove") {
+                    let path = self
+                        .late_write
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take();
+                    if let Some(path) = path {
+                        std::fs::write(path, "保留迟到用户写入🙂")?;
+                    }
+                }
+                let add = worktree && action == Some("add");
+                let result = self.inner.execute(command).await?;
+                if add && result.exit_code == 0 {
+                    self.adds.fetch_add(1, Ordering::AcqRel);
+                    if self.fail_after_add.swap(false, Ordering::AcqRel) {
+                        self.pending_list_failure.store(true, Ordering::Release);
+                    }
+                }
+                Ok(result)
+            })
+        }
+    }
+
+    // Tokio 的固定测试属性名，不是本项目的角色/调度概念。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reply_fork_native_git_partial_list_and_late_write_preserve_original_resources()
+    -> anyhow::Result<()> {
+        use crate::tauri::commands::files::tests::{ProjectGitExecutor, namespaced_files};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let temporary = tempfile::tempdir()?;
+        let repo = temporary.path().join("source");
+        std::fs::create_dir(&repo)?;
+        run_git(None, &repo, &["init"])?;
+        std::fs::write(repo.join("tracked.txt"), "已提交🙂")?;
+        run_git(None, &repo, &["add", "tracked.txt"])?;
+        run_git(
+            None,
+            &repo,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Eclip Fixture",
+                "-c",
+                "user.email=fixture@eko.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        )?;
+        let repo = repo.canonicalize()?;
+        let head = run_git(None, &repo, &["rev-parse", "HEAD"])?;
+        // Both the repo and its sibling target belong to this one original fixture namespace.
+        let namespace = temporary.path().canonicalize()?;
+        let files = Arc::new(namespaced_files(&namespace, &namespace));
+        let executor = Arc::new(ReplyForkFaultExecutor {
+            inner: ProjectGitExecutor {
+                files: files.clone(),
+            },
+            fail_after_add: AtomicBool::new(true),
+            pending_list_failure: AtomicBool::new(false),
+            late_write: std::sync::Mutex::new(None),
+            adds: AtomicUsize::new(0),
+        });
+        let store = Arc::new(echo_agent_app_core::api::tasks::task_runtime::TaskRuntimeStore::new_in_memory_with_shadow_root(temporary.path().join("tasks"))?);
+        store.bind_project_environment(
+            &store.active_workspace_id(),
+            echo_agent_app_core::api::workspace::ProjectLocation::Local { path: repo.clone() },
+            1,
+            files.clone(),
+            executor.clone(),
+        )?;
+        let control = ScopedWorktreeControl {
+            _global: None,
+            _project: None,
+            repo_root: repo.clone(),
+            store: Some(store),
+            files,
+        };
+        let target = temporary.path().canonicalize()?.join("partial");
+        let path = target.to_string_lossy().to_string();
+        let reason = "eko-reply-fork:partial-native";
+        let first = create_worktree_in_control(
+            &control,
+            &repo,
+            "eko/fork-partial",
+            &head,
+            Some(path.clone()),
+            Some(reason),
+        )?;
+        assert!(first.created && !first.observed && first.error.is_some());
+        let retry = create_worktree_in_control(
+            &control,
+            &repo,
+            "eko/fork-partial",
+            &head,
+            Some(path.clone()),
+            Some(reason),
+        )?;
+        assert!(retry.observed && retry.error.is_none());
+        assert_eq!(executor.adds.load(Ordering::Acquire), 1);
+        *executor
+            .late_write
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(target.join("late-user.txt"));
+        assert!(remove_worktree_in_control(&control, &repo, &path).is_err());
+        assert_eq!(
+            std::fs::read_to_string(target.join("late-user.txt"))?,
+            "保留迟到用户写入🙂"
+        );
+        let listing = run_git(
+            control.store.as_deref(),
+            &repo,
+            &["worktree", "list", "--porcelain", "-z"],
+        )?;
+        let actual = parse_worktree_list(&listing, &repo)
+            .into_iter()
+            .find(|item| item.path == path)
+            .ok_or_else(|| anyhow::anyhow!("actual retained worktree absent"))?;
+        assert_eq!(actual.lock_reason.as_deref(), Some(reason));
+        Ok(())
     }
 
     #[test]

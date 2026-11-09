@@ -1,5 +1,43 @@
 # Current CLI dependency risk decision
 
+## 2026-11-09 CLI consumer554 的本次精确绑定
+
+用户对本次具体问题直接回答：“同意，仅本次精确绑定（推荐）”。原问题与回答保存在主根 `.echo-semantic/local/dependency-exact-binding-20261109-r01/authorization.json`，SHA256 `b940901e6c755ea39725be1ad184c6713aa6c9c388f9c29e8d1b4d2ffd305733`。
+
+本次仅将 CLI 原五项完整风险身份绑定到 consumer `55413633c252b53cc79116b374a03d36fcdcfc3ec00dd093d159c91809e6eac4`（283 输入）和原锁 `48eece730daaa9eff539e416861454441c23c54abf02bacaa2c3bdb375bd6329`（769 包）。consumer 仅因微信诊断源码变化，原五项 name/version/source/checksum/advisory/kind、collector、checker、原8控制及扫描策略均不变；不增加 ignore 或过滤。policy 仅更新 consumer 字段，采用后原8控制和 actual-lock／canonical-origin 默认 fresh 正式门禁仍须实际通过，分别记录 scanner 与 gate 出口。
+
+原 glib0.18.5 unsound，以及 proc-macro-error1.0.4、zvariant5.13.1、zbus_names4.3.4、zvariant_derive5.14.0 unmaintained 风险仍未修复；本次不是零warning审计，不接受未来任何新源码、锁、版本、来源或风险，不向其它仓继承。GUI／手机、App和精确 main CI继续单独验收；整体提交合并仍按本次已授权整合目标与原门禁执行。下方旧43ed绑定和失败保留历史原义。
+
+原五项风险接触边界的独立复评、微信诊断实际RED/GREEN及完整本地Rust/GUI资格分别保全；本节先记录精确人类批准与采用，下段单列批准后本次正式原8项控制／两项fresh gate的实际结果。公共API、示例及官网产品行为未因本绑定新增；examples与官网无需为风险字段另改，官网最终来源摘要随最终main正常同步。
+
+批准后的原8项控制已实际自然0；两个原正式默认 fresh gate/caller均自然0，scanner各自然1、0漏洞、恰原5项完整warning、769包、ignore=[]、noFetch=false。数据库为 `7a40350e1b8ba5b656d909f88222a8059a83d88d`／1422条；两份独立原JSON均10795B／SHA256 `c89fea7b249432cbb925ea45458a3a12ad16c31a9634c22439b1b5e00dd301d9`。完整执行位于主根 `.echo-semantic/local/dependency-exact-binding-20261109-r01/formal-cli-r01/execution.json`，SHA256 `4490c6d7fd133485f256a24cc26c745681f8ebb23005343c92825cce12f68f4e`。283输入、policy和工具无漂移，临时转发与scanner均已停止；原五风险未修复，不以风险gate通过代替App、手机或精确main CI。
+
+## 2026-11-08 用户批准本次43ed源码与48ee锁精确绑定
+
+用户对列出完整consumer、锁、283输入、769包与原五项未修复warning的具体问题直接回答：“同意，仅本次精确绑定（推荐）”。原问题与回答保存在主根 `.echo-semantic/local/dependency-exact-binding-20261108-r01/authorization.json`，SHA256 `ad2267dc75aaec224777c4133a00c1c54277906fc6f0152f1a31b9486c24bae1`。
+
+本次源码提交为 `efbf200c0d2ff9c4ff20ba567e2660fa0200e248`，官方collector摘要为 `43ed071e6471d4ab627520a74843fdd8c3524a023b30c85205270176257c3143`（283个输入）；锁保持 `48eece730daaa9eff539e416861454441c23c54abf02bacaa2c3bdb375bd6329`（769包）。相对原42a源码的9新增、69修改、205相同、0删除已独立审查；原五项完整身份不变，静态复评未发现新增显式消费API或依赖、feature、平台边，原间接暴露与未修复风险继续保留。完整本地workspace测试自然0另有原冻结来源回执，不把后继Git元数据倒填成原编译时HEAD。
+
+正式policy只更新consumer字段；五项name/version/source/checksum/advisory/kind、官方scanner、collector、checker、原8项控制和fetch/yanked/无过滤要求保持。审批前两次fresh官方raw均自然1、0漏洞、原5项warning，仅作为原始扫描材料，不充当批准后的正式gate。批准后须执行原8项控制及actual-lock／canonical-origin默认fresh正式门禁，scanner真实出口与精确gate／caller分别保留。
+
+本次批准后的原8项控制已实际自然0；两个原正式fresh gate及各自caller均实际自然0。官方scanner各自然1，两份完整JSON分别由原命令独立生成，均为10,795B／SHA256 `850d2216b51da20bd88efc8012ea3db1d39e42ec4023d44abc9ab0c66d4ac8ea`，stderr各0字节。数据库为 `309392b18f6b17022f82c701f300433126901068`／1422条，两份均0漏洞、769包、恰原5项完整warning、ignore=[]、noFetch=false；原canonical helper生成的来源视图锁SHA256为 `d1ed9b961f09608a224375975ff0f9536a7ef7ec1ae6d22a940183542aff2c05`，应用构建锁48ee没有改变。执行终局位于主根 `.echo-semantic/local/dependency-exact-binding-20261108-r01/fresh-formal-r08/execution.json`，SHA256 `d37d2107d27c33064242880ffebdfb63b2c36054ff0969b0b829f1611d42820b`。
+
+两次原直连fetch失败／空audit和R03在包索引检查处的受控SIGINT均保留；后者不是自然scanner失败或完整终局。网络恢复仅使用本机临时CONNECT转发：官方GitHub域名和TLS验证保持，包索引沿既有配置，未替换数据库、关闭fetch/yanked或增加任何过滤。最终两项门禁使用原默认fresh命令自然完成后，临时server已停止，283源码及锁／policy／checker／helper均无漂移；不修改系统网络配置。预检探针失败不冒作正式scanner执行或旧批成功。
+
+原五项风险仍未修复：glib0.18.5为unsound，proc-macro-error1.0.4、zvariant5.13.1、zbus_names4.3.4及zvariant_derive5.14.0为unmaintained。这不是零warning审计，不接受未来任何源码、锁、版本、来源或风险，不向Framework/SDK继承。最终同源App、真实GUI和手机、main CI、推送、合并及发布继续分别验收。此变更维护本次验证绑定，不改变产品API、示例或官网产品行为；examples及产品官网无需因此另改。下方历史授权、失败和扫描结果保留各自原始切点。
+
+## 2026-11-05 用户精确批准48ee新锁
+
+用户直接回答：“同意本次 Framework 8fb62e 与 CLI 48eece 新锁的精确绑定，不自动接受后续新风险。”原文回执为主根 `.echo-semantic/local/dependency-exact-binding-20261105-r01/authorization.json`，SHA256 `a2e324628e7ad1c11dc737405a48cb46a36e8333f109e15f66b4836810815a62`。
+
+本次CLI锁为 `48eece730daaa9eff539e416861454441c23c54abf02bacaa2c3bdb375bd6329`／769包，consumer保持 `42a1dd0dd843ee8629ff12dc20d238dc9356c7b35d29e4bd3b353c0b72d53f42`。新锁采用已审官方calamine0.38和quick-xml0.42，完整差量保留在Framework local/calamine-advisory-validation-20261104-r01/cli038-lock-delta.json，包括原约束内iana-time-zone的windows-core边0.62.2→0.61.2；不宣Windows运行等价。
+
+正式policy仅lock字段由d542更新到48ee；原五项name/version/source/checksum/advisory/kind以及原consumer逐项不变。原8控制仅将精确包数量768改为769、相应错误人口767改为768，保留全部拒绝断言。checker、collector、官方URL、fetch、yanked及ignore=[]不变。原14项Framework控制和8项CLI控制实际各自然0；Framework原完整scanner raw读回的正式rebound caller自然0。
+
+此次默认fresh actual-lock和canonical-origin两个正式gate／caller均实际自然0。官方scanner各自然1，两个JSON均零漏洞、769包、恰原五项完整warning、ignore=[]、noFetch=false，原stderr各0字节；数据库均为 `965bf9ad083b58e6340d65829d85217b18be9290`／1403条。两份audit JSON内容相同、但分别由两个原命令独立生成，SHA256均为 `7fde83a1cfad12eefb4034668bae61da3a2fb91f61762da821f301f33fb59b13`；调用路径、标准来源锁及原caller分别保全在本次原文回执同目录。原升级阶段的fetch1／空audit和旧policy控制失败全部保留，不追改为旧时成功。
+
+批准只覆盖本次具体锁和原风险集合，不预授后续变化；原五风险仍存在，不称风险修复或零warning审计。SDK pin及现App未随此绑定升级，工程、原生和main CI仍单独验收。下方各旧切点、失败和人类来源保留其历史原义。此次是维护依赖验证绑定，公共调用方式、示例和官网产品行为没有新增变化，无需修改examples或网站。
+
 ## Status
 
 accepted
@@ -182,3 +220,397 @@ The exact lock changes from `d804d2907ad283e6f6831cb37551bc0b09e6a169c24a50abe32
 
 
 Executed new-lock qualification: the original six policy tests pass. Fresh actual-lock and canonical registry-origin scans each observe RustSec `84d943a6deeb8cc6c6f632531aaf4f1c62275239` (1,351 advisories), zero vulnerabilities, exactly the original six warnings, no yanked package and no `RUSTSEC-2026-0386`. Each preserves scanner exit1 and separate exact-risk gate0, with default fresh fetching. The full Rust/GUI gates and successor main CI for this lock remain separately recorded after execution; the previous lock’s results are not renamed.
+
+
+## 2026-10-24 bounded reassessment for Plan04 EKO consumer decoupling
+
+The current user delegation explicitly directs completion of Plan04 with the delivered framework bridge and asks to refresh actual consumer inputs/risk, produce a local contribution and handoff SHA, without push or main merge. This authorizes the bounded reassessment for these exact consumers, not a new risk, future automatic acceptance or relaxation of the scanner. The original fixed-six event-bounded decision remains the only accepted risk set.
+
+The unchanged gate first rejected the changed input before invoking cargo-audit (caller1, scannerExit null, consumer inputs changed). The system Python version check also correctly refused an older interpreter; the actual gate uses Python 3.12.4. Both outcomes remain in the task-local record.
+
+EKO base db5010ed888cf50f2400fbba31075ab63c5626e9 removes only LSP feature requests from its two manifests, LSP tool/runtime/command/UI consumption and dedicated adapters. The final bridge increment reads complete generic frozen diagnostics, preserving severity and original owner/path, and adds test-only cache/I/O cases. Framework companion e4e50396876c5e7e85b52cdc3dbb510bab9c4f4d adds only frozen build-boundary diagnostics over c3b; it changes no manifest/lock or public API and introduces no EKO policy. SDK f7bac pin is unchanged.
+
+Independent source/exposure review found no additional GTK/glib VariantStrIter call, related macro dependency, syntect/bincode serialization path, notification/D-Bus call, feature or platform entry. The original TUI markdown and Tauri IPC inputs are unchanged; notification registrations remain. Compiler/focused Clippy/fmt and the six directly relevant current-source modules pass: 133 distinct tests, zero failures/ignores/warnings, with two additional successful single-case executions. The complete-diagnostics regression first failed 1-vs-2 (Cargo101), then the same entry passed0. All five Unix I/O inputs actually ran locally, including read and metadata permission errors; no privileged-environment fallback was taken.
+
+Only consumer_inputs_sha256 is rebound from 47bb8f6a1d67d4ab808903c04750d6eaf8d3ba3944d64e60eccc311f913cc22b to ace3f77e95819525f7bc78d2ce1370a2c5b1d01120833122b9f99168278f1bd0 (294 Rust/build inputs). Cargo.lock remains cca90ea328dbdbb5ebf819b5afb8845714c202e5f5fd1b9c032811c35f0e1307. All six names, versions, registry sources, checksums, advisory IDs and kinds are byte-equivalent to the existing policy; no ignore, dependency upgrade, scanner change, schema change or repaired-risk claim is introduced.
+
+Fresh six-method policy checks and actual-lock/canonical registry-origin official scans must validate this rebound independently. Their natural scanner exit and separate exact-risk gate are recorded after execution. Full workspace/all-feature/GUI/example matrices, final main CI and product/native acceptance remain separate; local source review and focused qualification do not satisfy those gates.
+
+Executed rebound qualification: six original risk-policy test methods pass. Both fresh actual-lock and canonical registry-origin scans observe official RustSec commit 21d909e4c8bd4e14c7aea58bf980c881a0053ab1, 1,352 advisories and 839 locked dependencies, zero vulnerabilities, no yanked diagnostic and exactly the unchanged six accepted warnings. Each original scanner exits1; each separate fixed-six gate/caller exits0 with noFetch=false. Default HTTPS fetching first failed and its raw failure remains preserved. Only the successful processes use Git HTTP/1.1 and an exact official RustSec HTTPS-URL-to-the-same-repository SSH transport rewrite; no global Git configuration, scanner filtering or cached/no-fetch exemption is introduced. This is not a warning-free audit or main/full-matrix acceptance.
+
+## 2026-10-24 bounded reassessment for Plan04 full-gate test-literal repair
+
+The coordinating user explicitly preserves the original clean 2b52251f1bb43d5844c1749028bd188cf6899eca / ace3 checkpoint and authorizes a new same-six binding only for the two required equivalent Unix test-literal spellings and this decision epoch. This is not automatic renewal for future inputs, a new advisory acceptance, an ignore, or a relaxation of the original gate.
+
+The first exact-2b all-target/all-feature Clippy command exited 101 because two `Permissions::from_mode(0)` expressions in `echo-agent-app-core/src/plugin_runtime/tests.rs` require octal notation. The successor changes only those two expressions to `from_mode(0o0)`. Both are inside the existing `#[cfg(test)]` module; the permission value, error scenarios, assertions, fallback and production source bytes are unchanged. The original file, 958-input snapshot, true Clippy101 and raw output are retained. New qualification is for this reviewed successor, not a claim that the unchanged 2b checkpoint passed all gates.
+
+Independent finite source/exposure review reports pass, zero findings. Recomputing with the original `consumer_digest` confirms 294 Rust/build inputs: Git 2b yields `ace3f77e95819525f7bc78d2ce1370a2c5b1d01120833122b9f99168278f1bd0`, and the two-literal successor yields `352d02bc873e42fc83c6c0e42c3608eccd1f056769791db37e572a4224c4e319`. Only the test file differs. All production callers, features, platform entries, build inputs and dependency edges remain unchanged; no GTK/glib VariantStrIter, macro, syntect/bincode or notification/D-Bus exposure is added. Existing residual risks are neither repaired nor declared unreachable.
+
+Only `consumer_inputs_sha256` is rebound to that successor. Lock SHA256 remains `cca90ea328dbdbb5ebf819b5afb8845714c202e5f5fd1b9c032811c35f0e1307`, with 839 packages and the same exact six package/version/source/checksum/advisory/kind entries. The policy schema and all other fields remain unchanged; earlier 2b/ace3 decisions and scanner evidence remain historical originals.
+
+Fresh actual-lock and canonical registry-origin official scans, using a verified clean official database coordinated with its owner, must separately establish natural scanner exit1, exactly the unchanged six warnings and zero vulnerabilities before final fixed-six qualification. The default database's five unexplained untracked files must not be treated as trusted official input. Earlier scanner outputs do not substitute for fresh results. Complete Rust/GUI/source gates, exact main CI, native acceptance and publication are separate evidence and are reported only after execution. No SSH source is included in this successor.
+
+Executed successor qualification: all eight required local macOS arm64 Rust/GUI entries exit0 with zero compiler/Clippy warnings after the two equivalent test-literal corrections. The first exact-2b Clippy101 remains preserved. Six original policy unit methods pass on consumer352. Both newly executed actual-lock and freshly generated canonical registry-origin scans retain official scanner exit1, exactly the unchanged six warnings, zero vulnerabilities and separate gate/caller0 with noFetch=false. Both observe official DB21d909e4c8bd4e14c7aea58bf980c881a0053ab1/tree e48a5ffdb569c69337911adf13262a0058ebccc5, 1,352 advisories and 839 packages. The recipient-owned CARGO_HOME database has 1,371 tracked/physical files, per-file blob/mode equality, extra0 and Git clean before/after. Original source DBs are unchanged. Only the scanner processes use the recorded official same-repository SSH transport rewrite; HOME/global Git, configuration, credentials, scanner filters and accepted identities are unchanged. Public registry/git caches are linked, not copied. The default five unexplained untracked advisory files are neither used nor deleted.
+
+The eight Rust commands qualify the frozen compiled294-input consumer352; subsequent policy fingerprint and historical-journal updates change no Rust/build input and do not require recompiling identical source. Frontend421 inputs remain byte-identical to their accepted58-file/295-test and build evidence. Original examples were compiled by the all-target/full test chain; no real-model example main or native application was run. After saving full raw outputs, real exits/count groups and test/example binary hashes outside target, exact task cargo clean exits0 (19,303 files,24.7GiB); target is absent and the full Rust lease is returned. Exact successor source review/semantic receipt, local checkpoint identity, SDK/whole Plan04 Outcome, main/CI, native/platform and release boundaries are recorded separately; this is not a warning-free audit or published/native acceptance.
+
+## 2026-10-24 bounded reassessment for SSH terminal consumer on the qualified Plan04 successor
+
+The coordinating user explicitly authorizes this exact SSH source's same-six reassessment after independent finite exposure review, normal preflight and a protected fast-forward of the SSH branch from original 2b52251f1bb43d5844c1749028bd188cf6899eca to 4ab0de9fcc071bc9b390732737f9cfc09176c4f9. This introduces no new advisory acceptance, automatic renewal, ignore, dependency upgrade or permission relaxation. The original 2b/ace3, frozen pre-adoption SSH consumer778, qualified 4ab/352 and original Clippy101 evidence remain historical originals; 4ab's complete local matrix is not relabeled as SSH qualification.
+
+The original SSH22 source bytes remain identical to manifest ea4c118ac05e284e4cb0e2314097840c549f792450751762a64fd2f5b7562e54; the corresponding manifest relative to 4ab is 3f6f6edc721e580d9c81e3a729fa8c5ec3c3f0073fac6cfe6612205627f57203. The paired sibling framework remains clean e4e50396876c5e7e85b52cdc3dbb510bab9c4f4d. Original consumer_digest computes 294 application Rust/build inputs and consumer710a34bcb0367b7d6af239df9afa75925a2bd222f0a992253d290fd02f0b4f1f. Against 4ab, exactly eight Rust files differ: seven production deltas extend the existing terminal process target, original child/reader settlement and consumer event adapters; src/cli/channels.rs changes only three existing test fixtures' exit fields. Manifests, features, build scripts, Cargo configuration and lock graph remain unchanged. System OpenSSH adds no Rust SSH protocol dependency, terminal owner, task store, credential store or model-tool schema.
+
+Independent source-bound exposure review reports pass, Critical0/Important0/Minor0 (review raw SHA256 413f64d7ea92a0abf3cfb03d77421cde4ac2dc941d6f9a08c24ce8f1f3ce7dd6). It independently compares all current961 source hashes, baseline/current294 inputs, the eight-file actual patch, 839 packages and all six complete accepted identities. Existing Tauri/base64/xterm output and JSON events add no glib VariantStrIter/GTK macro, syntect dump/bincode deserialization or notification/D-Bus-specific API/dependency path. Existing Linux/BSD GTK/glib unsoundness and notification/zbus maintenance paths remain real; they are not repaired, resolved or proven globally unreachable. Remote PTY bytes and lifecycle changes are real production changes, not a test-only exemption.
+
+Only consumer_inputs_sha256 is rebound from 352d02bc873e42fc83c6c0e42c3608eccd1f056769791db37e572a4224c4e319 to 710a34bcb0367b7d6af239df9afa75925a2bd222f0a992253d290fd02f0b4f1f. Cargo.lock remains cca90ea328dbdbb5ebf819b5afb8845714c202e5f5fd1b9c032811c35f0e1307 with the same 839 packages and exact six name/version/source/checksum/advisory/kind entries. Schema, accepted array, helpers and scanner remain unchanged; the complete 4ab decision prefix is preserved byte-for-byte. Any future source, lock, identity or exposure change requires reassessment.
+
+The original six policy methods and fresh actual-lock/canonical registry-origin official scans must separately qualify this installed binding; prior 352 scanner output is not reused. Use only the task's independently copied and blob/mode-verified clean official DB, with real fetching and unfiltered scanner output. The default five unexplained advisory files are neither used nor removed. Natural scanner exit1 with exactly the unchanged six warnings, zero vulnerabilities, no extra warning/yanked or scan error and separate exact gate0 is the required fixed-six result, not a warning-free audit. Results are appended only after execution.
+
+Original SSH25 focused cases remain evidence for their exact ea4/2b/e4e source, not a new 710 full-matrix run. The 425 frontend inputs remain byte-identical to the SSH61-file/314-test, lint, build and Prettier evidence; later adoption changes no frontend byte. Actual SSH Clippy/complete Rust/GUI, new Tauri-mode native binary, real authentication/remote interaction, Linux/BSD and other platform acceptance, main/CI and release remain separately unqualified. Plan06 remains ready and incomplete; this bounded risk epoch does not complete its Outcome.
+
+Executed 710a metadata qualification: the original six policy methods pass, and two newly executed actual-lock/canonical registry-origin official scans each retain natural scanner exit1, exactly the unchanged six warnings, zero vulnerabilities and independent caller/gate0 with noFetch=false. Both freshly observe official DB21d909e4c8bd4e14c7aea58bf980c881a0053ab1/tree e48a5ffdb569c69337911adf13262a0058ebccc5, 1,352 advisories and 839 packages. Their source-bound commands execute at 2026-10-24T15:18:41Z–15:18:53Z, using a task-owned independently copied DB with 1,371 tracked/physical files, per-Git-blob/mode equality, extra0 and Git clean before/after; its FETCH_HEAD updates during the scans. Identical advisory output hashes reflect the unchanged lock and official DB, not reused 352 scans. Full raw scanner stdout/stderr, canonical-helper output and each true exit remain separate. The prior task's source DB stays unchanged. Only these scanner processes use the recorded official same-repository SSH transport rewrite and HTTP/1.1; no HOME/global Git, default five unknown advisory originals, credential/configuration, scanner filter or accepted identity is changed. No Rust build, Clippy, native or remote execution is included in this metadata qualification. Final metadata review, task semantic verification and local source checkpoint identity remain separate receipts.
+
+## 2026-10-25 bounded reassessment for the private terminal settlement-slot alias
+
+The coordinating user authorizes only the equivalent private type-alias repair of the original SSH consumer, with the existing exact six risk identities and event-bounded lifetime. The original d7fc64fd85bd23a9c9958b41be90ce24c511d4ee/consumer710a source, complete decision prefix, earlier 2b/ace3/778/352 histories and all raw failures remain preserved. This is not a new advisory acceptance, ignore, dependency upgrade, automatic renewal or broader permission.
+
+The exact focused command cargo clippy -p echo-agent-app-core -p echo-agent-cli --lib --all-features --locked -- -D warnings ran from 2026-10-24T15:58:03Z to 16:03:12Z and naturally exited101. Two clippy::type_complexity diagnostics reject the identical Arc<Mutex<Option<JoinHandle<Result<(), String>>>>> at terminal.rs field144 and private prepare parameter191. The final Cargo summary is not a third independent lint. The CLI/Tauri library body was not reached. Raw SHA256 0ba27deae656653e66abd345da93d5c951fef1686182d8df3b7d57e680332cea and actual resource/exit/source-guard receipts remain task-local. No resource ceiling was hit; after preserving raw and confirming no target readers, exact own-target cargo clean exits0, removing5863files/1.2GiB, and the slot is returned.
+
+The sole Rust delta from d7fc is a private transparent type TerminalSettlementSlot for that identical nested generic, referenced by the original field and parameter. Inverse text expansion exactly restores the original file; original type, allocations, synchronization, ownership, spawn/admission, failure/retry and physical-settlement control flow are unchanged. This is not a newtype, struct, public API, state owner or runtime mechanism. The source changes from SHA256 55a9a0abe58dc28dc12f64c79503982a12bdb7b53bbd6ff21cd1d7f222621abb to253a9a771093b6b21d292d17a243f9ff88c137f7bad1a714d6daf9907cf36e80. The prior independent413f64 exposure review of the original eight Rust inputs is reused only across this independently reviewed transparent alias; no new glib/GTK macro, syntect/bincode or notification/D-Bus call/dependency edge is added. Existing accepted soundness/maintenance risks remain real, neither repaired nor globally unreachable.
+
+Only consumer_inputs_sha256 is rebound from710a34bcb0367b7d6af239df9afa75925a2bd222f0a992253d290fd02f0b4f1f to956859854b214d447fcdeb294152dc634d3cdb53290ecffc478b12394897c468 for the 294 Rust/build inputs. The paired framework remains e4e50396876c5e7e85b52cdc3dbb510bab9c4f4d. Cargo.lock remains cca90ea328dbdbb5ebf819b5afb8845714c202e5f5fd1b9c032811c35f0e1307, with839packages and exactly the unchanged six full package/version/source/checksum/advisory/kind entries. Schema, helpers, scanner, features and build/config inputs remain unchanged. The installed alias and policy/decision candidates require original-reviewer incremental source/metadata review before this binding is installed.
+
+The original six policy methods and fresh actual-lock/canonical-origin scans qualify this new candidate independently; old710 reports are not borrowed. Their true results and scanner1/same-six warnings/0vuln/separate gate0/noFetch=false conditions are recorded in new task receipts. Any new warning, vulnerability, yanked, scan error or identity/source drift blocks the workflow. No new Clippy retry, Rust/GUI matrix, Node matrix, native or real-remote execution is included in this repair epoch. Original25case and425-input Node evidence remain limited to their earlier exact source; pure private alias changes no frontend semantics/bytes. Product docs/examples/website need no alias migration; the next same-command Clippy lease and whole Plan06/main/CI/release remain separate and incomplete.
+
+
+Executed private-alias successor qualification: original six policy methods and the new own-DB actual/canonical-origin scans on consumer9568 each pass their independent gate, retaining scanner1, exactly the unchanged six warnings, zero vulnerabilities and noFetch=false. Those scans execute at2026-10-24T16:17:11Z–16:17:24Z; they do not reuse710 reports. Only the same two-library/all-feature Clippy command is then retried at16:29:43.840Z–16:35:40.328Z and naturally exits0, signalnull, with zero compiler/Clippy warning/error lines and untruncated19919-byte raw SHA256fb3be75da4af6895311a4f6b927d00848705f01e9af04eabed666ffe04458ab5. Both selected package libraries emit real rmeta metadata hashes; these are not native executable acceptance. The complete command, not a partial app-core check, establishes this focused library scope; no tests, bins, examples or native/remote execution are added.
+
+The task observer separately exits1 because du races a temporary archive rename. Its full original tool response, observer script and incomplete sample series remain preserved. A recovery observer reattaches the same original runner/Cargo process group, retries only that transient measurement with bounds, retains the original time/resource ceilings and does not restart Cargo. The compiler's natural0 comes from its original run-command receipt, not the observer result. Resource samples have an explicit gap from16:30:09Z to16:34:48Z; observed readings are not claimed as a continuous peak or proof that no pressure ever occurred. Source963/294 consumer9568, exact five owned paths, frameworke4e, lock and risk policy remain unchanged throughout the compiler command.
+
+After full raw/true exit/source guard and both selected lib.rmeta hashes are saved outside target, the exact target-reader check returns1 with empty stdout/stderr. Immediate task-manifest/target cargo clean exits0 at16:35:45Z, removing5939files/1.2GiB; target is absent and the slot is returned before metadata review. Original d7/710, first Clippy101, its1.2GiBclean and prior scanner/semantic failures are not relabeled. Qualification-record/current-observation updates change no Rust/build input and do not renew risks. This completes only focused two-library Clippy qualification on the transparent alias; full Rust/GUI matrices, real Tauri/SSH, other platforms, main/CI/release and wholePlan06 remain incomplete.
+
+
+## 2026-10-25 bounded reassessment for GUI channel, HITL and desktop integration
+
+The coordinating user authorizes the exact same-six reassessment and mechanical lock/consumer binding maintenance after the independent finite exposure review. The original 2026-10-16 three-risk and 2026-10-21 additional-three decisions remain the sole human acceptance; no new advisory, warning kind, schema, ignore, scanner exception or automatic renewal is introduced. The preceding decision bytes, original policy4638915, accepted28bb/consumer9568, E7 sourcef5e1 and all earlier failures, clocks and raw outputs remain preserved.
+
+Independent source-exposure review2ca2e90186a66b4a1fe97de817d4a60a1e3f481f6e4e085657bf1c8be77de38a (Markdown723409eead560aa5a760b6560940f5d0b70fc14e3f8c82aba050fea568f002b2, receipt77ccdae86245870a28c9b626935d8b28ca8f2162595c1bf2ac851f2c21859695) reports pass, C0/I0/M0 for the exact current application consumer relative28bb9459bde9872b8d36cdd4a6eb98929feb0927. Its70 Rust/build input changes (15 added,3 deleted; the separate example is outside the original consumer rule) take294 inputs to306. The original unchanged consumer_digest independently yields08f993b8d72c2f446c7181f3fbc910939e5a0abc114e77a93d14633c9bbcb8b9. The review includes19 locked upstream source/archive-checksum records and actual caller/feature/platform chains; equality of839 package identities is supporting evidence, not the exposure conclusion by itself.
+
+The new MenuItem/Menu/TrayIconBuilder and hidden-window/show/restore behavior are real production GTK menu/tray activation on Linux/BSD. The existing libappindicator backend can activate native session-bus/AppIndicator work. This is not described as no new GTK caller or no D-Bus activity. The review places it within the original explicit GTK3 menu/tray integration scope (original decision line17), with unchanged locked GTK/glib and tray backend features; no ksni backend, new Rust notification/zbus wire API, raw destination/variant construction or unrelated caller family is introduced. The original glib VariantStrIter unsoundness and possible UB/NULL-pointer crashes remain real and unrepaired. No Linux/BSD native safety or unreachability claim follows from source review or macOS tests.
+
+The other five complete accepted identities and their semantic consumer families remain unchanged: existing GTK/glib host macros; existing syntect/bincode embedded syntax/theme dump path; and the original notification/notify-rust/zbus path. In particular, src/tui/markdown.rs and src/tauri/ipc.rs, Cargo configuration and build scripts retain their accepted bytes. New channels forwarding moves existing async-stream/shell-words consumption to app-core and enables the already locked matchit channel edge; these do not create a new accepted maintenance or soundness category. Existing maintenance risks are not declared resolved.
+
+The actual metadata derivation retained839 package identities, versions, registry sources, checksums and all non-dependency fields. Exactly four edges change: app-core adds async-stream and shell-words, CLI removes its direct async-stream edge, and echo_integration adds matchit. Only policy lock_sha256 moves fromcca90ea328dbdbb5ebf819b5afb8845714c202e5f5fd1b9c032811c35f0e1307 tocd05fc1c3ffa425b972d48a687486446ea70f24dea30282d096b4f2856fac335 and consumer_inputs_sha256 from956859854b214d447fcdeb294152dc634d3cdb53290ecffc478b12394897c468 to08f993b8d72c2f446c7181f3fbc910939e5a0abc114e77a93d14633c9bbcb8b9. All six accepted name/version/source/checksum/advisory/kind entries and original gate helpers remain byte-equivalent. EKO AGENTS lock text follows this current binding; framework/SDK duplicate-warning exceptions do not apply.
+
+E7 actually executed the original four B filters (new0..3, original26..29) on frozen sourcef5e1/inputs930e/lockcd05/framework0a18157140b1212c06db38ae5edbe4326381c891:16 distinct tests passed (6+1+1+8), zero failures, ignored or compiler warnings, each natural Cargo0/wrapper0. Its original independent reader/owner guard, exact clean0 and post-clean guard0 returned the compiler slot; formal return7d8b61e45491326ad34b59c5188986ad89278090934f374c18a8a1db3a2990f9 and independent actual-evidence reviewbfb6abc29e6373c5e55731d68ebeab08aafd1d5b5a1e22812294df984a796af1 remain immutable. Historical A26/42 is external evidence for its original0b296/1b8/ba863 source only, not new A execution. This metadata maintenance changes no Rust/build consumer byte and does not require recompiling identical inputs; the whole source epoch changes and is recorded separately.
+
+The original six Python policy methods and two new official actual-lock/canonical registry-origin fresh scans must separately qualify this binding. Preserve official stdout/stderr and natural scanner1 for the same six warnings/zero vulnerabilities, distinct gate/caller0, noFetch=false, unfiltered settings and a task-owned audit DB with actual fresh fetching. Any additional warning, vulnerability, yanked finding, scanner error or input/identity drift blocks qualification. Original scanner/compile failures are retained; earlier scans are not reused. Results are appended only after execution. Full matrices/examples, generated type export, live GUI/IM/SSH, other platforms, native acceptance, main/CI and publication remain separate and unqualified by this record.
+
+
+Executed GUI-integration binding qualification: the original six Python policy methods pass. Newly executed actual-lock (2026-10-25T02:04:26Z–02:06:07Z) and freshly generated canonical registry-origin (02:07:06Z–02:07:31Z) scans each report839 dependencies, zero vulnerabilities and exactly the unchanged six warnings, preserving official scanner1 and separate gate/caller0 with noFetch=false and unfiltered settings. Both freshly observe official RustSec21d909e4c8bd4e14c7aea58bf980c881a0053ab1/tree e48a5ffdb569c69337911adf13262a0058ebccc5,1352 advisories. Full raw JSON for each is12049B/SHA256716bcda7bb57c1c2118c20fc44a7b3dd97b7fec35fc73e9c5dd3285961321e05, with separate original command receipts and empty stderr. Equality reflects the same advisory population, not copied earlier outputs; canonical fetch advances the task DB's FETCH_HEAD timestamp.
+
+The task audit DB is newly fetched into its own per-scanner CARGO_HOME; existing bin/registry/git/config/credential authority paths remain linked to the original Cargo home and HOME is unchanged. No other actor's DB is borrowed or mutated, no audit.toml is introduced, and no build environment is changed. After actual-lock and before/after canonical scanning, all1371 tracked/physical DB files match their Git blobs/modes, extra0 and Git clean. The original default-HTTPS actual-lock attempt failed with a real fetch I/O error (scanner1/gate1, no JSON findings); it remains preserved and is not renamed as success. Only the successful scanner processes use the already established HTTP/1.1 plus exact official HTTPS-to-the-same-repository SSH transport rewrite; no global Git, scanner option/filter, dependency acceptance or stale/no-fetch exemption changes. The canonical projection is produced by the original clean F0a framework helper from the actual CLI lock, never a substituted framework build lock.
+
+Only the policy binding, this append-only decision journal and EKO AGENTS lock text change in this maintenance increment. All306 Rust/build consumer hashes and scanner helpers remain unchanged from the reviewed f5e1 compilation cut. The new whole-source metadata epoch is separately recorded; original E7 inputs/manifest/clock/actual return and all old failures are immutable. These results establish the exact current same-six policy checkpoint, not warning-free dependencies, repaired risks, a new Rust/native run, whole-product/main CI acceptance or publication. The coordinating root owns the corresponding top-level AGENTS text synchronization and later integrated checkpoint.
+
+
+## 2026-10-25 bounded reassessment for console boundaries and truthful cancel Tool receipts
+
+The coordinating user authorizes one combined same-six consumer reassessment after the reviewed console R1/R2 overlay, truthful application cancel_run response, existing active-claim regression extension and four comment-only corrections. Independent finite source/exposure review7944fabd5735abe828f5b0bd606b69f4975558170794c22e87526e505b4ab053 reports pass, C0/I0/M0. It reuses the earlier source-bound2ca2e90186a66b4a1fe97de817d4a60a1e3f481f6e4e085657bf1c8be77de38a review only for these exact application deltas. Existing GTK/menu/tray/AppIndicator/session-bus activation remains acknowledged; no new accepted consumer family or repaired/unreachable-risk claim follows. Original human decisions, six full name/version/source/checksum/advisory/kind identities, schema, helpers, filters and lock remain unchanged.
+
+The original Store request_cancel primitive and physical owner/claim settlement stay authoritative. The application Tool names the same boolean cancellation_requested, without a cancelled completion alias. The extended existing real Store test executes actual CancelRunTool through original ChatResources with active claim and physical intent, then verifies original pending cancellation/settlement behavior. Desktop argument ownership and the single existing auto-memory AtomicBool move only within the application; original startup/Result/map_err/wait_final and validation order are retained. No new harness, state owner, queue, executor, dependency or framework mechanism is introduced. Existing console entrypoints are not claimed removed.
+
+After cargo fmt --all0 and cargo fmt --all -- --check0, the Root-authorized original three-command all-features/locked/offline window actually executes1+10+2=13 distinct tests, zero failed/ignored/compiler warnings, each natural Cargo0/wrapper0. The cancellation Tool/active-claim test,10 desktop argument/lifecycle tests and2 invalid-auto-memory-scope tests bind frozenee89a2c31b9259f9d06b9c3bc5dc3f1accc14637b6022e8ca2b6a36c3233a12a and1002-input manifestc5f51f0d624c7fa72442d702cfab601e5cca7b6813c74c34921e79fe8f3482e2. Original receipts, monitors, source guards and current executable identities were saved outside target before original exact clean0 removed7161files/4.3GiB. Post-clean original guard0 confirms target absent and no active Rust/target processes; formal returnfe4695efea1bb35c2e78efb660441e233a76d89ddc55e6b62e39eabd605bda81 returns the compiler slot. Work1191.595s and formal return1343.387s remain within the original2400+300s budget; observed RSS3547447296B and target4814446592B are three-second sampled maxima, not continuous peaks. Observation gaps0. Earlier A42/E7B16, clocks, raw failures and metadata/UI checkpoints retain their original scopes.
+
+Only consumer_inputs_sha256 moves from08f993b8d72c2f446c7181f3fbc910939e5a0abc114e77a93d14633c9bbcb8b9 tod47a0c2be53fa5dc6e053477c837a864d4e532526f9344ae5c59f66efa7df59f for the same306 Rust/build inputs. Cargo.lock remainscd05fc1c3ffa425b972d48a687486446ea70f24dea30282d096b4f2856fac335 and sibling framework remains0a18157140b1212c06db38ae5edbe4326381c891. Policy is deliberately unchanged throughout actual Rust execution and clean; this metadata epoch starts only after formal return. AGENTS already names the current lock and delegates consumer identity to the policy, so no child AGENTS text change is necessary. The coordinating root owns top-level synchronization.
+
+This binding still requires the original six Python methods and two newly executed fresh actual-lock/canonical-origin scans. Use this chat's existing own advisory DB with real fresh fetching and the previously accepted per-scanner-process transport recovery to the same official RustSec repository; do not borrow another actor's DB, use no-fetch, modify global settings or suppress warnings. Preserve scanner1 and separate exact-six gate/caller0 with zero vulnerabilities and unfiltered settings. Any new finding, identity drift or scan error blocks qualification. Append results only after execution. Full Rust/GUI matrices, examples, live GUI/IM/SSH, Linux/BSD native safety, main/CI, release and whole Plan07 remain separately incomplete.
+
+
+Executed console/Tool binding qualification: the original six Python policy methods pass0. The newly executed actual-lock scan runs at2026-10-25T03:23:00.910Z–03:23:06.780Z; canonical-origin runs at03:23:28.953Z–03:23:34.202Z. Each scanner naturally returns1, with839 dependencies, zero vulnerabilities and exactly the unchanged six warnings; each separate gate and original wrapper/caller returns0, noFetch=false and unfiltered settings. Each full official JSON is12049B/SHA256716bcda7bb57c1c2118c20fc44a7b3dd97b7fec35fc73e9c5dd3285961321e05, with empty stderr and separate new original process receipts. They newly fetch official RustSec21d909e4c8bd4e14c7aea58bf980c881a0053ab1/tree e48a5ffdb569c69337911adf13262a0058ebccc5,1352 advisories; equality with the earlier population does not reuse its scan. Own-DB FETCH_HEAD timestamps advance separately for both scans. Before, between and after them all1371 tracked/physical files match complete Git blobs/modes, Git clean and extra0. The original F0a helper freshly generates the canonical view from the actual CLI lock; scanner/helper source and global configuration remain unchanged.
+
+Both original scanner processes fully settle before the next native/frontend window. At03:24:01Z complete process inspection finds no cargo-audit/scanner process and own-DB lsof returns1 with empty stdout/stderr (no readers). Current source is the tested306-input consumer plus only mechanical policy binding, append-only decision and existing Evidence qualification updates; no further Rust/build input changes or duplicate scans occur. Policy SHA256 is07e5cf3fdc8ba4d43acbfe3f928001d767bebe0da240d1e7f2de2c0cb7544661. The six risks remain accepted, not resolved; no warning-free audit, additional actual Rust run, native safety or full/main acceptance is claimed.
+
+
+## 2026-10-25 bounded reassessment after full local qualification and two private lint repairs
+
+Root authorizes one final bounded same-six consumer reassessment after the complete stable local Rust batch. The original human decisions, six complete package/version/source/checksum/advisory/kind identities, schema, scanner/helper code, warning filters, lock and framework remain unchanged. No new advisory acceptance, ignore, upgrade, automatic renewal or resolved-risk claim is introduced. Every previous decision byte and failed execution/clock remains preserved.
+
+The exact first full all-target/all-feature Clippy naturally fails101 for private ChannelRenderEvent::Journaled688B versus Driver472B. Its formal return93276fc3740b3f6bdab8a5eae2763d82eaddb21a1f3b47763283e7929de582b0 preserves the actual failure, clean0 and unrun other five commands. The sole private repair uses an owned Box at the original enum and sole original journal enqueue constructor. Independent source/finite exposure reviewfedf84b00329ab6050b581daada3c2fea03a34faa7ca0222acf0fa0b1a2682de reports pass C0/I0/M0 and exact inverse restoration. Serialized envelopes, event identity, byte budgets, queue capacity, order, cancellation and physical-settlement owners remain unchanged. No lint allow or replacement event owner is introduced.
+
+The next full Clippy naturally fails101 later for the retained desktop CloseRequested/hide-error nested if. Its formal return05803fb0abe3147bff5e58f80616f0d2e103aa01b80c5afa77733248423f486b preserves that real failure, unrun five commands and clean0. The equivalent let-chain preserves original short-circuit, once-only hide_requested_window, prevent_close-before-hide and identical error logging/show/dialog body. Independent narrow increment reviewd233073d762d0e2320b202acef090bc083fab91c52aa6ba1e71a7e8f479a400d reports pass C0/I0/M0 and exact inverse restoration. Existing GTK/glib menu/tray/dialog/AppIndicator/session-bus activation remains acknowledged, neither repaired nor unreachable. Reusing the earlier2ca2 source-exposure review across these finite internal deltas does not repeat its19 upstream-source investigations or invent new evidence. No new GTK/glib/macro/syntect-bincode/notification-D-Bus consumer edge, dependency, permission or public/serialized API is added.
+
+After final-source fmt/check0 and both source reviews, the exact six original EKO AGENTS commands actually run on frozen source4b09b2cad222a1da6dccdb24b4ceab253f2a868634d2d2df6e56bc9d8b5ea238,1005 tracked plus2 protected open inputs SHA25619037ae5ca7d385aa51c3408562225145aa4d98670841cffa372dbeae675ac89. Both full Clippy commands, workspace all-features tests, app-core no-default check, GUI-only check and GUI-only tests naturally exit Cargo0/wrapper0 with zero failures/compiler warnings. Workspace top-level groups total2124 passed/15 pre-existing ignored, plus one repeated filtered process-helper execution; GUI-only groups total145 passed/3 pre-existing doctest ignored. Feature combinations overlap and are not summed as distinct tests. Ignored live analytics/provider/performance cases and doctests remain unverified, not newly skipped or counted passed. Frontend437 inputs remain byte-identical to actual354-test/full-lint/Prettier0 and same-source tsc/Vite0 receipts, which are reused once.
+
+The one original04:39:22Z du temporary-file disappearance sample has unknown target/RSS, followed by recovered sampling; it is retained rather than filled with zero. All six original compiler/test receipts are successful, but resource numbers remain sampled maxima only: RSS3285499904B/target12344877056B, not continuous peaks. Work2983.757s and formal return3229.761s, including246.003s preservation/clean, remain within the original3600+300s window. Necessary real dev GUI Mach-O plus non-test producer/fingerprint/.d/config/frontend identities are saved outside target before original clean-guard0/exact clean0/postguard0 removes11261files/11.1GiB. Target is absent and all original owners/readers settle. Formal return6f624cbe95c7cd479dd02b320f11f42c6f9e9f0c854f3c15e336aec09a98a127 returns the compiler slot. The regular artifact is dev=true, requires the configured localhost1420 frontend, and has not been launched or used for native/SSH acceptance.
+
+Only consumer_inputs_sha256 is mechanically rebound fromd47a0c2be53fa5dc6e053477c837a864d4e532526f9344ae5c59f66efa7df59f to3b76ef95f80c6f68d2d1ae1a9d9e5555e628fb251322cd98d293fcf6de688d61 after formal compiler return. All306 Rust/build consumer inputs keep their final compiled bytes. Lock remainscd05fc1c3ffa425b972d48a687486446ea70f24dea30282d096b4f2856fac335 and framework remains0a18157140b1212c06db38ae5edbe4326381c891. Policy07e5 stays frozen during every compiler command and clean; the current update is a later metadata epoch, not a source hot edit or old-qualification substitution. EKO AGENTS already names the current lock and delegates exact consumer identity to this policy; no rule relaxation or child AGENTS update is needed. Root owns top-level synchronization.
+
+The original six Python methods and two newly executed actual-lock/canonical registry-origin fresh scans must qualify this final binding independently. Use only this chat's own existing clean RustSec DB with real fresh fetching and the previously accepted per-process HTTP1.1/exact-same-official-repository SSH transport recovery; preserve unfiltered official output, scanner natural1 for exactly the unchanged six warnings/zero vulnerabilities, independent gate/caller0 and noFetch=false. Any additional warning/vulnerability/yanked/error or identity drift blocks the workflow. No old scan is renamed current; results are appended only after actual execution. The six risks remain accepted, not repaired. Plan10's protected open records and real delete-preflight1 remain untouched; no deletion, external-tool repair, main/CI, production static/native performance/live IM/SSH or publication acceptance follows from this record.
+
+
+Executed final stable-consumer qualification: the original six Python policy methods pass0. The new actual-lock scan runs2026-10-25T05:17:29.042Z–05:17:35.070Z; canonical-origin runs05:18:14.454Z–05:18:19.991Z. Both official scanners naturally return1, report839 dependencies/zero vulnerabilities/exactly the unchanged six warnings, and have separate original gate/wrapper0, noFetch=false and unfiltered settings. Each complete official JSON is12049B/SHA256716bcda7bb57c1c2118c20fc44a7b3dd97b7fec35fc73e9c5dd3285961321e05 with empty stderr; distinct new process receipts and actual fetch timestamps prove these are newly executed scans despite the unchanged advisory population. They fetch official RustSec21d909e4c8bd4e14c7aea58bf980c881a0053ab1/tree e48a5ffdb569c69337911adf13262a0058ebccc5,1352 advisories. Before, between and after scans,1371 Git-tracked/physical files match every blob/mode with extra0/Git clean. FETCH_HEAD advances separately for each scan. The canonical lock view is newly generated by the unchanged F0a helper from the actual CLI lock, not borrowed from framework's build lock.
+
+All original scanner processes/readers settle; complete process inspection finds no cargo-audit/helper and own-DB lsof returns1 with empty stdout/stderr. Policy SHA25679521c86609ef31ee6879dc2f134428809913d79d6f3ad819d22f97b2c157617 now binds the exact final3b76 consumer without altering any accepted identity. Qualification/return91cca5ea99b833b4be4debf72d2ba182764c85a5c69d6787ef3126c87a008af8 preserves raw paths and outcomes. This later metadata epoch changes no compiled Rust/build input or retained GUI artifact; no recompile of identical code is added. Normal task semantic closure, local checkpoint authorization and main/native/live-service acceptance remain distinct. The two open retirement materials remain protected, not silently adopted or resolved.
+
+
+## 2026-10-25 central Project855 finite same-six reassessment
+
+Root explicitly authorizes this source-frozen central Project/Domain union maintenance after Batch2 physical cleanup. Independent finite exposure review e9210b82ff1dd305c6b0a1ca1764ea6906d353135e9f60a7207ed516e5a01941 establishes the unchanged six complete package/version/source/checksum/advisory/kind entries. This is neither new advisory acceptance nor risk resolution, an ignore, automatic renewal, SDK/Framework policy inheritance or product/native/main completion. All earlier decision bytes remain historical originals.
+
+The exact central lock is `2f1f128b2ba6e1cac7e254d9a499d96926e860bbdce353ee71c94a0ba2289a57` with 855 packages. The original production collector yields `e50f45c974d30461edebdd4715defa2083f244d3c7692c9ff2c9fef6e0d5b875` on two stable reads of 316 Rust/build inputs after business-source freeze v13 b4108a7c7f4ef105532ecc1b9c81c7802fd6c3d0cffb76d5a168eb8a6190d21f. Only the two machine policy bindings change; policy SHA256 is `0caf363da624552728f49febd3408464cc31d0a96bf0f46b9e11befacece13ff`. All six accepted entries, schema, decision path, frozen glib 0.18.5/proc-macro-error 1.0.4/bincode 1.3.3 versions, scanner implementation and unfiltered configuration stay unchanged. The tests replace only eleven 839 population literals with 855 and the negative 838 with 854; all six methods and negative assertions remain. The collector excludes Framework source/HEAD, docs, AGENTS, policy and the Python test itself. Framework `950af3d1a01645981437b8037c71da666be8cce1` / tree `1240b99d0f19e118b1ce4afe72599e458a558be7` is a separately observed review source, not hidden digest input; its canonical-origin helper SHA256 `9e9323b99e3c1c8735bb9d98157806772a5ebbab8a188d8b66ca86fb41e15460` is checked independently. A later private native-path fix needs qualified source adoption and affected consumer rerun; this paragraph does not pre-qualify it.
+
+Compared with original cd05/839, 838 complete old package identities remain; 17 added identities all belong to exact openssh-sftp-client 0.15.10's closure. The new app-core dependency is unconditional with default-features=false: real remote protocol/request/runtime ownership and macro exposure exists even before SSH selection. Its optional openssh integration is disabled. Original retained ProjectSshConnection launches system SSH/SFTP without another authentication stack. Six-risk direct parents and GTK/glib, macro, syntect/bincode and notification/D-Bus consumers remain acknowledged. prost-derive 0.13.5 genuinely changes its itertools edge from 0.13.0 to already-present 0.14.0, removing the former package; this is not merely unused-package cleanup. termwiz explicitly names num-derive 0.4.2 because new 0.5.1 coexists, without changing its resolved identity. No other old package identity or accepted warning is widened.
+
+Old policy79521c86609ef31ee6879dc2f134428809913d79d6f3ad819d22f97b2c157617 gate1 (scannerExit null) and original six-method failures3/errors7 remain preserved, alongside the original HTTPS fetch failure. Two earlier fresh official reports SHA2567e610d1dc0e2e35457655f3a513d7cf36572b88bda3d468464fab7551f8723b2 cover their actual 15:39 snapshot/DB21d909e4c8bd4e14c7aea58bf980c881a0053ab1 only; rereading them is not a fresh scanner run or final process gate0. New original six-method execution and actual/canonical-origin fresh-fetch process gates are required. Their results are appended only after real completion. Any new warning, vulnerability, yanked finding, source/identity drift or scanner error blocks rather than expands acceptance.
+
+This metadata epoch follows exact target clean0/owner-reader settlement: central Batch2 closed with 110 distinct Rust tests passed and two real GUI native file tests failed (ENOTDIR in Framework950). Those failures remain open. Original v10 embedded debug binary cd68b08d retains its true older source identity. Risk maintenance claims no current-source native artifact, real SSH, full matrix, SDK pin, website/main/CI or Goal completion. It changes no product/example API or website behavior; the existing example compilation and uniform website-mirror qualification remain separate.
+
+
+Executed final Project855 qualification: all six original Python methods naturally pass0 at17:18:53Z. The new original actual-lock gate runs 2026-10-25T17:20:15.537093+00:00–2026-10-25T17:20:20.825179+00:00; the canonical-origin gate runs 2026-10-25T17:20:20.905396+00:00–2026-10-25T17:20:25.526624+00:00. Both original scanner processes naturally return1 and both separate exact-risk gate/callers return0 with noFetch=false. Reports each cover855 locked packages, zero vulnerabilities, exactly the unchanged five unmaintained plus one unsound findings, empty stderr and unfiltered settings/ignore[]. Raw JSON SHA256 `7e610d1dc0e2e35457655f3a513d7cf36572b88bda3d468464fab7551f8723b2` matches the earlier report because lock/advisory data are unchanged; these are nevertheless new real processes with independent receipts and advancing FETCH_HEAD mtimes, not renamed old scans. Both freshly fetch official RustSec21d909e4c8bd4e14c7aea58bf980c881a0053ab1/tree e48a5ffdb569c69337911adf13262a0058ebccc5 (1352 advisories). A new recipient-owned --local --no-hardlinks clone from the previously verified public DB is restored to the exact official HTTPS origin; only these processes use the known exact-same-repository SSH/HTTP1.1 transport recovery. No global Git/registry/filter or production checker changes. Before/after1371 tracked/physical files match original blobs/modes, extra0 and Git clean. The six-risk gate is accepted-risk qualification, never a zero-warning audit or native/main completion. Full raw/natural exits, separate scanner/gate results, original failures, final consumer inputs and source bindings are retained under `.echo-semantic/local/project-domain-union/dependency-risk-maintenance-v1/`. No Cargo target is created by this governance batch; cargo clean is not applicable.
+
+## 2026-10-27 本轮用户明确复评与运行隔离切片
+
+用户在新协调会话明确回复“继续保留原六个依赖，完成本次修复和验证（推荐）”。本轮沿用原六项完整身份，不新增风险、ignore、source或版本例外；原三稳定版本及三项D-Bus闭包身份保持。旧b0的批准原件继续保留，但其完整消费源码未复原，不能声称当前只是旧b0的可证明小增量。本次以当前完整源码直接复评建立新可恢复基准。
+
+实际锁仍为`3fb8955b56e86eb4bef2454d3328b6ef8eb7f36d7663806387f3b990244e7ed6`（856包）；当前GREEN消费摘要为`d38f9a06ca1df7f042295d579bf8144ab3a741a92b6b5bd99fb104941c58ecd9`，由原collector覆盖全部321个Rust/manifest/配置输入；机器policy SHA为`97c2fbe65910328dcc8ba83e5e8ae09d19ea28ded3f4bb8df3a2f0cd2fb34225`。本次运行修复仅身份/scoped指导、3真实Fork消费者及Goal/Steer冷恢复边界测试；没有新增GTK/glib、proc-macro-error、syntect/bincode或通知/D-Bus调用，依赖边及accepted六项字节未变。此处是本轮精确绑定，不是下轮自动续期；后继源变化仍需本轮范围内实际复核和新冻结，超出范围/锁/身份变化重新裁决。
+
+fresh实际锁与registry-origin两报告均0漏洞、恰5项unmaintained+1项unsound，原六完整身份新增0/缺失0/变化0，scanner自然1原样保留；原HTTPS I/O和首次本地镜像HEAD失败不重标通过，后继由官方同一RustSec仓SSH真实fresh至3279c99911354c400e1d41e47c7d60e39258b147，再由各scanner实际fetch进程级同源镜像，不关闭fetch/yanked或加ignore。最终正式原adapter的两次gate及原六Python方法需执行后才有资格，用户同意本身不冒验证。原Python测试仅855人口改856、854负控改855，六方法及所有负断言保持，未改checker/threshold或放宽身份。
+
+扫描/完整身份比较/当前源恢复包及用户原答复位于根`.echo-semantic/local/dependency-reassessment-exact-facts-20261027/`；本次最终consumer与policy/正式gate回执位于本仓`.echo-semantic/local/i1-goal-runtime-integration-20261027/risk-maintenance/`。1797构建输入测试证据仍绑定原policy03cf，不把本policy增量冒充原构建整树无漂移；行为34测试和两示例/fmt单列，完整Rust/native/mainCI未由风险复评取得。
+
+## 2026-10-29 F15后继指定273输入的原五身份子集复评候选
+
+原用户本轮授权原话“继续保留原六个依赖，完成本次修复和验证（推荐）”和原六项policy/全部失败保持。当前不是用户新批准五项；Root明确要求在本轮既有授权内按实际退役和新consumer源码复评：bincode1.3.3随独立终端/syntect闭包移除，剩余五项的name/version/source/checksum/advisory/kind与原六项完全相同。无新增risk、ignore、版本或来源接受，不扩展未来迭代、Framework或SDK。
+
+本候选仅绑定Root指定`eko-appcore-fixture-resume-20261029/gui3-final-source-freeze.json`的273个consumer输入，摘要`d027ea4999a8bcbdc8d6262d4cfdd64f4669565135547e2b0e540e0baa01af9e`；freeze SHA为`20dc7b2019f78f2bfd5a3b8fbfcfbbedabab8d34b29e6afb13a8e5a3194fcb96`，其中292构建来源＋14元数据共306项已核回。CLI锁为`399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f`（768包）。不引用旧7659、89c7、2dc13或6a17票作为当前新资格。
+
+完整321→273暴露复查以原89c7准确快照为基础。Root逐次转交的89c7→2dc13 prepared_turn类型修正、2dc13→6a17 chat_driver hostArtifact/layout正控及诊断都保完整diff和历史票，生产依赖暴露不变仍精确重绑。**本次6a17→d027是实际生产变化，已重新读源码复评**：仅`validated_reply_fork_publication_events`和`validate_reply_fork_publication`两函数删除无native信息时的成功早退，其余原publication selector/owner/FinalAnswer/真实Settled/正文/双序号/checksum和错误传播原样。无native信息现在沿原selector的None转Validation拒绝；原query的无native快速返回没有启动新I/O，更未引入工具/模型/通知调用。没有新增平台桥、依赖边或完整风险身份，现有GTK/D-Bus来源链仍在。另两文件只含cfg(test)透明future转发和重复测试去重，普通history测试构造glue也仅cfg(test)，没有借增栈/预算/断言放宽处理。所有差异已具名保存，不能把Root摘要或旧6a票替代这次复查。
+
+GUI47 distinct的实际行为证据和current official source0按原owner回执独立保存；GUI3三项已在25项组内不重复计票，原quiet性能ignored不算通过。EKO后继非Rust doc-index变动不在原consumer keyset内，仍以实际两读确认摘要相等并单独记录元数据漂移，不用“只是文档”来跳源码/提交门禁。本policy候选是当前d027输入的可审最终收紧提案，正式采用及fresh actual/canonical仍须Root批准和唯一writer正常门禁；再有任何consumer/source改动一律重新拒绝与复核。
+
+原321源码由原本地Git提交0ebd8984的逐文件blob重算，准确得到原d38f摘要；对当前指定273输入的实际比较为新增5、删除53、修改58、同字节210。逐个新增/修改的source行为、manifest与平台native调用复查见所属ADR和本线证据；删除的是批准的独立CLI/TUI/HITL入口，保GUI/IM/cron/PTY/Fork及当前恢复。
+
+锁fresh对照856→768，新增包0/移除88、共同身份version/source/checksum变化0；共同resolved边新增0/移除24。根Cargo移除16项终端依赖，保留依赖的参数不变；default由tui转gui是产品入口收敛，明确承认桌面GUI现为默认，不能据“包更少”声称平台暴露消失。保留GTK/glib、gtk3-macros/proc-macro-error及通知zbus/zvariant三项闭包；原notification IPC发送、插件注册和menu/tray仍真实可用。源码检查没有新增这些风险API直接调用或锁内依赖边，但不宣称transitive native调用安全或不可达。
+
+上游11份缓存crate归档均按当前锁checksum核验，实际读的manifest/关键source与归档字节一致；来源链和target/feature规则具名记录。app-core批次不运行GTK/D-Bus，不能代替rootGUI、Linux/BSD/macOS平台测试；glib VariantStrIter unsound及维护性风险不叫已修复。
+
+checker采用已审固定five和完整warning集合校验，少项/加项/重复/4或6集合、身份/settings/漏洞/yanked/扫描错误继续拒绝。旧真实raw逐warning缺失的RED和旧6＋新2＋raw4 GREEN原件保持；本273隔离候选的原六＋新增两方法、捕获raw四控制均自然0。raw来自前次官方actual/canonical扫描，其自然1/零漏洞/严格五warning原样保留；本次没有fresh scanner，也没有正式原gate。候选票不能冒最终actual/canonical门禁通过。
+
+唯一EKO writer只能在真实reader安全点按准确base正常预检采用；Root/owner在必要Rust验证结束、最终source稳定后另排原actual-lock和canonical-origin gate。source/consumer变化先复查与机械精确绑定；依赖身份或风险/范围新增则交Root保持阻塞，不自动接受。无正式policy/checker/source/AGENTS写入，无scanner/filter/ignore/globalGit改动，无stage/commit；完整Goal、原native验收和性能仍未由本候选取得资格。
+
+
+### 2026-10-29 当前绑定的真实门禁结果
+
+前文“候选／待正式采用及 fresh 扫描”记录保留为本次审查准备阶段的原件，本后继段记录当前实际采用与验证，不改原人类六项接受原话、候选暴露复查、旧失败或完整身份。原六项减去退役 bincode1.3.3 的五身份严格子集已经由唯一 EKO writer 在正常当前 Task 下正式采用；policy SHA 为 `5cfcbd288da8ca059d70e4a9599dd13cce643ea685d81e4839dff898688732b6`。
+
+原 actual-lock caller 于 2026-10-29 04:00:29＋08:00 启动，canonical-origin caller 于 04:02:07＋08:00 启动，均真实采用默认 fresh fetch。两个官方 scanner 自然退出均为 1，完整 raw 和 stderr 原样保留；两个独立精确 gate/caller 实际均退出 0。两报告均为零漏洞、4 项 unmaintained 和 1 项 unsound，完整五身份、类别和 settings 与当前原接受合同精确相同；这不是零 warning 审计、风险修复或新增人类五项接受。
+
+两次调用前后当前 316 项源码／元数据无漂移，collector 的 273 输入两读均为 `d027ea4999a8bcbdc8d6262d4cfdd64f4669565135547e2b0e540e0baa01af9e`，实际构建锁仍为 `399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f`、768 包。canonical 沿原 Framework helper（SHA `498670e5a346eac600eb1540bd392ef68fb3b475af51c750e4eecd9a0a300667`）生成独立审计锁，SHA `f6f52503a2de104add23c857ebd776eb060ddc18dca49d9ff19fc0f34e9e6b6d`；没有覆盖实际构建锁或修改依赖。
+
+官方数据库报告为 commit `40f5be6fb12ed93fc591bf4ab23b7d793b3f2239`、1381 条 advisory。实际 fetch 将原 DB 从 `99670cfc0bc574433034b75876a4b791ccaa2efb` 更新到该 commit，canonical 的后继 fetch 时间也实际推进。DB 前／间／后 tracked blob 与模式均逐项核回；原六份未跟踪 RUSTSEC-0000 草稿状态原样保留并分别记录，没有擅删、忽略它们或声称 clean DB。没有新增 no-fetch、ignore、filter、URL 或全局 Git 配置。
+
+原 actual/canonical `.audit.json`、`.audit.stderr`、`.gate.json`、`.caller-run.json`，以及 DB 三个状态快照和实核汇总，均保存在 CLI 仓内 `.echo-semantic/local/eko-appcore-fixture-resume-20261029/fresh-exact5-gates-20261029/`。Root 的独立 raw／gate／输入复核保存在顶层 `.echo-semantic/local/controlled-goal-resume-20261029/root-cli-fresh5-gates-readback.json`。官方自然 1 与精确 gate 0 分列，不用旧 raw 或合同控制测试替代本次 fresh 执行。
+
+本后继事实只覆盖当前精确 consumer／lock／完整五身份和设置。任何后继源码、锁、consumer、身份、advisory、漏洞或 settings 变化仍先拒绝并复核，不给未来来源永久签票，也不向 Framework／SDK 继承；Rust、文档、原生、全矩阵、SDK 来源、main CI、发布与完整 Goal 仍分别验收。此次只追加非 consumer 采用／扫描事实，不重复 Rust／GUI／前端验证。
+
+
+### 2026-10-30 Store owner 修复后精确274输入的绑定维护准备（采用前历史）
+
+原人类本轮裁决“继续保留原六个依赖，完成本次修复和验证（推荐）”及旧六项、退役后五身份严格子集、d027 实际扫描和原失败均保留。Root 在完整当前差异 source-only 复核后，仅批准这个冻结 consumer 的验证绑定维护方向；这不是新的风险接受或未来来源续期。
+
+当前原 collector 对全部274输入两读均为 `78e10e9372eb354e861f6c0ee8944daa8d9f5264360c15035c1883f634596360`。原基准 `a71a7542d1e6b84b78300fa50ca985860b07190f` 的273个 Git blob 可逐项恢复并准确复现 `d027ea4999a8bcbdc8d6262d4cfdd64f4669565135547e2b0e540e0baa01af9e`。完整差异为新增1、修改58、移除0，其中27路径含生产语义，32路径仅测试；Root独立报告逐项复核完整变化集，Critical／Important／Minor 均为0，没有发现新增原GTK/glib、宏或通知D-Bus调用、依赖、feature暴露的具体反例。源码审查不宣称这些上游风险已修复。
+
+实际构建锁仍为 `399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f`／768包。CLI manifest、feature、build和配置未变；原五项name/version/source/checksum/advisory/kind保持，Framework／SDK风险例外不继承。本候选policy仅替换consumer_inputs_sha256，schema、decision路径、lock与accepted五身份以及settings／ignore均不改；本准备阶段的正式policy当时仍绑定旧d027。
+
+本段仅记录候选准备与精确维护边界。原8道Rust门全部实际通过、代码稳定且原collector重新两读仍为上述78e10后，Root再给具体正常预检采用与原工具控制／fresh actual-lock／canonical-origin窗口。此刻未正式采用新policy，未运行或预签fresh scanner／gate。官方scanner自然出口与独立精确gate出口继续分列；新warning、漏洞、yanked、身份、锁、settings或source漂移仍阻断，不增加ignore、不关闭fetch或改官方来源。
+
+证据分别为CLI本批 `risk-current-two-reads-and-exposure.json`（原collector两读、完整旧源恢复、1新增58修改diff与五身份），以及Root `eko-store-factory-dependency-exposure-review-r01.md`（SHA-256 `292f3e4f65afcea54dd28d4aaba5bad30188ce624d450492c256e923e2712114`）。正在执行的工程门与已通过focused12只属于各自精确源码；风险metadata后继即使不改变consumer，也必须有新显式guard和正常门禁，不热写已经冻结的cli-after。任何工程修复改变代码时，先交真实delta复核，不沿当前source票签新hash。完整Rust／前端／原生／mainCI和整体Goal继续分别验收。
+
+
+### 2026-10-30 精确78e10绑定的真实采用与fresh门禁结果
+
+上节“绑定维护准备”明确保留为采用前历史。本节记录后续真实结果，不改原人类“继续保留原六个依赖，完成本次修复和验证（推荐）”、旧d027扫描、原失败或当时source-only审查的验证范围。Root在原8道Rust、3道前端与postSource全部自然退出0、原collector终态后两读仍为78e10／274后，明确授权唯一EKO writer正常预检采用这一个冻结consumer的绑定维护。正式policy的consumer_inputs_sha256现为 `78e10e9372eb354e861f6c0ee8944daa8d9f5264360c15035c1883f634596360`，policy SHA-256为 `703b5bc5e9fd85e637de32ab40d662856bac352eb3470fc7f656d083a893f5e0`；schema、decision路径、lock与accepted五身份、settings和ignore均未改变。
+
+原六方法与缺warning／settings两项负控共8个工具测试实际全部通过。原actual-lock caller于2026-10-30 16:21:10＋08:00启动，原canonical-origin caller于2026-10-30 16:22:29＋08:00启动，两次均采用默认fresh fetch、原官方HTTPS URL及原checker。两次official scanner自然出口均为1，原完整JSON与stderr保留；两个independent exact gate及caller均实际退出0。两报告均零漏洞、4项unmaintained与1项unsound，完整五身份和原settings精确相同。这是当前已接受风险合同的验证资格，不是零warning审计、上游风险修复、新人类风险接受或未来源码续期。
+
+前／间／后source guard核验保持当前274输入两读78e10、实际构建锁 `399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f`／768包及原checker／canonical helper字节。原helper生成独立canonical审计锁SHA-256 `f6f52503a2de104add23c857ebd776eb060ddc18dca49d9ff19fc0f34e9e6b6d`，未覆盖构建锁。DB实际从 `40f5be6fb12ed93fc591bf4ab23b7d793b3f2239`更新到 `ee1a49a2769a24a596afc1c20cb33748d2769586`，报告1386条advisory；tracked文件1400→1405且前／间／后物理blob与mode逐核一致。两次FETCH_HEAD时间均实际推进，原6份未跟踪草稿的字节与mode保持，不清DB、不改来源、不禁fetch、不加ignore或filter。
+
+原8Rust／3frontend资格仍绑定未热改的d826工程快照，正式风险policy与本决定的metadata变化另有显式guard；source-only风险暴露审查没有被改写为当时执行过scanner。当前正常Source与final结果仅为本Task，globalClosure仍not_checked，不授capture、Tauri/App、真实auth／SSH／IM／cron、quiet/native、mainCI或发布资格。源码、consumer、锁、身份、漏洞、warning或settings再变化时原工具仍阻断，必须先交真实delta复核。
+
+此前正常Source于2026-10-30 16:19:30＋08:00退出0、正常final于16:25:40＋08:00退出0，仅覆盖旧决定字节 `2b61a3bd8bda177ca6bad2a9637985de668dda0468f5837f8840ab0451b2595e`；16:27:45＋08:00后准备的时态候选 `5c835ae55353cf2a024bcb3945294403c167a3745c04254e60dd067583b3ddfd` 及本后继新字节不继承这两票，正式采用后须另建metadata-only guard并重新取得Source／final实际结果。
+
+完整原raw／stderr／caller-run／gate、before／between／after DB和source快照、两metadata采用guard及正常Source／final实际收据保存在本仓 `.echo-semantic/local/eko-resume-20261029/store-owner-49d-consumer-epoch-20261030-r03/risk-fresh-78e10-execution-r01/`。本节只追加真实采用与门禁时态，不重跑未受影响的Rust／前端，不以文稿或旧raw替代本次fresh结果。
+
+
+### 2026-10-31 TaskRun 同 cut 修复后的精确绑定维护提案（尚未采用）
+
+原人类“继续保留原六个依赖，完成本次修复和验证（推荐）”及退役后五项严格子集的来源、完整身份、旧扫描与失败记录继续原样保留。本节是当前具名源码增量的复核与绑定提案，不新增风险接受，不延续未来源码资格。
+
+正式 CLI 仍为 HEAD `6c0bc7879bc2b3b0dd3b7dd086913405cbafe035` 上未提交的四文件增量。原 collector 的 274 项输入连续两读均为 `f17364a7e07685e35b90a40af4b70b5893ec60a300c3796aa058efb418e54aa1`；相对原 `78e10e9372eb354e861f6c0ee8944daa8d9f5264360c15035c1883f634596360` 为修改三项、新增零、删除零。`run_authority.rs` 是一项生产正确性变化，复用原 checkpoint/reducer、typed builder 与完整序列化结果判断现有派生文件；`file_shadow.rs`、`file_store.rs` 的增量均在既有 cfg(test) 范围。应用性能说明是第四个文件，不属于 collector 输入。
+
+生产增量没有新增依赖、feature、公共 API、unsafe、GTK/glib、通知 D-Bus 或 proc-macro-error 调用；新增的 serde_json/std 文件读取复用原类型与原派生修复路径。锁仍为 `399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f`、768 包，五项 name/version/source/checksum/advisory/kind 精确不变。这份源级暴露复核不表示上游风险已修复。
+
+已验 B 副本先取得真实目标 runtime RED，再取得原序十项 GREEN，各项精确选一、零忽略、Cargo 自然零和零编译告警；正式四文件全 fmt/check 与 diff-check 已零退出，并逐 byte 等于已验 B，其他正式源码与 Framework 内容/模式无差异。这些是正确性及来源证据，不替代风险 fresh 门禁或性能结果。
+
+本提案机器 policy 仅替换 consumer_inputs_sha256，schema、decision 路径、lock、accepted 五身份及 scanner 原命令/settings/URL/fetch/ignore 均不改变。Root 复核本提案后另行授权正式绑定及原 fresh actual-lock/canonical-origin 两门；本提案阶段尚未写正式 policy/本决定，尚未执行这两门，不继承旧 78e 绿票。官方 scanner 自然出口与独立精确 gate 出口继续分列；新漏洞、warning、yanked、身份、设置、锁或后继 consumer 漂移继续阻断。
+
+本次为内部 TaskRun 派生读取修复，无公共 API、配置、工具或示例调用变化；已同步应用性能说明，examples 与官网不需要改动。完整 Goal、原生 App、性能 after、main CI 和发布继续按各自实际证据验收。
+
+
+### 2026-10-31 精确 f173 绑定的真实采用与 fresh 门禁结果
+
+上节“尚未采用”保留为采用前提案历史。本节记录后续实际事实，不改原人类六项裁决、退役后五身份严格子集、旧 78e 扫描与失败记录。Root 独立核对三项 consumer 变化及最小两文件提案后，唯一 EKO writer 在原 policy `703b5bc5e9fd85e637de32ab40d662856bac352eb3470fc7f656d083a893f5e0`、决定 `1a0e47631e5e9da5b46db5b4f4d527f25a862d66400f008de0bc5a03a46ee18a` 的 SHA 预检通过后正常采用。正式 policy 现为 `3144106beb2acb946ba313e0c12df4e378fcee6763c18ac59596a56047817294`，仅将 consumer 绑定为 `f17364a7e07685e35b90a40af4b70b5893ec60a300c3796aa058efb418e54aa1`／274；锁 `399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f`／768 包、原五项完整身份、schema、decision 路径与 scanner 设置均不变。
+
+原六方法及既有缺 warning／settings 两负控共八项实际全部通过。原 actual-lock caller 于 2026-10-31 15:49:13＋08:00 启动，原 canonical-origin caller 于 15:49:27＋08:00 启动，均使用默认 fresh fetch、原官方 HTTPS URL、完整官方输出及原 checker。两次官方 scanner 自然出口均为 1、零漏洞、四项 unmaintained 与一项 unsound；两个独立精确 gate／caller 自然出口均为 0。没有关闭 fetch、改变来源、增加 ignore/filter、替换 scanner 或接受新 warning。这是精确已接受风险合同的实际门禁资格，不是零 warning 审计或上游风险修复。
+
+前／间／后 1078 项正式源码／元数据均匹配冻结 guard，原 collector 两读持续为 f173／274。官方报告数据库 commit 为 `2295466c4e9df26647fd67d8fa1c705ac2fc7f81`、1395 条 advisory，物理 tracked blob 与模式逐项一致；两次 FETCH_HEAD 修改时间均实际推进，原六份未跟踪草稿的字节与模式保持，未清理或忽略它们。canonical 原 helper 生成独立审计锁 `f6f52503a2de104add23c857ebd776eb060ddc18dca49d9ff19fc0f34e9e6b6d`，没有覆盖实际构建锁。
+
+原 stdout／stderr／gate／caller-run、三次源码及 DB 快照、控制结果与实核汇总保存在 `.echo-semantic/local/taskrun-materialization-formal-integration-20261031-r01/risk-fresh-f173-execution-r01/`，实核汇总为 `two-fresh-official-risk-gates-qualified.json`。本实际结果段是门禁结束后的非 consumer 文档后继，须对其精确新字节重新取得正常 Source／final，不能借用旧决定或旧票。Root／CLI AGENTS 的当前时态同步由 Root 统一处理；本 writer 没有改 Root AGENTS。原生 App、性能 after、main CI、发布及整体 Goal 继续分别验收。
+
+
+### 2026-10-31 HookTest 单 cfg(test) 增量的精确绑定（采用与门禁前记录）
+
+本段记录 Root 已具体批准的唯一测试源码增量，不扩原人类“继续保留原六个依赖，完成本次修复和验证（推荐）”的接受范围，不授未来输入续期。基于已保存的 `bc08ea4db89ec05071002fb0b76282d344ee2c4e`，唯一 EKO writer 正常应用已审 f00f 补丁到 `echo-agent-app-core/src/extension_control/tests.rs`，精 base 为 `9f5ace3bdc79b894d0d5bce03356cc8435dce4eb20e027754472af5a9b3c3015`，after 为 `11ae8258ffa30e9afcae67e2b9e9610ef763c5ce22600103bae2377087e029c5`。原19相关输入按当前已批准 bc08 基准核对；其中 CLI AGENTS 从旧6c准备稿到已提交 bc08 的差异明确保留来源，其余相关生产／依赖输入未变，不冒称旧19与新规则字节相同。
+
+Gov 的独立 B 新 epoch 已实际执行三项 HookTest，每项一通过、零失败／忽略／编译告警，原 raw／自然出口／冷 bin c23 与完整 restore 保全均另存，准备源与真实结果已独审。正式本文件与已验 B 逐 byte 一致，cargo fmt --all／check 与 diff-check 均自然零，未新增 Rust 编译或重复三项／旧十项。原 f173／bc08 结果继续保留其自身范围。
+
+原 collector 仍为274输入，相对 `f17364a7e07685e35b90a40af4b70b5893ec60a300c3796aa058efb418e54aa1` 只有上述既有 tests.rs 一项修改，新增／删除均零；两读当前摘要为 `525f19abeb161c7b118cee03c2e3bbdcd5344cf9f1bf0911509fb969b215f55a`。增量仅在原 cfg(test) 路径复用 fanout_fixture、ExtensionCommandDispatcher、typed Tested／Failed 回执，覆盖请求 workspace、generation 和 captured runtime；无生产路径、公共 API、权限、网络、unsafe、GTK/glib、proc-macro-error 或通知 D-Bus 调用变化。原三项 TaskRun 生产源码／测试及锁 `399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f`／768包、五完整身份、checker／settings 不变。机器 policy 仅替换 consumer 字段，原 human／schema／decision路径／accepted／URL／fetch／ignore 不动。
+
+此刻是本增量采用及 fresh 门禁前的具名来源记录，不能拿前次 f173 的两 gate 追标新源码；Root 已条件授权原八控制与原 fresh actual-lock／canonical-origin 两 caller，实际结果另作后继。任何额外 source、身份、漏洞、warning、yanked 或 settings 漂移都停止，不自动接受。只有本条具体已审源码与已复核条件成立才可绑定，不为未来源码提供自动规则。测试专用增量没有新 API、配置或示例调用，examples／官网不需修改；原生、性能、main CI 与整体 Goal 独立。
+
+
+### 2026-10-31 HookTest 525f 精确绑定的实际采用与 fresh 结果
+
+上一段为本增量采用与门禁前的原阶段记录。本后继只记录后来实际结果，不改前 f173／bc08 历史、人类六项原话、五身份严格子集或任何失败。Root 事先具体授权的唯一源码条件已实核：原 collector 两读 `525f19abeb161c7b118cee03c2e3bbdcd5344cf9f1bf0911509fb969b215f55a`／274，相对 f173 仅既有 `echo-agent-app-core/src/extension_control/tests.rs` 一项修改，新增／删除零；正式该文件字节等于 Gov 原实际三项测试源，生产三文件与其余输入、锁和工具不变。sole writer 正常 check/apply 后，机器 policy 为 `e99f7641ec5fb8fe0eb7b792b73470cfa6eb3a827b207daf79bc79b6590c2ff2`，仅 consumer 字段从 f173 替换为本摘要，原 schema／decision 路径／锁／完整 accepted 五身份保持。
+
+原八项工具控制实际全部通过。原 actual-lock caller 于 2026-10-31 16:31:13＋08:00 启动，原 canonical-origin caller 于 16:31:26＋08:00 启动，均采用默认 fresh fetch 与原官方 URL。官方 scanner 两次均自然退出 1、零漏洞、四项 unmaintained 与一项 unsound；两个独立精确 gate／caller 均自然退出 0，完整 settings 与五完整身份精确相等。无 no-fetch、filter、ignore、scanner／helper 或工具变更，不叫零 warning 审计或风险修复，也不接受后来源码。
+
+三次 1078 项正式源码／元数据 guard、原 collector 两读和锁均保持当前冻结值。DB 报告 commit `2295466c4e9df26647fd67d8fa1c705ac2fc7f81`、1395 条 advisory，tracked 物理 blob／模式逐项核回、两次 FETCH_HEAD 时间真实推进，原六份未跟踪草稿字节／模式保留。canonical 原 helper 的独立审计锁仍为 `f6f52503a2de104add23c857ebd776eb060ddc18dca49d9ff19fc0f34e9e6b6d`，未覆盖实际锁3995／768包。原 stdout／stderr、scanner 自然码、gate／caller、三次源码与 DB 快照及原八控制都保在 `.echo-semantic/local/hook-test-fixture-formal-integration-20261031-r01/risk-fresh-525f-execution-r01/`，汇总 `two-fresh-official-risk-gates-qualified.json`。
+
+本段和 Root 后续规则文档更新属于非 consumer 后继，必须在实际最终字节上重新取得正常 Source／final，不沿 f173 旧票；Root／CLI AGENTS 与 ADR 当前绑定的准确文字交 Root 处理跨仓一致。该变更只有 cfg(test) 覆盖，无新 API、配置或示例调用，examples／官网不需变更。无新 Rust 编译、未重跑原三项或十项、未 stage/commit；原生、性能、main CI、发布与完整 Goal 独立。
+
+
+### 2026-11-01 IM/cron 历史与前台续接呈现的具名源码复核（执行前记录）
+
+原人类“继续保留原六个依赖，完成本次修复和验证（推荐）”以及退役后五项严格子集的来源与历史保持不变。本段仅维护本次具名源码绑定，不新增风险接受，不延续未来源码资格。
+
+当前正式 collector 连续两读为 `7441191402e2350ea32fdf72052c0a5f68c3ce0431f326608b37a3988b54bf74`／274 输入。相对 HEAD 667 的原 525f 切点仅八个既有 Rust 文件修改，新增／删除输入零：channel_runtime、native_message_tests、chat_driver、foreground_turn、scheduler/runner、task_runtime/continuation、file_store 与 store/tests。生产变化恢复渠道／定时运行的原历史可见性、保留续接 surface journal 根，并在同 generation 读回原 Run 后映射已有前台结果；私有瞬态观察不参与准入或执行，不创建 store／registry／第二套执行器。新测试保原失败证据、型别化输入与事件、工作空间／代际、物理等待和旧终态，Duration 只在新增 cfg(test) 函数局部导入。
+
+原锁 `399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f`／768 包及完整 accepted 五身份保持。runtime 与 quality 独审均已对具名生产增量 source-only 通过；测试导入桥不扩大 GTK／glib、相关宏或 native_notify 的 zbus／variant 调用面。没有新增依赖／feature／unsafe／权限或外部网络入口，checker、官方 URL、fetch、settings 与 ignore 均不修改。机器 policy 仅替换 consumer 字段，原 schema／decision 路径／锁与 accepted 数组保持。
+
+此刻仅为具名来源复核与执行前记录。原八项工具控制，以及默认 fresh actual-lock／canonical-origin 的官方 scanner 自然退出 1 和独立精确 gate／caller 0，仍须逐项实际记录；不能把 source review、当前编译或旧 525f 结果追标为本切点风险 GREEN。源码、锁、身份、advisory、warning、yanked 或 settings 漂移仍停止重新复核，不自动接受。
+
+本次没有新公开模型／协议或示例调用；examples 不需变更。中文 runtime 说明已同步；官网正式镜像由所属作者在合格源码后继中统一维护。最新 App、真人微信、性能、main CI、发布与完整 Goal 验收仍各自独立。
+
+
+### 2026-11-01 IM/cron 744 绑定的实际 fresh 结果
+
+上段为本切点来源与执行前记录；本后继只追加实际结果，不改旧 525f、人类原话、完整风险身份或任何失败。正式机器 policy 现为 `c1993eb7f64c36e81f18eec7768d08fb0045f16d0e74d11fcbcec5a10a5c0b9c`，唯一字段改动为 consumer 525f→744；锁 3995／768、accepted 五完整身份及 checker／helper／settings 保持。原 collector 在实际两 gate 后连续两读仍为 744／274。
+
+原八项工具控制实际 8/8、自然退出 0；测试临时目录固定到本任务主根内。默认 fresh actual-lock 与 canonical-origin 两原 caller 分别于 2026-11-01 00:53:25＋08:00、其后同一串行批启动：两个官方 scanner 均自然退出 1，零漏洞，恰四项 unmaintained 与一项 unsound；两个独立精确 gate／caller 均自然退出 0。默认 fetch、官方 URL、空 ignore 与原 settings 不变，无 no-fetch 或输出过滤。DB 报告为 `2295466c4e9df26647fd67d8fa1c705ac2fc7f81`／1395 条。完整官方 JSON、stderr、scanner 自然码、独立 gate、真实 caller、原八控制与输入绑定汇总保存在 `.echo-semantic/local/im-cron-history-fix-20261031-r01/risk-fresh-744/`。这表示符合原接受合同，不称风险已修复或零 warning 审计。
+
+本次风险通过只覆盖当前具名 744 来源，不替代本轮 Rust 行为、GUI 类型检查、正常 Source／final、最新 App／真人微信、性能、main CI、发布或整个 Goal。任何后继源码或 advisory 身份漂移都需重新复核；不把本次结果自动延续至未来输入。
+
+
+### 2026-11-02 r03 真实进度消费者单 cfg(test) 的精确机械绑定
+
+Root 已亲读并审定本次具名 test-only 源码与持有者，Source 审查 pass C0/I0/M0；这不是新的风险接受、运行通过或未来输入续期。原人类本轮“继续保留原六个依赖，完成本次修复和验证（推荐）”、退役后五完整身份及全部旧失败继续保留。CLI 当前基底 b04c5923dc207869c22b17916874feb43fc19f94，Framework 固定 clean a8a8511d9ec2cd3da382bd5f7b151ac537374aa8。
+
+仅既有 echo-agent-app-core/src/turn_context.rs 的 cfg(test) 模块增加一个显式 opt-in consumer；生产前缀 15116 字节未变，无新增或删除 consumer 输入。正式采用后原 collector 实际连续两读均为 cdef66173e81c681c4c88129526cf75777e11f079c34bbfa30dcf7fd7ea084a7／274，相对旧744只此一个Rust文件变化，after SHA08912a582d73e99c1b1c80f418dd49098886b4846d38c3f6d8db7981d4d69263。不是把候选编码预估当实际读取。
+
+本 case 在隔离产品数据与loopback下调用真实OpenAiClient、ShellTool和原drive_chat/projector，验证原默认60／120秒期限、typed ToolResult、公开Unknown与同注册进度提醒；没有更改生产函数、依赖、feature、unsafe、GTK/glib或通知D-Bus调用面。holder仍是本地受控测试持有者，不改用户App或UserRoot/Auth/config。该source-only暴露复查不等编译、60秒、owner正常/中断/取证失败或完整native通过。
+
+锁仍为399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f／768包；原五项name/version/source/checksum/advisory/kind及schema/decision路径/settings/官方URL/fetch/ignore保持。机器policy仅consumer_inputs_sha256由744替换为本次精cdef。Root具体授权本次机械维护与受控focused，AGENTS不改，不新增风险、ignore或冻结依赖升级，也不向Framework/SDK继承。
+
+原八控制与默认fresh actual-lock/canonical-origin两门禁随后实际执行；官方scanner自然1、恰五原warning/零漏洞与独立gate0须分列记录，当前这一段是采用及执行前来源事实，不提前声明门禁或测试成功。任何新的风险、identity、source、warning或编译告警仍阻断；若编译需要改已审Rust，保留原失败和最小差量交Root重审，不自动追随新digest。examples/官网无新公共调用，本case不需要新增API示例；Rust、GUI、完整矩阵、mainCI、发行与整个Goal仍独立。
+
+
+### 2026-11-02 r03 两处测试编译错误的具名修正与 3cea 精确绑定
+
+原 cdef／08912 来源的默认 fresh actual-lock 与 canonical-origin 两 gate 已分别实际自然 0，官方 scanner 均自然 1、零漏洞及原五项 warning；原网络失败、原 raw 与其精确来源资格全部保留。其后同批 focused NoRun 实际自然 101、零 warning、两项 error：E0433 指向不存在的 infra::factory 子模块，E0277 是本最小 feature 中 Uuid 未实现 Serialize。原失败日志及 2557 份 FP／dep-info 已在 target 外保全，未运行 list、正常用例或三个 owner 控制；不能把风险 gate 或 Source 通过改称 Rust 通过。
+
+Root 依原完整诊断、infra 的 include! 与既有生产路径及 uuid v4 依赖核因，原 reviewer 对精确 aabeef 补丁给出 Source delta pass C0/I0/M0；Root 随后具体授权本次两处 test-only 修正。turn_context.rs 的 after 为 8db76b265d78a05d75c74b74cae11a2dd7ed32f9adc00638d9a88bc1149bfa69：改用原 infra 同层 Critic owner 常量；Uuid 内存类型及所有注册身份断言不变，仅为本测试观测字段增加 collect_str 序列化。生产前缀、holder／wrapper、原 60／120 秒期限、真实 client／ShellTool、typed 结果、Unknown／reset／0-1-0 及 final／settled／原 driver EOF 断言均不改，不新增依赖或 feature。
+
+采用前原 collector 实际两读 cdef／274，原其余 273 项输入均与冻结来源一致。采用后原 collector 实际连续两读为 3cea0bd9f6db2ad796db30c73e7d44d950d24333eaded8401044cc475b9cb93f／274，仅上述一个文件改变，路径新增删除均为零；此前内存预估不充作本次实际读取。机器 policy 只将 consumer_inputs_sha256 从 cdef 机械替换为 3cea，锁仍为 399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f／768 包，原五完整风险身份、decision 路径、settings、官方 URL、默认 fetch 和 ignore 保持。这是本次具名精源的机械维护，不是新风险接受或未来来源续期，不改 AGENTS。
+
+本段仅记录采用及执行前事实：新来源的正常 fresh 预检／Source、原八控制、双默认 fresh gate 及同 target／同 profile 的原 NoRun 尚须另取真实结果；旧 cdef 绿票不能重命名为 3cea 绿票。NoRun 零 warning 且实际 list 精确选中 1 后才继续正常用例，正常通过后才做三个 owner 控制。任何新差异仍停止核因，不增 feature、不换 Mock、不放宽断言或自动追 hash。本次为既有测试的编译修正，无新公共 API 或示例调用，examples／官网无需改动；GUI／App／完整矩阵／main CI／发布及整个 Goal 仍独立验收。
+
+
+### 2026-11-02 r03 平台命令后继 dd438／dd9c 的具名精确绑定
+
+上一精源 8db／3cea 已取得原 Source、八控制和两默认 fresh 风险 gate 资格，随后同 target 原 NoRun 实际自然 0、零 warning／error，实际新程序 c0cab 精确 list 1。首次真实 normal 选中 1、通过 0、失败 1，Rust 自然 101、holder 自然 1；原第二 ToolCall 参数为 /bin/true，原 typed ToolResult 是 Permanent／Stop StructuredError，最早可见 cause 为 OS spawn 的 ENOENT。原 cwd 存在，本机不存在 /bin/true，存在可执行 /usr/bin/true；没有证据指向权限拒绝、共享 cancel 或应用状态。permission_mode 未单独取证，保持 unknown。第一条真实 Timeout 为 60003ms，driver Completed、fixture close／portgone 与测试失败各 scope 保留，三个 owner 控制未启动，所有原件不改写。
+
+Root 派 Provider 唯一作者另存新 epoch，Model 仅将 FAST_COMMAND 一个字面量改为 /usr/bin/true，wrapper 仅更新来源路径和 SHA；原失败 cwd 中直接 /usr/bin/true 自然 0 只是主机命令检查，不冒充 typed ShellTool 或完整 case 通过。Provider 41f65 入口及原 reviewer 对 28 refs 的新组装 Source 均为 pass C0/I0/M0。Root 具体批准 Model 0578e3d0df9ee6335a8aca4352c9bb1773a640833e6d53dffb0532dcfcc5a146、wrapper dae152d98294331c3b9a08a76d11bc3e251bcec0b25b8231b9f8b34626af80dc、Rust dd438a3a3e125e00f329aa2366166aa2a1d6b45516dc545d267bae5d3e69031a，以及另存新 owned holder c4d9acaae1d860a7f5e3b9d4cdcb785d11aab286b7d27a84fea7338d1abafe6d；旧 5f／5db／e903／c0cab 全保。
+
+本次 Rust 仅改 Model SHA 与快速命令预期两处编译常量，生产前缀和其余测试字节不变；holder 只改 entry 路径、wrapper SHA 与 Model SHA 三绑定，原生命周期不变。原 Timeout／CommandOutput exit0、phase／body 原身份、Unknown／reset／0-1-0、60／120 秒及 cleanup 全部强断言保留；不加动态名单、失配 fallback 或伪 SHA 来复用旧程序。
+
+正式采用前原 collector 两实际读为 3cea／274，原其余 273 项与冻结来源逐项一致；采用后原 collector 两实际读必须并已均为 dd9c5cd0bb460792b7a8c482eb043edb81f1cc135ba80c25a43bc2e9c3e507ee／274，仅 turn_context.rs 一项变化，路径增删零。机器 policy 仅将 consumer_inputs_sha256 改为本次精 dd9c，完整 policy 为 54ae3981bc10f031ac1ac7aababd917e31542d544711fd6681f7faeb0cff75ee；原锁 399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f／768 包、原五完整风险身份、decision／settings／官方 URL／默认 fetch／ignore 保持。此前 dd9c 预估不冒充本次采用后实际读；本授权不接受未来来源，不改 AGENTS，不向 Framework／SDK 继承。
+
+本段仅为采用和执行前事实。新来源仍须实际完整 manifest、原 Source／八控制／双默认 fresh gate，官方 scanner 自然 1、零漏洞和恰原五 warning 与独立 gate 0 分列；旧 3cea gate 不给 dd9c 签票。必要同 target／同 profile NoRun W0、真实新程序／FP／SHA 与精 list 1 后只跑一次 normal，正常 0 才三 owner 控制。网络只在纯 IO 失败时允许同默认参数一次新 prefix 有界复试，原失败保存；其它变化停止核因，不自动追 hash 或放宽断言。本次没有公共 API／示例或产品行为变更，examples／官网不需修改；GUI／App／完整矩阵／main CI／发行及整个 Goal 仍独立。
+
+
+### 2026-11-02 dd9c 平台后继的本批实际结果
+
+本后继只追加当前具名输入的实际结果，不改原错误、旧来源资格或人类裁决。dd438／dd9c 与新 Model0578／wrapperdae1／holderc4d9 的完整实际来源 manifest 已覆盖 CLI1089、Framework2853、498 个前端文件以及 13 份工程输入；当时 F 为 clean a8，源工具／配置／holder／Model 逐项无漂。ignored holder 被误列为正式语义查询时的预检拒绝 1 及只读诊断 2 均保原；按官方工具合同对三个正式路径 fresh 预检实际 0，ignored 工程输入仍经独审与精 manifest 核对，不改工具、schema、ignore 或风险档位。
+
+新来源 task Source 实际 0，原八项控制 8／8、自然 0。原 actual-lock 与 canonical-origin 默认 fresh 各首轮实际通过，官方 scanner 均自然 1、零漏洞、恰原五完整身份 warning，两个独立精确 gate／caller 均自然 0；本轮未触发有界网络复试。完整官方 JSON／stderr、自然出口及全部旧网络失败继续分列保留，表示符合原接受合同，不是风险修复或零 warning 审计；旧 3cea gate 不冒充本次 dd9c gate。
+
+原同 target／同 profile 的必要 NoRun 实际自然 0、零 warning／error；实际 features=[]、test opt0／debug0，j2／incremental0 与原冻结 1.99.1 保持。新的实际程序 SHA256 为 8c7bb907fff5b06e20064933c531c1e364963f5b0dada42ea304a2b508ff374e，496621056 字节，明确不同旧 c0cab；新程序及 2559 份真实 FP／dep-info 已在 target 外保全并逐项读回。该次真实程序的 exact＋ignored list 自然 0，精确 1 test／0 benchmarks。
+
+唯一新 normal 实际 selected1／pass1／fail0／ignored0，Rust、原 holder、fixture 各自然 0。原首条 typed Timeout 为 60005ms，第二条是原 typed CommandOutput exit0，主三请求实际提醒为 0／1／0；两处不同公开 Unknown、原 provider／body／同注册 reset、唯一 final、最后 Settled、原 driver return 与注册退休等全部原强断言完整执行通过。它是实际 EKO drive_chat／projector／client／ShellTool 的受控 loopback library consumer 结果，不是完整 AppState／GUI／真实外部 provider 验收。旧 normal1／0／1 与 ENOENT 仍保原。
+
+正常通过后才依次执行三个新 owner 控制，实际原 owner 自然退出分别为 130（SIGINT＋cleanup 取证槽失败）、143（SIGTERM）、1（终态 JSON 槽失败）。三个原 Rust child 均沿原预算自然结算并先被回收，fixture listener／handler 随后关闭并 join，原端口消失；原中断／取证失败未被后来的 child0 覆盖。终态槽失败的原 JSON 仍缺失且槽为目录，不补造成功 terminal；单独物理回收证据保留。三项故障控制符合各自预期，不把它们改写成三张正常 EKO 成功票。
+
+截至该切点全部 owned handles 已终态，12 个具名原 holder／consumer／fixture PID 的 ps 退出 1 且 stdout／stderr 均空，准确 target 及新 retained program 的 lsof 亦退出 1 两空；必要新程序／元数据／原始日志均已保全。这是准确官方 clean 的前置事实，clean 和最终 Source／Final 自然出口另有回执后才可作相应声明；Root 保留唯一 stage／commit 权限。当前原 collector 在全部运行后两实际读仍为 dd9c／274，锁／五身份／policy54ae 不变，不预授未来来源。App47013、live fixture38255／1420／1451 和 UserRoot／Auth／配置／MCP／历史未操作；整矩阵、main CI、发布与整个 Goal 仍各自独立。
+
+
+## 2026-11-03：async-executor 单包去 yank 的人类精确授权与正式绑定
+
+人类在 Root 会话的原问题 `call_6ffdc346972249549e7c242af391e0b2`／question0 直接回答“允许采用最小修复（推荐）”。完整问题明确包含采用 async-executor 1.14.0 → 1.14.1，以及将原五项风险合同绑定到新锁；原授权票为主工作区 `.echo-semantic/local/new-coordinator-20261102-r01/cli-async-executor-human-approved-d542-r01/human-approval-and-bounded-adoption-go.json`，SHA256 `3e3d76e70001c9bf9d6d5552559cebac2718ee2b5a387bc8c3cbd4c8861ea44f`。这是该具体新锁的人类授权，不是委派推断，也不代表后续工程门禁通过。
+
+本次正常预检覆盖后，唯一 writer 正式采用已审候选的 Cargo.lock：`399509eeb951c87d407ffd949c60ac4c5b7dcc460a189e078a25f8287f4e2a4f` → `d542c37ea3d32ca9a8064f0ef473fa3e2fd7175c0576c8e97d4564db09ed39e1`，仍为 768 包。仅 async-executor 的 version/checksum 改变，原 source 仍是 `registry+https://github.com/rust-lang/crates.io-index`，新 checksum 为 `f426a31126c735126297bc5ea7a521263c9faff4f63ca415267ee625651c4f37`；其依赖列表及其余 767 个完整 package 表逐项不变。没有再次 cargo update、改 dependency API 或采用额外包。候选已证实 1.14.1 当前未 yank，修复原 Executor::drop／Waker 的 use-after-free 回归；直接维护者 yank 原因原文未取得，与已证版本状态及修复说明分别保留。
+
+机器 policy 本次仅改 `lock_sha256` 字段，完整 SHA256 从 `bd5d02798f883ea3a3d9ce64b548de973fe131f13719519f05a0c166825e5f9d` 变为 `f6a42b3ccf90ada2dc639b9999fc2bc70551c2e4f83cce00c2e87347bdde5950`；consumer_inputs_sha256 仍为 `d5a9668f203ab76633df87eddb1fa4f111b78c30fb85a3599ec1d2477d71660c`／274 输入，采用前后 original consumer_digest 均各实际两读一致。decision 路径、原五项 name/version/source/checksum/advisory/kind 及其它 policy 字节完全不变；不接受第六项/yanked，不扩 ignore、过滤、URL 或 no-fetch，不预授未来锁/consumer，也不向 Framework/SDK 继承。原 glib 0.18.5、proc-macro-error 1.0.4、zvariant 5.13.1、zbus_names 4.3.4、zvariant_derive 5.14.0 的风险未被修复或改称 resolved。
+
+原 Root r04 的有效审计为 DB `263a4d951a0867d4bddc29dddd6d59427c78f9a7`／1402，零漏洞、原五项完整 warning 加 async-executor 1.14.0 yanked；原 checker 以 unknown/yanked category 阻断，原件不改写。后续独占候选 bf78 的两份独立原官方 scanner 实际均自然 1、零漏洞、恰原五项 warning、零 yanked、ignore=[]，但旧 policy 的 actual/canonical 两个 exact gate 均因未接受新锁自然 1。候选票不改称正式采用后的 gate0。
+
+正式 d542/f6/d5 来源的原八项 controls 本次 8/8、自然 0。fresh actual 首轮及一次同参数新 prefix 有界网络复试、fresh canonical 各自然 1；均为 RustSec 原 URL 的 advisory database fetch 失败，audit stdout 零字节，没有有效审计 JSON，因而当前五 warning 集合未知、fresh 双 gate0 尚未取得。未把该网络失败称新风险或 policy mismatch；未用旧 DB、候选 scanner 或历史 R03/Root actual0 替代本正式切点的新 gate 资格。原 caller/argv/stdout/stderr/gate 自然出口保存在本仓 ignored `.echo-semantic/local/cli-async-executor-formal-adoption-20261103-r01/`，不再原样循环重试。
+
+Framework 仍为精 c62397061bbe7c22ed169d7277c3ed07c054df4d；测试 087、ADR0057 76d、R03 dd438 和 publication 三生产文件未改。本轮不启动 Rust compile/NoRun/list/RED/GREEN、Clippy/fmt、GUI/App、业务 HTTP 或清理 target；R2 正使用独立副本的既有编译资源，不与其并发加重。当前新锁/五风险精绑定事实、源码治理 Source/Final 与后续运行资格分别验收；Root 必须安排 fresh 双 gate0 和独占资源后，才进入原 publication RED → 684 → 实际后继 consumer → GREEN。
+
+本切片只修复应用传递依赖和风险身份绑定，没有新增或修改公共 API、示例调用、产品页面或 SDK/Framework 协议，因此 examples 与 echo-website 无相应实现同步。顶层 AGENTS 的本次时态仅生成中文片段交 Root 写入，本 writer 不抢顶层写权。旧历史、人类来源、全部 RED/失败和未验证事项保持。
+
+
+## 2026-11-03 正式 d542/f6/d5 的 Root fresh 双 gate 实际后继
+
+本后继只追加网络恢复后的新实证；前段正式采用时 actual 首轮/有界复试与 canonical 的 fetch1、空 audit，以及 e804 Source/Final 原件全部保留，不改称当时已通过。人类原精答“允许采用最小修复（推荐）”及3e3d授权已充分，不再请求同一锁批准，也不由后续票追认旧失败为工程0。
+
+Root 在新独占 prefix 对当前正式锁 `d542c37ea3d32ca9a8064f0ef473fa3e2fd7175c0576c8e97d4564db09ed39e1`／768包、policy `f6a42b3ccf90ada2dc639b9999fc2bc70551c2e4f83cce00c2e87347bdde5950` 取得真正 fresh actual-lock 与 canonical-origin 两个 exact gate／caller 自然0。原 actual caller 为2026-11-03 02:44:27.941–02:44:32.160 UTC（上海10:44:27.941–10:44:32.160），耗时4.218977625秒；canonical 为02:45:09.973–02:45:14.220 UTC（上海10:45:09.973–10:45:14.220），耗时4.246889375秒。两个原官方 scanner 均自然1，DB `263a4d951a0867d4bddc29dddd6d59427c78f9a7`／1402条，零漏洞、恰原五项完整 name/version/source/checksum/advisory/kind warning、零yanked、noFetch=false、ignore=[]。原URL、设置、预算、代理与工具不改，只增加只读 transport 观察；未证明历史网络失败的根因，不把这次恢复称为网络永久修复。
+
+唯一 Root acceptance 为主工作区 `.echo-semantic/local/new-coordinator-20261102-r01/cli-d542-formal-fresh-double-gate-root-r01/acceptance.json`，SHA256 `0970aa37689ed74530cd4daef28130c5a7199fd1308f6ea1629d736d0364c22b`，绑定两个目录所有原caller/raw/gate/audit/stderr/transport。EKO本线已逐项核对这些哈希，并用未改的原checker复核报告与当前policy完整五身份；只复用同raw/receipt，没有重跑scanner或8controls。Root后置和本线复核的原collector实际两读均仍为 `d5a9668f203ab76633df87eddb1fa4f111b78c30fb85a3599ec1d2477d71660c`／274输入。
+
+本次实双0仅表示当前已获人类授权的新锁/consumer符合既有五项风险合同，scanner1不是零warning审计，原五风险未修复。r04新增yanked、候选旧policy双gate1、原网络失败、静态PENDING包和先前e804记录均作为各自历史输入保留；不增第六项接受、ignore/过滤/新来源/未来锁或consumer自动续期，不向Framework/SDK继承。
+
+此后继只改两份中文文档的时态，不改正式锁/policy、tests087、ADR0057 76d、R03 dd438、Frame c623或原684生产patch。正常Source/显式Final按本次文档新bytes另取，globalClosure仍不宣称已查。SDK继续独占重型编译窗；本线只准备原publication NoRun→两exact实RED→原684三生产文件→实际后继consumer两读/限定绑定及fresh两gate→GREEN/全scope的最小包，不执行Rust/NoRun或偷改测试/预算/ID。即使当前风险双gate0，仍须Root在SDK释放后明确派CLI资源。仅文档状态更新，无公共API/示例/页面变化，examples和官网无需同步实现；顶层AGENTS仍仅交中文片段由Root写。
+
+
+## 2026-11-03 publication 原链修复、真实 RED→GREEN 与 test-only Clippy 后继
+
+Root 以资源票 `55c391070da1b774e9c0be10c317cdaa320655fac0453af741942d9ba23cd285` 准入唯一 j2/debug0/inc0、frozen1.99.1/private RUSTUP 原流水线。基线仍为 tests087、F c623 与 d542/f6/d5，原 NoRun 实际自然0、零compiler warning/error，features=[]、test opt0/debug0；实际新程序 `02337c8c6c195d79fcaf5d46193915d6d17f8db78fd2600d907915d95724aa42` 已连同原CargoJSON、FP/u64原字节与.d保全到target外。两selector各actual list1后，header实际1P/0F/0I、自然0；publication实际0P/1F/0I、自然101，错误精为“original unattended producer did not publish cold history”。这是原producer缺publication的行为RED，未拿编译/fixture/loader错误或0selected替代。
+
+在此真实RED之后，才正式采用原production-only patch `6844248a95f7a405c7133aa98d2403f52bfc2f1b10a6f28fe7ed6b44d6218a53`。仅dispatch.rs=3bcf939698e29243b03306988b13e6273d9226e2c75910053c830dbfb5785a86、events.rs=97bf46a2f81571522c487db871cd684fed14cd44a1011a6d802d8746beaeb7fa、store/runtime.rs=d8195077968f4b8856e4aa66f6a3c06c1982193f50091676bb756a7c45be879b之外不采用其它生产差量；实际文件权威以原manifest及Root亲核为准。原collector采用后实际两读恰 `77d4bfad090c97f41f68b885b897e70dd4a5c014b3a803050247debfd72c66dd`／274，相对d5只有这3输入变化、无增删，policy仅consumer字段机械后继为 `55067559a9bfc9ca92770ab3b8a32d5061952cf410c7e1a9b914fb4d9ff0e917`；锁d542与原五完整风险身份及其它policy字节不变。
+
+新77d的fresh actual/canonical原件实际在本仓 `.echo-semantic/local/cli-publication-d542-actual-focused-20261103-r01/risk-77d/`，两caller/gate均自然0，且都完成于修复后NoRun之前。两原官方scanner自然1、DB263a4d951a0867d4bddc29dddd6d59427c78f9a7/1402、零漏洞、恰原五完整warning、零yanked、noFetch=false、ignore=[]；并非复用d5票。修复后NoRun0/W0/E0，新程序 `b297745cb489e66621c430436f419d7b4d2457c4013159873ff546128f6f5677` 以原tests087取得两exact各1P、整个executor实际list79/run79P/0F/0I，指定6项strict history/planless/resume/nativeprojection各actual list1/exact1P。随后 targeted Clippy 自然101，唯一错误是 tests.rs:6012 的clippy::replace_box。按首个未知失败即停的票据要求，该cut未继续fmt/文档/SourceFinal，原087/77d GREEN、Clippy101及完整原件保持。
+
+Root另以 `74650a887008c6324172a95ca34e2343db769307a55291cdfe1ccbaa3cfa2702` 准许独审C0/I0/M0的精test-only修复：既有foreign-owner消费者负控只将原Box内容就地替换，EventEnvelope构造器、identity/sequence/parent/payload、Result传播、断言、ID、预算和场景完全相同，没有Box地址比较，不加allow/skip。正式tests精SHA变为 `4f495651c40e9b0e77ff56b9be28c9c98af74c60bedbc504625cdc13c31a4766`；原collector两实际读必须并已恰为 `19ecac5f16256d4141540f528ae1e9e3c604a77b7be7d42676d77dd1ffc31cc4`／274，对77d仅tests这一输入改变、无增删。policy仅consumer字段机械后继为 `b94bbfefeffa523df850299db7a32e5a4e9efa13594c214d52694ab58ce53e05`，本次并非把Root预演冒作实际。
+
+19ec新cut的原controls8/8实际自然0；fresh actual/canonical两caller/gate自然0，原scanner各自然1、DB263a4d/1402、零漏洞、原五完整warning、零yanked、noFetch=false、ignore=[]。新原件位于 `.echo-semantic/local/cli-publication-replace-box-19ec-actual-20261103-r01/risk-19ec/`；旧77d或d5票不签19ec。原同T/j2/debug0/inc0新NoRun自然0、W0/E0、features=[]和test opt0/debug0不变，新实际程序 `2f99d59572253414129d406ddad55aa94120fe94d051fa21acfa25b9164db04d`／497199376字节及完整FP/u64/.d已在T外保存。此新程序两目标各list1/exact1P，整个executor实际list79/run79P/0F/0I；根Scope内同一publication测试仍完整执行缺publication、缺真实Settled、foreign owner、产品failed和cold reopen负控。
+
+原6项额外回归的方法源码未变，依Root本次明示复用77d的各exact1P原件，不冒充19ec新程序的独立6次执行。新cut targeted app-core lib/tests/no-default Clippy -Dwarnings自然0，原replace_box错误消除；fmt --all write和check均自然0，格式化引入的源码字节差量为零。旧Clippy101不改称当时通过。本轮没有宽断言、加预算/权限、换fixture/工具/Model、生成新UUID/physicalID冒turn、放松strict reader或raw fallback，也未改R03/Frame c623和原684三个生产SHA。
+
+以上consumer-only后继分别由Root具名票55c391和74650基于精源/差量复核，不由人类3e3d的新锁批准推导未来来源自动续期。当前锁仍为 `d542c37ea3d32ca9a8064f0ef473fa3e2fd7175c0576c8e97d4564db09ed39e1`／768，原五项完整风险身份和其余767包及policy其它字段保持；scanner1不是零warning审计，不新增风险/ignore/过滤/no-fetch，Framework/SDK不继承。
+
+本次是新受控合成Model（MockLlmClient/MockTool）经过原unattended/RunTurn/Driver/sink/sharedLog/strict cold reader的Rust消费者资格，不是旧Cron payload回放、外部provider、完整AppState/Tauri/native/GUI验收。R03、NodeFull/三语、GUI/App/SSH/业务RPC、main CI与发布未重跑。正常Source/显式Final只按本轮最终源/文档bytes和task闭包验证，结果以最终回执为准，globalClosure不宣称已查；必要程序/原FP/u64/.d及所有raw已T外保全，准确T仅在reader0并经Root验后另票清理。本writer不stage/commit/push。
+
+文档同步已核对：本实现只把EKO原unattended publication接入既有shared log并修正原测试分配，未变更Framework/SDK公共API或示例调用，examples和官网不需要新增实现；ADR0057与CLI AGENTS追加对应行为/时态，顶层AGENTS仅交中文片段由Root写。

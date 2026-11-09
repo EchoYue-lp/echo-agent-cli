@@ -1,27 +1,46 @@
-import { useState, useEffect, useCallback } from 'react';
-import {
-  X,
-  FolderPlus,
-  MoreHorizontal,
-  ArrowRight,
-  Trash2,
-  FolderOpen,
-  Edit3,
-  RotateCcw,
-} from 'lucide-react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { X, FolderPlus, MoreHorizontal, ArrowRight, Trash2 } from 'lucide-react';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
-import { workspaceApi } from '../../api/endpoints';
+import { workspaceApi, type ProjectSource, type Workspace } from '../../api/endpoints';
 import { fileSystem, isTauri } from '../../lib/tauri-bridge';
 import { WORKSPACE_KINDS as WORKSPACE_KIND } from '../../lib/workspaceKinds';
 import { Modal } from '../common/Modal';
 import DirectoryPicker from './DirectoryPicker';
+import {
+  ProjectSourceFields,
+  emptyProjectSource,
+  localProjectSource,
+  type ProjectSourceDraft,
+} from './ProjectSourceFields';
+import { useUiStore } from '../../stores/uiStore';
+import { workspaceLocationLabel } from '../../lib/workspacePresentation';
 
 interface Props {
   isOpen: boolean;
   onClose: () => void;
+  initialSource?: ProjectSourceDraft['kind'];
 }
 
-export default function NewTaskDialog({ isOpen, onClose }: Props) {
+function observeDirectory(original: Promise<{ path: string }>): Promise<{ path: string }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    original,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () =>
+          reject(
+            new Error(
+              '远程目录验证尚未确认，未发起创建；可稍后再次点击重试观察，或取消。原验证仍由连接持有。'
+            )
+          ),
+        30_000
+      );
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+export default function NewTaskDialog({ isOpen, onClose, initialSource }: Props) {
+  const reconnectRequest = useUiStore((state) => state.workspaceDialogReconnect);
   const workspaces = useWorkspaceStore((s) => s.workspaces);
   const current = useWorkspaceStore((s) => s.current);
   const init = useWorkspaceStore((s) => s.init);
@@ -29,37 +48,127 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
   const createAndSwitch = useWorkspaceStore((s) => s.createAndSwitch);
   const deleteWorkspace = useWorkspaceStore((s) => s.delete);
 
-  const [view, setView] = useState<'list' | 'create'>('list');
+  const [view, setView] = useState<'list' | 'create' | 'reconnect'>('list');
   const [newName, setNewName] = useState('');
   const [newKind, setNewKind] = useState('code');
-  const [customRoot, setCustomRoot] = useState('');
+  const [source, setSource] = useState(emptyProjectSource);
+  const [remoteSource, setRemoteSource] = useState<ProjectSource>();
+  const [reconnecting, setReconnecting] = useState<Workspace>();
   const [defaultRoot, setDefaultRoot] = useState('');
-  const [useCustomRoot, setUseCustomRoot] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [creationStage, setCreationStage] = useState('处理中…');
   const [error, setError] = useState('');
   const [showPicker, setShowPicker] = useState(false);
+  const latestWorkspaces = useRef(workspaces);
+  latestWorkspaces.current = workspaces;
+  const live = useRef(false);
+  const opened = useRef(isOpen);
+  opened.current = isOpen;
+  const operation = useRef<symbol | null>(null);
+  const verification = useRef<{
+    key: string;
+    owner: string;
+    settled: boolean;
+    promise: Promise<{ path: string }>;
+  } | null>(null);
+
+  useEffect(() => {
+    live.current = true;
+    return () => {
+      live.current = false;
+      operation.current = null;
+    };
+  }, []);
+  useEffect(() => {
+    operation.current = null;
+    setCreating(false);
+  }, [isOpen, initialSource, reconnectRequest]);
+  const ownsOperation = (token: symbol) =>
+    live.current && opened.current && operation.current === token;
+  const verifyRemote = async (intent: Extract<ProjectSource, { kind: 'ssh' }>) => {
+    const target = {
+      kind: 'ssh' as const,
+      host: intent.host,
+      user: intent.user,
+      port: intent.port,
+    };
+    const key = JSON.stringify([intent.connection_id, target, intent.path.trim()]);
+    let pending = verification.current;
+    if (
+      pending &&
+      !pending.settled &&
+      pending.owner === intent.connection_id &&
+      pending.key !== key
+    )
+      throw new Error('原目录验证仍未确认，请等待原操作结算或断开连接；未发起创建。');
+    if (!pending || pending.key !== key || pending.settled) {
+      const record = {
+        key,
+        owner: intent.connection_id,
+        settled: false,
+        promise: workspaceApi.verifySsh(intent.connection_id, target, intent.path.trim()),
+      };
+      verification.current = record;
+      void record.promise.then(
+        () => {
+          record.settled = true;
+        },
+        () => {
+          record.settled = true;
+        }
+      );
+      pending = record;
+    }
+    return observeDirectory(pending.promise);
+  };
 
   useEffect(() => {
     if (isOpen) {
       init();
-      setView('list');
+      setView(initialSource ? 'create' : 'list');
       setNewName('');
       setNewKind('code');
-      setCustomRoot('');
+      setSource({ ...emptyProjectSource(), kind: initialSource ?? 'existing_local' });
+      setRemoteSource(undefined);
+      setReconnecting(undefined);
       setDefaultRoot('');
-      setUseCustomRoot(false);
       setError('');
+      if (reconnectRequest) {
+        const target = latestWorkspaces.current.find(
+          (item) =>
+            item.id === reconnectRequest.workspaceId &&
+            item.product_data_generation === reconnectRequest.workspaceGeneration
+        );
+        const location = target?.metadata.project_location;
+        if (target && location?.kind === 'ssh') {
+          setView('reconnect');
+          setReconnecting(target);
+          setSource({
+            ...emptyProjectSource(),
+            kind: 'ssh',
+            host: location.host,
+            user: location.user ?? '',
+            port: location.port?.toString() ?? '',
+            remotePath: location.path,
+          });
+          setError('远程连接尚未准备，请在此重新连接；原工作空间和数据保留。');
+        } else {
+          setView('list');
+          setError('工作空间已变化，请重新选择后连接。');
+        }
+      }
     }
-  }, [isOpen, init]);
+  }, [isOpen, init, initialSource, reconnectRequest]);
 
   // Fetch default root path when name changes
   useEffect(() => {
     const trimmed = newName.trim();
-    if (!trimmed) {
+    if (!isOpen || view !== 'create' || !trimmed) {
       setDefaultRoot('');
       return;
     }
     let cancelled = false;
+    setDefaultRoot('');
     workspaceApi
       .defaultRoot(trimmed)
       .then((res) => {
@@ -71,15 +180,14 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [newName]);
+  }, [newName, isOpen, view, source.kind, source.localPath, source.directoryName]);
 
   const handleBrowse = useCallback(async () => {
     if (isTauri()) {
       try {
-        const selected = await fileSystem.selectDirectory('选择工作区目录');
+        const selected = await fileSystem.selectDirectory('选择工作空间目录');
         if (selected) {
-          setCustomRoot(selected);
-          setUseCustomRoot(true);
+          setSource((previous) => ({ ...previous, localPath: selected }));
         }
       } catch (e) {
         console.error('Browse directory failed:', e);
@@ -91,52 +199,132 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
   }, []);
 
   const handlePickerSelect = useCallback((path: string) => {
-    setCustomRoot(path);
-    setUseCustomRoot(true);
+    setSource((previous) => ({ ...previous, localPath: path }));
     setShowPicker(false);
   }, []);
 
   if (!isOpen) return null;
 
   const handleCreate = async () => {
+    if (operation.current) return;
     const name = newName.trim();
     if (!name) {
-      setError('请输入任务名称');
+      setError('请输入工作空间名称');
       return;
     }
     setCreating(true);
     setError('');
+    const token = Symbol('create-workspace');
+    operation.current = token;
     try {
-      const root = useCustomRoot && customRoot.trim() ? customRoot.trim() : undefined;
-      await createAndSwitch(name, newKind, root);
+      let intent = source.kind === 'ssh' ? remoteSource : localProjectSource(source, name);
+      if (source.kind === 'ssh' && !intent) throw new Error('请先测试 SSH 连接');
+      if (intent?.kind === 'ssh') {
+        if (!intent.path.trim()) throw new Error('请输入远程项目文件夹，连接测试不要求目录');
+        setCreationStage('正在验证远程目录…');
+        const verified = await verifyRemote(intent);
+        if (!ownsOperation(token)) return;
+        intent = { ...intent, path: verified.path };
+      }
+      setCreationStage('正在创建工作空间…');
+      await createAndSwitch(name, newKind, undefined, intent);
+      if (!ownsOperation(token)) return;
       onClose();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : '创建失败';
-      setError(msg);
+      if (ownsOperation(token)) setError(msg);
     } finally {
-      setCreating(false);
+      if (ownsOperation(token)) {
+        operation.current = null;
+        setCreating(false);
+      }
     }
   };
 
   const handleSwitch = async (id: string) => {
+    const target = workspaces.find((workspace) => workspace.id === id);
+    if (!target || operation.current) return;
+    const token = Symbol('open-existing-workspace');
+    operation.current = token;
     try {
-      await switchTo(id);
+      await switchTo(id, undefined, target.product_data_generation);
+      if (ownsOperation(token)) onClose();
+    } catch (error) {
+      if (!ownsOperation(token)) return;
+      const location = target.metadata.project_location;
+      if (location.kind === 'ssh') {
+        setError(
+          `远程连接尚未准备，请重新连接；原工作空间和数据保留。${error instanceof Error ? error.message : String(error)}`
+        );
+        setReconnecting(target);
+        setRemoteSource(undefined);
+        setSource({
+          ...emptyProjectSource(),
+          kind: 'ssh',
+          host: location.host,
+          user: location.user ?? '',
+          port: location.port?.toString() ?? '',
+          remotePath: location.path,
+        });
+        setView('reconnect');
+      } else {
+        setError(error instanceof Error ? error.message : '切换失败');
+      }
+    } finally {
+      if (ownsOperation(token)) operation.current = null;
+    }
+  };
+
+  const handleReconnect = async () => {
+    if (!reconnecting || remoteSource?.kind !== 'ssh' || operation.current) return;
+    const token = Symbol('reconnect-workspace');
+    operation.current = token;
+    setCreating(true);
+    setError('');
+    try {
+      const initialTarget = latestWorkspaces.current.find((item) => item.id === reconnecting.id);
+      if (initialTarget?.product_data_generation !== reconnecting.product_data_generation)
+        throw new Error('工作空间已变化，请重新选择后连接。');
+      setCreationStage('正在验证原远程目录…');
+      await verifyRemote(remoteSource);
+      if (!ownsOperation(token)) return;
+      const target = latestWorkspaces.current.find((item) => item.id === reconnecting.id);
+      if (target?.product_data_generation !== reconnecting.product_data_generation)
+        throw new Error('工作空间已变化，请重新选择后连接。');
+      setCreationStage('正在连接工作空间…');
+      await switchTo(
+        reconnecting.id,
+        remoteSource.connection_id,
+        reconnecting.product_data_generation
+      );
+      if (!ownsOperation(token)) return;
       onClose();
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : '切换失败';
-      setError(msg);
+    } catch (error) {
+      if (ownsOperation(token)) setError(error instanceof Error ? error.message : '连接失败');
+    } finally {
+      if (ownsOperation(token)) {
+        operation.current = null;
+        setCreating(false);
+      }
     }
   };
 
   const handleDelete = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (!confirm('确定删除此工作区？所有数据将被清除。')) return;
+    if (!confirm('确定移除此项目及其本机会话数据？项目代码文件不会被删除。')) return;
     try {
       await deleteWorkspace(id);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : '删除失败';
       setError(msg);
     }
+  };
+
+  const returnToList = () => {
+    operation.current = null;
+    setRemoteSource(undefined);
+    setView('list');
+    setError('');
   };
 
   const kindIcon = (kind: { type: string }) => {
@@ -150,8 +338,10 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
   return (
     <>
       <Modal
-        onClose={onClose}
-        ariaLabel="任务工作区"
+        onClose={() => {
+          if (!creating) onClose();
+        }}
+        ariaLabel="工作空间"
         active={!showPicker}
         className="flex max-h-[85vh] w-[540px] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-[var(--shadow-xl)]"
       >
@@ -161,15 +351,17 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
           style={{ borderColor: 'var(--border-primary)' }}
         >
           <h2 className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
-            {view === 'list' ? '新建任务' : '创建新任务'}
+            {view === 'list'
+              ? '工作空间'
+              : view === 'reconnect'
+                ? '连接已有远程项目'
+                : '创建工作空间'}
           </h2>
           <div className="flex items-center gap-2">
-            {view === 'create' && (
+            {view !== 'list' && (
               <button
-                onClick={() => {
-                  setView('list');
-                  setError('');
-                }}
+                disabled={creating}
+                onClick={returnToList}
                 className="text-xs px-2 py-1 rounded-md hover:opacity-80"
                 style={{ color: 'var(--text-secondary)' }}
               >
@@ -178,8 +370,9 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
             )}
             <button
               type="button"
-              aria-label="关闭任务工作区"
+              aria-label="关闭工作空间"
               onClick={onClose}
+              disabled={creating}
               className="flex h-7 w-7 items-center justify-center rounded-lg transition-colors hover:opacity-80"
               style={{ color: 'var(--text-tertiary)' }}
             >
@@ -215,7 +408,7 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
                     className="text-[11px] font-medium uppercase tracking-wider mb-1"
                     style={{ color: 'var(--accent)' }}
                   >
-                    当前工作区
+                    当前工作空间
                   </div>
                   <div className="flex items-center gap-2">
                     {kindIcon(current.kind)}
@@ -233,7 +426,7 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
                     className="text-[11px] mt-1 truncate"
                     style={{ color: 'var(--text-tertiary)' }}
                   >
-                    {current.root}
+                    {workspaceLocationLabel(current)}
                   </div>
                 </div>
               )}
@@ -252,9 +445,9 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
               >
                 <FolderPlus size={20} style={{ color: 'var(--accent)' }} />
                 <div>
-                  <div className="text-sm font-medium">创建新任务</div>
+                  <div className="text-sm font-medium">创建工作空间</div>
                   <div className="text-[11px]" style={{ color: 'var(--text-tertiary)' }}>
-                    新建工作区，隔离所有数据
+                    选择已有文件夹、新建文件夹或远程项目
                   </div>
                 </div>
                 <ArrowRight
@@ -271,7 +464,7 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
                     className="text-[11px] font-semibold uppercase tracking-wider mb-2"
                     style={{ color: 'var(--text-tertiary)' }}
                   >
-                    已有工作区
+                    已有工作空间
                   </div>
                   <div className="space-y-1">
                     {workspaces.map((ws) => (
@@ -301,7 +494,7 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
                               className="truncate text-[11px]"
                               style={{ color: 'var(--text-tertiary)' }}
                             >
-                              {ws.kind.type} · {ws.root}
+                              {workspaceLocationLabel(ws)}
                             </div>
                           </div>
                           {current?.id !== ws.id && (
@@ -310,7 +503,7 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
                         </button>
                         <button
                           type="button"
-                          aria-label={`删除工作区 ${ws.name}`}
+                          aria-label={`删除工作空间 ${ws.name}`}
                           onClick={(e) => handleDelete(ws.id, e)}
                           className="mr-2 rounded-md p-1 transition-colors hover:text-red-500"
                           style={{ color: 'var(--text-tertiary)' }}
@@ -324,24 +517,43 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
                 </div>
               )}
             </div>
+          ) : view === 'reconnect' ? (
+            <div className="space-y-4">
+              <p className="text-sm text-[var(--text-primary)]">{reconnecting?.name}</p>
+              <p className="text-xs text-[var(--text-secondary)]">
+                项目记录已保留。重新认证并验证同一远程位置后进入，不会自动改变项目绑定。
+              </p>
+              <ProjectSourceFields
+                draft={source}
+                onChange={setSource}
+                onBrowse={handleBrowse}
+                onRemoteSource={setRemoteSource}
+                busy={creating}
+                fixedLocation
+              />
+            </div>
           ) : (
             <div className="space-y-4">
               {/* Name input */}
               <div>
                 <label
-                  htmlFor="new-task-name"
+                  htmlFor="workspace-name"
                   className="block text-xs font-medium mb-1.5"
                   style={{ color: 'var(--text-secondary)' }}
                 >
-                  任务名称
+                  工作空间名称
                 </label>
                 <input
-                  id="new-task-name"
+                  id="workspace-name"
+                  disabled={creating}
                   type="text"
                   value={newName}
                   onChange={(e) => setNewName(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !useCustomRoot) handleCreate();
+                    // Candidate confirmation must not create or switch projects.
+                    // WebKit may clear isComposing before its final Enter.
+                    if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
+                    if (e.key === 'Enter' && !creating) void handleCreate();
                   }}
                   placeholder="例：用户行为分析、NLP论文综述..."
                   className="w-full rounded-lg border px-3 py-2.5 text-sm outline-none transition-colors focus:border-[var(--accent)]"
@@ -354,150 +566,81 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
                 />
               </div>
 
-              {/* Kind selector */}
               <div>
-                <div
-                  className="block text-xs font-medium mb-1.5"
-                  style={{ color: 'var(--text-secondary)' }}
+                <label
+                  htmlFor="workspace-purpose"
+                  className="mb-1.5 block text-xs font-medium text-[var(--text-secondary)]"
                 >
-                  任务类型
-                </div>
-                <div className="grid grid-cols-2 gap-2">
-                  {WORKSPACE_KIND.map((k) => {
-                    const Icon = k.icon;
-                    const selected = newKind === k.value;
-                    return (
-                      <button
-                        key={k.value}
-                        type="button"
-                        aria-pressed={selected}
-                        onClick={() => setNewKind(k.value)}
-                        className={`flex items-center gap-2.5 rounded-lg border p-3 text-left transition-all ${
-                          selected ? 'border-2' : ''
-                        }`}
-                        style={{
-                          borderColor: selected ? k.color : 'var(--border-primary)',
-                          background: selected ? `${k.color}10` : 'transparent',
-                        }}
-                      >
-                        <Icon size={18} style={{ color: k.color }} />
-                        <div>
-                          <div
-                            className="text-sm font-medium"
-                            style={{ color: 'var(--text-primary)' }}
-                          >
-                            {k.label}
-                          </div>
-                          <div className="text-[11px]" style={{ color: 'var(--text-tertiary)' }}>
-                            {k.desc}
-                          </div>
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
+                  用途
+                </label>
+                <select
+                  id="workspace-purpose"
+                  value={newKind}
+                  disabled={creating}
+                  onChange={(event) => setNewKind(event.target.value)}
+                  className="w-full rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-3 py-2.5 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--accent)]"
+                >
+                  {WORKSPACE_KIND.map((kind) => (
+                    <option key={kind.value} value={kind.value}>
+                      {kind.label}
+                    </option>
+                  ))}
+                </select>
               </div>
 
-              {/* Folder path */}
-              <div>
-                <div
-                  className="block text-xs font-medium mb-2"
-                  style={{ color: 'var(--text-secondary)' }}
-                >
-                  工作目录
-                </div>
-
-                {useCustomRoot ? (
-                  <div className="space-y-2">
-                    <div className="flex gap-2">
-                      <input
-                        type="text"
-                        value={customRoot}
-                        onChange={(e) => setCustomRoot(e.target.value)}
-                        placeholder="输入目录路径，或点击浏览..."
-                        className="flex-1 rounded-lg border px-3 py-2.5 text-sm outline-none transition-colors focus:border-[var(--accent)]"
-                        style={{
-                          background: 'var(--bg-input)',
-                          borderColor: 'var(--border-primary)',
-                          color: 'var(--text-primary)',
-                        }}
-                        autoFocus
-                      />
-                      <button
-                        onClick={handleBrowse}
-                        className="flex items-center gap-1.5 rounded-lg border px-4 py-2.5 text-sm font-medium transition-colors hover:bg-[var(--bg-hover)]"
-                        style={{ borderColor: 'var(--accent)', color: 'var(--accent)' }}
-                      >
-                        <FolderOpen size={14} />
-                        浏览
-                      </button>
-                    </div>
-                    <div className="text-[11px]" style={{ color: 'var(--text-tertiary)' }}>
-                      将在该目录下创建工作区子目录（sessions/、memory/ 等）
-                    </div>
-                    <button
-                      onClick={() => {
-                        setUseCustomRoot(false);
-                        setCustomRoot('');
-                      }}
-                      className="flex items-center gap-1 text-[11px] transition-colors hover:opacity-80"
-                      style={{ color: 'var(--text-tertiary)' }}
-                    >
-                      <RotateCcw size={11} /> 恢复默认路径
-                    </button>
-                  </div>
-                ) : (
-                  <div className="space-y-2">
-                    <div
-                      className="rounded-lg border px-3 py-2.5 text-sm"
-                      style={{
-                        background: 'var(--bg-secondary)',
-                        borderColor: 'var(--border-primary)',
-                        color: 'var(--text-tertiary)',
-                      }}
-                    >
-                      <span className="flex items-center gap-1.5">
-                        <FolderOpen size={14} />
-                        {defaultRoot || '输入任务名称后显示默认路径'}
-                      </span>
-                    </div>
-                    <button
-                      onClick={() => setUseCustomRoot(true)}
-                      className="flex items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium transition-colors hover:bg-[var(--bg-hover)]"
-                      style={{ borderColor: 'var(--accent)', color: 'var(--accent)' }}
-                    >
-                      <Edit3 size={12} /> 选择其他文件夹
-                    </button>
-                  </div>
-                )}
-              </div>
+              <ProjectSourceFields
+                draft={source}
+                onChange={setSource}
+                onBrowse={handleBrowse}
+                onRemoteSource={setRemoteSource}
+                busy={creating}
+                workspaceName={newName.trim()}
+                defaultProjectRoot={defaultRoot}
+              />
+              <details className="text-[11px] text-[var(--text-tertiary)]">
+                <summary className="cursor-pointer">本机数据保存位置</summary>
+                <p className="mt-2 break-all">{defaultRoot || '输入名称后显示'}</p>
+              </details>
             </div>
           )}
         </div>
 
         {/* Footer (create view only) */}
-        {view === 'create' && (
+        {view !== 'list' && (
           <div
-            className="flex items-center justify-end gap-2 border-t px-5 py-3"
+            className="flex flex-wrap items-center justify-end gap-2 border-t px-5 py-3"
             style={{ borderColor: 'var(--border-primary)' }}
           >
+            {source.kind === 'ssh' && !creating && (
+              <p className="mr-auto w-full text-xs text-[var(--text-tertiary)]" role="status">
+                {!remoteSource
+                  ? '请先测试 SSH 连接，登录成功后才可创建。'
+                  : !source.remotePath.trim()
+                    ? '连接已通过，请填写远程项目文件夹。'
+                    : '登录已通过；点击后验证远程目录并进入。'}
+              </p>
+            )}
             <button
-              onClick={() => {
-                setView('list');
-                setError('');
-              }}
+              disabled={creating}
+              onClick={returnToList}
               className="rounded-lg px-4 py-2 text-sm transition-colors hover:opacity-80"
               style={{ color: 'var(--text-secondary)' }}
             >
               取消
             </button>
             <button
-              onClick={handleCreate}
-              disabled={creating || !newName.trim()}
+              onClick={view === 'reconnect' ? handleReconnect : handleCreate}
+              disabled={
+                creating ||
+                (view === 'reconnect'
+                  ? !remoteSource
+                  : !newName.trim() ||
+                    (source.kind === 'ssh' && (!remoteSource || !source.remotePath.trim())))
+              }
               className="rounded-lg px-5 py-2 text-sm font-medium text-[var(--text-on-accent)] transition-colors disabled:opacity-50"
               style={{ background: 'var(--accent)' }}
             >
-              {creating ? '创建中...' : '创建并进入'}
+              {creating ? creationStage : view === 'reconnect' ? '连接并进入' : '创建并进入'}
             </button>
           </div>
         )}

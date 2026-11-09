@@ -2,6 +2,37 @@ use std::path::{Path, PathBuf};
 
 use super::gitignore::GitIgnore;
 
+/// 显式项目根与产品数据目录可以分离；只有项目内 cwd 才参与目录规则链。
+pub(crate) fn project_context_working_dir(
+    root: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Option<PathBuf> {
+    match (root, cwd) {
+        (Some(root), Some(cwd)) if cwd.starts_with(root) => Some(cwd.to_path_buf()),
+        (Some(root), _) => Some(root.to_path_buf()),
+        (None, cwd) => cwd.map(Path::to_path_buf),
+    }
+}
+
+/// 传输复用只活在一次物理准备中；内容在下一条消息重新读取。
+///
+/// 作用域语义由 framework 的 `with_read_session` 持有（工具侧共用同一实现），
+/// 这里只补充准备阶段的结构化日志，不重复实现 begin/finish 规则。
+pub(crate) fn with_read_session<T>(
+    files: &dyn echo_agent::tools::filesystem::FileSystem,
+    read: impl FnOnce(&dyn echo_agent::tools::filesystem::FileSystem) -> echo_agent::error::Result<T>,
+) -> echo_agent::error::Result<T> {
+    let started = std::time::Instant::now();
+    let (result, reused) = echo_agent::tools::filesystem::with_read_session(files, read);
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis(),
+        reused,
+        success = result.is_ok(),
+        "project file preparation settled"
+    );
+    result
+}
+
 /// Structural project context: directory tree + git state + ignore rules.
 ///
 /// Instruction/rules content is NOT loaded here — that responsibility belongs
@@ -17,6 +48,9 @@ pub struct ProjectContext {
     pub file_tree_summary: String,
     /// Parsed .gitignore rules (empty if no .gitignore exists).
     pub gitignore: GitIgnore,
+    /// Captured from this project's executor, never a late local process call.
+    pub git_context: Option<String>,
+    git_repository: bool,
 }
 
 pub fn discover_project_root(start: Option<&Path>) -> Option<PathBuf> {
@@ -63,7 +97,73 @@ pub fn load_project_context(project_root: &Path) -> ProjectContext {
         name,
         file_tree_summary,
         gitignore,
+        git_context: load_git_context(project_root),
+        git_repository: project_root.join(".git").exists(),
     }
+}
+
+pub fn load_project_context_with_file_system(
+    project_root: &Path,
+    files: &dyn echo_agent::tools::filesystem::FileSystem,
+) -> echo_agent::error::Result<ProjectContext> {
+    let mut entries = Vec::new();
+    collect_dir_entries_with_file_system(project_root, &mut entries, 0, 3, files)?;
+    Ok(ProjectContext {
+        root: project_root.to_path_buf(),
+        name: project_root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".to_string()),
+        file_tree_summary: entries.join("\n"),
+        gitignore: GitIgnore::load_with_file_system(project_root, files)?,
+        git_context: None,
+        git_repository: files.exists(&project_root.join(".git"))?,
+    })
+}
+
+/// The selected executor retains its real capability/isolation and process
+/// owner. This phase runs before a host/agent can be published to a model.
+pub async fn load_project_git_context(
+    context: &mut ProjectContext,
+    executor: &dyn echo_agent::sandbox::SandboxExecutor,
+    resource_guards: Vec<echo_agent::tools::InvocationResourceGuard>,
+) -> echo_agent::error::Result<()> {
+    if !context.git_repository {
+        return Ok(());
+    }
+    let mut command = echo_agent::sandbox::SandboxCommand::program(
+        "git",
+        vec!["status".to_string(), "--short".to_string()],
+    );
+    command.working_dir = Some(context.root.clone());
+    command.resource_guards = resource_guards.clone();
+    let status = executor.execute(command).await?;
+    if status.exit_code != 0 {
+        return Err(echo_agent::error::ReactError::Other(
+            "Project git status failed".to_string(),
+        ));
+    }
+    let mut command = echo_agent::sandbox::SandboxCommand::program(
+        "git",
+        vec!["diff".to_string(), "--stat".to_string()],
+    );
+    command.working_dir = Some(context.root.clone());
+    command.resource_guards = resource_guards;
+    let diff = executor.execute(command).await?;
+    if diff.exit_code != 0 {
+        return Err(echo_agent::error::ReactError::Other(
+            "Project git diff failed".to_string(),
+        ));
+    }
+    let mut text = String::new();
+    if !status.stdout.trim().is_empty() {
+        text.push_str(&format!("```\n{}\n```\n", status.stdout.trim()));
+    }
+    if !diff.stdout.trim().is_empty() {
+        text.push_str(&format!("```\n{}\n```\n", diff.stdout.trim()));
+    }
+    context.git_context = (!text.is_empty()).then_some(text);
+    Ok(())
 }
 
 impl ProjectContext {
@@ -98,9 +198,9 @@ pub fn build_system_prompt_with_context(base_prompt: &str, context: &ProjectCont
     }
 
     // Inject git context if available
-    if let Some(git_ctx) = load_git_context(&context.root) {
+    if let Some(git_ctx) = &context.git_context {
         prompt.push_str("\n## Git Status\n\n");
-        prompt.push_str(&git_ctx);
+        prompt.push_str(git_ctx);
         prompt.push('\n');
     }
 
@@ -148,36 +248,55 @@ fn generate_file_tree_summary(root: &Path) -> String {
 }
 
 fn collect_dir_entries(dir: &Path, out: &mut Vec<String>, depth: usize, max_depth: usize) {
+    let _ = collect_dir_entries_with_file_system(
+        dir,
+        out,
+        depth,
+        max_depth,
+        &echo_agent::tools::files::LocalFileSystem,
+    );
+}
+
+/// 树预取的并发上限。远端每个目录至少一次往返，顺序遍历在高延迟下会把
+/// 等待叠加成 O(目录数) 个 RTT；渲染顺序仍是单线程深度优先，输出不变。
+const PREFETCH_CONCURRENCY: usize = 8;
+/// 每层最多预取的目录数；渲染在 80 行处截断，读超过这个数量没有收益。
+const PREFETCH_DIRS_PER_LEVEL: usize = 32;
+
+fn collect_dir_entries_with_file_system(
+    dir: &Path,
+    out: &mut Vec<String>,
+    depth: usize,
+    max_depth: usize,
+    filesystem: &dyn echo_agent::tools::filesystem::FileSystem,
+) -> echo_agent::error::Result<()> {
+    // 只有根调用建立预取缓存；递归渲染自己不会再发起一轮预取。
+    let prefetched = if depth == 0 {
+        prefetch_directory_entries(dir, max_depth, filesystem)
+    } else {
+        std::collections::HashMap::new()
+    };
+    render_dir_entries(dir, out, depth, max_depth, filesystem, &prefetched)
+}
+
+fn render_dir_entries(
+    dir: &Path,
+    out: &mut Vec<String>,
+    depth: usize,
+    max_depth: usize,
+    filesystem: &dyn echo_agent::tools::filesystem::FileSystem,
+    prefetched: &std::collections::HashMap<PathBuf, Vec<echo_agent::tools::filesystem::FileEntry>>,
+) -> echo_agent::error::Result<()> {
     if depth > max_depth {
-        return;
+        return Ok(());
     }
 
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
+    let rd = match prefetched.get(dir) {
+        Some(entries) => entries.clone(),
+        None => filesystem.read_dir(dir)?,
     };
 
-    let mut dirs = Vec::new();
-    let mut files = Vec::new();
-
-    for entry in rd.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') && name != ".env.example" {
-            continue;
-        }
-        if SKIP_DIRS.contains(&name.as_str()) {
-            continue;
-        }
-
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            dirs.push(name);
-        } else {
-            files.push(name);
-        }
-    }
-
-    dirs.sort();
-    files.sort();
-
+    let (dirs, files) = listable_children(&rd);
     let indent = "  ".repeat(depth);
 
     for name in &files {
@@ -191,11 +310,112 @@ fn collect_dir_entries(dir: &Path, out: &mut Vec<String>, depth: usize, max_dept
     for dir_name in &dirs {
         if out.len() > 80 {
             out.push(format!("{}  ... (truncated)", indent));
-            return;
+            return Ok(());
         }
         out.push(format!("{}{}/", indent, dir_name));
-        collect_dir_entries(&dir.join(dir_name), out, depth + 1, max_depth);
+        render_dir_entries(
+            &dir.join(dir_name),
+            out,
+            depth + 1,
+            max_depth,
+            filesystem,
+            prefetched,
+        )?;
     }
+    Ok(())
+}
+
+/// 与渲染一致的可见性过滤：隐藏项（`.env.example` 除外）和构建/缓存目录
+/// 不参与列表，也不参与预取，避免为无关目录发起远端请求。
+fn listable_children(
+    entries: &[echo_agent::tools::filesystem::FileEntry],
+) -> (Vec<String>, Vec<String>) {
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    for entry in entries {
+        let name = entry.file_name.to_string_lossy().to_string();
+        if name.starts_with('.') && name != ".env.example" {
+            continue;
+        }
+        if SKIP_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+        if entry.file_type.is_dir() {
+            dirs.push(name);
+        } else {
+            files.push(name);
+        }
+    }
+    dirs.sort();
+    files.sort();
+    (dirs, files)
+}
+
+/// 按层并发预取目录项。任何一层读取失败只是不缓存该目录，渲染阶段会按
+/// 原顺序再次读取并产生与之前完全相同的错误，因此预取不改变错误语义。
+fn prefetch_directory_entries(
+    root: &Path,
+    max_depth: usize,
+    filesystem: &dyn echo_agent::tools::filesystem::FileSystem,
+) -> std::collections::HashMap<PathBuf, Vec<echo_agent::tools::filesystem::FileEntry>> {
+    let mut cache = std::collections::HashMap::new();
+    let Ok(root_entries) = filesystem.read_dir(root) else {
+        return cache;
+    };
+    let (frontier, _files) = listable_children(&root_entries);
+    cache.insert(root.to_path_buf(), root_entries);
+    let mut frontier = frontier
+        .into_iter()
+        .map(|name| root.join(name))
+        .collect::<Vec<_>>();
+
+    for _ in 1..=max_depth {
+        if frontier.is_empty() {
+            break;
+        }
+        frontier.truncate(PREFETCH_DIRS_PER_LEVEL);
+        let mut next = Vec::new();
+        for (path, entries) in read_directories_concurrently(&frontier, filesystem) {
+            let (child_dirs, _files) = listable_children(&entries);
+            next.extend(child_dirs.into_iter().map(|name| path.join(name)));
+            cache.insert(path, entries);
+        }
+        next.sort();
+        frontier = next;
+    }
+    cache
+}
+
+fn read_directories_concurrently(
+    paths: &[PathBuf],
+    filesystem: &dyn echo_agent::tools::filesystem::FileSystem,
+) -> Vec<(PathBuf, Vec<echo_agent::tools::filesystem::FileEntry>)> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let collected = std::sync::Mutex::new(Vec::new());
+    let cursor = AtomicUsize::new(0);
+    let workers = PREFETCH_CONCURRENCY.min(paths.len());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let index = cursor.fetch_add(1, Ordering::AcqRel);
+                    let Some(path) = paths.get(index) else {
+                        break;
+                    };
+                    if let Ok(entries) = filesystem.read_dir(path) {
+                        collected
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .push((path.clone(), entries));
+                    }
+                }
+            });
+        }
+    });
+    collected
+        .into_inner()
+        .unwrap_or_else(|error| error.into_inner())
 }
 
 const SKIP_DIRS: &[&str] = &[
@@ -217,3 +437,44 @@ const SKIP_DIRS: &[&str] = &[
     ".vscode",
     ".DS_Store",
 ];
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+    use echo_agent::tools::files::LocalFileSystem;
+
+    /// 预取只改变读取时序，不改变渲染顺序：文件先于目录、各自排序、
+    /// 隐藏项（`.env.example` 除外）与 SKIP_DIRS 都被排除。
+    #[test]
+    fn tree_prefetch_keeps_depth_first_order_and_filters()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("a.txt"), "a")?;
+        std::fs::write(root.path().join(".env.example"), "")?;
+        std::fs::write(root.path().join(".hidden"), "")?;
+        std::fs::create_dir(root.path().join("node_modules"))?;
+        std::fs::write(root.path().join("node_modules/skip.js"), "")?;
+        std::fs::create_dir(root.path().join("docs"))?;
+        std::fs::write(root.path().join("docs/readme.md"), "")?;
+        std::fs::create_dir_all(root.path().join("src/lib"))?;
+        std::fs::write(root.path().join("src/main.rs"), "")?;
+        std::fs::write(root.path().join("src/lib/mod.rs"), "")?;
+
+        let mut entries = Vec::new();
+        collect_dir_entries_with_file_system(root.path(), &mut entries, 0, 3, &LocalFileSystem)?;
+        assert_eq!(
+            vec![
+                ".env.example".to_string(),
+                "a.txt".to_string(),
+                "docs/".to_string(),
+                "  readme.md".to_string(),
+                "src/".to_string(),
+                "  main.rs".to_string(),
+                "  lib/".to_string(),
+                "    mod.rs".to_string(),
+            ],
+            entries
+        );
+        Ok(())
+    }
+}

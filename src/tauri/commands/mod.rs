@@ -8,13 +8,13 @@
 
 pub mod analysis;
 pub mod browser;
+pub mod channels;
 pub mod chat;
 pub mod config;
 pub mod conversations;
 pub mod extensions;
 pub mod files;
 pub mod hooks;
-pub mod lsp;
 pub mod mcp;
 pub mod memory;
 pub mod panels;

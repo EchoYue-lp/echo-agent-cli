@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   pluginApi,
+  pluginMutationCommitted,
+  type PluginMutationResult,
   extensionRequestScope,
   type PluginInfo,
   type PluginOutputStyle,
@@ -29,6 +31,12 @@ import {
 import { applyPluginTheme, useUiStore } from '../../stores/uiStore';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 
+type PluginView = {
+  scope: ReturnType<typeof extensionRequestScope>;
+  active: boolean;
+  listSequence: number;
+};
+
 export function PluginPanel() {
   const workspace = useWorkspaceStore((state) => state.current);
   const requestScope = useMemo(() => extensionRequestScope(workspace), [workspace]);
@@ -54,197 +62,273 @@ export function PluginPanel() {
   const [styleOmitted, setStyleOmitted] = useState(0);
   const [activeOutputStyle, setActiveOutputStyle] = useState<string | null>(null);
   const [runtimeBusy, setRuntimeBusy] = useState(false);
+  const currentView = useRef<PluginView | null>(null);
+
+  const isCurrentView = useCallback((view: PluginView) => {
+    const live = extensionRequestScope(useWorkspaceStore.getState().current);
+    return (
+      view.active &&
+      currentView.current === view &&
+      live.workspace_id === view.scope.workspace_id &&
+      live.workspace_generation === view.scope.workspace_generation &&
+      live.sender_id === view.scope.sender_id &&
+      live.sender_incarnation === view.scope.sender_incarnation
+    );
+  }, []);
 
   const mutationMessage = (
-    result: { wiring_ok?: boolean; errors?: string[]; message?: string },
+    result: PluginMutationResult,
     fallback: string
   ): { type: 'success' | 'error'; text: string } => {
-    if (result.wiring_ok === false) {
-      const details = result.errors?.join('; ') || 'Some components could not be activated';
-      return { type: 'error', text: `${result.message || fallback}: ${details}` };
+    if (result.wiring_ok === false || result.settlement_status === 'degraded') {
+      const details = result.errors?.join('; ') || result.error || '部分组件未启用';
+      const omitted = result.errors_omitted ? `；另有 ${result.errors_omitted} 条诊断未展开` : '';
+      return {
+        type: 'error',
+        text: `已提交，部分组件未启用或存在诊断：${details}${omitted}`,
+      };
     }
     return { type: 'success', text: result.message || fallback };
   };
 
-  const loadPlugins = useCallback(async () => {
-    try {
-      setLoading(true);
-      const [data, themes, styles] = await Promise.all([
-        pluginApi.list(requestScope),
-        pluginApi.themes(requestScope),
-        pluginApi.outputStyles(requestScope),
-      ]);
-      setPlugins(data.plugins);
-      setPluginOmitted(data.omitted);
-      setPluginThemes(themes.themes);
-      setThemeOmitted(themes.omitted);
-      applyPluginTheme(themes.themes.find((theme) => theme.name === themes.active) || null);
-      setOutputStyles(styles.styles);
-      setStyleOmitted(styles.omitted);
-      setActiveOutputStyle(styles.active);
-      setError(null);
-    } catch (e: any) {
-      setError(e.message || 'Failed to load plugins');
-    } finally {
-      setLoading(false);
-    }
-  }, [requestScope]);
+  const loadPlugins = useCallback(
+    async (view: PluginView) => {
+      if (!isCurrentView(view)) return;
+      const sequence = ++view.listSequence;
+      const isLatest = () => isCurrentView(view) && sequence === view.listSequence;
+      try {
+        setLoading(true);
+        const [data, themes, styles] = await Promise.all([
+          pluginApi.list(view.scope),
+          pluginApi.themes(view.scope),
+          pluginApi.outputStyles(view.scope),
+        ]);
+        if (!isLatest()) return;
+        setPlugins(data.plugins);
+        setPluginOmitted(data.omitted);
+        setPluginThemes(themes.themes);
+        setThemeOmitted(themes.omitted);
+        applyPluginTheme(themes.themes.find((theme) => theme.name === themes.active) || null);
+        setOutputStyles(styles.styles);
+        setStyleOmitted(styles.omitted);
+        setActiveOutputStyle(styles.active);
+        setError(null);
+      } catch (e: any) {
+        if (isLatest()) setError(e.message || 'Failed to load plugins');
+      } finally {
+        if (isLatest()) setLoading(false);
+      }
+    },
+    [isCurrentView]
+  );
 
   useEffect(() => {
-    void loadPlugins();
-  }, [loadPlugins]);
+    // 旧访问的全局主题写入也必须失效；后端已开始的操作仍由原 owner 结算。
+    const view: PluginView = { scope: requestScope, active: true, listSequence: 0 };
+    currentView.current = view;
+    setPlugins([]);
+    setPluginOmitted(0);
+    setPluginThemes([]);
+    setThemeOmitted(0);
+    setOutputStyles([]);
+    setStyleOmitted(0);
+    setActiveOutputStyle(null);
+    setError(null);
+    setMessage(null);
+    setExpanded(null);
+    setRuntimeBusy(false);
+    setDeveloperBusy(false);
+    setInstalling(false);
+    void loadPlugins(view);
+    return () => {
+      view.active = false;
+    };
+  }, [loadPlugins, requestScope]);
 
   const handleThemeChange = async (name: string) => {
+    const view = currentView.current;
+    if (!view || !isCurrentView(view)) return;
     try {
       setRuntimeBusy(true);
-      const result = await pluginApi.activateTheme(requestScope, name || null);
+      const result = await pluginApi.activateTheme(view.scope, name || null);
+      if (!isCurrentView(view)) return;
       applyPluginTheme(result.theme);
       setMessage({
         type: 'success',
         text: result.active ? `Theme '${result.active}' activated` : 'Theme reset to default',
       });
     } catch (e: any) {
-      setMessage({ type: 'error', text: e.message || 'Failed to activate theme' });
+      if (isCurrentView(view))
+        setMessage({ type: 'error', text: e.message || 'Failed to activate theme' });
     } finally {
-      setRuntimeBusy(false);
+      if (isCurrentView(view)) setRuntimeBusy(false);
     }
   };
 
   const handleConfigure = async (name: string, values: Record<string, unknown>) => {
-    const result = await pluginApi.configure(requestScope, name, values);
-    if (!result.success) {
+    const view = currentView.current;
+    if (!view || !isCurrentView(view)) return;
+    const result = await pluginApi.configure(view.scope, name, values);
+    if (!isCurrentView(view)) return;
+    if (!pluginMutationCommitted(result)) {
       throw new Error(result.errors?.join('; ') || result.error || 'Configuration failed');
     }
-    setMessage({ type: 'success', text: result.message || `Plugin '${name}' configured` });
-    await loadPlugins();
+    setMessage(mutationMessage(result, `Plugin '${name}' configured`));
+    await loadPlugins(view);
   };
 
   const handleOutputStyleChange = async (name: string) => {
+    const view = currentView.current;
+    if (!view || !isCurrentView(view)) return;
     try {
       setRuntimeBusy(true);
-      const result = await pluginApi.activateOutputStyle(requestScope, name || null);
+      const result = await pluginApi.activateOutputStyle(view.scope, name || null);
+      if (!isCurrentView(view)) return;
       setActiveOutputStyle(result.active);
       setMessage({
         type: 'success',
         text: result.active ? `Output style '${result.active}' activated` : 'Output style cleared',
       });
     } catch (e: any) {
-      setMessage({ type: 'error', text: e.message || 'Failed to activate output style' });
+      if (isCurrentView(view))
+        setMessage({ type: 'error', text: e.message || 'Failed to activate output style' });
     } finally {
-      setRuntimeBusy(false);
+      if (isCurrentView(view)) setRuntimeBusy(false);
     }
   };
 
   const handleInstall = async () => {
     if (!installSource.trim()) return;
+    const view = currentView.current;
+    if (!view || !isCurrentView(view)) return;
     try {
       setInstalling(true);
       setMessage(null);
-      const result = await pluginApi.install(requestScope, {
+      const result = await pluginApi.install(view.scope, {
         source: installSource.trim(),
         scope: installScope,
       });
-      if (result.success) {
+      if (!isCurrentView(view)) return;
+      if (pluginMutationCommitted(result)) {
         setMessage(mutationMessage(result, `Plugin '${result.plugin_id}' installed`));
         setInstallSource('');
         setShowInstall(false);
-        await loadPlugins();
+        await loadPlugins(view);
       } else {
         setMessage({ type: 'error', text: result.error || 'Install failed' });
       }
     } catch (e: any) {
-      setMessage({ type: 'error', text: e.message || 'Install failed' });
+      if (isCurrentView(view)) setMessage({ type: 'error', text: e.message || 'Install failed' });
     } finally {
-      setInstalling(false);
+      if (isCurrentView(view)) setInstalling(false);
     }
   };
 
   const handleUninstall = async (name: string) => {
+    const view = currentView.current;
+    if (!view || !isCurrentView(view)) return;
     if (!confirm(`Uninstall plugin '${name}'?`)) return;
     try {
-      const result = await pluginApi.uninstall(requestScope, { name });
-      if (result.success) {
+      const result = await pluginApi.uninstall(view.scope, { name });
+      if (!isCurrentView(view)) return;
+      if (pluginMutationCommitted(result)) {
         setMessage(mutationMessage(result, `Plugin '${name}' uninstalled`));
-        await loadPlugins();
+        await loadPlugins(view);
       } else {
         setMessage({ type: 'error', text: result.error || 'Uninstall failed' });
       }
     } catch (e: any) {
-      setMessage({ type: 'error', text: e.message || 'Uninstall failed' });
+      if (isCurrentView(view)) setMessage({ type: 'error', text: e.message || 'Uninstall failed' });
     }
   };
 
   const handleToggle = async (plugin: PluginInfo) => {
+    const view = currentView.current;
+    if (!view || !isCurrentView(view)) return;
     try {
       const result = plugin.enabled
-        ? await pluginApi.disable(requestScope, plugin.name)
-        : await pluginApi.enable(requestScope, plugin.name);
-      if (result.success) {
+        ? await pluginApi.disable(view.scope, plugin.name)
+        : await pluginApi.enable(view.scope, plugin.name);
+      if (!isCurrentView(view)) return;
+      if (pluginMutationCommitted(result)) {
         setMessage(mutationMessage(result, `Plugin ${plugin.enabled ? 'disabled' : 'enabled'}`));
-        await loadPlugins();
+        await loadPlugins(view);
       } else {
         setMessage({ type: 'error', text: result.error || 'Toggle failed' });
       }
     } catch (e: any) {
-      setMessage({ type: 'error', text: e.message || 'Toggle failed' });
+      if (isCurrentView(view)) setMessage({ type: 'error', text: e.message || 'Toggle failed' });
     }
   };
 
   const handleReload = async () => {
+    const view = currentView.current;
+    if (!view || !isCurrentView(view)) return;
     try {
       setLoading(true);
-      const result = await pluginApi.reload(requestScope);
-      if (result.success) {
-        setMessage({ type: 'success', text: result.message || 'Plugins reloaded' });
-        await loadPlugins();
+      const result = await pluginApi.reload(view.scope);
+      if (!isCurrentView(view)) return;
+      if (pluginMutationCommitted(result)) {
+        setMessage(mutationMessage(result, 'Plugins reloaded'));
+        await loadPlugins(view);
       } else {
         setMessage({ type: 'error', text: result.error || 'Reload failed' });
       }
     } catch (e: any) {
-      setMessage({ type: 'error', text: e.message || 'Reload failed' });
+      if (isCurrentView(view)) setMessage({ type: 'error', text: e.message || 'Reload failed' });
     } finally {
-      setLoading(false);
+      if (isCurrentView(view)) setLoading(false);
     }
   };
 
   const handleScaffold = async () => {
     if (!developerPath.trim() || !scaffoldName.trim()) return;
+    const view = currentView.current;
+    if (!view || !isCurrentView(view)) return;
     try {
       setDeveloperBusy(true);
       const result = await pluginApi.scaffold(
-        requestScope,
+        view.scope,
         developerPath.trim(),
         scaffoldName.trim()
       );
+      if (!isCurrentView(view)) return;
       setMessage(
         result.success
           ? { type: 'success', text: result.message || `Plugin scaffolded at ${result.path}` }
           : { type: 'error', text: result.error || 'Scaffold failed' }
       );
     } catch (e: any) {
-      setMessage({ type: 'error', text: e.message || 'Scaffold failed' });
+      if (isCurrentView(view)) setMessage({ type: 'error', text: e.message || 'Scaffold failed' });
     } finally {
-      setDeveloperBusy(false);
+      if (isCurrentView(view)) setDeveloperBusy(false);
     }
   };
 
   const handleValidate = async () => {
     if (!developerPath.trim()) return;
+    const view = currentView.current;
+    if (!view || !isCurrentView(view)) return;
     try {
       setDeveloperBusy(true);
-      const report = await pluginApi.validate(requestScope, developerPath.trim());
+      const report = await pluginApi.validate(view.scope, developerPath.trim());
+      if (!isCurrentView(view)) return;
       setMessage(
-        report.valid
+        report.valid && report.errors.length === 0
           ? {
               type: 'success',
               text: `Plugin '${report.name || 'unknown'}' is valid: ${report.components.join(', ')}`,
             }
-          : { type: 'error', text: report.errors.join('; ') || 'Validation failed' }
+          : {
+              type: 'error',
+              text: `${report.valid ? `Retained components valid: ${report.components.join(', ')}. ` : ''}${report.errors.join('; ') || 'Validation failed'}`,
+            }
       );
     } catch (e: any) {
-      setMessage({ type: 'error', text: e.message || 'Validation failed' });
+      if (isCurrentView(view))
+        setMessage({ type: 'error', text: e.message || 'Validation failed' });
     } finally {
-      setDeveloperBusy(false);
+      if (isCurrentView(view)) setDeveloperBusy(false);
     }
   };
 

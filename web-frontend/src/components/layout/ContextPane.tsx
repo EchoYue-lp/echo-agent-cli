@@ -47,6 +47,17 @@ export function ContextPane() {
     useContextPaneStore.getState().reset();
   }, [workspace?.id, activeConversationId]);
 
+  const previousTaskScope = useRef(workspaceScope);
+  useEffect(() => {
+    if (
+      previousTaskScope.current !== workspaceScope &&
+      useContextPaneStore.getState().target?.kind === 'tasks'
+    ) {
+      useContextPaneStore.getState().reset();
+    }
+    previousTaskScope.current = workspaceScope;
+  }, [workspaceScope]);
+
   useEffect(() => {
     if (!target) return;
     const handleEscape = (event: KeyboardEvent) => {
@@ -78,11 +89,11 @@ export function ContextPane() {
       <button
         type="button"
         aria-label="点击遮罩关闭上下文面板"
-        className="fixed inset-0 z-[55] bg-black/25 xl:hidden"
+        className="fixed inset-0 z-[55] bg-[var(--bg-overlay)] xl:hidden"
         onClick={close}
       />
       <aside
-        className="fixed inset-y-0 right-0 z-[60] flex min-w-0 flex-col border-l border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-xl max-md:!w-full max-md:border-l-0 xl:relative xl:z-20 xl:shadow-none"
+        className="fixed inset-y-0 right-0 z-[60] flex min-w-0 flex-col border-l border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-[var(--shadow-xl)] max-md:!w-full max-md:border-l-0 xl:relative xl:z-20 xl:shadow-none"
         style={{ width }}
         aria-label={`${title}上下文面板`}
       >
@@ -124,7 +135,7 @@ export function ContextPane() {
           )
         ) : (
           <>
-            <header className="flex h-11 shrink-0 items-center gap-2 border-b border-[var(--border-primary)] px-3">
+            <header className="flex h-[52px] shrink-0 items-center gap-2 border-b border-[var(--border-secondary)] bg-[var(--bg-secondary)] px-4">
               <div className="min-w-0 flex-1 truncate text-sm font-medium text-[var(--text-primary)]">
                 {title}
               </div>
@@ -134,7 +145,7 @@ export function ContextPane() {
                 autoFocus
                 aria-label={returnTarget ? '返回 Subagent' : '关闭上下文面板'}
                 title={returnTarget ? '返回 Subagent' : '关闭上下文面板'}
-                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                className="eko-pane-control"
               >
                 {returnTarget ? <ArrowLeft size={14} /> : <PanelRightClose size={14} />}
               </button>
@@ -164,7 +175,7 @@ function MissingContext({ text, onClose }: { text: string; onClose: () => void }
         onClick={onClose}
         aria-label="关闭不可用的上下文"
         title="关闭上下文"
-        className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+        className="eko-pane-control"
       >
         <PanelRightClose size={14} />
       </button>

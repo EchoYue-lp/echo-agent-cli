@@ -12,7 +12,7 @@
 use super::file_shadow::FileTaskShadow;
 use super::types::{
     Artifact, PlanRevision, PlanTask, ReviewResult, RunStateSnapshot, RuntimeTaskEvent,
-    TaskExecutionSummary, TaskPlan, TaskRun, TodoItem, TodoStatus,
+    TaskExecutionSummary, TaskPlan, TaskRun, TaskRunPage, TaskRunStatus, TodoItem, TodoStatus,
 };
 
 /// File-backed read store. Cheap to clone (wraps a `FileTaskShadow`).
@@ -31,6 +31,34 @@ pub(crate) struct TaskRunLoadIssue {
 pub(crate) struct TaskRunScan {
     pub runs: Vec<TaskRun>,
     pub issues: Vec<TaskRunLoadIssue>,
+}
+
+// Read-only cursor state travels with the caller, never in a second registry.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+struct TaskRunPageKey {
+    created_at: chrono::DateTime<chrono::Utc>,
+    run_id: String,
+}
+
+impl From<&TaskRun> for TaskRunPageKey {
+    fn from(run: &TaskRun) -> Self {
+        Self {
+            created_at: run.created_at,
+            run_id: run.run_id.clone(),
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskRunContinuation {
+    version: u8,
+    workspace_id: String,
+    workspace_generation: String,
+    statuses: Vec<String>,
+    limit: usize,
+    upper: TaskRunPageKey,
+    after: TaskRunPageKey,
 }
 
 impl FileTaskStore {
@@ -121,6 +149,130 @@ impl FileTaskStore {
         Ok(TaskRunScan { runs, issues })
     }
 
+    /// The same provenance rule serves latest-conversation and historical views.
+    pub(crate) fn task_ui_visible(&self, state: &RunStateSnapshot) -> Result<bool, FileReadError> {
+        // 渠道和cron的每次原运行都是用户历史；不要求它先生成计划。
+        let external_trigger = state.run.conversation_id.starts_with("channel:")
+            || state
+                .run
+                .conversation_id
+                .starts_with(crate::scheduler::CRON_CONVERSATION_PREFIX);
+        Ok(external_trigger
+            || !state.execution_profile.is_conversation_turn()
+            || self.read_plan_resilient(&state.run.run_id)?.is_some())
+    }
+
+    /// Bound retained headers and transport. ID enumeration and authority recovery
+    /// still scan the collection; this is not a persistent index or a transaction snapshot.
+    pub(crate) fn task_run_page(
+        &self,
+        workspace_id: &str,
+        workspace_generation: &str,
+        statuses: &[TaskRunStatus],
+        limit: usize,
+        continuation: Option<&str>,
+    ) -> Result<TaskRunPage, FileReadError> {
+        if !(1..=20).contains(&limit) || workspace_generation.is_empty() {
+            return Err(FileReadError::InvalidPlan(
+                "task page requires a generation and limit 1..20".into(),
+            ));
+        }
+        let mut status_keys = statuses
+            .iter()
+            .map(|value| value.as_str().to_string())
+            .collect::<Vec<_>>();
+        status_keys.sort();
+        status_keys.dedup();
+        let cursor = continuation
+            .map(|value| {
+                if value.chars().take(4097).count() > 4096 {
+                    return Err(FileReadError::InvalidPlan(
+                        "task continuation is too long".into(),
+                    ));
+                }
+                let cursor: TaskRunContinuation = serde_json::from_str(value).map_err(|error| {
+                    FileReadError::InvalidPlan(format!("invalid task continuation: {error}"))
+                })?;
+                if cursor.version != 1
+                    || cursor.workspace_id != workspace_id
+                    || cursor.workspace_generation != workspace_generation
+                    || cursor.statuses != status_keys
+                    || cursor.limit != limit
+                    || cursor.after > cursor.upper
+                {
+                    return Err(FileReadError::InvalidPlan(
+                        "task continuation does not match this query; refresh the list".into(),
+                    ));
+                }
+                Ok(cursor)
+            })
+            .transpose()?;
+        let mut upper = cursor.as_ref().map(|value| value.upper.clone());
+        let mut items = Vec::with_capacity(limit.saturating_add(1));
+        for run_id in self.shadow.list_task_query_run_ids()? {
+            // Unlike the generic legacy list, a failed candidate is not silently
+            // omitted: a partial collection must not look like a complete page.
+            let Some(state) = self.read_run_state_resilient(&run_id)? else {
+                continue;
+            };
+            if state.run.workspace_id != workspace_id {
+                return Err(FileReadError::InvalidPlan(format!(
+                    "TaskRun {run_id} belongs to another workspace"
+                )));
+            }
+            if (!statuses.is_empty() && !statuses.contains(&state.run.status))
+                || !self.task_ui_visible(&state)?
+            {
+                continue;
+            }
+            let key = TaskRunPageKey::from(&state.run);
+            if let Some(cursor) = &cursor {
+                if key > cursor.upper || key >= cursor.after {
+                    continue;
+                }
+            } else if upper.as_ref().is_none_or(|value| key > *value) {
+                upper = Some(key);
+            }
+            items.push(state.run);
+            items.sort_by(|left, right| {
+                right
+                    .created_at
+                    .cmp(&left.created_at)
+                    .then_with(|| right.run_id.cmp(&left.run_id))
+            });
+            items.truncate(limit.saturating_add(1));
+        }
+        let has_more = items.len() > limit;
+        items.truncate(limit);
+        let next_continuation = if has_more {
+            match (upper, items.last()) {
+                (Some(upper), Some(last)) => Some(
+                    serde_json::to_string(&TaskRunContinuation {
+                        version: 1,
+                        workspace_id: workspace_id.to_string(),
+                        workspace_generation: workspace_generation.to_string(),
+                        statuses: status_keys,
+                        limit,
+                        upper,
+                        after: TaskRunPageKey::from(last),
+                    })
+                    .map_err(|error| FileReadError::InvalidPlan(error.to_string()))?,
+                ),
+                _ => {
+                    return Err(FileReadError::InvalidPlan(
+                        "task page lost its continuation position".into(),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        Ok(TaskRunPage {
+            items,
+            next_continuation,
+        })
+    }
+
     pub(crate) fn list_runs(&self) -> Result<Vec<TaskRun>, FileReadError> {
         let scan = self.scan_runs()?;
         for issue in scan.issues {
@@ -202,6 +354,8 @@ impl FileTaskStore {
                 })
                 .collect();
         Ok(Some(TaskPlan {
+            domain_binding: plan.domain_binding,
+
             plan_id: plan.plan_id,
             run_id: plan.run_id,
             revision: plan.revision,
@@ -385,6 +539,9 @@ mod tests {
 
     fn task(id: &str, kind: PlanTaskKind) -> PlanTask {
         PlanTask {
+            domain_binding: None,
+            domain_role: None,
+
             id: id.to_string(),
             title: format!("task {id}"),
             description: format!("do {id}"),
@@ -429,6 +586,8 @@ mod tests {
             .map_err(|error| error.to_string())?;
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+
                 plan_id: "rebuild-plan".to_string(),
                 run_id: "rebuild-run".to_string(),
                 revision: 1,
@@ -475,6 +634,137 @@ mod tests {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "run did not recover the durable event tail".to_string())?;
         assert_eq!(recovered.status, TaskRunStatus::Running);
+        // 以下控制必须关闭所有旧 authority；不能用 warm handle 掩盖冷恢复分支。
+        use crate::tasks::task_runtime::event_rebuild::EventFoldState;
+        use echo_agent::state::journal::{CheckpointStore, FileCheckpointStore};
+
+        let run_path = tmp.path().join("rebuild-run/run-state.json");
+        let plan_path = tmp.path().join("rebuild-run/plan.json");
+        let checkpoint_path = tmp.path().join("rebuild-run/checkpoint.json");
+        let expected_run_bytes = std::fs::read(&run_path).map_err(|error| error.to_string())?;
+        let expected_plan_bytes = std::fs::read(&plan_path).map_err(|error| error.to_string())?;
+        let expected_checkpoint_bytes =
+            std::fs::read(&checkpoint_path).map_err(|error| error.to_string())?;
+        let expected_state: RunStateSnapshot =
+            serde_json::from_slice(&expected_run_bytes).map_err(|error| error.to_string())?;
+        drop(file);
+        drop(shadow);
+        drop(store);
+        for case in [
+            "missing-state",
+            "corrupt-state",
+            "stale-state",
+            "missing-plan",
+            "corrupt-plan",
+            "stale-plan",
+            "missing-checkpoint",
+            "corrupt-checkpoint",
+            "legacy-query-checkpoint",
+        ] {
+            for (path, bytes) in [
+                (&run_path, &expected_run_bytes),
+                (&plan_path, &expected_plan_bytes),
+                (&checkpoint_path, &expected_checkpoint_bytes),
+            ] {
+                std::fs::write(path, bytes).map_err(|error| error.to_string())?;
+            }
+            match case {
+                "missing-state" => {
+                    std::fs::remove_file(&run_path).map_err(|error| error.to_string())?
+                }
+                "corrupt-state" => {
+                    std::fs::write(&run_path, b"{partial").map_err(|error| error.to_string())?
+                }
+                "stale-state" => {
+                    let mut value: serde_json::Value = serde_json::from_slice(&expected_run_bytes)
+                        .map_err(|error| error.to_string())?;
+                    let goal = value
+                        .get_mut("run")
+                        .and_then(|run| run.get_mut("goal"))
+                        .ok_or_else(|| "run goal fixture field missing".to_string())?;
+                    *goal = serde_json::json!("陈旧但合法的同 cut 内容");
+                    std::fs::write(
+                        &run_path,
+                        serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())?,
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                "missing-plan" => {
+                    std::fs::remove_file(&plan_path).map_err(|error| error.to_string())?
+                }
+                "corrupt-plan" => {
+                    std::fs::write(&plan_path, b"{partial").map_err(|error| error.to_string())?
+                }
+                "stale-plan" => {
+                    let mut value: serde_json::Value = serde_json::from_slice(&expected_plan_bytes)
+                        .map_err(|error| error.to_string())?;
+                    let revision = value
+                        .get_mut("revision")
+                        .ok_or_else(|| "plan revision fixture field missing".to_string())?;
+                    *revision = serde_json::json!(0);
+                    std::fs::write(
+                        &plan_path,
+                        serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())?,
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                "missing-checkpoint" => {
+                    std::fs::remove_file(&checkpoint_path).map_err(|error| error.to_string())?
+                }
+                "corrupt-checkpoint" => std::fs::write(&checkpoint_path, b"{partial")
+                    .map_err(|error| error.to_string())?,
+                "legacy-query-checkpoint" => {
+                    // 原 typed store 重新计算原 digest；不是造一个无效CRC去替代旧schema控制。
+                    let checkpoints = FileCheckpointStore::<EventFoldState>::open(&checkpoint_path);
+                    let mut frame = checkpoints
+                        .load()
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| "checkpoint fixture missing".to_string())?;
+                    frame.state.clear_query_projection_schema_for_test();
+                    checkpoints
+                        .save(&frame.journal_identity, &frame.state, frame.sequence)
+                        .map_err(|error| error.to_string())?;
+                }
+                _ => return Err("unknown projection recovery control".to_string()),
+            }
+            let cold = FileTaskStore::from_root(tmp.path()).map_err(|error| error.to_string())?;
+            let state = cold
+                .get_run_state("rebuild-run")
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("{case}: run state did not recover"))?;
+            let repaired_plan = cold
+                .get_plan("rebuild-run")
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("{case}: plan did not recover"))?;
+            if state.journal_sequence != expected_state.journal_sequence
+                || state.run.status != TaskRunStatus::Running
+                || state.run.goal != "rebuild projections"
+                || repaired_plan.plan_id != "rebuild-plan"
+                || repaired_plan.revision != 1
+                || repaired_plan.tasks.len() != 1
+            {
+                return Err(format!(
+                    "{case}: cold recovery returned stale or incomplete data"
+                ));
+            }
+            if std::fs::read(&run_path).map_err(|error| error.to_string())? != expected_run_bytes
+                || std::fs::read(&plan_path).map_err(|error| error.to_string())?
+                    != expected_plan_bytes
+            {
+                return Err(format!(
+                    "{case}: cold recovery did not republish the original readmodel"
+                ));
+            }
+            let checkpoint = FileCheckpointStore::<EventFoldState>::open(&checkpoint_path)
+                .load()
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("{case}: recovered checkpoint missing"))?;
+            if checkpoint.sequence != expected_state.journal_sequence
+                || !checkpoint.state.has_current_query_projection_schema()
+            {
+                return Err(format!("{case}: checkpoint cut/schema did not recover"));
+            }
+        }
         Ok(())
     }
 
@@ -497,6 +787,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
             revision: 1,
@@ -588,6 +880,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         store.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
             revision: 1,
@@ -791,6 +1085,8 @@ mod tests {
         let mut downstream = task("downstream", PlanTaskKind::Summary);
         downstream.depends_on = vec![upstream.id.clone()];
         store.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: "derived-block-plan".to_string(),
             run_id: "derived-block".to_string(),
             revision: 1,

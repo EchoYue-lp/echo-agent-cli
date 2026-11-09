@@ -61,7 +61,7 @@ interface CardHeaderProps extends HTMLAttributes<HTMLDivElement> {
 
 export function CardHeader({ children, className = '', ...rest }: CardHeaderProps) {
   return (
-    <div className={`flex flex-col gap-1 px-4 pt-3 ${className}`.trim()} {...rest}>
+    <div className={`flex flex-col gap-1 px-4 pt-4 ${className}`.trim()} {...rest}>
       {children}
     </div>
   );
@@ -73,7 +73,7 @@ interface CardContentProps extends HTMLAttributes<HTMLDivElement> {
 
 export function CardContent({ children, className = '', ...rest }: CardContentProps) {
   return (
-    <div className={`px-4 py-3 ${className}`.trim()} {...rest}>
+    <div className={`min-w-0 px-4 py-4 ${className}`.trim()} {...rest}>
       {children}
     </div>
   );

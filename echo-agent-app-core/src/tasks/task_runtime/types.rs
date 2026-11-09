@@ -31,6 +31,8 @@ use ts_rs::TS;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, rename = "DomainProfile")]
+/// Historical profile projection only. New professional work selects an
+/// explicit domain plugin; this discriminator grants no execution policy.
 pub enum DomainProfile {
     #[default]
     General,
@@ -517,11 +519,15 @@ impl ArtifactKind {
 #[ts(export, rename = "RuntimeEventKind")]
 pub enum RuntimeEventKind {
     RunCreated,
+    /// Typed framework delivery events committed by the original TaskRun journal.
+    WeixinDeliveryRecorded,
     /// The user explicitly replaced the sole authoritative TaskRun Goal.
     RunGoalUpdated,
     /// A user steer landed in a run-bound turn — an incremental constraint
     /// that must survive context compression alongside the Goal.
     RunSteerRecorded,
+    /// 原输入版本已被任务journal耐久接受；不代表进入context、Applied或当前有效。
+    RunInputAccepted,
     /// Existing evidence was detached from an older Goal revision.
     RequirementEvidenceInvalidated,
     /// Unchanged evidence was explicitly rebound after a Goal-aware plan update.
@@ -632,8 +638,10 @@ impl RuntimeEventKind {
         use RuntimeEventKind::*;
         match self {
             RunCreated => "run_created",
+            WeixinDeliveryRecorded => "weixin_delivery_recorded",
             RunGoalUpdated => "run_goal_updated",
             RunSteerRecorded => "run_steer_recorded",
+            RunInputAccepted => "run_input_accepted",
             RequirementEvidenceInvalidated => "requirement_evidence_invalidated",
             RequirementEvidenceRevalidated => "requirement_evidence_revalidated",
             RequirementSkipped => "requirement_skipped",
@@ -737,8 +745,10 @@ impl RuntimeEventKind {
         use RuntimeEventKind::*;
         Some(match s {
             "run_created" => RunCreated,
+            "weixin_delivery_recorded" => WeixinDeliveryRecorded,
             "run_goal_updated" => RunGoalUpdated,
             "run_steer_recorded" => RunSteerRecorded,
+            "run_input_accepted" => RunInputAccepted,
             "requirement_evidence_invalidated" => RequirementEvidenceInvalidated,
             "requirement_evidence_revalidated" => RequirementEvidenceRevalidated,
             "requirement_skipped" => RequirementSkipped,
@@ -829,6 +839,8 @@ pub struct TaskRun {
     pub conversation_id: String,
     pub root_message_id: String,
     pub domain_profile: DomainProfile,
+    #[serde(default)]
+    pub domain_binding: Option<crate::domain_plugin::DomainBindingRef>,
     pub status: TaskRunStatus,
     pub goal: String,
     #[ts(type = "number")]
@@ -856,10 +868,33 @@ pub struct TaskRun {
     pub updated_at: DateTime<Utc>,
 }
 
+/// One finite, live page of formal task runs. Continuations do not own a snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskRunPage {
+    pub items: Vec<TaskRun>,
+    pub next_continuation: Option<String>,
+}
+
+/// A finite journal slice; sequence positions retain the original lossless string wire.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskEventPage {
+    pub events: Vec<RuntimeTaskEvent>,
+    #[serde(
+        serialize_with = "serialize_seq_as_string",
+        deserialize_with = "deserialize_seq_from_string"
+    )]
+    #[ts(type = "string")]
+    pub next_after_sequence: i64,
+    pub has_more: bool,
+}
+
 /// Immutable product provenance for a TaskRun. This is deliberately separate
 /// from `route`: route is diagnostic text, while provenance controls recovery
 /// and surface projection without reviving a string-based interaction mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskRunProvenance {
     ConversationTurn,
@@ -870,7 +905,8 @@ pub enum TaskRunProvenance {
 /// Whether an orchestrated primary Agent may complete read-only work directly
 /// or must first materialize a revisioned plan. It is execution policy, not a
 /// TaskRun lifecycle state.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum RunPlanPolicy {
     #[default]
@@ -878,10 +914,30 @@ pub enum RunPlanPolicy {
     AllowDirect,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct TaskRunExecutionProfile {
     pub provenance: TaskRunProvenance,
     pub plan_policy: RunPlanPolicy,
+    /// None means a legacy run without trustworthy delegation authorization.
+    /// Only a genuinely new RunCreated admission captures the config default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(as = "Option<u8>", optional)]
+    pub subagent_depth_limit: Option<crate::subagent_policy::SubagentDepthLimit>,
+}
+
+/// Immutable execution location captured by the original RunCreated event.
+/// The Workspace manifest owns configuration; this value only fences an
+/// accepted run from being resumed against a different machine or checkout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProjectExecutionBinding {
+    pub workspace_id: String,
+    /// SHA-256 of the canonical typed Workspace location, including its
+    /// endpoint and path. This is an identity fence, not another SSH config.
+    pub location_sha256: String,
+    #[ts(type = "number")]
+    pub revision: u64,
 }
 
 impl TaskRunExecutionProfile {
@@ -889,6 +945,7 @@ impl TaskRunExecutionProfile {
         Self {
             provenance: TaskRunProvenance::ConversationTurn,
             plan_policy: RunPlanPolicy::AllowDirect,
+            subagent_depth_limit: None,
         }
     }
 
@@ -896,11 +953,28 @@ impl TaskRunExecutionProfile {
         Self {
             provenance: TaskRunProvenance::Orchestrated,
             plan_policy,
+            subagent_depth_limit: None,
         }
     }
 
     pub const fn is_conversation_turn(self) -> bool {
         matches!(self.provenance, TaskRunProvenance::ConversationTurn)
+    }
+
+    pub const fn with_subagent_depth_limit(
+        mut self,
+        limit: crate::subagent_policy::SubagentDepthLimit,
+    ) -> Self {
+        self.subagent_depth_limit = Some(limit);
+        self
+    }
+
+    pub fn require_subagent_depth_limit(
+        self,
+    ) -> Result<crate::subagent_policy::SubagentDepthLimit, String> {
+        self.subagent_depth_limit.ok_or_else(|| {
+            "This historical run has no bound Subagent depth policy; new delegation requires explicit confirmation".to_string()
+        })
     }
 }
 
@@ -909,17 +983,22 @@ impl TaskRunExecutionProfile {
 /// A later lookup must match every field and remain paused. This prevents a
 /// delayed command from driving a deleted-and-recreated run that reused the
 /// same external run id.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct TaskRunResumeIdentity {
     pub run_id: String,
     pub workspace_id: String,
     pub conversation_id: String,
     pub root_message_id: String,
     pub created_at: DateTime<Utc>,
+    #[ts(type = "number")]
     pub goal_revision: u64,
+    #[ts(type = "number")]
     pub journal_sequence: u64,
     pub continuation_enabled: bool,
     pub execution_profile: TaskRunExecutionProfile,
+    #[serde(default)]
+    pub project_binding: Option<ProjectExecutionBinding>,
 }
 
 impl TaskRunResumeIdentity {
@@ -938,6 +1017,7 @@ impl TaskRunResumeIdentity {
                 .as_ref()
                 .is_some_and(|continuation| continuation.enabled),
             execution_profile: snapshot.execution_profile,
+            project_binding: snapshot.project_binding.clone(),
         }
     }
 
@@ -946,6 +1026,7 @@ impl TaskRunResumeIdentity {
     }
 
     pub fn validate_resumable(&self, snapshot: &RunStateSnapshot) -> Result<(), String> {
+        self.execution_profile.require_subagent_depth_limit()?;
         let run = &snapshot.run;
         let mut changed = Vec::new();
         if run.run_id != self.run_id {
@@ -979,6 +1060,9 @@ impl TaskRunResumeIdentity {
         }
         if snapshot.execution_profile != self.execution_profile {
             changed.push("execution_profile");
+        }
+        if snapshot.project_binding != self.project_binding {
+            changed.push("project_binding");
         }
         if !changed.is_empty() {
             return Err(format!(
@@ -1037,6 +1121,8 @@ pub struct TaskPlan {
     /// DAG; every accepted dynamic patch increments it exactly once.
     pub revision: u64,
     pub domain_profile: DomainProfile,
+    #[serde(default)]
+    pub domain_binding: Option<crate::domain_plugin::DomainBindingRef>,
     pub goal_revision: u64,
     pub goal_sha256: String,
     pub assumptions: Vec<String>,
@@ -1052,6 +1138,7 @@ impl TaskPlan {
             run_id: self.run_id.clone(),
             revision: self.revision,
             domain_profile: self.domain_profile,
+            domain_binding: self.domain_binding.clone(),
             goal_revision: self.goal_revision,
             goal_sha256: self.goal_sha256.clone(),
             assumptions: self.assumptions.clone(),
@@ -1208,6 +1295,10 @@ pub struct TaskExecutionTarget {
     pub group_id: String,
     pub subagent_role: String,
     pub address: crate::agent_router::AgentAddress,
+    /// Resolved with this revision's concrete target. Missing historical
+    /// bindings cannot silently select today's remote project location.
+    #[serde(default)]
+    pub project_binding: Option<ProjectExecutionBinding>,
 }
 
 impl TaskExecutionTarget {
@@ -1217,6 +1308,16 @@ impl TaskExecutionTarget {
         }
         if self.subagent_role.trim().is_empty() || self.subagent_role.chars().count() > 128 {
             return Err("execution_target.subagent_role must contain 1-128 characters".to_string());
+        }
+        if let Some(binding) = self.project_binding.as_ref()
+            && (binding.workspace_id != self.address.workspace_id.to_string()
+                || binding.location_sha256.chars().count() != 64
+                || !binding
+                    .location_sha256
+                    .chars()
+                    .all(|value| value.is_ascii_hexdigit()))
+        {
+            return Err("execution_target has an invalid project location binding".to_string());
         }
         self.address.validate().map_err(|error| error.to_string())
     }
@@ -1235,6 +1336,10 @@ pub struct EkoTaskSpec {
     pub kind: PlanTaskKind,
     pub agent_role: String,
     pub domain_profile: DomainProfile,
+    #[serde(default)]
+    pub domain_binding: Option<crate::domain_plugin::DomainBindingRef>,
+    #[serde(default)]
+    pub domain_role: Option<crate::domain_plugin::DomainRoleBinding>,
     pub depends_on: Vec<String>,
     pub parallel_group: Option<String>,
     #[serde(default)]
@@ -1265,6 +1370,8 @@ impl TryFrom<&EkoTaskSpec> for echo_agent::tasks::TaskSpec {
             kind: value.kind,
             agent_role: value.agent_role.clone(),
             domain_profile: value.domain_profile,
+            domain_binding: value.domain_binding.clone(),
+            domain_role: value.domain_role.clone(),
             parallel_group: value.parallel_group.clone(),
             execution_target: value.execution_target.clone(),
             files: value.files.clone(),
@@ -1300,6 +1407,8 @@ impl TryFrom<echo_agent::tasks::TaskSpec> for EkoTaskSpec {
             kind: extension.kind,
             agent_role: extension.agent_role,
             domain_profile: extension.domain_profile,
+            domain_binding: extension.domain_binding,
+            domain_role: extension.domain_role,
             depends_on: spec.depends_on,
             parallel_group: extension.parallel_group,
             execution_target: extension.execution_target,
@@ -1320,6 +1429,10 @@ pub struct EkoTaskExtension {
     pub kind: PlanTaskKind,
     pub agent_role: String,
     pub domain_profile: DomainProfile,
+    #[serde(default)]
+    pub domain_binding: Option<crate::domain_plugin::DomainBindingRef>,
+    #[serde(default)]
+    pub domain_role: Option<crate::domain_plugin::DomainRoleBinding>,
     pub parallel_group: Option<String>,
     #[serde(default)]
     pub execution_target: Option<TaskExecutionTarget>,
@@ -1339,6 +1452,8 @@ pub struct EkoTaskExtension {
 pub struct EkoPlanMetadata {
     pub plan_id: String,
     pub domain_profile: DomainProfile,
+    #[serde(default)]
+    pub domain_binding: Option<crate::domain_plugin::DomainBindingRef>,
     pub goal_revision: u64,
     pub goal_sha256: String,
 }
@@ -1352,6 +1467,8 @@ pub struct PlanRevision {
     #[ts(type = "number")]
     pub revision: u64,
     pub domain_profile: DomainProfile,
+    #[serde(default)]
+    pub domain_binding: Option<crate::domain_plugin::DomainBindingRef>,
     #[ts(type = "number")]
     pub goal_revision: u64,
     pub goal_sha256: String,
@@ -1384,6 +1501,12 @@ pub struct RunStateSnapshot {
     /// require-plan, which is fail-closed for recovery.
     #[serde(default)]
     pub execution_profile: TaskRunExecutionProfile,
+    /// Folded from RunCreated, never filled from the currently selected GUI
+    /// project during recovery. Missing historical bindings remain unknown.
+    #[serde(default)]
+    pub project_binding: Option<ProjectExecutionBinding>,
+    #[serde(default)]
+    pub domain_binding: Option<crate::domain_plugin::DomainBinding>,
     /// Last authoritative journal sequence folded into this snapshot. This is
     /// the optimistic-concurrency epoch for queued resume actions.
     #[serde(default)]
@@ -1401,8 +1524,82 @@ pub struct RecordedUserSteer {
     pub recorded_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// 同一 TaskRun 接受的不可变源版本；原输入 journal 仍拥有可编辑队列与投递生命周期。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunInputSnapshot {
+    pub source: crate::conversation_input::ConversationInputSource,
+    pub identity: crate::conversation_input::ConversationInputIdentity,
+    pub payload: crate::conversation_input::ConversationInputPayload,
+}
+
+impl RunInputSnapshot {
+    pub(crate) fn key(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&(
+            &self.identity.address,
+            &self.identity.input_id,
+            self.identity.revision,
+        ))
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        use crate::conversation_input::{ConversationInputPayload, ConversationInputSource};
+        let identity = &self.identity;
+        if identity.input_id.trim().is_empty()
+            || identity.revision == 0
+            || identity.address.workspace_id.trim().is_empty()
+            || identity.address.conversation_id.trim().is_empty()
+            || identity.payload_sha256 != self.payload.payload_sha256
+            || (self.source != ConversationInputSource::Channel
+                && self.payload.channel_binding.is_some())
+        {
+            return Err("原输入身份、来源或修订不匹配".to_string());
+        }
+        let rebuilt = match self.payload.channel_binding.as_ref() {
+            Some(binding) => ConversationInputPayload::new_for_channel(
+                &identity.address,
+                self.payload.text.clone(),
+                self.payload.attachments.clone(),
+                self.payload.domain_plugin.clone(),
+                binding.clone(),
+            ),
+            None => ConversationInputPayload::new_with_domain(
+                self.payload.text.clone(),
+                self.payload.attachments.clone(),
+                self.payload.domain_plugin.clone(),
+            ),
+        }
+        .map_err(|_| "原输入版本无法验证".to_string())?;
+        if rebuilt.payload_sha256 != identity.payload_sha256 {
+            return Err("原输入正文与已持久摘要不匹配".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// 仅区分原输入接受用途，不承担投递或要求生效状态机。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunInputRole {
+    InitialGoal,
+    Steer,
+}
+
+/// 只证明 TaskRuntime 原 journal 已接受此源版本，不证明 mailbox、Drained 或 Applied。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunInputAcceptance {
+    pub role: RunInputRole,
+    pub run_id: String,
+    pub turn_id: String,
+    pub source: crate::conversation_input::ConversationInputSource,
+    pub identity: crate::conversation_input::ConversationInputIdentity,
+    pub journal_sequence: i64,
+    pub duplicate: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct RunStateEventIndex {
+    #[serde(default)]
+    pub(crate) accepted_user_inputs: std::collections::BTreeMap<String, RunInputAcceptance>,
     #[serde(default)]
     pub(crate) started_turns: std::collections::BTreeSet<String>,
     #[serde(default)]
@@ -1510,6 +1707,9 @@ impl TurnVisibility {
 /// Thin identity binding that prevents continuation turns from deriving a new run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunTurnBinding {
+    /// Explicit selection at initial admission; resumed runs retain RunCreated.
+    #[serde(default)]
+    pub domain_plugin: Option<String>,
     pub run_id: Option<String>,
     pub turn_id: String,
     pub root_message_id: String,
@@ -1531,6 +1731,7 @@ impl RunTurnBinding {
     ) -> Self {
         let root_message_id = identity.root_message_id.clone();
         Self {
+            domain_plugin: None,
             run_id: Some(identity.run_id.clone()),
             turn_id: turn_id.into(),
             root_message_id,
@@ -1850,6 +2051,10 @@ pub struct PlanTask {
     pub kind: PlanTaskKind,
     pub agent_role: String,
     pub domain_profile: DomainProfile,
+    #[serde(default)]
+    pub domain_binding: Option<crate::domain_plugin::DomainBindingRef>,
+    #[serde(default)]
+    pub domain_role: Option<crate::domain_plugin::DomainRoleBinding>,
     pub depends_on: Vec<String>,
     pub parallel_group: Option<String>,
     /// Optional cross-workspace member selected from a persistent Agent group.
@@ -1915,6 +2120,8 @@ impl Default for PlanTask {
             kind: PlanTaskKind::ReadOnlyReview,
             agent_role: "general".to_string(),
             domain_profile: DomainProfile::General,
+            domain_binding: None,
+            domain_role: None,
             depends_on: Vec::new(),
             parallel_group: None,
             execution_target: None,
@@ -1944,6 +2151,8 @@ impl PlanTask {
             kind: self.kind,
             agent_role: self.agent_role.clone(),
             domain_profile: self.domain_profile,
+            domain_binding: self.domain_binding.clone(),
+            domain_role: self.domain_role.clone(),
             depends_on: self.depends_on.clone(),
             parallel_group: self.parallel_group.clone(),
             execution_target: self.execution_target.clone(),
@@ -1977,6 +2186,8 @@ impl PlanTask {
             kind: spec.kind,
             agent_role: spec.agent_role,
             domain_profile: spec.domain_profile,
+            domain_binding: spec.domain_binding,
+            domain_role: spec.domain_role,
             depends_on: spec.depends_on,
             parallel_group: spec.parallel_group,
             execution_target: spec.execution_target,
@@ -2035,6 +2246,8 @@ impl TryFrom<echo_agent::tasks::Task> for PlanTask {
             kind: spec.kind,
             agent_role: spec.agent_role,
             domain_profile: spec.domain_profile,
+            domain_binding: spec.domain_binding,
+            domain_role: spec.domain_role,
             depends_on: spec.depends_on,
             parallel_group: spec.parallel_group,
             execution_target: spec.execution_target,
@@ -2126,11 +2339,12 @@ impl TryFrom<&TaskPatch> for echo_agent::tasks::TaskSpecPatch {
 pub enum TaskUpdateOperation {
     Insert {
         after_task_id: Option<String>,
-        task: EkoTaskSpec,
+        // Keep the expanded Domain draft indirect; serde/TS retain the same task shape.
+        task: Box<EkoTaskSpec>,
     },
     Update {
         task_id: String,
-        patch: TaskPatch,
+        patch: Box<TaskPatch>,
     },
     Skip {
         task_id: String,
@@ -2161,12 +2375,12 @@ impl TryFrom<&TaskUpdateRequest> for echo_agent::tasks::TaskPlanPatch {
                     task,
                 } => echo_agent::tasks::TaskPlanPatchOp::Insert {
                     after_task_id: after_task_id.clone(),
-                    task: task.try_into()?,
+                    task: task.as_ref().try_into()?,
                 },
                 TaskUpdateOperation::Update { task_id, patch } => {
                     echo_agent::tasks::TaskPlanPatchOp::Update {
                         task_id: task_id.clone(),
-                        patch: patch.try_into()?,
+                        patch: patch.as_ref().try_into()?,
                     }
                 }
                 TaskUpdateOperation::Skip { task_id } => echo_agent::tasks::TaskPlanPatchOp::Skip {
@@ -2234,6 +2448,7 @@ pub struct RuntimeTaskEvent {
     pub task_id: Option<String>,
     pub step_id: Option<String>,
     pub event_type: RuntimeEventKind,
+    #[ts(type = "unknown")]
     pub payload: serde_json::Value,
     #[serde(with = "echo_agent::utils::time::local_rfc3339")]
     #[ts(as = "String")]
@@ -2795,6 +3010,9 @@ mod tests {
     #[test]
     fn plan_task_round_trips_through_framework_task() -> Result<(), String> {
         let task = PlanTask {
+            domain_binding: None,
+            domain_role: None,
+
             id: "t1".to_string(),
             title: "Inspect runtime".to_string(),
             description: "Read task runtime code".to_string(),
@@ -2810,6 +3028,7 @@ mod tests {
                     crate::workspace::WorkspaceId::from_name("remote"),
                     "remote-conversation",
                 ),
+                project_binding: None,
             }),
             files: vec!["src/lib.rs".to_string()],
             allowed_tools: vec!["read_file".to_string()],
@@ -2996,6 +3215,9 @@ mod tests {
     #[test]
     fn plan_task_status_projection_preserves_failure_detail() -> Result<(), String> {
         let task = PlanTask {
+            domain_binding: None,
+            domain_role: None,
+
             id: "failed-task".to_string(),
             title: "Failed task".to_string(),
             description: "Exercise status projection".to_string(),
@@ -3071,6 +3293,8 @@ mod tests {
             ..PlanTask::default()
         };
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: "plan-artifact".to_string(),
             run_id: "run-artifact".to_string(),
             revision: 4,
@@ -3241,6 +3465,7 @@ mod tests {
             conversation_id: "conversation-a".to_string(),
             root_message_id: "root-a".to_string(),
             domain_profile: DomainProfile::General,
+            domain_binding: None,
             status: TaskRunStatus::Paused,
             goal: "goal".to_string(),
             goal_revision: 1,
@@ -3253,17 +3478,29 @@ mod tests {
             updated_at: now,
         };
         let mut snapshot = RunStateSnapshot {
+            domain_binding: None,
+
             run,
             tasks: Vec::new(),
             continuation: None,
             background_cells: Vec::new(),
             recent_constraints: Vec::new(),
-            execution_profile: TaskRunExecutionProfile::default(),
+            execution_profile: TaskRunExecutionProfile::default()
+                .with_subagent_depth_limit(crate::subagent_policy::SubagentDepthLimit::default()),
+            project_binding: None,
             journal_sequence: 7,
             event_index: RunStateEventIndex::default(),
         };
         let identity = TaskRunResumeIdentity::capture(&snapshot);
         assert!(identity.validate_resumable(&snapshot).is_ok());
+
+        let mut legacy = snapshot.clone();
+        legacy.execution_profile.subagent_depth_limit = None;
+        assert!(
+            TaskRunResumeIdentity::capture(&legacy)
+                .validate_resumable(&legacy)
+                .is_err_and(|error| error.contains("no bound Subagent depth policy"))
+        );
 
         snapshot.run.created_at = now + chrono::Duration::milliseconds(1);
         assert!(
@@ -3271,5 +3508,115 @@ mod tests {
                 .validate_resumable(&snapshot)
                 .is_err_and(|error| error.contains("identity changed"))
         );
+    }
+}
+
+#[cfg(test)]
+mod domain_roundtrip_tests {
+    use super::*;
+
+    #[test]
+    fn task_extension_roundtrip_preserves_binding_role_and_independent_rule_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = crate::domain_plugin::test_binding(true)?;
+        let task = PlanTask {
+            id: "domain-node".to_string(),
+            domain_binding: Some(binding.reference()),
+            domain_role: Some(binding.role_for_kind(PlanTaskKind::Investigation)?.clone()),
+            required_artifacts: binding.snapshot.required_artifacts.clone(),
+            execution_checks: binding.snapshot.execution_checks.clone(),
+            acceptance_criteria: binding.review_criteria(),
+            execution_target: Some(TaskExecutionTarget {
+                group_id: "project-domain-group".to_string(),
+                subagent_role: "explorer".to_string(),
+                address: crate::agent_router::AgentAddress::new(
+                    crate::workspace::WorkspaceId::from_raw("target-workspace".to_string()),
+                    "target-conversation",
+                ),
+                project_binding: Some(ProjectExecutionBinding {
+                    workspace_id: "target-workspace".to_string(),
+                    location_sha256: "ab".repeat(32),
+                    revision: 7,
+                }),
+            }),
+            ..Default::default()
+        };
+        let framework: echo_agent::tasks::TaskSpec = (&task.spec()).try_into()?;
+        let restored = EkoTaskSpec::try_from(framework)?;
+        assert_eq!(restored, task.spec());
+        let materialized = PlanTask::from_parts(restored, task.execution());
+        assert_eq!(materialized.domain_binding, task.domain_binding);
+        assert_eq!(materialized.domain_role, task.domain_role);
+        assert_eq!(materialized.execution_target, task.execution_target);
+        // Indirection limits the Rust enum size; the public JSON/TS payload
+        // remains the original object and carries both independent identities.
+        let request = TaskUpdateRequest {
+            base_revision: 1,
+            reason: "insert the bound target".to_string(),
+            operations: vec![TaskUpdateOperation::Insert {
+                after_task_id: None,
+                task: Box::new(task.spec()),
+            }],
+        };
+        let wire = serde_json::to_value(&request)?;
+        let encoded_task = wire
+            .get("operations")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|operations| operations.first())
+            .and_then(|operation| operation.get("task"))
+            .ok_or("unboxed task wire object missing")?;
+        assert_eq!(encoded_task, &serde_json::to_value(task.spec())?);
+        let patch = echo_agent::tasks::TaskPlanPatch::try_from(serde_json::from_value::<
+            TaskUpdateRequest,
+        >(wire)?)?;
+        let Some(echo_agent::tasks::TaskPlanPatchOp::Insert { task: inserted, .. }) =
+            patch.operations.first()
+        else {
+            return Err("framework insertion missing".into());
+        };
+        assert_eq!(EkoTaskSpec::try_from(inserted.clone())?, task.spec());
+        assert_ne!(
+            materialized.execution_checks,
+            materialized.acceptance_criteria
+        );
+        let metadata = EkoPlanMetadata {
+            plan_id: "domain-plan".to_string(),
+            domain_profile: DomainProfile::General,
+            domain_binding: Some(binding.reference()),
+            goal_revision: 1,
+            goal_sha256: task_goal_sha256("goal"),
+        };
+        assert_eq!(
+            serde_json::from_value::<EkoPlanMetadata>(serde_json::to_value(&metadata)?)?,
+            metadata
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn domain_task_capabilities_reserve_primary_for_the_real_verification_route()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = crate::domain_plugin::test_binding(false)?;
+        let capabilities = super::super::task_tools::TaskCapabilityCatalog::new(
+            std::sync::Arc::new(crate::subagent_loader::SubagentCatalogSnapshot::default()),
+            Vec::<String>::new(),
+        );
+        let mut task = PlanTask {
+            agent_role: "primary".to_string(),
+            kind: PlanTaskKind::Investigation,
+            domain_binding: Some(binding.reference()),
+            domain_role: Some(binding.role_for_kind(PlanTaskKind::Verification)?.clone()),
+            ..Default::default()
+        };
+        let invalid: echo_agent::tasks::TaskSpec = (&task.spec()).try_into()?;
+        assert!(
+            capabilities
+                .validate_task_spec(&invalid)
+                .is_err_and(|error| error.contains("reserve primary"))
+        );
+        task.kind = PlanTaskKind::Verification;
+        let valid: echo_agent::tasks::TaskSpec = (&task.spec()).try_into()?;
+        capabilities.validate_task_spec(&valid)?;
+        Ok(())
     }
 }

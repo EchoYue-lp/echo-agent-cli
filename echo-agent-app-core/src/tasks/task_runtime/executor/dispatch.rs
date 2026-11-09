@@ -175,6 +175,7 @@ trait TaskDispatcher: Send + Sync {
 struct RealTaskDispatcher {
     primary_agent: crate::agent_handle::AgentHandle,
     workspace_io: Option<crate::state::WorkspaceIoInvocation>,
+    invocation_resources: Vec<echo_agent::tools::InvocationResourceGuard>,
 }
 
 async fn resolve_task_execution_agent(
@@ -219,8 +220,69 @@ async fn resolve_task_execution_agent(
         )
     })?;
     let lease = resolver.acquire(&leader, target).await?;
+    if let Some(binding) = blocking
+        .run("read target dispatch original domain binding", {
+            let run_id = run_id.to_string();
+            move |store| {
+                Ok(store
+                    .get_run_state(&run_id)?
+                    .and_then(|state| state.domain_binding))
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        lease.verify_domain_binding(&binding).await?;
+    }
     let agent = lease.agent();
     Ok((agent, Some(lease)))
+}
+
+async fn resolve_task_project_environment(
+    store: &TaskRuntimeStore,
+    task: &PlanTask,
+) -> Result<Option<super::store::ProjectExecutionEnvironment>, String> {
+    let Some(target) = task.execution_target.as_ref() else {
+        return Ok(store.project_environment());
+    };
+    let resolver = store
+        .execution_target_resolver()
+        .ok_or_else(|| "cross-workspace project resolver is unavailable".to_string())?;
+    let environment = resolver.project_environment(target).await?;
+    if environment.as_ref().map(|environment| &environment.binding)
+        != target.project_binding.as_ref()
+    {
+        return Err(
+            "cross-workspace project location changed after its PlanTask revision was accepted"
+                .to_string(),
+        );
+    }
+    Ok(environment)
+}
+
+async fn prepare_project_agent(
+    agent: &crate::agent_handle::AgentHandle,
+    environment: Option<super::store::ProjectExecutionEnvironment>,
+    working_dir: Option<std::path::PathBuf>,
+    resource_guards: Vec<echo_agent::tools::InvocationResourceGuard>,
+) -> Result<Option<crate::infra::PreparedProjectContext>, String> {
+    let Some(environment) = environment else {
+        return Ok(None);
+    };
+    // Read facts before the model driver, then bind the immutable result to
+    // its actual turn. Mutating current messages alone would be undone by
+    // Execute/checkpoint restore; no shared Agent preparation lock is needed.
+    let token_limit = agent.read(|agent| agent.config().get_token_limit()).await;
+    crate::infra::prepare_dynamic_project_context(
+        working_dir.as_deref(),
+        Some(&environment.state_dir),
+        environment.files,
+        environment.executor,
+        resource_guards,
+        token_limit,
+    )
+    .await
+    .map(Some)
 }
 
 impl TaskDispatcher for RealTaskDispatcher {
@@ -239,6 +301,7 @@ impl TaskDispatcher for RealTaskDispatcher {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TaskDispatchResult> + Send>> {
         let local_agent = self.primary_agent.clone();
         let workspace_io = self.workspace_io.clone();
+        let mut invocation_resources = self.invocation_resources.clone();
         Box::pin(async move {
             let run_id = context.run_id().to_owned();
             let cancel = context.cancellation_token().clone();
@@ -251,6 +314,24 @@ impl TaskDispatcher for RealTaskDispatcher {
             // A cross-workspace target needs its own target-runtime receipt.
             // Never reuse the leader workspace authority for that Agent.
             let workspace_io = target_lease.is_none().then_some(workspace_io).flatten();
+            if let Some(target) = target_lease.as_ref() {
+                let binding = store
+                    .get_run_state(&run_id)
+                    .map_err(|error| {
+                        TaskDispatchFailure::failed(task.id.clone(), error.to_string())
+                    })?
+                    .and_then(|state| state.domain_binding);
+                if let Some(binding) = binding {
+                    let projection = super::compact_context::task_runtime_projection_registry()
+                        .retain_for_invocation(&run_id, store.clone())
+                        .map_err(|error| TaskDispatchFailure::failed(task.id.clone(), error))?;
+                    invocation_resources = vec![
+                        target
+                            .domain_resource_guard(&run_id, &binding, Some(Arc::new(projection)))
+                            .map_err(|error| TaskDispatchFailure::failed(task.id.clone(), error))?,
+                    ];
+                }
+            }
             // Scope run_id + cancel + trace_sink into task-local so Subagent-internal
             // tools (task_*/task_execute, and their execute_with_context
             // fallback path) and L3 nested Subagents can read them.
@@ -280,6 +361,7 @@ impl TaskDispatcher for RealTaskDispatcher {
                         cancel,
                         delegation_policy,
                         workspace_io,
+                        invocation_resources,
                     )
                     .await
                 },
@@ -337,12 +419,19 @@ impl TaskDispatcher for RealTaskDispatcher {
                 .read(|agent| agent.working_dir())
                 .await
                 .ok_or_else(|| "writer integration requires a Git working directory".to_string())?;
-            let repo_root =
-                tokio::task::spawn_blocking(move || super::worktree::git_repo_root(&working_dir))
-                    .await
-                    .map_err(|error| format!("failed to join repo-root lookup: {error}"))?
-                    .map_err(|error| error.to_string())?;
-            let merge_lock = super::worktree::repo_merge_lock(&repo_root);
+            let environment = resolve_task_project_environment(&store, &task).await?;
+            let lookup_environment = environment.clone();
+            let repo_root = tokio::task::spawn_blocking(move || {
+                super::worktree::git_repo_root_in_environment(
+                    &working_dir,
+                    lookup_environment.as_ref(),
+                )
+            })
+            .await
+            .map_err(|error| format!("failed to join repo-root lookup: {error}"))?
+            .map_err(|error| error.to_string())?;
+            let merge_lock =
+                super::worktree::repo_merge_lock_in_environment(&repo_root, environment.as_ref());
             let _merge_guard = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err("cancelled while waiting for worktree integration".to_string()),
@@ -388,12 +477,13 @@ impl TaskDispatcher for RealTaskDispatcher {
             let repo_for_merge = repo_root.clone();
             let label_for_merge = label.clone();
             let outcome = tokio::task::spawn_blocking(move || {
-                super::worktree::integrate_fork_worktree(
+                super::worktree::integrate_fork_worktree_in_environment(
                     &repo_for_merge,
                     &label_for_merge,
                     &task_id,
                     &execution_for_merge,
                     &ownership,
+                    environment.as_ref(),
                 )
             })
             .await
@@ -837,15 +927,72 @@ struct PrimaryTaskTurnPersistence {
     replay_safe_tools: HashSet<String>,
 }
 
+#[derive(Clone)]
 struct RunTurnPersistence {
     blocking: TaskRuntimeOperation,
     turn_id: String,
+    workspace_id: String,
+    conversation_id: String,
+    chat_events: Option<Arc<crate::chat_event_log::ChatEventLog>>,
+}
+
+impl RunTurnPersistence {
+    async fn publish(
+        &self,
+        event: crate::chat_driver::ChatDriverEvent,
+    ) -> echo_agent::error::Result<()> {
+        // 最小 embedding 可明确没有产品 publication owner；真实 App 从原绑定取得同一 Arc。
+        let Some(log) = self.chat_events.clone() else {
+            return Ok(());
+        };
+        let workspace_id = self.workspace_id.clone();
+        let conversation_id = self.conversation_id.clone();
+        let root_turn_id = self.turn_id.clone();
+        let published = self
+            .blocking
+            .run_owned("publish original owned RunTurn chat event", move || {
+                log.append(&workspace_id, Some(&conversation_id), &root_turn_id, event)
+                    .map(|event| (log, event))
+                    .map_err(|error| {
+                        StoreError::InvalidPlan(format!("owned RunTurn publication: {error}"))
+                    })
+            })
+            .await
+            .map_err(|error| {
+                EkoAgentTurnSink::persistence_error("owned RunTurn publication failed", error)
+            })?;
+        // 耐久事实在原日志；没有可见 surface 不影响冷历史，live 拒绝不回滚原发布。
+        if !published.0.deliver_projected_event(&published.1, &[]) {
+            tracing::warn!("owned RunTurn publication committed; live delivery was rejected");
+        }
+        Ok(())
+    }
+
+    async fn publish_terminal(&self, receipt: &TurnReceipt) -> echo_agent::error::Result<()> {
+        if receipt.turn_id.as_str() != self.turn_id {
+            return Err(echo_agent::error::ReactError::Other(
+                "owned RunTurn publication receipt changed turn".into(),
+            ));
+        }
+        // 仅在调用者已持久化本原 RunTurn terminal 后发布产品状态；不创建 Frame 状态。
+        let status = match &receipt.outcome {
+            TurnOutcome::Completed => "completed",
+            TurnOutcome::Cancelled => "cancelled",
+            TurnOutcome::Failed(_) => "failed",
+        };
+        self.publish(crate::chat_driver::ChatDriverEvent::TurnStatus {
+            status: status.to_string(),
+        })
+        .await
+    }
 }
 
 #[derive(Default)]
 struct EkoAgentTurnState {
+    closed: bool,
     output: String,
-    in_thinking: bool,
+    // 同一原事件索引也去重用量，但用量不能解锁native正文/终态发布门槛。
+    native_event_ids: HashMap<String, (String, bool)>,
     pending_verification: HashMap<String, String>,
     pending_file_access: HashMap<String, (String, serde_json::Value)>,
     observed_evidence: Vec<echo_agent::subagent::SubagentEvidence>,
@@ -853,7 +1000,7 @@ struct EkoAgentTurnState {
     mutating_tool_observed: bool,
 }
 
-struct EkoAgentTurnObservation {
+pub(crate) struct EkoAgentTurnObservation {
     output: String,
     observed_evidence: Vec<echo_agent::subagent::SubagentEvidence>,
     observed_artifacts: Vec<echo_agent::subagent::SubagentArtifact>,
@@ -867,7 +1014,7 @@ struct EkoAgentTurnObservation {
 /// detection, typed failures, cancellation, and provider-reported receipt
 /// accounting. This sink owns only EKO product projection and persistence:
 /// `ExecEvent`, exact event-id usage, tool boundaries, evidence, and artifacts.
-struct EkoAgentTurnSink {
+pub(crate) struct EkoAgentTurnSink {
     context: EkoAgentTurnContext,
     trace_sink: Option<ExecSink>,
     primary_task: Option<PrimaryTaskTurnPersistence>,
@@ -877,6 +1024,19 @@ struct EkoAgentTurnSink {
 }
 
 impl EkoAgentTurnSink {
+    /// Reuse the real evidence collector without a second persistence path.
+    /// The foreground sink alone keeps usage, trace and terminal authority.
+    pub(crate) fn observe_chat(run: &TaskRun, mutating_tools: HashSet<String>) -> Self {
+        Self {
+            context: EkoAgentTurnContext::run(run),
+            trace_sink: None,
+            primary_task: None,
+            run_turn: None,
+            mutating_tools,
+            state: std::sync::Mutex::new(EkoAgentTurnState::default()),
+        }
+    }
+
     fn for_run(
         run: &TaskRun,
         turn_id: &str,
@@ -889,8 +1049,11 @@ impl EkoAgentTurnSink {
             trace_sink,
             primary_task: None,
             run_turn: Some(RunTurnPersistence {
+                chat_events: blocking.store.original_chat_event_log(),
                 blocking,
                 turn_id: turn_id.to_string(),
+                workspace_id: run.workspace_id.clone(),
+                conversation_id: run.conversation_id.clone(),
             }),
             mutating_tools,
             state: std::sync::Mutex::new(EkoAgentTurnState::default()),
@@ -922,11 +1085,12 @@ impl EkoAgentTurnSink {
         emit_exec(self.trace_sink.as_ref(), self.context.event(kind, payload));
     }
 
-    fn finish(&self, final_answer: Option<&str>) -> EkoAgentTurnObservation {
+    pub(crate) fn finish(&self, final_answer: Option<&str>) -> EkoAgentTurnObservation {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.closed = true;
         if let Some(final_answer) = final_answer.filter(|answer| !answer.is_empty()) {
             state.output = final_answer.to_string();
         }
@@ -952,51 +1116,165 @@ impl EventSink for EkoAgentTurnSink {
         &self,
         envelope: echo_agent::agent::EventEnvelope,
     ) -> echo_agent::error::Result<SinkControl> {
+        if self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .closed
+        {
+            return Err(echo_agent::error::ReactError::Other(
+                "owned EKO event sink is already closed".into(),
+            ));
+        }
         let source_event_id = envelope.event_id.to_string();
-        match envelope.payload {
-            AgentEvent::Token(content) => {
-                let in_thinking = {
-                    let mut state = self
-                        .state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if !state.in_thinking {
-                        state.output.push_str(&content);
-                    }
-                    state.in_thinking
-                };
-                self.emit(
-                    if in_thinking {
-                        RuntimeEventKind::ThinkingDelta
+        let native_started = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .native_event_ids
+            .values()
+            .any(|(_, publication)| *publication);
+        let usage_event = matches!(&envelope.payload, AgentEvent::LlmUsage { .. });
+        let mut confirmed_usage_hash = None;
+        let usage_source = serde_json::json!({
+            "workspace_id": self.context.workspace_id,
+            "conversation_id": envelope.conversation_id.as_ref().map(ToString::to_string),
+            "root_turn_id": self.run_turn.as_ref().map(|owner| owner.turn_id.as_str()),
+            "turn_id": envelope.turn_id.as_str(),
+            "execution_id": envelope.execution_id.as_ref().map(ToString::to_string),
+            "message_id": envelope.message_id.as_ref().map(ToString::to_string),
+            "event_id": source_event_id,
+        });
+        let native_publication = matches!(
+            &envelope.payload,
+            AgentEvent::AssistantMessage { .. } | AgentEvent::ExecutionStatus(_)
+        ) || (native_started
+            && matches!(
+                &envelope.payload,
+                AgentEvent::FinalAnswer(_)
+                    | AgentEvent::Cancelled
+                    | AgentEvent::Error { .. }
+                    // 保存事实沿同一个owner的journal发布；不能用它补造执行头。
+                    | AgentEvent::TranscriptProjectionSettlement(_)
+            ));
+        if native_publication || usage_event {
+            if envelope
+                .run_id
+                .as_ref()
+                .is_none_or(|id| id.as_str() != self.context.run_id)
+                || envelope
+                    .conversation_id
+                    .as_ref()
+                    .is_none_or(|id| id.as_str() != self.context.conversation_id)
+                || self.context.execution_id.as_ref().is_some_and(|expected| {
+                    envelope
+                        .execution_id
+                        .as_ref()
+                        .is_none_or(|id| id.as_str() != expected)
+                })
+                || self
+                    .context
+                    .execution_id
+                    .as_ref()
+                    .is_some_and(|expected| envelope.turn_id.as_str() != expected)
+                || self
+                    .run_turn
+                    .as_ref()
+                    .is_some_and(|owner| envelope.turn_id.as_str() != owner.turn_id)
+            {
+                return Err(echo_agent::error::ReactError::Other(
+                    "native task envelope does not match its original execution owner".into(),
+                ));
+            }
+            let source_hash = format!(
+                "{:x}",
+                <sha2::Sha256 as sha2::Digest>::digest(serde_json::to_vec(&envelope).map_err(
+                    |error| Self::persistence_error("canonical envelope encoding failed", error)
+                )?)
+            );
+            if let Some(previous) = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .native_event_ids
+                .get(&source_event_id)
+            {
+                if previous.0 == source_hash {
+                    return Ok(SinkControl::Continue);
+                }
+                return Err(echo_agent::error::ReactError::Other(
+                    "native event identity has conflicting canonical content".into(),
+                ));
+            }
+            // 原 Frame envelope 是 source 身份权威；Run 级 context 不伪造 execution。
+            let source_execution_id = envelope.execution_id.as_ref().map(ToString::to_string);
+            let payload = serde_json::json!({
+                "kind": "native_agent_event", "execution_id": source_execution_id,
+                "agent": self.context.agent_role, "agent_envelope": envelope,
+            });
+            // Persist in the existing TaskRuntime journal before the original
+            // live observer. This is an observation, never a task transition.
+            let persistence = self
+                .primary_task
+                .as_ref()
+                .map(|owner| &owner.blocking)
+                .or_else(|| self.run_turn.as_ref().map(|owner| &owner.blocking));
+            if native_publication && let Some(blocking) = persistence {
+                let run_id = self.context.run_id.clone();
+                let task_id = self.context.task_id.clone();
+                let execution_id = source_execution_id.clone();
+                let persisted = payload.clone();
+                blocking
+                    .run("persist native Agent envelope observation", move |store| {
+                        store.record_native_agent_event(
+                            &run_id,
+                            task_id.as_deref(),
+                            execution_id.as_deref(),
+                            persisted,
+                        )
+                    })
+                    .await
+                    .map_err(|error| {
+                        Self::persistence_error("native Agent envelope persistence failed", error)
+                    })?;
+            }
+            let mut journal_confirmed = true;
+            if let Some(owner) = self.run_turn.as_ref() {
+                // 用量只是观察，可以保留缺execution的未知；不能借它补造执行头。
+                if source_execution_id.is_some() || usage_event {
+                    let result = owner
+                        .publish(crate::chat_driver::ChatDriverEvent::Agent(Box::new(
+                            envelope.clone(),
+                        )))
+                        .await;
+                    if usage_event {
+                        // 观测写入失败只留下覆盖缺口，不能替换原provider错误或改变运行结果。
+                        if result.is_err() {
+                            tracing::warn!(event_id=%source_event_id,"Owned Run用量原日志尚未确认，原执行路径保持");
+                            journal_confirmed = false;
+                        }
                     } else {
-                        RuntimeEventKind::TokenDelta
-                    },
-                    serde_json::json!({ "content": content }),
-                );
+                        result?;
+                    }
+                }
             }
-            AgentEvent::ThinkStart => {
-                self.state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .in_thinking = true;
-                self.emit(RuntimeEventKind::ThinkingStarted, serde_json::json!({}));
+            if native_publication {
+                self.emit(RuntimeEventKind::Note, payload);
             }
-            AgentEvent::ThinkEnd {
-                prompt_tokens,
-                completion_tokens,
-            } => {
-                self.state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .in_thinking = false;
-                self.emit(
-                    RuntimeEventKind::ThinkingEnded,
-                    serde_json::json!({
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                    }),
-                );
+            if journal_confirmed {
+                if usage_event {
+                    // 原费用Store还可能失败；整个处理成功前不能让同event重试早退。
+                    confirmed_usage_hash = Some(source_hash);
+                } else {
+                    self.state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .native_event_ids
+                        .insert(source_event_id.clone(), (source_hash, native_publication));
+                }
             }
+        }
+        match envelope.payload {
             AgentEvent::LlmUsage {
                 model,
                 prompt_tokens,
@@ -1005,6 +1283,7 @@ impl EventSink for EkoAgentTurnSink {
                 cached_prompt_tokens,
                 cache_creation_prompt_tokens,
                 usage_reported,
+                observation,
             } => {
                 if usage_reported && let Some(primary_task) = self.primary_task.as_ref() {
                     let run_id = self.context.run_id.clone();
@@ -1073,9 +1352,18 @@ impl EventSink for EkoAgentTurnSink {
                         "cached_prompt_tokens": cached_prompt_tokens,
                         "cache_creation_prompt_tokens": cache_creation_prompt_tokens,
                         "usage_reported": usage_reported,
+                        "observation": observation,
                         "usage_event_id": source_event_id,
+                        "usage_source": usage_source,
                     }),
                 );
+                if let Some(source_hash) = confirmed_usage_hash {
+                    self.state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .native_event_ids
+                        .insert(source_event_id.clone(), (source_hash, false));
+                }
             }
             AgentEvent::ToolCall {
                 call_id,
@@ -1530,6 +1818,13 @@ impl TaskRuntimeOperationSupervisor {
 }
 
 impl TaskRuntimeOperation {
+    fn project_working_dir(&self) -> Option<std::path::PathBuf> {
+        self.store.project_working_dir()
+    }
+
+    fn project_environment(&self) -> Option<super::store::ProjectExecutionEnvironment> {
+        self.store.project_environment()
+    }
     pub fn new(store: Arc<TaskRuntimeStore>) -> Self {
         let supervisor = store.operation_supervisor();
         Self { store, supervisor }
@@ -1995,7 +2290,27 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                         })
                     })
                     .unwrap_or_else(|| echo_agent::subagent::subagent_status_from_error(&error))?;
-                let request = if let Some(failure) = typed_failure.as_ref().filter(|failure| {
+                let request = if typed_failure.as_ref().is_some_and(|failure| {
+                    super::compact_context::is_required_context_unavailable(failure)
+                }) {
+                    // 沿原 exact-claim interruption/CAS 结算为 Paused，不能只设 Blocked
+                    // （原 resume_runtime_task 只恢复 Paused），也不能伪装物理未结算。
+                    let _requested =
+                        echo_agent::tasks::RuntimeDagController::request_task_interruption(
+                            self,
+                            run_id,
+                            &runtime_task,
+                            &claim,
+                            echo_agent::tasks::RuntimeInterruptionDisposition::Paused {
+                                reason: message.clone(),
+                            },
+                        )
+                        .await?;
+                    echo_agent::tasks::RuntimeTaskResolutionRequest::Blocked {
+                        error: message.clone(),
+                        disposition: echo_agent::tasks::RuntimeStopDisposition::Pause,
+                    }
+                } else if let Some(failure) = typed_failure.as_ref().filter(|failure| {
                     failure.retryable
                         && failure.category == echo_agent::error::AgentFailureCategory::Llm
                 }) {
@@ -2489,3 +2804,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         self.note(run_id, None, reason.to_string()).await
     }
 }
+
+#[cfg(test)]
+#[path = "native_projection_tests.rs"]
+mod native_projection_tests;

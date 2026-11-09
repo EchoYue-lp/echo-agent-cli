@@ -19,18 +19,41 @@ pub(crate) async fn load_project_skills(
         return Ok(Vec::new());
     };
     let skills_root = project_root.join(".eko").join("skills");
-    if !skills_root.is_dir() {
+    let (files, executor) = agent
+        .read(|agent| {
+            (
+                agent.file_system().unwrap_or_else(|| {
+                    std::sync::Arc::new(echo_agent::tools::files::LocalFileSystem)
+                }),
+                agent.sandbox_manager().cloned(),
+            )
+        })
+        .await;
+    let prepare_files = files.clone();
+    let source_root = tokio::task::spawn_blocking(move || {
+        if !prepare_files.is_dir(&skills_root)? {
+            return Ok(None);
+        }
+        prepare_files.canonicalize(&skills_root).map(Some)
+    })
+    .await
+    .map_err(|error| format!("Project Skill directory preparation task failed: {error}"))?
+    .map_err(|error: echo_agent::error::ReactError| error.to_string())?;
+    let Some(source_root) = source_root else {
         return Ok(Vec::new());
-    }
-    let source_root = skills_root
-        .canonicalize()
-        .unwrap_or_else(|_| skills_root.clone());
+    };
     let source_root_for_agent = source_root.clone();
     agent
         .write_async(|agent| {
             Box::pin(async move {
                 let loaded = agent
-                    .load_skills_from_dir(source_root_for_agent.clone())
+                    .discover_skills_with_source(
+                        &[echo_agent::skills::external::DiscoveryScope::Custom(
+                            source_root_for_agent.clone(),
+                        )],
+                        files,
+                        executor,
+                    )
                     .await?;
                 let mut project_names = Vec::new();
                 for name in loaded {

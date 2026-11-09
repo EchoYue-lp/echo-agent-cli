@@ -28,6 +28,8 @@ struct PendingInitialRun {
     run: TaskRun,
     trigger: InitialRunTriggerMetadata,
     continuation: Option<(bool, bool, Option<u64>, Option<u64>)>,
+    domain_binding: Option<crate::domain_plugin::DomainBinding>,
+    execution_profile: super::types::TaskRunExecutionProfile,
 }
 
 type PendingInitialRuns = Arc<Mutex<HashMap<String, PendingInitialRun>>>;
@@ -122,11 +124,9 @@ impl RevisionedTaskStore for EkoTaskGraphStore {
             .run_store("commit revisioned task graph", move |store| {
                 match (pending, pending_direct) {
                     (Some(pending), None) => store
-                        .compare_and_publish_initial_revisioned_task_graph(
-                            &pending.run,
-                            &pending.trigger,
-                            pending.continuation,
-                            commit,
+                        .compare_and_publish_initial_revisioned_task_graph_with_domain(
+                            &pending.run, &pending.trigger, pending.continuation,
+                            pending.domain_binding.as_ref(), pending.execution_profile, commit,
                         ),
                     (None, Some(completion)) => store.compare_and_commit_direct_completion(
                         &owned_scope_id,
@@ -245,6 +245,38 @@ impl EkoTaskPolicy {
         }
     }
 
+    async fn domain_binding(
+        &self,
+        scope_id: &str,
+    ) -> Result<Option<crate::domain_plugin::DomainBinding>, TaskPolicyError> {
+        let run = self.run(scope_id).await?;
+        let owned = scope_id.to_string();
+        let binding = self
+            .blocking
+            .run_store("load task policy domain rules", move |store| {
+                Ok(store
+                    .get_run_state(&owned)?
+                    .and_then(|state| state.domain_binding))
+            })
+            .await
+            .map_err(|error| TaskPolicyError::Backend {
+                message: error.to_string(),
+            })?;
+        if binding
+            .as_ref()
+            .map(crate::domain_plugin::DomainBinding::reference)
+            != run.domain_binding
+        {
+            return Err(TaskPolicyError::Rejected {
+                message: "TaskRun domain binding projection is incomplete".to_string(),
+            });
+        }
+        if binding.is_none() && run.domain_profile != DomainProfile::General {
+            return Err(TaskPolicyError::Rejected { message: "historical professional run has no trusted plugin binding; create a new domain-bound TaskRun".to_string() });
+        }
+        Ok(binding)
+    }
+
     async fn run(&self, scope_id: &str) -> Result<super::types::TaskRun, TaskPolicyError> {
         if let Some(pending) = self
             .pending_initial_runs
@@ -319,7 +351,7 @@ impl TaskToolPolicy for EkoTaskPolicy {
                 serde_json::json!({
                     "type": "object",
                     "additionalProperties": false,
-                    "description": "Exact group, role, and address from the Agent group service.",
+                    "description": "Exact values from Agent group service.",
                     "properties": {
                         "group_id": { "type": "string" },
                         "subagent_role": { "type": "string" },
@@ -434,6 +466,8 @@ impl TaskToolPolicy for EkoTaskPolicy {
                     priority: 5,
                 },
                 continuation: None,
+                domain_binding: None,
+                execution_profile: super::types::TaskRunExecutionProfile::default(),
             });
         Ok(())
     }
@@ -453,6 +487,7 @@ impl TaskToolPolicy for EkoTaskPolicy {
         position: usize,
     ) -> Result<PreparedTaskPolicy, TaskPolicyError> {
         let run = self.run(scope_id).await?;
+        let binding = self.domain_binding(scope_id).await?;
         let kind = draft
             .extension
             .get("kind")
@@ -468,6 +503,14 @@ impl TaskToolPolicy for EkoTaskPolicy {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        let default_role = match &binding {
+            Some(binding) => binding
+                .role_for_kind(kind)
+                .map_err(|message| TaskPolicyError::Rejected { message })?
+                .role_name
+                .as_str(),
+            None => default_subagent_for(kind),
+        };
         let agent_role = draft
             .extension
             .get("subagent")
@@ -476,8 +519,8 @@ impl TaskToolPolicy for EkoTaskPolicy {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string)
-            .unwrap_or_else(|| default_subagent_for(run.domain_profile, kind).to_string());
-        let execution_target = draft
+            .unwrap_or_else(|| default_role.to_string());
+        let mut execution_target = draft
             .extension
             .get("execution_target")
             .cloned()
@@ -486,7 +529,7 @@ impl TaskToolPolicy for EkoTaskPolicy {
             .map_err(|error| TaskPolicyError::Rejected {
                 message: format!("task '{}' has invalid execution_target: {error}", draft.id),
             })?;
-        if let Some(target) = execution_target.as_ref() {
+        if let Some(target) = execution_target.as_mut() {
             target
                 .validate()
                 .map_err(|message| TaskPolicyError::Rejected {
@@ -500,11 +543,43 @@ impl TaskToolPolicy for EkoTaskPolicy {
                     ),
                 });
             }
+            let resolver = self
+                .blocking
+                .run("load project target resolver", |store| {
+                    Ok(store.execution_target_resolver())
+                })
+                .await
+                .map_err(|error| TaskPolicyError::Backend {
+                    message: error.to_string(),
+                })?;
+            if let Some(resolver) = resolver {
+                let current = resolver
+                    .bind_project(target)
+                    .await
+                    .map_err(|message| TaskPolicyError::Rejected { message })?;
+                if target.project_binding.is_some() && target.project_binding != current {
+                    return Err(TaskPolicyError::Rejected {
+                        message: format!("task '{}' project target location changed", draft.id),
+                    });
+                }
+                target.project_binding = current;
+            }
         }
+        let domain_role = match &binding {
+            Some(binding) => Some(
+                self.capabilities
+                    .resolve_domain_role(binding, kind, &agent_role)
+                    .await
+                    .map_err(|message| TaskPolicyError::Rejected { message })?,
+            ),
+            None => None,
+        };
         let extension = serde_json::to_value(EkoTaskExtension {
             kind,
             agent_role,
             domain_profile: run.domain_profile,
+            domain_binding: run.domain_binding.clone(),
+            domain_role,
             parallel_group,
             execution_target,
             files: string_array_extension(&draft.extension, "files"),
@@ -529,6 +604,7 @@ impl TaskToolPolicy for EkoTaskPolicy {
         let metadata = serde_json::to_value(EkoPlanMetadata {
             plan_id: format!("plan_{}", uuid::Uuid::new_v4().as_simple()),
             domain_profile: run.domain_profile,
+            domain_binding: run.domain_binding.clone(),
             goal_revision: run.goal_revision,
             goal_sha256: run.goal_sha256.clone(),
         })
@@ -546,7 +622,7 @@ impl TaskToolPolicy for EkoTaskPolicy {
 
     async fn finalize_task_extension(
         &self,
-        _scope_id: &str,
+        scope_id: &str,
         task_id: &str,
         position: usize,
         mut extension: serde_json::Value,
@@ -560,6 +636,64 @@ impl TaskToolPolicy for EkoTaskPolicy {
             serde_json::from_value(extension).map_err(|error| TaskPolicyError::Rejected {
                 message: format!("task '{task_id}' has invalid EKO extension: {error}"),
             })?;
+        let run = self.run(scope_id).await?;
+        let binding = self.domain_binding(scope_id).await?;
+        if extension.domain_binding != run.domain_binding {
+            let lookup_scope = scope_id.to_string();
+            let lookup_task = task_id.to_string();
+            let existing_task = self
+                .blocking
+                .run_store("load domain task patch identity", move |store| {
+                    Ok(store
+                        .get_plan(&lookup_scope)?
+                        .is_some_and(|plan| plan.tasks.iter().any(|task| task.id == lookup_task)))
+                })
+                .await
+                .map_err(|error| TaskPolicyError::Backend {
+                    message: error.to_string(),
+                })?;
+            if extension.domain_binding.is_none() && !existing_task {
+                extension.domain_binding = run.domain_binding.clone();
+            } else {
+                return Err(TaskPolicyError::Rejected {
+                    message: format!("task '{task_id}' cannot change its domain binding"),
+                });
+            }
+        }
+        if binding.is_some()
+            && ((extension.kind == PlanTaskKind::Verification)
+                != (extension.agent_role == "primary"))
+        {
+            return Err(TaskPolicyError::Rejected {
+                message: format!(
+                    "domain task '{task_id}' Verification must retain the primary execution owner"
+                ),
+            });
+        }
+        extension.domain_role = match &binding {
+            Some(binding) => {
+                if !binding.snapshot.allowed_tools.is_empty()
+                    && extension
+                        .allowed_tools
+                        .iter()
+                        .any(|tool| !binding.snapshot.allowed_tools.contains(tool))
+                {
+                    return Err(TaskPolicyError::Rejected {
+                        message: format!("task '{task_id}' exceeds its domain tool scope"),
+                    });
+                }
+                binding
+                    .effective_allowed_tools(&extension.allowed_tools)
+                    .map_err(|message| TaskPolicyError::Rejected { message })?;
+                Some(
+                    self.capabilities
+                        .resolve_domain_role(binding, extension.kind, &extension.agent_role)
+                        .await
+                        .map_err(|message| TaskPolicyError::Rejected { message })?,
+                )
+            }
+            None => None,
+        };
         extension.sort_order = i64::try_from(position).unwrap_or(i64::MAX);
         serde_json::to_value(extension).map_err(|error| TaskPolicyError::Backend {
             message: format!("Failed to encode EKO task extension: {error}"),
@@ -568,16 +702,53 @@ impl TaskToolPolicy for EkoTaskPolicy {
 
     async fn validate_candidate(
         &self,
-        _scope_id: &str,
+        scope_id: &str,
         tasks: &[echo_agent::tasks::Task],
     ) -> Result<(), TaskPolicyError> {
+        let binding = self.domain_binding(scope_id).await?;
         for task in tasks {
             self.capabilities
                 .validate_task_spec(&task.spec)
                 .map_err(|message| TaskPolicyError::Rejected { message })?;
         }
+        if let Some(binding) = binding {
+            check_domain_graph_rules(&binding, tasks)
+                .map_err(|message| TaskPolicyError::Rejected { message })?;
+        }
         Ok(())
     }
+}
+
+/// Product rules only: generic DAG/revision/claims remain framework-owned.
+pub(crate) fn check_domain_graph_rules(
+    binding: &crate::domain_plugin::DomainBinding,
+    tasks: &[echo_agent::tasks::Task],
+) -> Result<(), String> {
+    let extensions = tasks
+        .iter()
+        .filter(|task| task.execution.status != echo_agent::tasks::TaskStatus::Skipped)
+        .map(|task| task.spec.extension_as::<EkoTaskExtension>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let review_criteria = binding.review_criteria();
+    for (label, required, field) in [
+        ("artifact", &binding.snapshot.required_artifacts, 0),
+        ("execution check", &binding.snapshot.execution_checks, 1),
+        ("semantic criterion", &review_criteria, 2),
+    ] {
+        for requirement in required {
+            if !extensions.iter().any(|extension| match field {
+                0 => extension.required_artifacts.contains(requirement),
+                1 => extension.execution_checks.contains(requirement),
+                _ => extension.acceptance_criteria.contains(requirement),
+            }) {
+                return Err(format!(
+                    "domain {label} '{requirement}' must remain on an executable PlanTask"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn task_goal(title: &str, description: &str) -> String {
@@ -749,6 +920,8 @@ pub(crate) async fn publish_task_plan(
             run,
             trigger,
             continuation,
+            domain_binding: None,
+            execution_profile: super::types::TaskRunExecutionProfile::default(),
         },
     )])));
     let service = TaskRevisionService::new(
@@ -778,6 +951,7 @@ fn plan_graph_input(
     let context_metadata = serde_json::to_value(EkoPlanMetadata {
         plan_id: plan.plan_id,
         domain_profile: plan.domain_profile,
+        domain_binding: run.domain_binding.clone(),
         goal_revision: run.goal_revision,
         goal_sha256: run.goal_sha256.clone(),
     })
@@ -1079,6 +1253,8 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let task_id = "direct-answer";
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: format!("plan:{run_id}"),
             run_id: run_id.to_string(),
             revision: 0,

@@ -24,12 +24,13 @@ use crate::subagent_loader::SubagentCatalogSnapshot;
 
 use super::executor::{ExecEvent, RunOutcome};
 use super::profiles::ProfileTemplate;
-use super::types::{DomainProfile, EkoTaskExtension, RunPlanPolicy};
+use super::types::{DomainProfile, EkoTaskExtension, PlanTaskKind, RunPlanPolicy};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct TaskCapabilityCatalog {
     subagents: Arc<SubagentCatalogSnapshot>,
     tools: HashSet<String>,
+    registry: Option<Arc<echo_agent::subagent::SubagentRegistry>>,
 }
 
 impl TaskCapabilityCatalog {
@@ -53,7 +54,37 @@ impl TaskCapabilityCatalog {
         Self {
             subagents,
             tools: tools.into_iter().collect(),
+            registry: None,
         }
+    }
+
+    pub(crate) fn with_registry(
+        mut self,
+        registry: Arc<echo_agent::subagent::SubagentRegistry>,
+    ) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    pub(crate) async fn resolve_domain_role(
+        &self,
+        binding: &crate::domain_plugin::DomainBinding,
+        kind: PlanTaskKind,
+        name: &str,
+    ) -> std::result::Result<crate::domain_plugin::DomainRoleBinding, String> {
+        let definitions = match self.registry.as_ref() {
+            Some(registry) => registry.list_available().await,
+            None if name == "primary" => Vec::new(),
+            None => {
+                return Err("domain task policy has no live Subagent provider catalog".to_string());
+            }
+        };
+        crate::domain_plugin::resolve_role_for_kind(
+            kind,
+            name,
+            &binding.snapshot.dependency_closure,
+            &definitions,
+        )
     }
 
     pub(crate) fn validate_task_spec(
@@ -63,7 +94,25 @@ impl TaskCapabilityCatalog {
         let extension: EkoTaskExtension = task
             .extension_as()
             .map_err(|error| format!("task '{}' has invalid EKO extension: {error}", task.id))?;
-        if !self.subagents.contains(&extension.agent_role) {
+        // Verification is an existing primary execution route, not a fake
+        // registry role. Other kinds cannot claim primary to reset depth.
+        let is_primary_verification =
+            extension.kind == PlanTaskKind::Verification && extension.agent_role == "primary";
+        if extension.domain_binding.is_some()
+            && ((extension.kind == PlanTaskKind::Verification)
+                != (extension.agent_role == "primary"))
+        {
+            return Err(format!(
+                "domain task '{}' must reserve primary exclusively for Verification",
+                task.id
+            ));
+        }
+        if !is_primary_verification
+            && !self.subagents.contains(&extension.agent_role)
+            && !extension.domain_role.as_ref().is_some_and(|role| {
+                extension.domain_binding.is_some() && role.role_name == extension.agent_role
+            })
+        {
             let mut available = self
                 .subagents
                 .names()
@@ -121,6 +170,9 @@ tokio::task_local! {
     /// Exact EKO product-data root plus opaque framework lifetime guards.
     /// `task_execute` receives this from its value-carried ToolContext.
     pub static CURRENT_WORKSPACE_IO: Option<crate::state::WorkspaceIoInvocation>;
+    /// Existing opaque pool projections carried across tool spawns, not an
+    /// execution owner or a second authorization/selection store.
+    pub static CURRENT_INVOCATION_RESOURCES: Vec<echo_agent::tools::InvocationResourceGuard>;
     /// The unattended write mode for the currently executing run (D7 stage 2).
     /// Set by `ExecuteTaskTool::execute` so CP B preflight in `execute_task`
     /// can read it without threading the mode through `execute_run` →
@@ -186,6 +238,12 @@ pub(crate) fn current_workspace_io() -> Option<crate::state::WorkspaceIoInvocati
     CURRENT_WORKSPACE_IO.try_with(Clone::clone).ok().flatten()
 }
 
+pub(crate) fn current_invocation_resources() -> Vec<echo_agent::tools::InvocationResourceGuard> {
+    CURRENT_INVOCATION_RESOURCES
+        .try_with(Clone::clone)
+        .unwrap_or_default()
+}
+
 /// Read the current unattended write mode from the task-local scope (D7
 /// stage 2). Returns `Disabled` when no scope is active (attended runs,
 /// tests) — matching stage-1 behaviour as the safe default.
@@ -232,37 +290,48 @@ pub(crate) fn trace_sink_from_tool_context(
 /// 这里反序列化回 `ExecEvent` 包装成 `TraceSink` 注入 task_local。
 pub(crate) async fn scoped_with_ctx_run_id<F, Fut, R>(
     ctx: &echo_agent::tools::ToolContext,
+    workspace_io: Option<crate::state::WorkspaceIoInvocation>,
     f: F,
 ) -> R
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = R>,
 {
-    let workspace_io = crate::state::WorkspaceIoInvocation::from_context(ctx);
-    let scoped_run_id = ctx
-        .run_id
-        .clone()
-        .or_else(|| ctx.turn_id.as_deref().map(formal_run_id_for_turn));
-    match scoped_run_id {
-        Some(rid) => {
-            let cancel = ctx
-                .cancel
-                .as_ref()
-                .map(|c| (**c).clone())
-                .unwrap_or_default();
-            let trace_sink = trace_sink_from_tool_context(ctx);
-            CURRENT_WORKSPACE_IO
-                .scope(
-                    workspace_io,
-                    CURRENT_CANCEL.scope(
-                        cancel,
-                        CURRENT_RUN_ID.scope(rid, CURRENT_TRACE_SINK.scope(trace_sink, f())),
-                    ),
-                )
-                .await
-        }
-        None => CURRENT_WORKSPACE_IO.scope(workspace_io, f()).await,
-    }
+    let retained = ctx
+        .resource_guards
+        .iter()
+        .filter(|guard| guard.retains::<crate::agent_pool::AgentPoolPhysicalProjection>())
+        .cloned()
+        .collect::<Vec<_>>();
+    CURRENT_INVOCATION_RESOURCES
+        .scope(retained, async move {
+            let scoped_run_id = ctx
+                .run_id
+                .clone()
+                .or_else(|| ctx.turn_id.as_deref().map(formal_run_id_for_turn));
+            match scoped_run_id {
+                Some(rid) => {
+                    let cancel = ctx
+                        .cancel
+                        .as_ref()
+                        .map(|c| (**c).clone())
+                        .unwrap_or_default();
+                    let trace_sink = trace_sink_from_tool_context(ctx);
+                    CURRENT_WORKSPACE_IO
+                        .scope(
+                            workspace_io,
+                            CURRENT_CANCEL.scope(
+                                cancel,
+                                CURRENT_RUN_ID
+                                    .scope(rid, CURRENT_TRACE_SINK.scope(trace_sink, f())),
+                            ),
+                        )
+                        .await
+                }
+                None => CURRENT_WORKSPACE_IO.scope(workspace_io, f()).await,
+            }
+        })
+        .await
 }
 
 #[cfg(test)]
@@ -316,7 +385,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (run_id, scoped_cancel) = scoped_with_ctx_run_id(&ctx, || async {
+        let (run_id, scoped_cancel) = scoped_with_ctx_run_id(&ctx, None, || async {
             let run_id = current_run_id();
             let cancel = CURRENT_CANCEL
                 .try_with(Clone::clone)
@@ -352,12 +421,20 @@ mod tests {
 fn complex_run_prompt(
     user_goal: &str,
     reason: &str,
-    domain: DomainProfile,
     plan_mode: &str,
     initial_plan: &[String],
+    domain_binding: Option<&crate::domain_plugin::DomainBinding>,
     subagent_catalog: &SubagentCatalogSnapshot,
 ) -> String {
-    let template = ProfileTemplate::for_profile(domain);
+    let template = ProfileTemplate::general();
+    let (domain_key, method, execution, roles) = domain_binding.map_or_else(
+        || (template.key.to_string(), template.prompt_suffix.to_string(), template.execution_guidance.to_string(), template.default_subagent_roles.join(", ")),
+        |binding| (
+            binding.snapshot.plugin.plugin_id.clone(), binding.snapshot.method.clone(),
+            format!("Required artifacts: {:?}\nExecutable checks: {:?}\nAcceptance criteria: {:?}\nReview checklist: {:?}", binding.snapshot.required_artifacts, binding.snapshot.execution_checks, binding.snapshot.acceptance_criteria, binding.snapshot.review_checklist),
+            binding.snapshot.default_subagent_roles.values().map(|role| role.role_name.as_str()).collect::<Vec<_>>().join(", "),
+        ),
+    );
     let plan_contract = if plan_mode == "direct_execute" {
         "Complete the goal directly with ordinary tools when that remains the lightest reliable path. Do not create a placeholder plan merely for ceremony. If execution reveals real dependencies, parallel work, or separately verifiable outcomes, upgrade by submitting the complete DAG in one task_create call and execute its returned revision."
     } else {
@@ -375,11 +452,15 @@ fn complex_run_prompt(
 
     format!(
         "[complex_run]\nUser goal: {user_goal}\nComplexity rationale: {reason}\nDomain profile: {} ({})\nPlan mode: {plan_mode}\n\nRun contract:\n{plan_contract}\n\nDomain planning methodology:\n{}\n\nDomain execution standard:\n{}\n\nPreferred Subagents for this domain: {}\nAvailable Subagents:\n{}\n\nInitial decomposition brief:\n{initial}\n[/complex_run]",
-        template.key,
-        template.label,
-        template.prompt_suffix,
-        template.execution_guidance,
-        template.default_subagent_roles.join(", "),
+        domain_key,
+        domain_binding.map_or(template.label, |binding| binding
+            .snapshot
+            .plugin
+            .plugin_id
+            .as_str()),
+        method,
+        execution,
+        roles,
         subagent_catalog.prompt(),
     )
 }
@@ -421,7 +502,8 @@ mod task_create_tests {
     fn plan_task_schema_keeps_generated_briefs_in_user_language() -> std::result::Result<(), String>
     {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
-        let schema = FrameworkTaskCreateTool::new(task_service(store)).parameters();
+        let tool = FrameworkTaskCreateTool::new(task_service(store));
+        let schema = tool.parameters();
         let task_prefix = if schema.pointer("/properties/tasks/items").is_some() {
             "/properties/tasks/items"
         } else {
@@ -435,8 +517,11 @@ mod task_create_tests {
             .pointer(&format!("{task_prefix}/properties/description/description"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        assert!(title.contains("user's current language"));
-        assert!(description.contains("user's current language"));
+        assert!(!title.is_empty());
+        assert!(!description.is_empty());
+        let policy = tool.description();
+        assert!(policy.contains("Titles/briefs: user's language"));
+        assert!(policy.contains("code/paths/commands/technical IDs unchanged"));
         Ok(())
     }
 
@@ -525,6 +610,63 @@ mod task_create_tests {
         assert_eq!(
             plan.tasks.first().map(|task| task.agent_role.as_str()),
             Some("explorer")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verification_default_primary_and_same_run_insert_keep_the_binding()
+    -> std::result::Result<(), String> {
+        use crate::subagent_policy::{SubagentDepthDefaults, SubagentDepthLimit};
+        let defaults = Arc::new(SubagentDepthDefaults::default());
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?
+                .with_subagent_depth_defaults(defaults.clone()),
+        );
+        let tool = FrameworkTaskCreateTool::new(task_service(store.clone()));
+        let run_id = "default-verification-policy";
+        let result = with_run_id(run_id.to_string(), tool.execute(one_task_params(
+            serde_json::json!({"id":"verify", "title":"Verify", "description":"Verify changes", "kind":"verification"})
+        ))).await.map_err(|error| error.to_string())?;
+        assert!(result.success);
+        let plan = store
+            .get_plan(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "plan missing".to_string())?;
+        assert_eq!(
+            plan.tasks.first().map(|task| task.agent_role.as_str()),
+            Some("primary")
+        );
+        defaults.publish(SubagentDepthLimit::new(3)?);
+        let mut next = one_task_params(serde_json::json!({
+            "id":"inspect", "title":"Inspect", "description":"Inspect changes",
+            "kind":"investigation", "subagent":"explorer"
+        }));
+        next.insert("base_revision".to_string(), serde_json::json!(1));
+        let result = with_run_id(run_id.to_string(), tool.execute(next))
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(result.success);
+        let snapshot = store
+            .get_run_state(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "run missing".to_string())?;
+        assert_eq!(
+            snapshot
+                .execution_profile
+                .require_subagent_depth_limit()?
+                .get(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_plan(run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "plan missing".to_string())?
+                .tasks
+                .len(),
+            2
         );
         Ok(())
     }
@@ -620,7 +762,7 @@ mod task_create_tests {
     }
 
     #[tokio::test]
-    async fn task_create_inherits_domain_and_routes_data_subagents()
+    async fn task_create_keeps_general_host_routes_and_explicit_registered_specialists()
     -> std::result::Result<(), String> {
         let shadow_root = tempfile::tempdir().map_err(|error| error.to_string())?;
         let store = Arc::new(
@@ -634,7 +776,7 @@ mod task_create_tests {
                 "default",
                 "conversation:data",
                 "message:data",
-                DomainProfile::DataAnalysis,
+                DomainProfile::General,
                 "清洗并分析销售数据",
                 "agent_task_plan",
                 AttendedMode::Attended,
@@ -692,9 +834,13 @@ mod task_create_tests {
         assert!(
             plan.tasks
                 .iter()
-                .all(|task| task.domain_profile == DomainProfile::DataAnalysis)
+                .all(|task| task.domain_profile == DomainProfile::General)
         );
-        assert!(plan.tasks.iter().any(|task| task.agent_role == "analyst"));
+        assert!(
+            plan.tasks
+                .iter()
+                .any(|task| task.agent_role == "implementer")
+        );
         assert!(
             plan.tasks
                 .iter()
@@ -827,13 +973,13 @@ mod task_create_tests {
         let prompt = complex_run_prompt(
             "分析临床研究",
             "multi_source synthesis",
-            DomainProfile::MedicalResearch,
             "plan_then_execute",
             &["检索指南: 形成证据表".to_string()],
+            None,
             &test_subagent_catalog(),
         );
-        assert!(prompt.contains("medical_research"));
-        assert!(prompt.contains("PICO"));
+        assert!(prompt.contains("general"));
+        assert!(!prompt.contains("PICO"));
         assert!(prompt.contains("formal, reviewable DAG"));
         assert!(prompt.contains("do not create a wrapper"));
         assert!(prompt.contains("Available Subagents"));
@@ -856,9 +1002,9 @@ mod task_create_tests {
         let prompt = complex_run_prompt(
             "inspect",
             "multi_source synthesis",
-            DomainProfile::General,
             "plan_then_execute",
             &[],
+            None,
             &catalog,
         );
 
@@ -895,11 +1041,12 @@ impl Tool for CreateComplexTaskTool {
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
-            "required": ["user_goal", "reason", "domain_profile", "plan_mode"],
+            "required": ["user_goal", "reason", "plan_mode"],
             "properties": {
                 "user_goal": { "type": "string", "description": "The user's full goal (verbatim or distilled), as the Run's goal." },
                 "reason": { "type": "string", "description": "Why an independent Run is warranted. Name the material signals: dependent multi_step work, multi_file/architectural change, long_running/cross_turn state, or multi_source synthesis." },
-                "domain_profile": { "type": "string", "enum": ["general","ai_coding","data_analysis","academic_research","medical_research"], "description": "Best-fit evidence and review profile. Cross-domain tasks should choose the profile that governs the final claim or artifact." },
+                "domain_plugin": { "type": ["string", "null"], "description": "Optional enabled plugin manifest.name whose domain.yaml supplies this Run's fixed method and evidence obligations. Omit for the General host method." },
+                "domain_profile": { "type": "string", "enum": ["general"], "description": "Legacy host projection. New specialized tasks select domain_plugin instead of compiled professional profiles." },
                 "plan_mode": { "type": "string", "enum": ["plan_then_execute","direct_execute"], "description": "Use plan_then_execute when the work benefits from an explicit reviewable DAG; use direct_execute only when autonomous ReAct is sufficient and a formal plan adds no value." },
                 "initial_plan": { "type": "array", "items": { "type": "object", "properties": { "step_name": {"type":"string"}, "expected_outcome": {"type":"string"} }, "required": ["step_name"] }, "description": "Optional coarse decomposition (>=2 steps) as a brief. Not the PlanTask DAG — the Run's agent refines via task_create." },
                 "priority": { "type": "string", "enum": ["foreground","background"], "default": "background", "description": "Default background (returns run_id immediately, non-blocking). foreground only for <1min tasks where you need the result in this turn (blocks the UI until done)." }
@@ -972,67 +1119,12 @@ impl CreateComplexTaskTool {
             .get("domain_profile")
             .and_then(|v| v.as_str())
             .unwrap_or("general");
-        let domain = super::types::DomainProfile::from_str(domain_profile_str)
-            .unwrap_or(super::types::DomainProfile::General);
-        let plan_mode = params
-            .get("plan_mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("plan_then_execute");
-        let plan_policy = if plan_mode == "direct_execute" {
-            RunPlanPolicy::AllowDirect
-        } else {
-            RunPlanPolicy::RequirePlan
-        };
-        let priority = params
-            .get("priority")
-            .and_then(|v| v.as_str())
-            .unwrap_or("background");
-        let initial_plan: Vec<String> = params
-            .get("initial_plan")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| {
-                        let step_name = v
-                            .get("step_name")
-                            .and_then(|s| s.as_str())
-                            .map(str::trim)
-                            .filter(|value| !value.is_empty())?;
-                        let expected = v
-                            .get("expected_outcome")
-                            .and_then(|s| s.as_str())
-                            .map(str::trim)
-                            .filter(|value| !value.is_empty());
-                        Some(match expected {
-                            Some(expected) => format!("{step_name}: {expected}"),
-                            None => step_name.to_string(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let goal = if initial_plan.is_empty() {
-            user_goal.clone()
-        } else {
-            format!(
-                "{user_goal}\n\nInitial plan:\n{}",
-                initial_plan
-                    .iter()
-                    .map(|s| format!("- {s}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
-        };
-        let run_prompt = complex_run_prompt(
-            &user_goal,
-            &reason,
-            domain,
-            plan_mode,
-            &initial_plan,
-            &self.subagent_catalog,
-        );
-
+        if domain_profile_str != "general" {
+            return Ok(ToolResult::error(
+                "compiled professional domain_profile selection has retired; select an enabled domain_plugin instead",
+            ));
+        }
+        let domain = DomainProfile::General;
         let run_id = uuid::Uuid::new_v4().to_string();
         let conv = res
             .conv_id
@@ -1083,8 +1175,115 @@ impl CreateComplexTaskTool {
                 )));
             }
         };
+        let domain_plugin = match params.get("domain_plugin") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(id)) if !id.trim().is_empty() => Some(id.as_str()),
+            Some(_) => {
+                return Ok(ToolResult::error(
+                    "domain_plugin must be a nonempty plugin name or null",
+                ));
+            }
+        };
+        // Keep the original pool admission receipt alive through RunCreated.
+        // The background driver separately revalidates under its actual lease.
+        let domain_admission = if domain_plugin.is_some() {
+            let Some(conversation_id) = res.conv_id.as_deref() else {
+                return Ok(ToolResult::error(
+                    "domain selection requires an admitted conversation Agent",
+                ));
+            };
+            match pool.lease_existing(conversation_id).await {
+                Ok(Some(lease)) => Some(lease),
+                Ok(None) => {
+                    return Ok(ToolResult::error(
+                        "domain conversation Agent is no longer admitted",
+                    ));
+                }
+                Err(error) => {
+                    return Ok(ToolResult::error(format!(
+                        "domain admission unavailable: {error}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+        let domain_binding = match (domain_plugin, domain_admission.as_ref()) {
+            (Some(id), Some(lease)) => match pool.bind_domain(lease, id).await {
+                Ok(binding) => Some(binding),
+                Err(error) => return Ok(ToolResult::error(error)),
+            },
+            _ => None,
+        };
+        let requested_plan_mode = params
+            .get("plan_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("plan_then_execute");
+        let plan_mode = if domain_binding
+            .as_ref()
+            .is_some_and(crate::domain_plugin::DomainBinding::requires_plan)
+        {
+            "plan_then_execute"
+        } else {
+            requested_plan_mode
+        };
+        let plan_policy = if plan_mode == "direct_execute" {
+            RunPlanPolicy::AllowDirect
+        } else {
+            RunPlanPolicy::RequirePlan
+        };
+        let priority = params
+            .get("priority")
+            .and_then(|v| v.as_str())
+            .unwrap_or("background");
+        let initial_plan: Vec<String> = params
+            .get("initial_plan")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| {
+                        let step_name = v
+                            .get("step_name")
+                            .and_then(|s| s.as_str())
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())?;
+                        let expected = v
+                            .get("expected_outcome")
+                            .and_then(|s| s.as_str())
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty());
+                        Some(match expected {
+                            Some(expected) => format!("{step_name}: {expected}"),
+                            None => step_name.to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let goal = if initial_plan.is_empty() {
+            user_goal.clone()
+        } else {
+            format!(
+                "{user_goal}\n\nInitial plan:\n{}",
+                initial_plan
+                    .iter()
+                    .map(|s| format!("- {s}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+        let run_prompt = complex_run_prompt(
+            &user_goal,
+            &reason,
+            plan_mode,
+            &initial_plan,
+            domain_binding.as_ref(),
+            &self.subagent_catalog,
+        );
+
         registration.mark_preparation_started();
-        if let Err(e) = store.create_run_for_active_workspace_with_profile(
+        if let Err(e) = store.create_run_for_active_workspace_with_domain(
             &run_id,
             &conv,
             &res.root_message_id,
@@ -1093,10 +1292,12 @@ impl CreateComplexTaskTool {
             "agent_autonomous",
             attended,
             super::types::TaskRunExecutionProfile::orchestrated(plan_policy),
+            domain_binding.as_ref(),
         ) {
             registration.fail_preparation(e.to_string());
             return Ok(ToolResult::error(format!("Failed to create run: {e}")));
         }
+        drop(domain_admission);
         #[allow(clippy::collapsible_if)]
         // outer guard + inner if-let-Err reads clearer than a let-chain
         if !res.attachments.is_empty() {
@@ -1246,7 +1447,7 @@ impl CheckRunStatusTool {
     }
 }
 
-/// Cancel a background Run by run_id.
+/// Request cancellation of a background Run; final settlement remains store-owned.
 pub struct CancelRunTool;
 
 impl Tool for CancelRunTool {
@@ -1254,7 +1455,7 @@ impl Tool for CancelRunTool {
         "cancel_run"
     }
     fn description(&self) -> &str {
-        "Cancel a background Run by run_id. Use when a task is no longer needed or going wrong."
+        "Request cancellation of a background Run by run_id. cancellation_requested only reports request acceptance; observe the original TaskRuntime status and physical-settlement receipts for completion."
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
@@ -1299,8 +1500,8 @@ impl CancelRunTool {
             })
             .await
         {
-            Ok(cancelled) => Ok(ToolResult::success(
-                serde_json::json!({"run_id": run_id, "cancelled": cancelled}).to_string(),
+            Ok(cancellation_requested) => Ok(ToolResult::success(
+                serde_json::json!({"run_id": run_id, "cancellation_requested": cancellation_requested}).to_string(),
             )),
             Err(error) => Ok(ToolResult::error(format!(
                 "Failed to cancel run {run_id}: {error}"

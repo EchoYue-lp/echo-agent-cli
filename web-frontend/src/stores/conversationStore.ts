@@ -1,17 +1,31 @@
+import { restoredAgentInput } from '../lib/agentCommunication';
 import { create } from 'zustand';
 import { useChatStore } from './chatStore';
-import { sessionApi, conversationApi, toolExecutionApi } from '../api/endpoints';
+import {
+  sessionApi,
+  conversationApi,
+  toolExecutionApi,
+  type ConversationForkRequest,
+  type ConversationForkReceipt,
+  type ProductDataScope,
+} from '../api/endpoints';
+import { useWorkspaceStore } from './workspaceStore';
+import { productDataScope, sameProductDataScope } from '../lib/productDataScope';
 import { useToastStore } from './toastStore';
 import { useToolExecutionStore } from './toolExecutionStore';
-import { useSubagentRunStore } from './subagentRunStore';
+import { ingestSubagentExecEvent, useSubagentRunStore } from './subagentRunStore';
 import { useTaskRuntimeStore } from './taskRuntimeStore';
-import { GLOBAL_WORKSPACE_ID } from '../lib/viewAddress';
+import { nativeSourceKey, savedPresentationBySource } from '../lib/nativePresentation';
+import { transcriptToolExecution } from '../types/api';
+import { GLOBAL_WORKSPACE_ID, viewAddress, type ViewAddress } from '../lib/viewAddress';
 import type {
   ChatMessage,
   ConversationListItem,
   ExecutionStep,
   SavedMessage,
   SideConversationEntry,
+  TranscriptToolRecord,
+  ToolExecution,
 } from '../types/api';
 
 let listGeneration = 0;
@@ -31,6 +45,14 @@ export interface ConversationMeta {
   workspaceId?: string;
   /** Archived in EKO's workspace-scoped conversation projection. */
   archived?: boolean;
+}
+
+/** 创建弹窗的来源快照只约束前端准入和导航；后端仍拥有支线关系与首轮生命周期。 */
+export interface SideConversationSource {
+  scope: ProductDataScope;
+  conversationId: string;
+  conversationEpoch: number;
+  navigationEpoch: number;
 }
 
 function conversationMeta(item: ConversationListItem, workspaceId: string): ConversationMeta {
@@ -67,19 +89,28 @@ interface ConversationState {
   /** Immediately detach the visible conversation projection during a workspace transition. */
   detachForWorkspace: (workspaceId: string) => void;
   /** Save current chat messages as a conversation (upsert) */
-  saveCurrent: (messages: ChatMessage[]) => Promise<void>;
-  /** Load a conversation and display it */
-  loadConversation: (id: string) => Promise<void>;
+  saveCurrent: (
+    messages: ChatMessage[],
+    onCreated?: (address: ViewAddress) => void
+  ) => Promise<ViewAddress | null>;
+  /** 仅本次已投影 transcript 时返回 true；包含上下文恢复失败后的只读历史。 */
+  loadConversation: (id: string, canProject?: () => boolean) => Promise<boolean>;
   /** Branch the canonical transcript immediately before one user turn. */
   branchCurrent: (userTurnIndex: number) => Promise<{ id: string; targetContent: string }>;
   /** Copy through a completed reply, refresh the list, and open the ordinary fork. */
-  forkCurrent: (userTurnIndex: number) => Promise<string>;
+  forkCurrent: (
+    fork: ConversationForkRequest,
+    canOpen?: () => boolean
+  ) => Promise<ConversationForkReceipt & { opened: boolean; open_error?: string }>;
   /** Create and immediately open a Side Conversation. */
   createSideConversation: (input: {
     requestId: string;
     prompt: string;
     title?: string;
     modelId?: string;
+    source?: SideConversationSource;
+    canProject?: () => boolean;
+    onCreated?: (canProject: () => boolean) => void | Promise<void>;
   }) => Promise<SideConversationEntry>;
   /** Update one child-local model; null means inherit the primary model. */
   updateSideConversationModel: (conversationId: string, modelId: string | null) => Promise<void>;
@@ -194,34 +225,29 @@ export function chatMessagesToSaved(messages: ChatMessage[]): SavedMessage[] {
   const saved: SavedMessage[] = [];
 
   for (const m of messages) {
+    // AgentRouter owns these observations; they must never become user input rows.
+    if (m.agentInput) continue;
     // Save the main message
     const entry: SavedMessage = {
       message_id: m.id,
       role: m.role,
+      created_at: new Date(m.timestamp).toISOString(),
       content: m.content,
       internal_agent: m.internalAgent,
+      assistant_blocks: m.assistantBlocks,
+      final_answer_confirmed: m.finalAnswerConfirmed,
+      execution_status: m.executionStatus,
+      final_answer_source: m.finalAnswerSource,
+      turn_source: m.turnSource,
     };
-
-    // Save thinking segments
-    if (m.thinkingSegments && m.thinkingSegments.length > 0) {
-      entry.thinking_segments = m.thinkingSegments.map((s) => s.content);
-    }
 
     // Save execution steps (chronological order of thinking/tool interleaving)
     if (m.executionSteps && m.executionSteps.length > 0) {
       entry.execution_steps = m.executionSteps.map((s) =>
-        s.type === 'thinking'
+        s.type === 'assistant'
           ? { type: s.type, index: s.index }
           : { type: s.type, call_id: s.callId }
       );
-    }
-
-    // Save execution rounds (round-based model with thinking + parallel tools)
-    if (m.executionRounds && m.executionRounds.length > 0) {
-      entry.execution_rounds = m.executionRounds.map((r) => ({
-        thinking: r.thinking ? { content: r.thinking.content } : undefined,
-        tool_call_ids: [...r.toolCallIds],
-      }));
     }
 
     // Save user-uploaded attachments (data URLs) so the message renders on reload
@@ -248,12 +274,171 @@ export function chatMessagesToSaved(messages: ChatMessage[]): SavedMessage[] {
   return saved;
 }
 
+function canonicalMessageTimestamp(message: SavedMessage): number {
+  const timestamp = Date.parse(message.created_at);
+  if (!Number.isFinite(timestamp)) throw new Error('会话消息缺少有效的原始时间');
+  return timestamp;
+}
+
 export function restoredMessageId(
   conversationId: string,
   index: number,
   message: SavedMessage
 ): string {
   return message.message_id ?? `loaded-${conversationId}-${index}`;
+}
+
+/** Restore display references without turning transcript text into runtime state. */
+function restoreTranscriptTools(
+  saved: SavedMessage[],
+  messages: ChatMessage[],
+  workspaceId: string,
+  conversationId: string,
+  tools: Readonly<Record<string, ToolExecution>>
+): ChatMessage[] {
+  const callCounts = new Map<string, number>();
+  for (const message of saved) {
+    for (const call of message.tool_calls ?? []) {
+      callCounts.set(call.id, (callCounts.get(call.id) ?? 0) + 1);
+    }
+  }
+  const resultMeta = saved.map((message) => {
+    if (message.role !== 'tool' || !message.tool_result) return null;
+    try {
+      const value: unknown = JSON.parse(message.tool_result);
+      if (!value || typeof value !== 'object') return null;
+      const fields = value as Record<string, unknown>;
+      return {
+        callId: typeof fields.tool_call_id === 'string' ? fields.tool_call_id : undefined,
+        name: typeof fields.name === 'string' ? fields.name : undefined,
+      };
+    } catch {
+      return null;
+    }
+  });
+  const pairedResults = new Set<number>();
+  const byIndex = new Map<number, ChatMessage>();
+  let visibleIndex = 0;
+  saved.forEach((source, sourceIndex) => {
+    if (source.role !== 'user' && source.role !== 'assistant') return;
+    const message = messages.at(visibleIndex);
+    visibleIndex += 1;
+    if (!message) return;
+    byIndex.set(sourceIndex, message);
+    if (source.role !== 'assistant') return;
+    const existingIds = new Set([
+      ...(message.executionSteps?.flatMap((step) => (step.type === 'tool' ? [step.callId] : [])) ??
+        []),
+    ]);
+    const claimedReferences = new Set<string>();
+    const records = (source.tool_calls ?? []).map((call, callIndex): TranscriptToolRecord => {
+      const unique = callCounts.get(call.id) === 1;
+      const record: TranscriptToolRecord = {
+        id: `transcript:${JSON.stringify([workspaceId, conversationId, sourceIndex, callIndex, call.id])}`,
+        workspaceId,
+        conversationId,
+        messageId: source.message_id,
+        callId: call.id,
+        callType: call.type,
+        name: call.function.name,
+        requestedArguments: call.function.arguments,
+        identityAmbiguous: !unique,
+      };
+      const summary = transcriptToolExecution(record, tools);
+      // An old opaque reference can identify a display row without proving its
+      // runtime owner. Reusing that key never grants a terminal status.
+      const matchingReferences = [...existingIds].filter((id) => {
+        const referenced = tools[id];
+        return (
+          !claimedReferences.has(id) &&
+          referenced &&
+          referenced.workspace_id === workspaceId &&
+          referenced.conversation_id === conversationId &&
+          referenced.call_id === call.id &&
+          referenced.name === call.function.name
+        );
+      });
+      if (summary && existingIds.has(summary.id)) record.id = summary.id;
+      else if (existingIds.has(call.id) && !claimedReferences.has(call.id)) record.id = call.id;
+      else if (matchingReferences.length === 1) record.id = matchingReferences.at(0) ?? record.id;
+      else if (summary) record.id = summary.id;
+      if (existingIds.has(record.id)) claimedReferences.add(record.id);
+      const resultIndexes: number[] = [];
+      if (unique) {
+        for (let index = sourceIndex + 1; index < saved.length; index += 1) {
+          if (saved.at(index)?.role === 'user') break;
+          const meta = resultMeta.at(index);
+          if (meta?.callId === call.id && meta.name === call.function.name)
+            resultIndexes.push(index);
+        }
+      }
+      if (resultIndexes.length === 1) {
+        const resultIndex = resultIndexes.at(0);
+        if (resultIndex != null) {
+          record.recordedOutput = saved.at(resultIndex)?.content ?? '';
+          pairedResults.add(resultIndex);
+        }
+      }
+      return record;
+    });
+    // Every retained reference gets the same message-bound status gate. A bare
+    // execution key with no source owner must not bypass it through tools[id].
+    for (const id of existingIds) {
+      if (records.some((record) => record.id === id)) continue;
+      const referenced = tools[id];
+      const exactOwner =
+        referenced &&
+        source.message_id &&
+        referenced.workspace_id === workspaceId &&
+        referenced.conversation_id === conversationId &&
+        referenced.owner.kind === 'chat' &&
+        referenced.owner.message_id === source.message_id;
+      records.push({
+        id,
+        workspaceId,
+        conversationId,
+        messageId: source.message_id,
+        callId: exactOwner ? referenced.call_id : undefined,
+        name: exactOwner ? referenced.name : undefined,
+        identityAmbiguous: !exactOwner || (callCounts.get(referenced.call_id) ?? 0) > 1,
+      });
+    }
+    message.transcriptTools = records;
+    const missing = records.filter((record) => !existingIds.has(record.id));
+    if (missing.length === 0) return;
+    message.executionSteps = [
+      ...(message.executionSteps ?? []),
+      ...missing.map((record) => ({ type: 'tool' as const, callId: record.id })),
+    ];
+  });
+  return saved.flatMap((source, sourceIndex) => {
+    const message = byIndex.get(sourceIndex);
+    if (message) return [message];
+    if (source.role !== 'tool' || pairedResults.has(sourceIndex)) return [];
+    const id = `transcript-result:${JSON.stringify([workspaceId, conversationId, sourceIndex])}`;
+    const meta = resultMeta.at(sourceIndex);
+    return [
+      {
+        id,
+        role: 'tool' as const,
+        content: source.content ?? '',
+        internalAgent: source.internal_agent ?? false,
+        isStreaming: false,
+        timestamp: canonicalMessageTimestamp(source),
+        transcriptTools: [
+          {
+            id,
+            workspaceId,
+            conversationId,
+            callId: meta?.callId,
+            name: meta?.name,
+            recordedOutput: source.content ?? '',
+            identityAmbiguous: true,
+          },
+        ],
+      },
+    ];
+  });
 }
 
 function projectSideInitialPrompt(conversationId: string, messageId: string, prompt: string): void {
@@ -346,13 +531,23 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     }));
   },
 
-  saveCurrent: async (messages: ChatMessage[]) => {
+  saveCurrent: async (messages: ChatMessage[], onCreated?: (address: ViewAddress) => void) => {
     const activeId = get().activeId;
     const workspaceId = get().workspaceId;
-    if (messages.length === 0) return;
+    const originalLoadGeneration = loadGeneration;
+    const originalNewConversationEpoch = get().newConversationEpoch;
+    if (messages.length === 0) return null;
+    let savedId = activeId;
 
-    const firstUserMsg = messages.find((m) => m.role === 'user');
-    const title = firstUserMsg?.content?.slice(0, 50) || 'New Chat';
+    const firstUserMsg = messages.find(
+      (m) => m.role === 'user' && !m.internalAgent && !m.agentInput
+    );
+    // A received observation cannot create or rename a conversation as if the user submitted it.
+    if (!firstUserMsg) return activeId ? viewAddress(workspaceId, activeId) : null;
+    const title =
+      firstUserMsg?.content?.slice(0, 50) ||
+      get().conversations.find((conversation) => conversation.id === activeId)?.title ||
+      'New Chat';
     if (import.meta.env.DEV)
       console.debug('[saveCurrent] activeId:', activeId, 'msgCount:', messages.length);
 
@@ -374,18 +569,40 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
           messages: [],
         });
         if (import.meta.env.DEV) console.debug('[saveCurrent] save result:', res, 'newId:', newId);
-        if (get().workspaceId !== workspaceId) return;
-        set({ activeId: newId });
+        if (!res?.id || typeof res.id !== 'string')
+          throw new Error('Conversation save did not return its identity');
+        savedId = res.id;
+        // The save belongs to its original address even when selection moved.
+        // Only its original view may adopt the newly created identity.
+        if (
+          get().workspaceId === workspaceId &&
+          get().activeId === activeId &&
+          loadGeneration === originalLoadGeneration &&
+          get().newConversationEpoch === originalNewConversationEpoch
+        ) {
+          // Let the original sender bind its existing admission before the
+          // selection effect observes this one legitimate null-to-id change.
+          // A view observer failure cannot undo the successful canonical save.
+          try {
+            onCreated?.(viewAddress(workspaceId, savedId));
+          } catch (error) {
+            console.error('[saveCurrent] identity observer FAILED:', error);
+          }
+          set({ activeId: savedId });
+        }
       }
     } catch (e) {
       console.error('[saveCurrent] FAILED:', e);
-      return; // Don't attempt list refresh if save failed
+      return null; // Don't attempt list refresh if save failed
     }
+    if (!savedId) return null;
+    const savedAddress = viewAddress(workspaceId, savedId);
+    if (get().workspaceId !== workspaceId) return savedAddress;
 
     // Refresh list (best-effort, must not throw)
     try {
       const items = await conversationApi.list(workspaceId);
-      if (get().workspaceId !== workspaceId) return;
+      if (get().workspaceId !== workspaceId) return savedAddress;
       if (import.meta.env.DEV)
         console.debug('[saveCurrent] refreshed list:', items.length, 'conversations');
       const metas: ConversationMeta[] = items
@@ -398,42 +615,60 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     } catch (e) {
       console.error('[saveCurrent] refresh FAILED:', e);
     }
+    return savedAddress;
   },
 
-  loadConversation: async (id: string) => {
+  loadConversation: async (id: string, canProject = () => true) => {
     const workspaceId = get().workspaceId;
     const generation = loadGeneration + 1;
     loadGeneration = generation;
     loadingConversationId = id;
-    useChatStore.getState().clearMessages();
-    useTaskRuntimeStore.getState().reset();
-    useToolExecutionStore.getState().clear();
-    useSubagentRunStore.getState().clear();
-    // Publish the selected id only after transcript/tool hydration completes.
-    // This makes the chat hook rebind the live turn after `replaceMessages`
-    // instead of creating a placeholder that the late transcript load erases.
-    set({ isLoading: true, activeId: null });
+    // Keep the current view and its live projection until the requested record
+    // has loaded successfully. A parse error must not erase the prior view.
+    set({ isLoading: true });
 
     try {
       const [record, tools] = await Promise.all([
         conversationApi.get(workspaceId, id),
         toolExecutionApi.list(workspaceId, id),
       ]);
-      if (generation !== loadGeneration || get().workspaceId !== workspaceId) return;
-
+      if (generation !== loadGeneration || get().workspaceId !== workspaceId || !canProject())
+        return false;
       // Restore agent context on the backend so conversation can continue.
       let restoreReady = true;
       try {
         await conversationApi.restore(workspaceId, id);
       } catch (e) {
+        if (generation !== loadGeneration || get().workspaceId !== workspaceId || !canProject())
+          return false;
         restoreReady = false;
         console.error('Failed to restore agent context:', e);
         useToastStore.getState().addToast('error', '会话上下文恢复失败，已切换为只读历史视图');
         useChatStore.getState().setHistoryView(true);
       }
-      if (generation !== loadGeneration || get().workspaceId !== workspaceId) return;
+      if (generation !== loadGeneration || get().workspaceId !== workspaceId || !canProject())
+        return false;
+      // Keep the source projection until hydration and navigation admission
+      // both finish; closing a fork observer must not erase the current chat.
+      useChatStore.getState().clearMessages();
+      useTaskRuntimeStore.getState().reset();
+      useToolExecutionStore.getState().clear();
+      useSubagentRunStore.getState().clear();
+      set({ activeId: null });
       useToolExecutionStore.getState().hydrateConversation(workspaceId, id, tools);
 
+      const presentations = savedPresentationBySource(record.messages);
+      for (const value of presentations.values()) {
+        for (const entry of value?.records ?? []) {
+          if (entry.payload.kind === 'subagent')
+            ingestSubagentExecEvent(entry.payload.data.event, {
+              event_id: entry.event_id,
+              stream_id: entry.cursor.stream_id,
+              sequence: entry.cursor.sequence,
+              timestamp: entry.timestamp,
+            });
+        }
+      }
       // Convert user/assistant messages for display. Tool-role payloads stay in
       // the agent context; the GUI renders tools from lightweight summaries.
       const chatMessages: ChatMessage[] = record.messages
@@ -441,35 +676,38 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         .map((m, idx) => {
           const base: ChatMessage = {
             // P2-7: 此前用 `loaded-${Date.now()}-${idx}`, 每次加载产生不同 id,
-            // React key 变化导致消息列表全量重渲染。改用会话 id + 索引, 同一会话
-            // 每次加载产生确定性 id, key 稳定。timestamp 仍用 now (无服务端时间)。
+            // React key 变化导致消息列表全量重渲染。改用会话 id + 索引；
+            // 时间只读后端原始 created_at，不用加载时刻冒消息顺序。
             id: restoredMessageId(id, idx, m),
             role: m.role as 'user' | 'assistant',
             content: m.content || '',
             internalAgent: m.internal_agent ?? false,
+            presentationRecords: m.turn_source
+              ? presentations.get(nativeSourceKey(m.turn_source))?.records
+              : undefined,
+            presentationUnavailable:
+              m.presentation_unavailable ||
+              (m.turn_source && presentations.get(nativeSourceKey(m.turn_source)) === null) ||
+              false,
+            assistantBlocks: m.assistant_blocks,
+            finalAnswerConfirmed: m.final_answer_confirmed,
+            executionStatus: m.execution_status,
+            finalAnswerSource: m.final_answer_source,
+            turnSource: m.turn_source,
+            finalAnswerExecutionId: m.final_answer_confirmed
+              ? m.execution_status?.execution_id
+              : undefined,
             isStreaming: false,
-            timestamp: Date.now(),
+            // 会话时间只读原canonical行，来源payload的创建时间不覆盖接收顺序。
+            timestamp: canonicalMessageTimestamp(m),
+            ...(m.agent_input ? restoredAgentInput(m.agent_input, workspaceId, id) : {}),
           };
-
-          // Restore thinking segments
-          if (m.thinking_segments && m.thinking_segments.length > 0) {
-            base.thinkingSegments = m.thinking_segments.map((s) => ({ content: s }));
-          }
-
-          // Restore execution rounds (round-based model).
-          // Typed via the SavedMessage shape instead of `any` (P1-40).
-          if (m.execution_rounds && m.execution_rounds.length > 0) {
-            base.executionRounds = m.execution_rounds.map((round) => ({
-              thinking: round.thinking ? { content: round.thinking.content } : undefined,
-              toolCallIds: [...round.tool_call_ids],
-            }));
-          }
 
           // Restore chronological order using stable tool execution IDs.
           if (m.execution_steps && m.execution_steps.length > 0) {
             base.executionSteps = m.execution_steps.reduce<ExecutionStep[]>((steps, step) => {
-              if (step.type === 'thinking' && step.index != null) {
-                steps.push({ type: 'thinking', index: step.index });
+              if (step.type === 'assistant' && step.index != null) {
+                steps.push({ type: 'assistant', index: step.index });
               }
               if (step.type === 'tool' && step.call_id) {
                 steps.push({ type: 'tool', callId: step.call_id });
@@ -493,7 +731,15 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         });
 
       const chatStore = useChatStore.getState();
-      chatStore.replaceMessages(chatMessages);
+      chatStore.replaceMessages(
+        restoreTranscriptTools(
+          record.messages,
+          chatMessages,
+          workspaceId,
+          id,
+          useToolExecutionStore.getState().tools
+        )
+      );
       chatStore.setHistoryView(!restoreReady);
 
       set((state) => ({
@@ -504,9 +750,17 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         ),
       }));
       loadingConversationId = null;
+      return true;
     } catch (e) {
       console.error('Failed to load conversation:', e);
-      if (generation === loadGeneration) {
+      if (generation === loadGeneration && get().workspaceId === workspaceId && canProject()) {
+        loadingConversationId = null;
+        set({ isLoading: false });
+        useToastStore.getState().addToast('error', '无法加载会话或工具历史；原始记录保留，请重试');
+      }
+      return false;
+    } finally {
+      if (generation === loadGeneration && get().workspaceId === workspaceId && !canProject()) {
         loadingConversationId = null;
         set({ isLoading: false });
       }
@@ -523,29 +777,170 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     return { id: result.id, targetContent: result.target_content };
   },
 
-  forkCurrent: async (userTurnIndex: number) => {
+  forkCurrent: async (fork, canOpen = () => true) => {
     const sourceId = get().activeId;
     const workspaceId = get().workspaceId;
+    const scope = productDataScope(useWorkspaceStore.getState().current);
     const generation = loadGeneration;
-    if (!sourceId) throw new Error('No active conversation to fork');
-    const result = await conversationApi.branch(workspaceId, sourceId, userTurnIndex, true);
-    if (get().workspaceId !== workspaceId) return result.id;
-    await get().init(workspaceId);
-    // A late fork response must not take over a newer user selection.
+    const epoch = get().newConversationEpoch;
+    const preparation = fork.preparation;
     if (
+      !sourceId ||
+      preparation.source_id !== sourceId ||
+      preparation.workspace_id !== workspaceId ||
+      preparation.workspace_id !== scope.workspaceId ||
+      preparation.workspace_generation !== scope.workspaceGeneration
+    )
+      throw new Error('分叉来源已变化，请从原回复重新打开');
+    const ownsSource = () =>
+      canOpen() &&
       get().workspaceId === workspaceId &&
       get().activeId === sourceId &&
-      generation === loadGeneration
-    ) {
-      await get().loadConversation(result.id);
+      get().newConversationEpoch === epoch &&
+      generation === loadGeneration &&
+      !useWorkspaceStore.getState().isLoading &&
+      sameProductDataScope(scope, productDataScope(useWorkspaceStore.getState().current));
+    const result = await conversationApi.branch(
+      workspaceId,
+      sourceId,
+      preparation.user_turn_index,
+      true,
+      fork
+    );
+    if (
+      result.request_id !== preparation.request_id ||
+      result.source_id !== sourceId ||
+      result.source_workspace_id !== workspaceId ||
+      result.destination !== fork.destination
+    )
+      throw new Error('分叉回执身份不匹配，请从工作空间或 Worktree 列表核对已创建资源');
+    const receipt = result as ConversationForkReceipt;
+    if (receipt.workspace) {
+      const workspace = receipt.workspace;
+      const targetState = useWorkspaceStore.getState();
+      const known = targetState.workspaces.find((item) => item.id === workspace.id);
+      if (
+        workspace.id !== receipt.workspace_id ||
+        workspace.product_data_generation !== receipt.workspace_generation ||
+        (known && known.product_data_generation !== workspace.product_data_generation) ||
+        (targetState.current?.id === workspace.id &&
+          targetState.current.product_data_generation !== workspace.product_data_generation)
+      )
+        return {
+          ...receipt,
+          opened: false,
+          open_error: '目标工作空间代际已变化，保留原资源回执；请从当前工作空间列表检查。',
+        };
+      try {
+        await useWorkspaceStore.getState().refreshList();
+      } catch (error) {
+        return {
+          ...receipt,
+          opened: false,
+          open_error: error instanceof Error ? error.message : '已创建资源的列表尚未核实',
+        };
+      }
+      const actual = useWorkspaceStore
+        .getState()
+        .workspaces.find((item) => item.id === workspace.id);
+      if (!actual || actual.product_data_generation !== receipt.workspace_generation)
+        return {
+          ...receipt,
+          opened: false,
+          open_error: '目标已删除或重开，原资源回执保留，请检查当前列表。',
+        };
     }
-    return result.id;
+    if (!receipt.success || !receipt.imported || !receipt.id || !ownsSource())
+      return { ...receipt, opened: false };
+    try {
+      if (receipt.workspace_id === workspaceId) {
+        if (receipt.workspace_generation !== scope.workspaceGeneration)
+          throw new Error('目标工作空间代际已变化，请从最近任务重新打开');
+        await get().init(workspaceId);
+        if (!ownsSource()) return { ...receipt, opened: false };
+      } else {
+        const target = receipt.workspace;
+        if (
+          !target ||
+          target.id !== receipt.workspace_id ||
+          target.product_data_generation !== receipt.workspace_generation
+        )
+          throw new Error('目标工作空间回执不完整，请从工作空间列表打开');
+        await useWorkspaceStore
+          .getState()
+          .switchTo(target.id, undefined, receipt.workspace_generation);
+        if (
+          !canOpen() ||
+          get().newConversationEpoch !== epoch + 1 ||
+          get().activeId !== null ||
+          !sameProductDataScope(
+            {
+              workspaceId: target.id,
+              workspaceGeneration: target.product_data_generation,
+            },
+            productDataScope(useWorkspaceStore.getState().current)
+          )
+        )
+          return { ...receipt, opened: false };
+      }
+      const selectionGeneration = loadGeneration + 1;
+      const canProject = () =>
+        canOpen() &&
+        sameProductDataScope(
+          {
+            workspaceId: receipt.workspace_id,
+            workspaceGeneration: receipt.workspace_generation,
+          },
+          productDataScope(useWorkspaceStore.getState().current)
+        );
+      await get().loadConversation(receipt.id, canProject);
+      const opened =
+        canProject() && get().activeId === receipt.id && get().workspaceId === receipt.workspace_id;
+      return {
+        ...receipt,
+        opened,
+        ...(!opened && canProject() && selectionGeneration === loadGeneration
+          ? { open_error: '会话已创建，但历史尚未打开；可从最近任务重试。' }
+          : {}),
+      };
+    } catch (error) {
+      return {
+        ...receipt,
+        opened: false,
+        open_error: error instanceof Error ? error.message : '打开分叉失败',
+      };
+    }
   },
 
-  createSideConversation: async ({ requestId, prompt, title, modelId }) => {
+  createSideConversation: async ({
+    requestId,
+    prompt,
+    title,
+    modelId,
+    source,
+    onCreated,
+    canProject = () => true,
+  }) => {
     const parentConversationId = get().activeId;
     const workspaceId = get().workspaceId;
+    const scope = source?.scope ?? productDataScope(useWorkspaceStore.getState().current);
+    const epoch = source?.conversationEpoch ?? get().newConversationEpoch;
+    const sourceLoadGeneration = loadGeneration;
+    const ownsSource = () =>
+      get().workspaceId === workspaceId &&
+      get().activeId === parentConversationId &&
+      get().newConversationEpoch === epoch &&
+      !useWorkspaceStore.getState().isLoading &&
+      sameProductDataScope(scope, productDataScope(useWorkspaceStore.getState().current)) &&
+      canProject();
     if (!parentConversationId) throw new Error('A persisted primary conversation is required');
+    if (
+      get().isLoading ||
+      !ownsSource() ||
+      (source &&
+        (source.conversationId !== parentConversationId || scope.workspaceId !== workspaceId))
+    )
+      throw new Error('支线所属的主对话或工作空间已变化，请重新打开');
     if (get().sideConversations.some((entry) => entry.conversation_id === parentConversationId)) {
       throw new Error('Side Conversations cannot create nested Side Conversations');
     }
@@ -557,10 +952,34 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       title: title?.trim() || null,
       model_id: modelId?.trim() || null,
     });
+    // 创建事实仍返回调用者；迟到回执不能初始化另一 Workspace 或抢占新选择。
+    if (!ownsSource() || loadGeneration !== sourceLoadGeneration) return receipt.creation.entry;
+    try {
+      void Promise.resolve(onCreated?.(ownsSource)).catch((error) =>
+        console.warn('[conversationStore] 支线创建后的草稿同步失败:', error)
+      );
+    } catch (error) {
+      console.warn('[conversationStore] 支线创建后的草稿同步失败:', error);
+    }
     await get().init(workspaceId);
-    await get().loadConversation(receipt.creation.entry.conversation_id);
+    if (!ownsSource() || loadGeneration !== sourceLoadGeneration) return receipt.creation.entry;
+    const childId = receipt.creation.entry.conversation_id;
+    const selectionGeneration = loadGeneration + 1;
+    const opened = await get().loadConversation(
+      childId,
+      () => ownsSource() && loadGeneration === selectionGeneration
+    );
+    if (
+      !opened ||
+      get().activeId !== childId ||
+      get().newConversationEpoch !== epoch ||
+      get().workspaceId !== workspaceId ||
+      !sameProductDataScope(scope, productDataScope(useWorkspaceStore.getState().current)) ||
+      !canProject()
+    )
+      return receipt.creation.entry;
     projectSideInitialPrompt(
-      receipt.creation.entry.conversation_id,
+      childId,
       receipt.first_turn?.message_key ?? `side-start:${receipt.creation.entry.group_id}`,
       receipt.initial_prompt
     );
@@ -746,13 +1165,25 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
 
   clearCurrent: async () => {
     loadGeneration += 1;
+    const generation = loadGeneration;
+    const { workspaceId, activeId, newConversationEpoch } = get();
     loadingConversationId = null;
     set({ isLoading: false });
     try {
-      const { workspaceId, activeId } = get();
       if (activeId) await sessionApi.reset(workspaceId, activeId);
     } catch (e) {
       console.error('Failed to reset session while clearing chat:', e);
+    }
+
+    // The original reset still settles, but its late result must not erase a
+    // newer selection or a reopened instance of the same conversation.
+    if (
+      generation !== loadGeneration ||
+      get().workspaceId !== workspaceId ||
+      get().activeId !== activeId ||
+      get().newConversationEpoch !== newConversationEpoch
+    ) {
+      return;
     }
 
     useChatStore.getState().clearMessages();
@@ -766,3 +1197,21 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     return groupByDate(get().conversations);
   },
 }));
+
+/** 复用既有加载/新会话epoch，为异步只读呈现补件保留原view身份。 */
+export function captureConversationView(): () => boolean {
+  const initial = useConversationStore.getState();
+  const generation = loadGeneration;
+  const epoch = initial.newConversationEpoch;
+  const workspaceId = initial.workspaceId;
+  const conversationId = initial.activeId;
+  return () => {
+    const current = useConversationStore.getState();
+    return (
+      generation === loadGeneration &&
+      epoch === current.newConversationEpoch &&
+      workspaceId === current.workspaceId &&
+      conversationId === current.activeId
+    );
+  };
+}

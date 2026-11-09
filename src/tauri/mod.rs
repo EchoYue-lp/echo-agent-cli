@@ -19,11 +19,13 @@ use tauri::Emitter;
 
 pub fn build_tauri_app(
     app_state: Arc<AppState>,
+    channel_runtime: Arc<echo_agent_app_core::api::channel_runtime::ChannelRuntime>,
     browser_runtime: Arc<BrowserRuntime>,
     subagent_projection: Arc<
         echo_agent_app_core::api::subagent_event_projection::SubagentEnvelopeProjectionService,
     >,
     bridge_supervisor: Arc<TauriBridgeSupervisor>,
+    desktop_lifecycle: std::sync::Weak<std::sync::Mutex<desktop::DesktopLifecycleState>>,
 ) -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -33,6 +35,7 @@ pub fn build_tauri_app(
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(TauriState::new(
             app_state,
+            channel_runtime,
             browser_runtime,
             subagent_projection,
             bridge_supervisor,
@@ -55,6 +58,20 @@ pub fn build_tauri_app(
             commands::analysis::run_analysis,
             commands::analysis::cancel_analysis,
             commands::analysis::delete_analysis,
+            // Existing QQ/Feishu runtime controls; save and connect remain separate.
+            commands::channels::get_channel_configuration,
+            commands::channels::save_channel_configuration,
+            commands::channels::list_channel_status,
+            commands::channels::control_channel,
+            commands::channels::abandon_channel_recovery_input,
+            commands::channels::begin_weixin_login,
+            commands::channels::get_weixin_login_status,
+            commands::channels::verify_weixin_login,
+            commands::channels::cancel_weixin_login,
+            commands::channels::forget_weixin_login,
+            commands::channels::get_weixin_notification_configuration,
+            commands::channels::configure_weixin_notification,
+            commands::channels::get_weixin_notification_result,
             // Config
             commands::config::get_config,
             commands::config::update_config,
@@ -65,6 +82,10 @@ pub fn build_tauri_app(
             commands::workspace::list_workspaces,
             commands::workspace::create_workspace,
             commands::workspace::create_and_switch_workspace,
+            commands::workspace::connect_project_ssh,
+            commands::workspace::test_project_ssh,
+            commands::workspace::verify_project_ssh,
+            commands::workspace::close_project_ssh,
             commands::workspace::get_default_root,
             commands::workspace::get_current_workspace,
             commands::workspace::get_workspace,
@@ -163,8 +184,6 @@ pub fn build_tauri_app(
             commands::hooks::list_hook_events,
             commands::hooks::reload_hooks,
             commands::hooks::test_hook,
-            // LSP
-            commands::lsp::lsp_control,
             // Providers
             commands::providers::list_model_providers,
             commands::providers::upsert_model_provider,
@@ -181,12 +200,17 @@ pub fn build_tauri_app(
             commands::scheduler::remove_scheduler_task,
             commands::scheduler::set_scheduler_task_status,
             commands::scheduler::run_scheduler_task,
+            commands::scheduler::edit_scheduler_task,
+            commands::scheduler::read_scheduler_history,
             // Conversations
             commands::conversations::list_conversations,
             commands::conversations::create_conversation,
             commands::conversations::set_conversation_archived,
             commands::conversations::get_conversation,
+            commands::conversations::get_conversation_usage,
+            commands::conversations::get_agent_communication_inputs,
             commands::conversations::update_conversation,
+            commands::conversations::prepare_conversation_fork,
             commands::conversations::branch_conversation,
             commands::conversations::delete_conversation,
             commands::conversations::export_conversation,
@@ -200,6 +224,7 @@ pub fn build_tauri_app(
             commands::chat::queue_chat_input,
             commands::chat::list_queued_chat_inputs,
             commands::chat::remove_queued_chat_input,
+            commands::chat::replace_queued_chat_input,
             commands::chat::reorder_queued_chat_inputs,
             commands::chat::cancel_chat,
             commands::chat::send_approval_response,
@@ -280,10 +305,46 @@ pub fn build_tauri_app(
             terminal::close_terminal,
             terminal::list_terminal_sessions,
         ])
-        .setup(|app| {
+        .on_window_event(|window,event| {
+            if let tauri::WindowEvent::CloseRequested {api,..} = event
+                && let Err(error) = desktop::hide_requested_window(||api.prevent_close(),||window.hide()) {
+                    use tauri_plugin_dialog::DialogExt;
+                    tracing::error!(%error,"Unable to hide Eclip window");
+                    if let Err(show_error) = window.show() {tracing::error!(%show_error,"Unable to restore visible Eclip window");}
+                    window.dialog().message("无法隐藏窗口，应用保持运行。请重试或使用托盘退出。").title("Eclip").show(|_|{});
+            }
+        })
+        .setup(move |app| {
             // Register global shortcut: CmdOrCtrl+Shift+E toggles window visibility
             use tauri::Manager;
             use tauri_plugin_global_shortcut::GlobalShortcutExt;
+            let show = tauri::menu::MenuItem::with_id(app,"eko-show","显示",true,None::<&str>)?;
+            let quit = tauri::menu::MenuItem::with_id(app,"eko-quit","退出",true,None::<&str>)?;
+            let menu = tauri::menu::Menu::with_items(app,&[&show,&quit])?;
+            let mut tray = tauri::tray::TrayIconBuilder::with_id("eko-background")
+                .menu(&menu).show_menu_on_left_click(true)
+                .on_menu_event(move |app,event| match event.id.as_ref() {
+                    "eko-show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            if let Err(error) = window.show() {tracing::error!(%error,"Unable to show Eclip window");}
+                            if let Err(error) = window.unminimize() {tracing::error!(%error,"Unable to restore Eclip window");}
+                            if let Err(error) = window.set_focus() {tracing::error!(%error,"Unable to focus Eclip window");}
+                        }
+                    }
+                    "eko-quit" => {
+                        if let Some(owner) = desktop_lifecycle.upgrade() {
+                            let result = owner.lock().unwrap_or_else(|error|error.into_inner()).begin_shutdown();
+                            match result {
+                                Ok(()) => app.exit(0),
+                                Err(error) => tracing::error!(%error,"Unable to begin original desktop shutdown"),
+                            }
+                        }
+                    }
+                    _ => {}
+                });
+            if let Some(icon) = app.default_window_icon() { tray = tray.icon(icon.clone()); }
+            let _tray = tray.build(app)?;
+
 
             // Keep normal `cargo gui-dev` usable. The inspector opens only for
             // an explicitly requested `devtools` build.

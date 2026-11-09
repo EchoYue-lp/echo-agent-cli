@@ -2,13 +2,19 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const mocks = vi.hoisted(() => ({
-  create: vi.fn(),
-  listConfigured: vi.fn(),
-}));
+const mocks = vi.hoisted(() => {
+  Object.defineProperty(window, 'matchMedia', {
+    configurable: true,
+    value: () => ({ matches: false }),
+  });
+  return { create: vi.fn(), listConfigured: vi.fn() };
+});
 
 vi.mock('../../api/endpoints', () => ({
-  providerApi: { listConfigured: mocks.listConfigured },
+  providerApi: {
+    listConfigured: mocks.listConfigured,
+    listProviders: vi.fn().mockResolvedValue({ providers: [] }),
+  },
 }));
 
 vi.mock('../../stores/conversationStore', () => ({
@@ -47,7 +53,7 @@ describe('SideConversationDialog', () => {
     const onClose = vi.fn();
     render(<SideConversationDialog isOpen onClose={onClose} />);
 
-    await waitFor(() => expect(mocks.listConfigured).toHaveBeenCalled());
+    await screen.findByRole('option', { name: /Default$/ });
     fireEvent.change(screen.getByRole('textbox', { name: '要处理的问题' }), {
       target: { value: '验证另一个实现方向' },
     });
@@ -77,6 +83,7 @@ describe('SideConversationDialog', () => {
       .mockResolvedValueOnce({ conversation_id: 'side-1' });
     const onClose = vi.fn();
     render(<SideConversationDialog isOpen onClose={onClose} />);
+    await screen.findByRole('option', { name: /Default$/ });
     fireEvent.change(screen.getByRole('textbox', { name: '要处理的问题' }), {
       target: { value: '保持同一个创建意图' },
     });

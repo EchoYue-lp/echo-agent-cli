@@ -39,12 +39,22 @@ use std::path::{Path, PathBuf};
 pub struct HooksLoadResult {
     /// 合并后的 hooks 定义(空表示无任何 user hook)。
     pub definition: HooksDefinition,
+    /// Ordered inputs to that same merged definition. Origins are transient
+    /// registration facts, not independent hook stores or configuration.
+    pub(crate) origins: Vec<HookConfigOrigin>,
     /// 实际加载成功的文件路径列表(内嵌 eko.yaml 不算文件,
     /// 不进入此列表;只含 `~/.eko/hooks.yaml` 与 `.eko/hooks.yaml`)。
     pub loaded_from: Vec<PathBuf>,
     /// Read/parse errors. Reload callers must keep the existing live hook set
     /// when this is non-empty rather than replacing it with partial data.
     pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HookConfigOrigin {
+    pub definition: HooksDefinition,
+    pub directory: PathBuf,
+    pub project: bool,
 }
 
 /// hook 配置来源标识(仅用于日志/审计,不影响框架 `HookSource`)。
@@ -101,7 +111,23 @@ impl HookConfigLoader {
         app_config: &EkoConfig,
         project_root: Option<&Path>,
     ) -> HooksLoadResult {
+        Self::load_merged_with_file_system(
+            app_config,
+            project_root,
+            &echo_agent::tools::files::LocalFileSystem,
+        )
+    }
+
+    /// Preserve the original merge order while reading only the project
+    /// source through its admitted provider. Application/global config stays
+    /// on the machine that owns the GUI and configuration.
+    pub(crate) fn load_merged_with_file_system(
+        app_config: &EkoConfig,
+        project_root: Option<&Path>,
+        files: &dyn echo_agent::tools::filesystem::FileSystem,
+    ) -> HooksLoadResult {
         let mut definition = HooksDefinition::default();
+        let mut origins = Vec::new();
         let mut loaded_from = Vec::new();
         let mut errors = Vec::new();
 
@@ -109,6 +135,12 @@ impl HookConfigLoader {
         let inline = app_config.hooks.clone();
         let inline_rule_count: usize = inline.rules.values().map(Vec::len).sum();
         if inline_rule_count > 0 {
+            origins.push(HookConfigOrigin {
+                definition: inline.clone(),
+                directory: std::env::current_dir()
+                    .unwrap_or_else(|_| crate::data_root::user_data_dir()),
+                project: false,
+            });
             definition.merge(inline);
             tracing::info!(
                 source = HookConfigSource::InlineConfig.label(),
@@ -118,10 +150,18 @@ impl HookConfigLoader {
         }
 
         // 2 & 3. 两个 hooks.yaml 文件(全局 + 项目级)
-        Self::merge_file_sources(&mut definition, &mut loaded_from, &mut errors, project_root);
+        Self::merge_file_sources(
+            &mut definition,
+            &mut origins,
+            &mut loaded_from,
+            &mut errors,
+            project_root,
+            files,
+        );
 
         HooksLoadResult {
             definition,
+            origins,
             loaded_from,
             errors,
         }
@@ -147,8 +187,21 @@ impl HookConfigLoader {
         config_path: Option<&Path>,
         project_root: Option<&Path>,
     ) -> HooksLoadResult {
+        Self::load_merged_from_disk_with_file_system(
+            config_path,
+            project_root,
+            &echo_agent::tools::files::LocalFileSystem,
+        )
+    }
+
+    pub(crate) fn load_merged_from_disk_with_file_system(
+        config_path: Option<&Path>,
+        project_root: Option<&Path>,
+        files: &dyn echo_agent::tools::filesystem::FileSystem,
+    ) -> HooksLoadResult {
         let mut config_errors = Vec::new();
         let mut app_config = EkoConfig::default();
+        let mut loaded_config_directory = None;
         let search_paths = config_path
             .map(|path| vec![path.to_path_buf()])
             .unwrap_or_else(crate::config::config_search_paths);
@@ -159,6 +212,14 @@ impl HookConfigLoader {
             match crate::config::load_config_file(&path) {
                 Ok(config) => {
                     app_config = config;
+                    let absolute = if path.is_absolute() {
+                        path.clone()
+                    } else {
+                        std::env::current_dir()
+                            .map(|directory| directory.join(&path))
+                            .unwrap_or_else(|_| crate::data_root::user_data_dir().join(&path))
+                    };
+                    loaded_config_directory = absolute.parent().map(Path::to_path_buf);
                     break;
                 }
                 Err(error) => config_errors.push(format!(
@@ -168,7 +229,13 @@ impl HookConfigLoader {
             }
         }
 
-        let mut result = Self::load_merged_for_workspace(&app_config, project_root);
+        let mut result = Self::load_merged_with_file_system(&app_config, project_root, files);
+        if let Some(directory) = loaded_config_directory
+            && !app_config.hooks.is_empty()
+            && let Some(inline) = result.origins.first_mut()
+        {
+            inline.directory = directory;
+        }
         result.errors.splice(0..0, config_errors);
         result
     }
@@ -181,15 +248,25 @@ impl HookConfigLoader {
     /// 文件来源合并的唯一实现。
     fn merge_file_sources(
         definition: &mut HooksDefinition,
+        origins: &mut Vec<HookConfigOrigin>,
         loaded_from: &mut Vec<PathBuf>,
         errors: &mut Vec<String>,
         project_root: Option<&Path>,
+        files: &dyn echo_agent::tools::filesystem::FileSystem,
     ) {
         // 2. 全局 hooks: ~/.eko/hooks.yaml
         let global_path = crate::data_root::user_data_path("hooks.yaml");
         match try_load_yaml(&global_path) {
             Ok(Some(def)) => {
                 let count: usize = def.rules.values().map(Vec::len).sum();
+                origins.push(HookConfigOrigin {
+                    definition: def.clone(),
+                    directory: global_path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(crate::data_root::user_data_dir),
+                    project: false,
+                });
                 definition.merge(def);
                 loaded_from.push(global_path);
                 tracing::info!(
@@ -205,9 +282,14 @@ impl HookConfigLoader {
         // 3. 项目级 hooks: <workspace>/.eko/hooks.yaml
         if let Some(project_root) = project_root {
             let project_path = project_root.join(".eko").join("hooks.yaml");
-            match try_load_yaml(&project_path) {
+            match try_load_yaml_with_file_system(&project_path, files) {
                 Ok(Some(def)) => {
                     let count: usize = def.rules.values().map(Vec::len).sum();
+                    origins.push(HookConfigOrigin {
+                        definition: def.clone(),
+                        directory: project_root.to_path_buf(),
+                        project: true,
+                    });
                     definition.merge(def);
                     loaded_from.push(project_path);
                     tracing::info!(
@@ -228,11 +310,21 @@ impl HookConfigLoader {
 /// 文件不存在 → `Ok(None)`;读取或解析失败 → `Err`, so a live reload can
 /// preserve the last known-good hook set.
 fn try_load_yaml(path: &Path) -> Result<Option<HooksDefinition>, String> {
-    if !path.exists() {
+    try_load_yaml_with_file_system(path, &echo_agent::tools::files::LocalFileSystem)
+}
+
+fn try_load_yaml_with_file_system(
+    path: &Path,
+    files: &dyn echo_agent::tools::filesystem::FileSystem,
+) -> Result<Option<HooksDefinition>, String> {
+    if !files
+        .exists(path)
+        .map_err(|error| format!("Failed to inspect hooks file {}: {error}", path.display()))?
+    {
         return Ok(None);
     }
-
-    let content = std::fs::read_to_string(path)
+    let content = files
+        .read_to_string(path)
         .map_err(|error| format!("Failed to read hooks file {}: {error}", path.display()))?;
     serde_yaml::from_str::<HooksDefinition>(&content)
         .map(Some)
@@ -273,6 +365,171 @@ mod tests {
             hooks: def,
             ..EkoConfig::default()
         }
+    }
+
+    struct ProjectHookFiles {
+        path: PathBuf,
+        bytes: Vec<u8>,
+        offline: bool,
+    }
+
+    fn unsupported<T>() -> echo_agent::error::Result<T> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "unused test operation").into())
+    }
+
+    impl echo_agent::tools::filesystem::FileSystem for ProjectHookFiles {
+        fn current_dir(&self) -> echo_agent::error::Result<PathBuf> {
+            unsupported()
+        }
+        fn canonicalize(&self, _: &Path) -> echo_agent::error::Result<PathBuf> {
+            unsupported()
+        }
+        fn metadata(
+            &self,
+            path: &Path,
+        ) -> echo_agent::error::Result<echo_agent::tools::filesystem::FileMetadata> {
+            if self.offline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "project hooks disconnected",
+                )
+                .into());
+            }
+            if path != self.path {
+                return Err(
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "no target file").into(),
+                );
+            }
+            Ok(echo_agent::tools::filesystem::FileMetadata {
+                file_type: echo_agent::tools::filesystem::FileType::File,
+                len: u64::try_from(self.bytes.len()).unwrap_or(u64::MAX),
+                mode: None,
+                // 内存中的派生文件没有目标文件系统时间。
+                modified: None,
+            })
+        }
+        fn symlink_metadata(
+            &self,
+            path: &Path,
+        ) -> echo_agent::error::Result<echo_agent::tools::filesystem::FileMetadata> {
+            self.metadata(path)
+        }
+        fn read(&self, path: &Path) -> echo_agent::error::Result<Vec<u8>> {
+            self.metadata(path)?;
+            Ok(self.bytes.clone())
+        }
+        fn read_dir(
+            &self,
+            _: &Path,
+        ) -> echo_agent::error::Result<Vec<echo_agent::tools::filesystem::FileEntry>> {
+            unsupported()
+        }
+        fn create_dir_all(&self, _: &Path) -> echo_agent::error::Result<()> {
+            unsupported()
+        }
+        fn create_file(&self, _: &Path) -> echo_agent::error::Result<()> {
+            unsupported()
+        }
+        fn write(&self, _: &Path, _: &[u8]) -> echo_agent::error::Result<()> {
+            unsupported()
+        }
+        fn append(&self, _: &Path, _: &[u8]) -> echo_agent::error::Result<()> {
+            unsupported()
+        }
+        fn rename(&self, _: &Path, _: &Path) -> echo_agent::error::Result<()> {
+            unsupported()
+        }
+        fn remove_file(&self, _: &Path) -> echo_agent::error::Result<()> {
+            unsupported()
+        }
+        fn remove_dir(&self, _: &Path) -> echo_agent::error::Result<()> {
+            unsupported()
+        }
+        fn remove_dir_all(&self, _: &Path) -> echo_agent::error::Result<()> {
+            unsupported()
+        }
+        fn set_mode(&self, _: &Path, _: u32) -> echo_agent::error::Result<()> {
+            unsupported()
+        }
+        fn atomic_write(&self, _: &Path, _: &[u8]) -> echo_agent::error::Result<()> {
+            unsupported()
+        }
+        fn checkpoint(&self, _: &Path) -> echo_agent::error::Result<Option<String>> {
+            unsupported()
+        }
+    }
+
+    #[test]
+    fn project_hook_origins_use_provider_and_keep_local_config_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let host = tempfile::tempdir()?;
+        let project_root = host.path().join("same-name-project");
+        std::fs::create_dir_all(project_root.join(".eko"))?;
+        let path = project_root.join(".eko/hooks.yaml");
+        std::fs::write(
+            &path,
+            serde_yaml::to_string(&single_def(HookEvent::Stop, "host-only", "wrong host"))?,
+        )?;
+        let config = app_config_with_inline(single_def(
+            HookEvent::Stop,
+            "inline-first",
+            "local app config",
+        ));
+        let files = ProjectHookFiles {
+            path: path.clone(),
+            bytes: serde_yaml::to_string(&single_def(
+                HookEvent::Stop,
+                "project-last",
+                "target config",
+            ))?
+            .into_bytes(),
+            offline: false,
+        };
+        let loaded =
+            HookConfigLoader::load_merged_with_file_system(&config, Some(&project_root), &files);
+        assert!(loaded.errors.is_empty());
+        let stop = loaded.definition.rules_for(HookEvent::Stop);
+        assert_eq!(
+            stop.first().map(|rule| rule.matcher.as_str()),
+            Some("inline-first")
+        );
+        assert_eq!(
+            stop.last().map(|rule| rule.matcher.as_str()),
+            Some("project-last")
+        );
+        assert!(!stop.iter().any(|rule| rule.matcher == "host-only"));
+        assert!(
+            loaded
+                .origins
+                .first()
+                .is_some_and(|origin| !origin.project && origin.directory.is_absolute())
+        );
+        assert!(
+            loaded
+                .origins
+                .last()
+                .is_some_and(|origin| origin.project && origin.directory == project_root)
+        );
+        let offline = ProjectHookFiles {
+            offline: true,
+            ..files
+        };
+        let failed =
+            HookConfigLoader::load_merged_with_file_system(&config, Some(&project_root), &offline);
+        assert!(
+            failed
+                .errors
+                .iter()
+                .any(|error| error.contains("project hooks disconnected"))
+        );
+        assert!(
+            !failed
+                .definition
+                .rules_for(HookEvent::Stop)
+                .iter()
+                .any(|rule| rule.matcher == "host-only" || rule.matcher == "project-last")
+        );
+        Ok(())
     }
 
     // ── 合并顺序测试 ─────────────────────────────────────────────

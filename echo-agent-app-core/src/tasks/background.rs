@@ -122,14 +122,10 @@ pub enum ResearchOutputFormat {
 }
 
 impl BackgroundTaskKind {
+    /// A job kind describes its request, never grants a plugin identity or
+    /// a compiled professional method. Explicit domains bind at RunCreated.
     pub fn domain_profile(&self) -> DomainProfile {
-        match self {
-            Self::Research { .. } | Self::ResearchToWriting { .. } => {
-                DomainProfile::AcademicResearch
-            }
-            Self::DataPipeline { .. } => DomainProfile::DataAnalysis,
-            Self::WritingPipeline { .. } => DomainProfile::General,
-        }
+        DomainProfile::General
     }
 
     /// Return the tag string for this kind (used in `Task.tags`).
@@ -240,7 +236,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn background_kinds_select_domain_profiles() {
+    fn background_kinds_keep_requests_without_implicit_professional_authorization() {
         let data = BackgroundTaskKind::DataPipeline {
             dataset_path: "data.csv".to_string(),
             objective: None,
@@ -251,8 +247,8 @@ mod tests {
             max_papers: 5,
             output_format: ResearchOutputFormat::Markdown,
         };
-        assert_eq!(data.domain_profile(), DomainProfile::DataAnalysis);
-        assert_eq!(research.domain_profile(), DomainProfile::AcademicResearch);
+        assert_eq!(data.domain_profile(), DomainProfile::General);
+        assert_eq!(research.domain_profile(), DomainProfile::General);
         let data_prompt = data.to_prompt();
         assert!(data_prompt.contains("run_code using script_path"));
         assert!(data_prompt.contains("contract_version to 1"));

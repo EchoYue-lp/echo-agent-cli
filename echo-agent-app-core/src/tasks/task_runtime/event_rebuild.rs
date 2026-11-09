@@ -21,11 +21,11 @@ use super::types::{
     ActiveSubagentBoundary, ActiveToolBoundary, Artifact, ArtifactKind, AttendedMode,
     BackgroundCellArtifactStatus, BackgroundCellPhase, BackgroundCellState,
     BackgroundCellTerminalCause, BlockerAudit, DomainProfile, ExecutionMode, PhysicalOwnerIntent,
-    PlanRevision, PlanTask, ProviderRetryState, RecordedUserSteer, RecoveryBlocker, ReviewOutcome,
-    ReviewResult, RunContinuationState, RunPause, RunPauseReason, RunStateEventIndex,
-    RunStateSnapshot, RunTurnOrigin, RunTurnStatus, RunTurnSummary, RuntimeEventKind,
-    RuntimeTaskEvent, TaskExecutionSummary, TaskPlan, TaskRun, TaskRunExecutionProfile,
-    TaskRunStatus, TurnVisibility,
+    PlanRevision, PlanTask, ProjectExecutionBinding, ProviderRetryState, RecordedUserSteer,
+    RecoveryBlocker, ReviewOutcome, ReviewResult, RunContinuationState, RunPause, RunPauseReason,
+    RunStateEventIndex, RunStateSnapshot, RunTurnOrigin, RunTurnStatus, RunTurnSummary,
+    RuntimeEventKind, RuntimeTaskEvent, TaskExecutionSummary, TaskPlan, TaskRun,
+    TaskRunExecutionProfile, TaskRunStatus, TurnVisibility,
 };
 
 /// How many recent user steers the fold keeps for the recovery capsule.
@@ -210,6 +210,7 @@ pub(crate) struct TodoQueryProjection {
 #[derive(Debug, Clone)]
 pub(crate) struct CompletionGateProjection {
     pub(crate) run: TaskRun,
+    pub(crate) project_binding: Option<ProjectExecutionBinding>,
     pub(crate) plan: Option<TaskPlan>,
     pub(crate) completion: CompletionQueryProjection,
     pub(crate) active_subagents: Vec<ActiveSubagentBoundary>,
@@ -232,6 +233,10 @@ pub struct RebuiltPlan {
     #[serde(default)]
     pub execution_profile: TaskRunExecutionProfile,
     #[serde(default)]
+    pub project_binding: Option<ProjectExecutionBinding>,
+    #[serde(default)]
+    pub domain_binding: Option<crate::domain_plugin::DomainBinding>,
+    #[serde(default)]
     pub(crate) event_index: RunStateEventIndex,
 }
 
@@ -242,6 +247,7 @@ impl RebuiltPlan {
             run_id: self.plan.run_id.clone(),
             revision: self.plan.revision,
             domain_profile: self.plan.domain_profile,
+            domain_binding: self.run.domain_binding.clone(),
             goal_revision: self.plan.goal_revision,
             goal_sha256: self.plan.goal_sha256.clone(),
             assumptions: self.plan.assumptions.clone(),
@@ -259,6 +265,8 @@ impl RebuiltPlan {
             background_cells: self.background_cells.clone(),
             recent_constraints: self.recent_constraints.clone(),
             execution_profile: self.execution_profile,
+            project_binding: self.project_binding.clone(),
+            domain_binding: self.domain_binding.clone(),
             journal_sequence,
             event_index: self.event_index.clone(),
         }
@@ -292,7 +300,13 @@ pub(crate) struct EventFoldState {
     #[serde(default)]
     recent_constraints: Vec<RecordedUserSteer>,
     #[serde(default)]
+    accepted_user_inputs: std::collections::BTreeMap<String, super::types::RunInputAcceptance>,
+    #[serde(default)]
     execution_profile: TaskRunExecutionProfile,
+    #[serde(default)]
+    project_binding: Option<ProjectExecutionBinding>,
+    #[serde(default)]
+    domain_binding: Option<crate::domain_plugin::DomainBinding>,
     #[serde(default)]
     started_turns: std::collections::BTreeSet<String>,
     #[serde(default)]
@@ -331,6 +345,77 @@ pub(crate) struct EventFoldState {
     missing_record_sequence: bool,
 }
 
+/// 原接受事实只折叠来源索引；不写近期context投影，也不把取消/替换解释成已应用。
+fn fold_run_input_snapshot(
+    event: &RuntimeTaskEvent,
+    run: Option<&TaskRun>,
+    accepted: &mut std::collections::BTreeMap<String, super::types::RunInputAcceptance>,
+) -> Result<(), String> {
+    use super::types::RunInputRole;
+    let role: RunInputRole = serde_json::from_value(
+        event
+            .payload
+            .get("role")
+            .cloned()
+            .ok_or_else(|| "任务输入接受缺少明确用途".to_string())?,
+    )
+    .map_err(|_| "任务输入接受用途无法恢复".to_string())?;
+    let snapshot: super::types::RunInputSnapshot = serde_json::from_value(
+        event
+            .payload
+            .get("input_snapshot")
+            .cloned()
+            .ok_or_else(|| "任务输入接受缺少原源快照".to_string())?,
+    )
+    .map_err(|_| "任务输入源快照无法恢复".to_string())?;
+    snapshot.validate()?;
+    let turn_id = json_string(&event.payload, "turn_id").unwrap_or_default();
+    if turn_id.trim().is_empty()
+        || run.is_none_or(|run| {
+            run.run_id != event.run_id
+                || run.workspace_id != snapshot.identity.address.workspace_id
+                || run.conversation_id != snapshot.identity.address.conversation_id
+                || (role == RunInputRole::InitialGoal
+                    && (run.goal != snapshot.payload.text || run.root_message_id != turn_id))
+        })
+    {
+        return Err("任务输入源不属于原运行地址或原始Goal".to_string());
+    }
+    let key = snapshot
+        .key()
+        .map_err(|_| "任务输入身份无法恢复".to_string())?;
+    if let Some(previous) = accepted.get(&key) {
+        if previous.identity != snapshot.identity
+            || previous.source != snapshot.source
+            || previous.turn_id != turn_id
+            || previous.role != role
+        {
+            return Err("同一任务输入修订发生身份或目标冲突".to_string());
+        }
+        return Ok(());
+    }
+    if accepted.values().any(|previous| {
+        previous.identity.address == snapshot.identity.address
+            && previous.identity.input_id == snapshot.identity.input_id
+            && previous.identity.revision > snapshot.identity.revision
+    }) {
+        return Err("任务输入旧修订迟于已接受的新修订".to_string());
+    }
+    accepted.insert(
+        key,
+        super::types::RunInputAcceptance {
+            role,
+            run_id: event.run_id.clone(),
+            turn_id,
+            source: snapshot.source,
+            identity: snapshot.identity,
+            journal_sequence: event.seq,
+            duplicate: false,
+        },
+    );
+    Ok(())
+}
+
 impl EventFoldState {
     pub(crate) fn has_committed_plan(&self) -> bool {
         self.plan.is_some()
@@ -349,7 +434,7 @@ impl EventFoldState {
     }
 
     pub(crate) fn has_current_query_projection_schema(&self) -> bool {
-        self.query_projection_schema == Some(3)
+        self.query_projection_schema == Some(5)
     }
 
     #[cfg(test)]
@@ -373,7 +458,10 @@ impl EventFoldState {
             background_cells,
             continuation,
             recent_constraints,
+            accepted_user_inputs,
             execution_profile,
+            project_binding,
+            domain_binding,
             started_turns,
             accounted_usage,
             accounted_compactions,
@@ -392,13 +480,34 @@ impl EventFoldState {
             sequence_overflow: _,
             missing_record_sequence: _,
         } = self;
-        *query_projection_schema = Some(3);
+        *query_projection_schema = Some(5);
         use RuntimeEventKind as K;
         for ev in std::slice::from_ref(event) {
             seen_run_ids.insert(ev.run_id.clone());
             match ev.event_type {
                 K::RunCreated => {
                     let p = &ev.payload;
+                    *domain_binding = match p.get("domain_binding").filter(|value| !value.is_null())
+                    {
+                        None => None,
+                        Some(value) => match serde_json::from_value::<
+                            crate::domain_plugin::DomainBinding,
+                        >(value.clone())
+                        {
+                            Ok(binding) => match binding.validate() {
+                                Ok(()) => Some(binding),
+                                Err(error) => {
+                                    *invalid_execution = Some(error);
+                                    None
+                                }
+                            },
+                            Err(_) => {
+                                *invalid_execution =
+                                    Some("RunCreated has an invalid domain binding".to_string());
+                                None
+                            }
+                        },
+                    };
                     let goal = p
                         .get("goal")
                         .and_then(|v| v.as_str())
@@ -426,6 +535,9 @@ impl EventFoldState {
                             .and_then(|v| v.as_str())
                             .and_then(DomainProfile::from_str)
                             .unwrap_or_default(),
+                        domain_binding: domain_binding
+                            .as_ref()
+                            .map(crate::domain_plugin::DomainBinding::reference),
                         status: TaskRunStatus::Pending,
                         goal_revision: p
                             .get("goal_revision")
@@ -460,6 +572,16 @@ impl EventFoldState {
                         .cloned()
                         .and_then(|value| serde_json::from_value(value).ok())
                         .unwrap_or_default();
+                    match p.get("project_binding").filter(|value| !value.is_null()) {
+                        None => *project_binding = None,
+                        Some(value) => match serde_json::from_value(value.clone()) {
+                            Ok(binding) => *project_binding = Some(binding),
+                            Err(error) => {
+                                *invalid_execution =
+                                    Some(format!("RunCreated project binding is invalid: {error}"));
+                            }
+                        },
+                    }
                 }
                 K::RunGoalUpdated => {
                     if let Some(r) = run.as_mut()
@@ -482,6 +604,13 @@ impl EventFoldState {
                         json_string(&ev.payload, "continuation_deferred_reason");
                     completion.requirement_skips.clear();
                     completion.revalidations.clear();
+                }
+                K::RunInputAccepted => {
+                    if let Err(error) =
+                        fold_run_input_snapshot(ev, run.as_ref(), accepted_user_inputs)
+                    {
+                        *invalid_execution = Some(error);
+                    }
                 }
                 K::RunSteerRecorded => {
                     if let Some(text) = json_string(&ev.payload, "text") {
@@ -673,6 +802,8 @@ impl EventFoldState {
                             }
                         }
                         *plan = Some(TaskPlan {
+                            domain_binding: committed.domain_binding,
+
                             plan_id: committed.plan_id,
                             run_id: committed.run_id,
                             revision: committed.revision,
@@ -1384,7 +1515,10 @@ impl EventFoldState {
             continuation: self.continuation.clone(),
             recent_constraints: self.recent_constraints.clone(),
             execution_profile: self.execution_profile,
+            project_binding: self.project_binding.clone(),
+            domain_binding: self.domain_binding.clone(),
             event_index: RunStateEventIndex {
+                accepted_user_inputs: self.accepted_user_inputs.clone(),
                 started_turns: self.started_turns.clone(),
                 accounted_usage: self.accounted_usage.clone(),
                 accounted_compactions: self.accounted_compactions.clone(),
@@ -1405,6 +1539,7 @@ impl EventFoldState {
             run_id: rebuilt.plan.run_id.clone(),
             revision: rebuilt.plan.revision,
             domain_profile: rebuilt.plan.domain_profile,
+            domain_binding: rebuilt.run.domain_binding.clone(),
             goal_revision: rebuilt.plan.goal_revision,
             goal_sha256: rebuilt.plan.goal_sha256.clone(),
             assumptions: rebuilt.plan.assumptions.clone(),
@@ -1446,6 +1581,7 @@ impl EventFoldState {
             .collect::<std::collections::HashSet<_>>();
         Ok(CompletionGateProjection {
             run: rebuilt.run,
+            project_binding: rebuilt.project_binding,
             plan,
             completion: self.completion.for_tasks(&task_ids),
             active_subagents: self.active_subagents.values().cloned().collect(),
@@ -1836,6 +1972,8 @@ fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
 
 fn empty_plan_for(run: &TaskRun) -> TaskPlan {
     TaskPlan {
+        domain_binding: run.domain_binding.clone(),
+
         plan_id: String::new(),
         run_id: run.run_id.clone(),
         revision: 0,
@@ -1878,6 +2016,9 @@ mod tests {
 
     fn sample_task(id: &str, kind: PlanTaskKind) -> PlanTask {
         PlanTask {
+            domain_binding: None,
+            domain_role: None,
+
             id: id.to_string(),
             title: format!("task {id}"),
             description: format!("do {id}"),
@@ -1916,6 +2057,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         store.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: "replay-plan".to_string(),
             run_id: "replay-run".to_string(),
             revision: 1,
@@ -2111,6 +2254,8 @@ mod tests {
 
         // 2. attach a structured plan (the authoritative plan-creation path).
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
             revision: 1,
@@ -2202,6 +2347,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         s.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
             revision: 1,
@@ -2220,7 +2367,7 @@ mod tests {
                 reason: "refine investigation".to_string(),
                 operations: vec![TaskUpdateOperation::Update {
                     task_id: "t1".to_string(),
-                    patch: TaskPatch {
+                    patch: Box::new(TaskPatch {
                         title: Some("renamed".to_string()),
                         description: Some("new desc".to_string()),
                         kind: Some(PlanTaskKind::ReadOnlyReview),
@@ -2232,7 +2379,7 @@ mod tests {
                         execution_checks: None,
                         acceptance_criteria: None,
                         max_retries: None,
-                    },
+                    }),
                 }],
             },
         )?;

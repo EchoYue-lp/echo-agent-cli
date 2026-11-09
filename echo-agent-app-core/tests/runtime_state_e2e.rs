@@ -23,7 +23,6 @@ fn make_app_config() -> EkoConfig {
     let mut c = EkoConfig::default();
     c.agent.name = "rt-test-agent".to_string();
     c.agent.system_prompt = "You are a test runtime agent.".to_string();
-    c.agent.max_iterations = 1;
     c.agent.token_limit = 4096;
     c.model_providers.insert(
         "test-provider".to_string(),
@@ -85,6 +84,7 @@ async fn create_agent_threads_state_store_and_conversation_id() -> Result<(), St
             echo_agent_app_core::api::product_data_io::ProductDataIoService::new(),
         ),
         execution_scope: None,
+        ..Default::default()
     };
     let app_config = make_app_config();
     let agent = infra::create_agent(&params, &app_config)
@@ -122,6 +122,7 @@ async fn create_agent_without_explicit_state_store_uses_product_default() -> Res
             echo_agent_app_core::api::product_data_io::ProductDataIoService::new(),
         ),
         execution_scope: None,
+        ..Default::default()
     };
     let app_config = make_app_config();
     let agent = infra::create_agent(&params, &app_config)
@@ -161,6 +162,7 @@ async fn memory_context_suffix_lands_in_system_prompt() -> Result<(), String> {
             echo_agent_app_core::api::product_data_io::ProductDataIoService::new(),
         ),
         execution_scope: None,
+        ..Default::default()
     };
     let app_config = make_app_config();
     let agent = infra::create_agent(&params, &app_config)
@@ -195,6 +197,7 @@ async fn create_agent_exposes_prompt_assembly_diagnostics() -> Result<(), String
             echo_agent_app_core::api::product_data_io::ProductDataIoService::new(),
         ),
         execution_scope: None,
+        ..Default::default()
     };
     let created = infra::create_agent_with_diagnostics(&params, &make_app_config()).await?;
 

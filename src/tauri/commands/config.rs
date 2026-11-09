@@ -8,6 +8,7 @@ use echo_agent_app_core::api::types::{
     AgentConfigResponse, ChannelsConfigResponse, FeishuConfigResponse, FullConfigResponse,
     LoggingConfigResponse, McpConfigResponse, ModelConfigResponse, QqConfigResponse,
     ServerConfigResponse, SessionConfigResponse, UpdateConfigRequest, UpdateFullConfigRequest,
+    WeixinConfigResponse,
 };
 
 fn configured_model_names(cfg: &echo_agent_app_core::api::config::EkoConfig) -> Vec<String> {
@@ -23,6 +24,7 @@ fn full_config_response(cfg: &echo_agent_app_core::api::config::EkoConfig) -> Fu
     let token_limit = echo_agent_app_core::api::infra::effective_token_limit(cfg, runtime.as_ref());
     let available_models = configured_model_names(cfg);
     FullConfigResponse {
+        max_subagent_depth: cfg.max_subagent_depth.get(),
         model: ModelConfigResponse {
             provider: runtime
                 .as_ref()
@@ -37,12 +39,10 @@ fn full_config_response(cfg: &echo_agent_app_core::api::config::EkoConfig) -> Fu
                 .is_some_and(|value| value.auth_token.is_some()),
             base_url: runtime.as_ref().and_then(|value| value.base_url.clone()),
             max_tokens: runtime.as_ref().and_then(|value| value.max_tokens),
-            temperature: runtime.as_ref().and_then(|value| value.temperature),
         },
         agent: AgentConfigResponse {
             model: runtime.map(|value| value.model).unwrap_or_default(),
             system_prompt: cfg.agent.system_prompt.clone(),
-            max_iterations: cfg.agent.max_iterations,
             token_limit,
             session_id: None,
             available_models,
@@ -59,6 +59,16 @@ fn full_config_response(cfg: &echo_agent_app_core::api::config::EkoConfig) -> Fu
                 enabled: cfg.channels.feishu.enabled,
                 app_id: cfg.channels.feishu.app_id.clone(),
                 mode: cfg.channels.feishu.mode.clone(),
+            },
+            weixin: WeixinConfigResponse {
+                enabled: cfg.channels.weixin.enabled,
+                has_credential: cfg.channels.weixin.account.is_some(),
+                account_id: cfg
+                    .channels
+                    .weixin
+                    .account
+                    .as_ref()
+                    .map(|account| account.account_id.clone()),
             },
             session: SessionConfigResponse {
                 timeout_minutes: cfg.channels.session.timeout_minutes,
@@ -85,17 +95,10 @@ fn build_agent_config_response(
     AgentConfigResponse {
         model: agent.model_name().to_string(),
         system_prompt: agent.system_prompt().to_string(),
-        max_iterations: display_max_iterations(agent.config().get_max_iterations()),
         token_limit: agent.config().get_token_limit(),
         session_id: agent.config().get_session_id().map(|s| s.to_string()),
         available_models,
     }
-}
-
-/// Keep the EKO wire sentinel stable while the framework receives a positive
-/// value for its validated iteration ceiling.
-fn display_max_iterations(value: usize) -> usize {
-    if value == usize::MAX { 0 } else { value }
 }
 
 #[tauri::command]
@@ -143,16 +146,6 @@ pub async fn update_config(
         tracing::info!("系统提示词已更新");
     }
 
-    // Sync the loop ceiling to every running agent (primary + pools). The
-    // EKO `0` = unlimited sentinel is resolved inside the publication.
-    if let Some(max_iterations) = req.max_iterations {
-        state
-            .app_state
-            .apply_max_iterations_to_agents(max_iterations)
-            .await;
-        tracing::info!(max_iterations, "max_iterations 已同步到运行中的 Agent");
-    }
-
     let available_models = {
         let cfg = state.app_state.config.app_config.read().await;
         configured_model_names(&cfg)
@@ -179,9 +172,16 @@ pub async fn update_full_config(
     req: UpdateFullConfigRequest,
 ) -> Result<FullConfigResponse, IpcError> {
     let reapply_active_model = req.model.is_some();
+    let update_prompt = req
+        .agent
+        .as_ref()
+        .is_some_and(|agent| agent.system_prompt.is_some());
     let config = state
         .app_state
         .update_app_config_owned(reapply_active_model, move |cfg| {
+            if let Some(limit) = req.max_subagent_depth {
+                cfg.max_subagent_depth = limit;
+            }
             if let Some(m) = req.model {
                 let active_model_id = model_config::resolve_runtime_model(cfg, None)
                     .ok()
@@ -191,13 +191,9 @@ pub async fn update_full_config(
                         .configured_models
                         .iter_mut()
                         .find(|model| model.id == active_model_id)
+                    && let Some(max_tokens) = m.max_tokens
                 {
-                    if let Some(max_tokens) = m.max_tokens {
-                        active_model.max_tokens = Some(max_tokens);
-                    }
-                    if let Some(temperature) = m.temperature {
-                        active_model.temperature = Some(temperature);
-                    }
+                    active_model.max_tokens = Some(max_tokens);
                 }
             }
 
@@ -207,9 +203,6 @@ pub async fn update_full_config(
                 }
                 if let Some(v) = a.system_prompt {
                     cfg.agent.system_prompt = v;
-                }
-                if let Some(v) = a.max_iterations {
-                    cfg.agent.max_iterations = v;
                 }
                 if let Some(v) = a.memory_path {
                     cfg.agent.memory_path = v;
@@ -285,18 +278,13 @@ pub async fn update_full_config(
 
     // Model runtime settings were settled by the owned config mutation. The
     // system prompt is independent of model generation publication.
-    let system_prompt = config.agent.system_prompt.clone();
-    state
-        .app_state
-        .apply_system_prompt_to_agents(system_prompt)
-        .await;
-    // `max_iterations` rides the same authoritative transaction: persist to
-    // YAML above, then publish the resolved ceiling to the running agents so
-    // the saved value is actually enforced without a restart.
-    state
-        .app_state
-        .apply_max_iterations_to_agents(config.agent.max_iterations)
-        .await;
+    if update_prompt {
+        let system_prompt = config.agent.system_prompt.clone();
+        state
+            .app_state
+            .apply_system_prompt_to_agents(system_prompt)
+            .await;
+    }
     tracing::info!("配置已同步到 Agent");
 
     Ok(full_config_response(&config))
@@ -324,18 +312,8 @@ pub async fn discover_config() -> Result<serde_json::Value, IpcError> {
         .collect();
 
     Ok(serde_json::json!({
+        "diagnostics": inventory.diagnostics,
         "total": inventory.total_count(),
         "files": files,
     }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::display_max_iterations;
-
-    #[test]
-    fn unbounded_iteration_sentinel_round_trips_as_eko_zero() {
-        assert_eq!(display_max_iterations(usize::MAX), 0);
-        assert_eq!(display_max_iterations(10), 10);
-    }
 }

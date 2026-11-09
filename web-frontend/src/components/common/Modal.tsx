@@ -10,11 +10,13 @@ import { createPortal } from 'react-dom';
 
 const FOCUSABLE_SELECTOR = [
   'a[href]',
-  'button:not([disabled])',
-  'input:not([disabled])',
-  'select:not([disabled])',
-  'textarea:not([disabled])',
-  '[tabindex]:not([tabindex="-1"])',
+  // :disabled包含父fieldset的禁用状态，避免HITL提交中把焦点送到不可操作的选项。
+  'button:not(:disabled)',
+  'input:not(:disabled)',
+  'select:not(:disabled)',
+  'textarea:not(:disabled)',
+  'summary',
+  '[tabindex]:not([tabindex="-1"]):not(:disabled)',
 ].join(',');
 
 interface ModalStackEntry {
@@ -186,7 +188,7 @@ export function Modal({
           type="button"
           tabIndex={-1}
           aria-label="关闭对话框"
-          className="absolute inset-0 z-0 cursor-default"
+          className="eko-modal-backdrop absolute inset-0 z-0 cursor-default"
           style={{ background: 'var(--bg-overlay)' }}
           onClick={() => {
             if (getTopmostModal() === entry) onCloseRef.current();
@@ -195,7 +197,7 @@ export function Modal({
       ) : (
         <div
           aria-hidden="true"
-          className="absolute inset-0 z-0"
+          className="eko-modal-backdrop absolute inset-0 z-0"
           style={{ background: 'var(--bg-overlay)' }}
         />
       )}
@@ -206,7 +208,7 @@ export function Modal({
         aria-label={ariaLabel}
         aria-labelledby={ariaLabelledBy}
         tabIndex={-1}
-        className={`relative z-10 ${className ?? ''}`}
+        className={`eko-modal-surface relative z-10 ${className ?? ''}`}
         style={style}
       >
         {children}

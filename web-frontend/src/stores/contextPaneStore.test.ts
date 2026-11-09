@@ -10,7 +10,7 @@ describe('context pane geometry', () => {
     expect(boundContextPaneWidth(200)).toBe(380);
     expect(boundContextPaneWidth(560)).toBe(560);
     expect(boundContextPaneWidth(1000)).toBe(760);
-    expect(contextPaneWidthForViewport(700, 1440, true)).toBe(656);
+    expect(contextPaneWidthForViewport(700, 1440, true)).toBe(632);
     expect(contextPaneWidthForViewport(520, 1000, false)).toBe(520);
   });
 });

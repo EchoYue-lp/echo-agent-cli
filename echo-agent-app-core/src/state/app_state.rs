@@ -82,6 +82,13 @@ impl AppState {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    #[cfg(all(test, feature = "channels"))]
+    pub(crate) fn set_workspace_transition_for_test(&self, in_progress: bool) {
+        self.workspace
+            .transitioning
+            .store(in_progress, std::sync::atomic::Ordering::Release);
+    }
+
     /// 从共享的 Agent 和 HITL Dispatcher 创建状态（用于双模式）
     #[allow(clippy::too_many_arguments)]
     pub fn from_shared(
@@ -94,6 +101,9 @@ impl AppState {
         mcp_config_runtime: Arc<crate::mcp_config_runtime::McpConfigRuntime>,
         product_data_io: crate::product_data_io::ProductDataIoService,
     ) -> anyhow::Result<Self> {
+        let subagent_depth_defaults = Arc::new(crate::subagent_policy::SubagentDepthDefaults::new(
+            app_config.max_subagent_depth,
+        ));
         let config = agent
             .try_write(|guard| WebConfig {
                 model: guard.model_name().to_string(),
@@ -136,6 +146,12 @@ impl AppState {
             ),
         };
         let conversation_binding = Arc::new(RwLock::new(global_conversation.clone()));
+        let terminal = crate::terminal::TerminalService::new();
+        let scheduler_cancel_token = CancellationToken::new();
+        #[cfg(feature = "channels")]
+        let weixin_notifications = Arc::new(crate::weixin_cron::WeixinCronBinding::new(
+            scheduler_cancel_token.clone(),
+        ));
 
         Ok(Self {
             connection: ConnectionState {
@@ -146,7 +162,9 @@ impl AppState {
                 conversation_binding: conversation_binding.clone(),
             },
             config: ConfigState {
+                subagent_depth_defaults: subagent_depth_defaults.clone(),
                 app_config: RwLock::new(app_config),
+                app_config_revision: std::sync::Mutex::new(uuid::Uuid::new_v4().to_string()),
                 active_model_id: RwLock::new(active_model_id),
                 config_path: crate::config_watcher::resolve_config_save_path(None),
                 web_config: RwLock::new(config),
@@ -213,14 +231,17 @@ impl AppState {
             },
             scheduler: SchedulerState {
                 runner: None,
-                cancel_token: echo_agent::agent::CancellationToken::new(),
+                cancel_token: scheduler_cancel_token,
+                #[cfg(feature = "channels")]
+                weixin_notifications,
                 handle: Mutex::new(None),
             },
             tasks: TaskState {
                 service: None,
                 cancel_token: CancellationToken::new(),
                 runtime: Some(Arc::new(
-                    crate::tasks::task_runtime::TaskRuntimeStore::new()?,
+                    crate::tasks::task_runtime::TaskRuntimeStore::new()?
+                        .with_subagent_depth_defaults(subagent_depth_defaults.clone()),
                 )),
             },
             webhook: WebhookState {
@@ -234,7 +255,9 @@ impl AppState {
                 runtimes: Arc::new(
                     crate::workspace::runtime::WorkspaceRuntimeRegistry::new_with_product_data_io(
                         product_data_io,
-                    ),
+                    )
+                    .with_subagent_depth_defaults(subagent_depth_defaults)
+                    .with_terminal_service(terminal.clone()),
                 ),
                 global_conversation,
                 transition: Arc::new(RwLock::new(())),
@@ -269,7 +292,7 @@ impl AppState {
             plugin_runtime: None,
             config_watcher: None,
             command_cell_runtime: None,
-            terminal: crate::terminal::TerminalService::new(),
+            terminal,
             browser_runtime: None,
             agent_router: crate::agent_router::AgentRouter::at_default_root(),
             agent_control_wake: Arc::new(std::sync::OnceLock::new()),
@@ -368,6 +391,30 @@ impl AppState {
         })
         .await
         .map(|receipt| receipt.config)
+    }
+
+    /// Compare channel edits inside the existing config mutation owner, after
+    /// earlier accepted publications; a preflight read alone would race.
+    #[cfg(feature = "channels")]
+    pub async fn update_channels_config_owned<Update>(
+        self: &Arc<Self>,
+        expected_revision: String,
+        update: Update,
+    ) -> Result<ModelMutationReceipt, ModelMutationError>
+    where
+        Update: FnOnce(&mut crate::config::ChannelsConfig) -> Result<(), String> + Send + 'static,
+    {
+        let state = Arc::clone(self);
+        self.run_owned_model_mutation(ModelMutationRequest::UpdateConfig {
+            reapply_active_model: false,
+            update: Box::new(move |config| {
+                if state.config.configuration_revision() != expected_revision {
+                    return Err("Channel configuration changed; reload before saving".to_string());
+                }
+                update(&mut config.channels)
+            }),
+        })
+        .await
     }
 
     async fn run_owned_model_mutation(
@@ -569,7 +616,21 @@ impl AppState {
 
         self.save_app_config(&mutation.config)
             .map_err(ModelMutationError::Persistence)?;
-        *self.config.app_config.write().await = mutation.config.clone();
+        // Publish only the default for future admissions. Never walk active
+        // agents/runs and rewrite their captured delegation policy.
+        let configuration_revision = uuid::Uuid::new_v4().to_string();
+        {
+            let mut config = self.config.app_config.write().await;
+            *config = mutation.config.clone();
+            *self
+                .config
+                .app_config_revision
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = configuration_revision.clone();
+            self.config
+                .subagent_depth_defaults
+                .publish(mutation.config.max_subagent_depth);
+        }
 
         if let Some(publication) = primary_publication {
             publication.commit().await;
@@ -602,6 +663,7 @@ impl AppState {
             tracing::info!("active model removed; agent requires model configuration");
         }
         Ok(ModelMutationReceipt {
+            configuration_revision,
             config: mutation.config,
             model_id: mutation.model_id,
             runtime: mutation.runtime,
@@ -1765,6 +1827,19 @@ impl AppState {
         // latent override bug where overlapping cron runs clobbered the shared
         // agent's working_dir). Falls back to the shared primary agent when no
         // pool is configured.
+        #[cfg(feature = "channels")]
+        let runner = crate::scheduler::runner::new_scheduler_runner_with_weixin(
+            store,
+            self.scheduler.cancel_token.clone(),
+            self.connection.agent.clone(),
+            self.tasks.runtime.clone(),
+            self.connection.pool.clone(),
+            Some(self.webhook.emitter.clone()),
+            self.review_integration.clone(),
+            Some(self.scheduler.weixin_notifications.clone()),
+        )
+        .await?;
+        #[cfg(not(feature = "channels"))]
         let runner = crate::scheduler::new_scheduler_runner(
             store,
             self.scheduler.cancel_token.clone(),
@@ -1839,6 +1914,92 @@ impl AppState {
             pool.spawn_cleanup_monitor().await;
         }
         Ok(())
+    }
+
+    /// Reconcile notification debt only after the original channel-start
+    /// owner has installed its GUI/HITL factory and attempted configured
+    /// transport startup. The caller retains that startup/lifecycle receipt.
+    /// Every candidate comes from the original completed TaskRun admission;
+    /// current GUI workspace and mutable notification config are not consulted.
+    #[cfg(feature = "channels")]
+    pub async fn recover_weixin_notifications_after_channel_start(
+        &self,
+        sender: Arc<dyn crate::tasks::task_runtime::weixin_delivery::WeixinCronDelivery>,
+        cancel: &CancellationToken,
+    ) -> crate::tasks::task_runtime::weixin_delivery::WeixinNotificationRecoveryReport {
+        use crate::tasks::task_runtime::weixin_delivery::WeixinNotificationRecoveryReport;
+        let mut report = WeixinNotificationRecoveryReport::default();
+        if let Some(store) = self.tasks.runtime.clone() {
+            report.merge(
+                store
+                    .recover_weixin_notifications(sender.clone(), cancel)
+                    .await,
+            );
+        }
+        let registry = Arc::clone(&self.workspace.registry);
+        let workspaces = match self
+            .session
+            .product_data_io
+            .run(
+                "list original workspaces for Weixin notification recovery",
+                move || registry.list(),
+            )
+            .await
+        {
+            Ok(Ok(workspaces)) => workspaces,
+            Ok(Err(error)) => {
+                report.pending.push(format!("workspace registry: {error}"));
+                return report;
+            }
+            Err(error) => {
+                report
+                    .pending
+                    .push(format!("workspace registry owner: {error}"));
+                return report;
+            }
+        };
+        for workspace in workspaces {
+            if cancel.is_cancelled() {
+                report.pending.push(
+                    "original channel-start recovery cancelled; frozen admissions remain pending"
+                        .to_string(),
+                );
+                break;
+            }
+            let workspace_id = workspace.id.to_string();
+            let (host, control_lease) =
+                match self.workspace.runtimes.get_or_open_control(workspace).await {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        report
+                            .pending
+                            .push(format!("workspace {workspace_id}: {error}"));
+                        continue;
+                    }
+                };
+            let store = match host.task_runtime().await {
+                Ok(store) => store,
+                Err(error) => {
+                    report
+                        .pending
+                        .push(format!("workspace {workspace_id}: {error}"));
+                    continue;
+                }
+            };
+            // Hold the same original scoped control lease through physical
+            // send settlement; workspace deletion cannot overtake recovery.
+            report.merge(
+                store
+                    .recover_weixin_notifications_with_workspace(
+                        sender.clone(),
+                        cancel,
+                        Some(control_lease.io_lifetime()),
+                    )
+                    .await,
+            );
+            drop(control_lease);
+        }
+        report
     }
 
     async fn reconcile_task_runs_at_boot(&self) -> TaskRunBootReport {
@@ -2256,27 +2417,75 @@ impl AppState {
     ) -> std::result::Result<Vec<crate::types::ToolInfo>, crate::tool_control::ToolControlError>
     {
         let policy_disabled = self.tool_control.snapshot()?.disabled_tools;
-        let (definitions, mut disabled) = handle
+        let (definitions, mut disabled, sources) = handle
             .read(|agent| {
                 let runtime = echo_agent::agent::AgentRunSnapshot::from_agent(agent);
                 (
                     agent.tool_definitions(),
                     runtime.tools.disabled_tools.clone(),
+                    crate::tool_control::mcp_tool_sources(agent),
                 )
             })
             .await;
-        disabled.extend(policy_disabled);
+        disabled.extend(policy_disabled.iter().cloned());
 
         Ok(definitions
             .into_iter()
             .map(|def| crate::types::ToolInfo {
                 enabled: !disabled.contains(&def.function.name),
+                policy_enabled: !policy_disabled.contains(&def.function.name),
+                required_reason: crate::tool_control::required_tool_reason(&def.function.name)
+                    .map(str::to_string),
+                category: crate::tool_control::tool_category(&def.function.name),
+                source: sources
+                    .get(&def.function.name)
+                    .cloned()
+                    .unwrap_or(crate::types::ToolSource::Unknown),
                 name: def.function.name,
                 description: def.function.description,
                 parameters: def.function.parameters,
-                source: crate::types::ToolSource::Builtin,
             })
             .collect())
+    }
+
+    /// GUI选择持原transition读锁直至取目录/操作完成，不能跨workspace焦点漂移。
+    /// 本地仍需校验：防迟到页面操作误改替代workspace中的同名工具。
+    pub async fn tool_control_runtime_for_scope(
+        &self,
+        workspace_id: &str,
+        workspace_generation: &str,
+    ) -> std::result::Result<(tokio::sync::OwnedRwLockReadGuard<()>, ScopedChatRuntime), String>
+    {
+        let publication = self
+            .workspace
+            .transition
+            .clone()
+            .try_read_owned()
+            .map_err(|_| "工作空间正在切换，请重新加载工具".to_string())?;
+        if self
+            .workspace
+            .transitioning
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err("工作空间正在切换，请重新加载工具".to_string());
+        }
+        let host = self.workspace.current.read().await.clone();
+        let matches = match host {
+            Some(host) => {
+                let workspace = host.workspace().await;
+                workspace.id.to_string() == workspace_id
+                    && workspace.opaque_product_data_generation() == workspace_generation
+            }
+            None => workspace_id == "global" && workspace_generation == "global",
+        };
+        if !matches {
+            return Err("工作空间或工程版本已变化，请重新加载工具".to_string());
+        }
+        let runtime = self
+            .current_chat_runtime_inner()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok((publication, runtime))
     }
 
     /// Apply one direct-user tool visibility choice to every current pool.
@@ -2300,6 +2509,7 @@ impl AppState {
             });
         }
 
+        crate::tool_control::validate_tool_choice(name, enabled)?;
         let mutation = self.tool_control.set_enabled(name, enabled)?;
         match self.connection.pool.as_ref() {
             Some(pool) => pool.publish_tool_control_generation().await?,
@@ -2401,6 +2611,30 @@ impl AppState {
                 name: name.to_string(),
                 kind,
                 root,
+                source: None,
+            })
+            .await?
+        {
+            WorkspaceSettlementOutcome::Created(workspace, created) => Ok((workspace, created)),
+            _ => anyhow::bail!("workspace create settlement returned an unexpected outcome"),
+        }
+    }
+
+    /// Three project sources share the original owned creation settlement.
+    /// A caller disappearing during filesystem/SSH preparation cannot abandon
+    /// an admitted publication or expose a half-created workspace.
+    pub async fn create_project_workspace_owned(
+        self: &Arc<Self>,
+        name: &str,
+        kind: crate::workspace::WorkspaceKind,
+        source: crate::workspace::ProjectSource,
+    ) -> anyhow::Result<(Workspace, bool)> {
+        match self
+            .run_owned_workspace_transition(WorkspaceTransitionRequest::Create {
+                name: name.to_string(),
+                kind,
+                root: None,
+                source: Some(source),
             })
             .await?
         {
@@ -2414,13 +2648,91 @@ impl AppState {
         name: String,
         kind: crate::workspace::WorkspaceKind,
         root: Option<std::path::PathBuf>,
+        source: Option<crate::workspace::ProjectSource>,
     ) -> anyhow::Result<(Workspace, bool)> {
         let _lifecycle = self.workspace.transition.write().await;
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            anyhow::bail!("请输入项目名称");
+        }
+        let verified_remote = if let Some(crate::workspace::ProjectSource::Ssh {
+            host,
+            user,
+            port,
+            path,
+            connection_id,
+        }) = source.as_ref()
+        {
+            // 本地数据/连接保护：项目创建只接独立 draft，不能迁走已登记来源。
+            if self.workspace.registry.is_identity_reserved(
+                &crate::workspace::WorkspaceId::from_raw(connection_id.clone()),
+            )? {
+                anyhow::bail!("请使用新项目的独立 SSH 认证连接，不能转移已有工作空间 owner");
+            }
+            let connection = self
+                .terminal
+                .project_ssh(connection_id)
+                .map_err(anyhow::Error::msg)?;
+            let target = crate::terminal::TerminalTarget::Ssh {
+                host: host.clone(),
+                user: user.clone(),
+                port: *port,
+            };
+            let verified_path = connection
+                .verify_target_directory(target, path.clone())
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let crate::terminal::TerminalTarget::Ssh {
+                host: effective_host,
+                user: effective_user,
+                port: effective_port,
+            } = connection.effective_target().map_err(anyhow::Error::msg)?
+            else {
+                anyhow::bail!("SSH effective target is unavailable");
+            };
+            Some((
+                crate::workspace::ProjectLocation::Ssh {
+                    host: host.clone(),
+                    user: user.clone(),
+                    port: *port,
+                    path: path.clone(),
+                },
+                crate::workspace::ProjectLocation::Ssh {
+                    host: effective_host.clone(),
+                    user: effective_user.clone(),
+                    port: *effective_port,
+                    path: verified_path,
+                },
+                connection,
+            ))
+        } else {
+            None
+        };
+        let remote_owner =
+            if let Some(crate::workspace::ProjectSource::Ssh { connection_id, .. }) =
+                source.as_ref()
+            {
+                let workspace_id = crate::workspace::WorkspaceId::from_name(&name).to_string();
+                let verified_connection = verified_remote
+                    .as_ref()
+                    .map(|(_, _, connection)| connection)
+                    .ok_or_else(|| anyhow::anyhow!("已认证 SSH owner 缺失，未转移连接"))?;
+                self.terminal
+                    .reassign_project_ssh_checked(connection_id, &workspace_id, verified_connection)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                Some(workspace_id)
+            } else {
+                None
+            };
         let registry = Arc::clone(&self.workspace.registry);
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let workspace_id = crate::workspace::WorkspaceId::from_name(&name);
             let requested_root = root.clone().unwrap_or_else(|| registry.default_root(&name));
             if let Ok(existing) = registry.open(&workspace_id) {
+                if source.is_some() {
+                    anyhow::bail!("项目名称已存在，请从列表打开或使用其它名称");
+                }
                 let same_root = match (existing.root.canonicalize(), requested_root.canonicalize())
                 {
                     (Ok(existing), Ok(requested)) => existing == requested,
@@ -2435,16 +2747,34 @@ impl AppState {
                     existing.root.display()
                 );
             }
-            let workspace = match root {
-                Some(root) => registry
-                    .create_at(&name, kind, root)
-                    .map_err(anyhow::Error::msg),
-                None => registry.create(&name, kind).map_err(anyhow::Error::msg),
-            }?;
+            let workspace =
+                if let Some((location, execution_location, _connection)) = verified_remote {
+                    registry.create_project(&name, kind, location, Some(execution_location))?
+                } else if let Some(source) = source {
+                    registry.create_local_project(&name, kind, source)?
+                } else {
+                    match root {
+                        Some(root) => registry
+                            .create_at(&name, kind, root)
+                            .map_err(anyhow::Error::msg),
+                        None => registry.create(&name, kind).map_err(anyhow::Error::msg),
+                    }?
+                };
             Ok((workspace, true))
         })
         .await
-        .map_err(|error| anyhow::anyhow!("workspace create task failed: {error}"))?
+        .map_err(|error| anyhow::anyhow!("workspace create task failed: {error}"))?;
+        if result.is_err()
+            && let Some(owner) = remote_owner
+        {
+            // Publication failed after connection handoff. The same detached
+            // transition observes physical connection cleanup; GUI teardown
+            // cannot assume its draft key still owns this connection.
+            if let Err(error) = self.terminal.close_project_ssh(&owner).await {
+                tracing::warn!(%error, "failed project creation retained SSH cleanup obligation");
+            }
+        }
+        result
     }
 
     pub async fn link_workspace_project_owned(
@@ -2617,6 +2947,41 @@ impl AppState {
         }
     }
 
+    /// Resolve a captured GUI project scope without creating an AgentPool or
+    /// requiring a configured model. Both IDs are checked before host admission.
+    pub async fn project_resources_for_workspace(
+        &self,
+        workspace_id: &str,
+        workspace_generation: &str,
+    ) -> anyhow::Result<ScopedProjectResources> {
+        let _lifecycle = self.workspace.transition.read().await;
+        let registry = self.workspace.registry.clone();
+        let id = crate::workspace::WorkspaceId::from_raw(workspace_id.to_string());
+        let workspace = self
+            .session
+            .product_data_io
+            .run("resolve GUI project resources", move || {
+                registry.inspect(&id)
+            })
+            .await
+            .map_err(anyhow::Error::msg)??;
+        validate_workspace_product_data_generation(Some(&workspace), workspace_generation)
+            .map_err(anyhow::Error::msg)?;
+        let (host, lease) = self
+            .workspace
+            .runtimes
+            .get_or_open_control(workspace)
+            .await?;
+        Ok(ScopedProjectResources {
+            host: host.clone(),
+            workspace: host.workspace().await,
+            working_dir: host.execution_scope().root().to_path_buf(),
+            files: host.project_file_system(),
+            executor: host.project_executor(),
+            lifetime: lease.io_lifetime(),
+        })
+    }
+
     /// Snapshot the immutable execution identity/root for a new turn.
     /// Existing turns retain their own snapshot across later focus changes.
     pub async fn current_execution_scope(&self) -> crate::workspace::WorkspaceExecutionScope {
@@ -2738,6 +3103,10 @@ impl AppState {
             .runtimes
             .shutdown_and_evict_if_idle(workspace_id)
             .await?;
+        self.terminal
+            .close_project_ssh(workspace_id.as_str())
+            .await
+            .map_err(anyhow::Error::msg)?;
         if let Some(hook) = self.workspace_delete_hook.as_ref() {
             hook.remove_workspace(workspace_id.as_str()).await?;
         }
@@ -2798,31 +3167,6 @@ impl AppState {
                 .pool()
                 .apply_system_prompt(system_prompt.clone())
                 .await;
-        }
-    }
-
-    /// Publish the ReAct loop ceiling (EKO `0` = unlimited sentinel) to the
-    /// process primary/pool and every loaded workspace pool, so a saved
-    /// `max_iterations` actually reaches the agents the user is talking to.
-    pub async fn apply_max_iterations_to_agents(&self, eko_value: usize) {
-        match self.connection.pool.as_ref() {
-            Some(pool) => pool.apply_max_iterations(eko_value).await,
-            None => {
-                let resolved = crate::infra::resolved_max_iterations(eko_value);
-                self.connection
-                    .primary_agent()
-                    .write(|agent| {
-                        if agent.config().get_max_iterations() != resolved
-                            && let Err(error) = agent.set_max_iterations(resolved)
-                        {
-                            tracing::warn!(%error, "rejected max_iterations publication");
-                        }
-                    })
-                    .await;
-            }
-        }
-        for (_, runtime) in self.workspace.runtimes.loaded_execution_runtimes().await {
-            runtime.pool().apply_max_iterations(eko_value).await;
         }
     }
 
@@ -3161,6 +3505,50 @@ impl AppState {
         )))
     }
 
+    /// Channel effects validate the current registry manifest under the same
+    /// publication lease that excludes unlink/recreate until admission ends.
+    #[cfg(feature = "channels")]
+    pub(crate) async fn channel_control_for_generation(
+        &self,
+        workspace_id: &str,
+        expected: &str,
+    ) -> anyhow::Result<(
+        tokio::sync::OwnedRwLockReadGuard<()>,
+        ScopedWorkspaceControl,
+    )> {
+        let publication = self.workspace.transition.clone().read_owned().await;
+        let control = if workspace_id == "global" {
+            ScopedWorkspaceControl {
+                runtime: self.global_chat_runtime(),
+                workspace: None,
+            }
+        } else {
+            let registry = Arc::clone(&self.workspace.registry);
+            let id = crate::workspace::WorkspaceId::from_raw(workspace_id.to_string());
+            let workspace = self
+                .session
+                .product_data_io
+                .run("validate channel workspace generation", move || {
+                    registry.inspect(&id).map_err(anyhow::Error::msg)
+                })
+                .await
+                .map_err(anyhow::Error::msg)??;
+            validate_workspace_product_data_generation(Some(&workspace), expected)
+                .map_err(anyhow::Error::msg)?;
+            let runtime = self
+                .chat_runtime_for_workspace_locked(workspace.clone())
+                .await?;
+            ScopedWorkspaceControl {
+                runtime,
+                workspace: Some(workspace),
+            }
+        };
+        control
+            .validate_generation(expected)
+            .map_err(anyhow::Error::msg)?;
+        Ok((publication, control))
+    }
+
     pub async fn workspace_control_for_scope(
         &self,
         workspace_id: &str,
@@ -3189,6 +3577,21 @@ impl AppState {
             runtime,
             workspace: Some(workspace),
         })
+    }
+
+    /// Validate a captured product-data token against the very host/control lease returned.
+    /// Callers keep this receipt through their operation; resolving by id again would lose
+    /// the checked generation and could mutate a replacement workspace incarnation.
+    pub async fn workspace_control_for_generation(
+        &self,
+        workspace_id: &str,
+        expected_generation: &str,
+    ) -> anyhow::Result<ScopedWorkspaceControl> {
+        let control = self.workspace_control_for_scope(workspace_id).await?;
+        control
+            .validate_generation(expected_generation)
+            .map_err(anyhow::Error::new)?;
+        Ok(control)
     }
 
     /// Resolve one exact product-data authority without running synchronous
@@ -3838,14 +4241,44 @@ impl AppState {
                 return Ok(false);
             }
         };
+        let input = (|| -> std::io::Result<echo_agent::llm::types::Message> {
+            let spill_dir = crate::prepared_turn::resolve_user_input_spill_dir(Some(
+                runtime.execution_scope().root(),
+            ));
+            let mut prepared =
+                crate::prepared_turn::PreparedUserTurn::runtime_instruction(instruction.clone());
+            prepared.bind_agent_input(
+                &claim.payload,
+                &spill_dir,
+                &target.conversation_id,
+                &snapshot.active_turn_id,
+            )?;
+            prepared.to_message()
+        })();
+        let input = match input {
+            Ok(input) => input,
+            Err(error) => {
+                self.agent_router
+                    .turn_settled(
+                        &claim,
+                        None,
+                        crate::agent_router::AgentDeliveryOutcome::Failed,
+                        false,
+                        Some(format!(
+                            "Agent input preparation failed before injection: {error}"
+                        )),
+                        false,
+                        None,
+                    )
+                    .await?;
+                return Ok(true);
+            }
+        };
         self.agent_router
             .begin_injection(&claim, snapshot.active_turn_id.clone())
             .await?;
         match agent
-            .steer_input_tracked(
-                Some(&snapshot.active_turn_id),
-                echo_agent::llm::types::Message::user(instruction.clone()),
-            )
+            .steer_input_tracked(Some(&snapshot.active_turn_id), input)
             .await
         {
             Ok(mut receipt) => {
@@ -3954,6 +4387,178 @@ impl AppState {
                 Ok(true)
             }
         }
+    }
+
+    /// 沿原输入日志固定唯一任务去向；此成功不代表TaskRuntime、mailbox或Applied。
+    pub(crate) async fn bind_user_input_target(
+        &self,
+        source: crate::conversation_input::ConversationInputSource,
+        projection: &crate::conversation_input::ConversationInputProjection,
+        run_id: &str,
+        turn_id: &str,
+    ) -> Result<crate::conversation_input::BoundRunInput, String> {
+        use crate::conversation_input::ConversationInputPhase;
+        let receipt = &projection.receipt;
+        let attempt = projection
+            .active_attempt
+            .as_ref()
+            .ok_or_else(|| "原输入投递 attempt 不可用".to_string())?;
+        if receipt.phase != ConversationInputPhase::AttemptStarted
+            || receipt.identity != attempt.identity
+            || receipt.attempt != Some(attempt.attempt)
+            || receipt.attempt_id.as_deref() != Some(attempt.attempt_id.as_str())
+            || receipt.turn_id.as_deref() != Some(attempt.turn_id.as_str())
+            || turn_id != attempt.turn_id
+            || run_id.trim().is_empty()
+        {
+            return Err("原输入 attempt 与准确任务准入不匹配，未投递".to_string());
+        }
+        if projection.claimed_before_current && projection.task_target.is_none() {
+            return Err(
+                "旧输入已有claim而任务去向未知，保留RecoveryRequired，禁止改绑新任务".to_string(),
+            );
+        }
+        let input = crate::tasks::task_runtime::RunInputSnapshot {
+            source,
+            identity: receipt.identity.clone(),
+            payload: projection.payload.clone(),
+        };
+        input.validate()?;
+        self.conversation_inputs()
+            .bind_task_target(attempt.clone(), run_id.to_string())
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(crate::conversation_input::BoundRunInput {
+            target: crate::conversation_input::ConversationInputTaskTarget {
+                run_id: run_id.to_string(),
+                turn_id: turn_id.to_string(),
+                identity: receipt.identity.clone(),
+            },
+            snapshot: input,
+        })
+    }
+
+    /// 首轮沿既有RunTurnBinding传递原文；不把PreparedUserTurn引用预览当作完整Goal。
+    pub async fn bind_initial_user_input(
+        &self,
+        source: crate::conversation_input::ConversationInputSource,
+        projection: &crate::conversation_input::ConversationInputProjection,
+        binding: Option<crate::tasks::task_runtime::RunTurnBinding>,
+    ) -> Result<
+        (
+            crate::tasks::task_runtime::RunTurnBinding,
+            crate::conversation_input::BoundRunInput,
+        ),
+        String,
+    > {
+        use crate::tasks::task_runtime::{RunTurnBinding, RunTurnOrigin, TurnVisibility};
+        let attempt = projection
+            .active_attempt
+            .as_ref()
+            .ok_or_else(|| "原输入attempt不存在".to_string())?;
+        let mut binding = binding.unwrap_or_else(|| RunTurnBinding {
+            domain_plugin: projection.payload.domain_plugin.clone(),
+            run_id: None,
+            turn_id: attempt.turn_id.clone(),
+            root_message_id: attempt.turn_id.clone(),
+            origin: RunTurnOrigin::User,
+            transcript_visibility: TurnVisibility::Visible,
+            expected_resume: None,
+        });
+        let run_id = binding.run_id.clone().unwrap_or_else(|| {
+            crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&binding.turn_id)
+        });
+        binding.run_id = Some(run_id.clone());
+        let input = self
+            .bind_user_input_target(source, projection, &run_id, &binding.turn_id)
+            .await?;
+        Ok((binding, input))
+    }
+
+    /// 原输入 attempt 和精确前台 TaskRun 共同授权投递；持久接受失败不触碰mailbox。
+    pub async fn accept_user_input_for_active_turn(
+        &self,
+        foreground: &crate::foreground_turn::ForegroundTurnControl,
+        source: crate::conversation_input::ConversationInputSource,
+        projection: &crate::conversation_input::ConversationInputProjection,
+    ) -> Result<crate::tasks::task_runtime::RunInputAcceptance, String> {
+        let attempt = projection
+            .active_attempt
+            .as_ref()
+            .ok_or_else(|| "原输入attempt不存在".to_string())?;
+        let address = &projection.receipt.identity.address;
+        let snapshots = foreground
+            .snapshots_for_conversation_scoped(&address.workspace_id, &address.conversation_id)
+            .map_err(|error| error.to_string())?;
+        let snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.active_turn_id == attempt.turn_id)
+            .ok_or_else(|| "原输入目标turn已变化，未投递".to_string())?;
+        let run_id = snapshot
+            .run_id
+            .clone()
+            .ok_or_else(|| "原turn的TaskRun身份尚未发布，输入继续保留".to_string())?;
+        let runtime = self
+            .chat_runtime_for_scope(&address.workspace_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let store = runtime
+            .task_runtime()
+            .ok_or_else(|| "原输入的TaskRuntime不可用，未投递".to_string())?;
+        let input = self
+            .bind_user_input_target(source, projection, &run_id, &attempt.turn_id)
+            .await?;
+        let turn_id = attempt.turn_id.clone();
+        crate::tasks::task_runtime::TaskRuntimeOperation::new(store)
+            .run_store("投递前持久接受原用户输入", move |store| {
+                store.accept_run_steer_input(
+                    &run_id,
+                    &turn_id,
+                    input.snapshot.source,
+                    &input.snapshot.identity,
+                    &input.snapshot.payload,
+                )
+            })
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// GUI/IM共用原消费顺序：outer错误只代表持久接受/准确目标未准许，inner保原mailbox结果。
+    /// 用户输入不受agent自动权限门控；本检查只防应用自身丢输入或投到错误运行。
+    pub async fn steer_user_input_for_active_turn(
+        &self,
+        foreground: &crate::foreground_turn::ForegroundTurnControl,
+        source: crate::conversation_input::ConversationInputSource,
+        projection: &crate::conversation_input::ConversationInputProjection,
+        agent: &crate::agent_handle::AgentHandle,
+        message: echo_agent::prelude::Message,
+    ) -> Result<
+        Result<echo_agent::agent::AgentSteerReceipt, echo_agent::agent::TurnSteerError>,
+        String,
+    > {
+        let accepted = self
+            .accept_user_input_for_active_turn(foreground, source, projection)
+            .await?;
+        let current = foreground
+            .snapshots_for_conversation_scoped(
+                &accepted.identity.address.workspace_id,
+                &accepted.identity.address.conversation_id,
+            )
+            .map_err(|error| error.to_string())?;
+        if !current.iter().any(|turn| {
+            turn.active_turn_id == accepted.turn_id
+                && turn.run_id.as_deref() == Some(accepted.run_id.as_str())
+                && !turn.cancellation_requested
+        }) {
+            return Err("持久接受后的原目标已结束、取消或切换，输入保留且未投递".to_string());
+        }
+        #[cfg(test)]
+        if let Some(attempt) = projection.active_attempt.as_ref() {
+            attempt.observation.mark_mailbox_invocation();
+        }
+        Ok(agent
+            .steer_input_tracked(Some(&accepted.turn_id), message)
+            .await)
     }
 
     /// Record one accepted user-authored steer against the exact foreground
@@ -4152,7 +4757,18 @@ impl AppState {
                 conversation_id: Some(&target.conversation_id),
                 turn_id: Some(&root_turn_id),
             },
-        ) {
+        )
+        .map_err(|error| error.to_string())
+        .and_then(|mut turn| {
+            turn.bind_agent_input(
+                &claim.payload,
+                &spill_dir,
+                &target.conversation_id,
+                &root_turn_id,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(turn)
+        }) {
             Ok(turn) => turn,
             Err(error) => {
                 let detail = format!("Agent message preparation failed: {error}");
@@ -4377,7 +4993,10 @@ impl AppState {
                 .await?;
             return Ok(true);
         }
-        execution.lock().unwrap_or_else(|error| error.into_inner()).take();
+        execution
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
         self.settle_internal_delivery_visibility(
             &runtime,
             target,
@@ -5176,7 +5795,7 @@ impl AppState {
         workspace: Workspace,
     ) -> anyhow::Result<WorkspaceTransitionReceipt> {
         match self
-            .run_owned_workspace_transition(WorkspaceTransitionRequest::Switch(workspace))
+            .run_owned_workspace_transition(WorkspaceTransitionRequest::Switch(Box::new(workspace)))
             .await?
         {
             WorkspaceSettlementOutcome::Transition(receipt) => Ok(receipt),
@@ -5188,15 +5807,160 @@ impl AppState {
         self: &Arc<Self>,
         workspace_id: crate::workspace::WorkspaceId,
     ) -> anyhow::Result<WorkspaceTransitionReceipt> {
+        self.switch_workspace_registered_with_connection(workspace_id, None, None)
+            .await
+    }
+
+    pub async fn switch_workspace_registered_with_connection(
+        self: &Arc<Self>,
+        workspace_id: crate::workspace::WorkspaceId,
+        connection_id: Option<String>,
+        expected_generation: Option<String>,
+    ) -> anyhow::Result<WorkspaceTransitionReceipt> {
         match self
-            .run_owned_workspace_transition(WorkspaceTransitionRequest::SwitchRegistered(
+            .run_owned_workspace_transition(WorkspaceTransitionRequest::SwitchRegistered {
                 workspace_id,
-            ))
+                connection_id,
+                expected_generation,
+            })
             .await?
         {
             WorkspaceSettlementOutcome::Transition(receipt) => Ok(receipt),
             _ => anyhow::bail!("workspace switch settlement returned an unexpected outcome"),
         }
+    }
+
+    /// Reconnect a registered target through its original owned transition,
+    /// without changing GUI focus. Reply-fork retries use this after a partial
+    /// publication; source connections are never transferred to the target.
+    pub async fn reconnect_workspace_project_owned(
+        self: &Arc<Self>,
+        workspace_id: crate::workspace::WorkspaceId,
+        connection_id: String,
+        expected_generation: Option<String>,
+    ) -> anyhow::Result<()> {
+        match self
+            .run_owned_workspace_transition(WorkspaceTransitionRequest::ReconnectProject {
+                workspace_id,
+                connection_id,
+                expected_generation,
+            })
+            .await?
+        {
+            WorkspaceSettlementOutcome::ProjectReconnected => Ok(()),
+            _ => anyhow::bail!("workspace reconnect settlement returned an unexpected outcome"),
+        }
+    }
+
+    async fn reconnect_workspace_project_inner(
+        &self,
+        workspace_id: &crate::workspace::WorkspaceId,
+        connection_id: &str,
+        expected_generation: Option<&str>,
+        expected_connection: Option<Arc<crate::terminal::ProjectSshConnection>>,
+    ) -> anyhow::Result<()> {
+        self.reconnect_workspace_project_with_verifier(
+            workspace_id,
+            connection_id,
+            expected_generation,
+            expected_connection,
+            |connection, target, path| async move {
+                connection.verify_target_directory(target, path).await
+            },
+        )
+        .await
+    }
+
+    async fn reconnect_workspace_project_with_verifier<F, Fut>(
+        &self,
+        workspace_id: &crate::workspace::WorkspaceId,
+        connection_id: &str,
+        expected_generation: Option<&str>,
+        previous: Option<Arc<crate::terminal::ProjectSshConnection>>,
+        verifier: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnOnce(
+                Arc<crate::terminal::ProjectSshConnection>,
+                crate::terminal::TerminalTarget,
+                String,
+            ) -> Fut
+            + Send,
+        Fut: std::future::Future<Output = Result<String, String>> + Send,
+    {
+        if connection_id == workspace_id.as_str() {
+            anyhow::bail!("Reconnection must hand off a newly prepared draft connection");
+        }
+        let _lifecycle = self.workspace.transition.write().await;
+        let workspace = self.workspace.registry.inspect(workspace_id)?;
+        if let Some(expected) = expected_generation {
+            validate_workspace_product_data_generation(Some(&workspace), expected)?;
+        }
+        let crate::workspace::ProjectLocation::Ssh {
+            host,
+            user,
+            port,
+            path,
+        } = workspace.project_location()
+        else {
+            anyhow::bail!("This project uses a local folder");
+        };
+        let current = self.terminal.project_ssh(workspace_id.as_str()).ok();
+        let unchanged = match (&previous, &current) {
+            (None, None) => true,
+            (Some(expected), Some(actual)) => Arc::ptr_eq(expected, actual),
+            _ => false,
+        };
+        if !unchanged {
+            anyhow::bail!(
+                "SSH connection generation changed while reconnect was queued; candidate was not published"
+            );
+        }
+        let connection = self
+            .terminal
+            .project_ssh(connection_id)
+            .map_err(anyhow::Error::msg)?;
+        let actual_path = verifier(
+            connection.clone(),
+            crate::terminal::TerminalTarget::Ssh { host, user, port },
+            path,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        let crate::terminal::TerminalTarget::Ssh { host, user, port } =
+            connection.effective_target().map_err(anyhow::Error::msg)?
+        else {
+            anyhow::bail!("SSH effective target is unavailable");
+        };
+        let actual = crate::workspace::ProjectLocation::Ssh {
+            host: host.clone(),
+            user: user.clone(),
+            port: *port,
+            path: actual_path,
+        };
+        if workspace.metadata.project_execution_location.as_ref() != Some(&actual) {
+            anyhow::bail!("远程主机或目录身份已变化；本次重连未修改项目位置");
+        }
+        // 通信恢复不退休Host/store；旧请求和unknown保留原代际。
+        match previous {
+            Some(previous) => {
+                self.terminal
+                    .reconnect_project_ssh_checked(
+                        workspace_id.as_str(),
+                        connection_id,
+                        &previous,
+                        &connection,
+                    )
+                    .await
+            }
+            None => {
+                self.terminal
+                    .reassign_project_ssh_checked(connection_id, workspace_id.as_str(), &connection)
+                    .await
+            }
+        }
+        .map_err(anyhow::Error::msg)?;
+        Ok(())
     }
 
     pub async fn exit_workspace(self: &Arc<Self>) -> anyhow::Result<WorkspaceTransitionReceipt> {
@@ -5264,6 +6028,18 @@ impl AppState {
         self: &Arc<Self>,
         request: WorkspaceTransitionRequest,
     ) -> anyhow::Result<WorkspaceSettlementOutcome> {
+        // 请求第一次进入原owned队列前固定预期代际；不能等前次发布后重新取current。
+        let expected_project_connection = match &request {
+            WorkspaceTransitionRequest::SwitchRegistered {
+                workspace_id,
+                connection_id: Some(_),
+                ..
+            }
+            | WorkspaceTransitionRequest::ReconnectProject { workspace_id, .. } => {
+                self.terminal.project_ssh(workspace_id.as_str()).ok()
+            }
+            _ => None,
+        };
         let mut settlement = self.workspace.settlement.lock().await;
         if let Some(previous) = settlement.as_mut() {
             if let Err(error) = await_workspace_settlement(previous).await {
@@ -5280,30 +6056,81 @@ impl AppState {
         *settlement = Some(tokio::spawn(async move {
             let _marker = marker;
             match request {
-                WorkspaceTransitionRequest::Create { name, kind, root } => state
-                    .create_workspace_inner(name, kind, root)
+                WorkspaceTransitionRequest::Create {
+                    name,
+                    kind,
+                    root,
+                    source,
+                } => state
+                    .create_workspace_inner(name, kind, root, source)
                     .await
                     .map(|(workspace, created)| {
                         WorkspaceSettlementOutcome::Created(workspace, created)
                     }),
                 #[cfg(test)]
                 WorkspaceTransitionRequest::Switch(workspace) => {
-                    let receipt = state.switch_workspace_inner(workspace).await?;
+                    let receipt = state.switch_workspace_inner(*workspace).await?;
                     Ok(WorkspaceSettlementOutcome::Transition(
                         state
                             .reconcile_extension_skills_after_workspace_load(receipt)
                             .await,
                     ))
                 }
-                WorkspaceTransitionRequest::SwitchRegistered(workspace_id) => {
-                    let receipt = state
-                        .switch_registered_workspace_inner(workspace_id)
+                WorkspaceTransitionRequest::SwitchRegistered {
+                    workspace_id,
+                    connection_id,
+                    expected_generation,
+                } => {
+                    if let Some(connection_id) = connection_id {
+                        state
+                            .reconnect_workspace_project_inner(
+                                &workspace_id,
+                                &connection_id,
+                                expected_generation.as_deref(),
+                                expected_project_connection,
+                            )
+                            .await?;
+                    }
+                    let mut receipt = state
+                        .switch_registered_workspace_inner(
+                            workspace_id.clone(),
+                            expected_generation,
+                        )
                         .await?;
+                    if let Some(error) = state
+                        .terminal
+                        .project_ssh_uncertainty(workspace_id.as_str())
+                    {
+                        receipt.status = WorkspaceTransitionStatus::Degraded;
+                        receipt
+                            .degraded_subsystems
+                            .push(WorkspaceSubsystemTransition {
+                                subsystem: "ssh_previous_operation".into(),
+                                target_root: receipt.target_root.clone(),
+                                stale_roots: Vec::new(),
+                                error,
+                            });
+                    }
                     Ok(WorkspaceSettlementOutcome::Transition(
                         state
                             .reconcile_extension_skills_after_workspace_load(receipt)
                             .await,
                     ))
+                }
+                WorkspaceTransitionRequest::ReconnectProject {
+                    workspace_id,
+                    connection_id,
+                    expected_generation,
+                } => {
+                    state
+                        .reconnect_workspace_project_inner(
+                            &workspace_id,
+                            &connection_id,
+                            expected_generation.as_deref(),
+                            expected_project_connection,
+                        )
+                        .await?;
+                    Ok(WorkspaceSettlementOutcome::ProjectReconnected)
                 }
                 WorkspaceTransitionRequest::Exit => state
                     .exit_workspace_inner()
@@ -5509,13 +6336,22 @@ impl AppState {
     async fn switch_registered_workspace_inner(
         &self,
         workspace_id: crate::workspace::WorkspaceId,
+        expected_generation: Option<String>,
     ) -> anyhow::Result<WorkspaceTransitionReceipt> {
         let _transition = self.workspace.transition.write().await;
+        // 原transition写锁内先核注册代际，旧Fork不得触碰后继目标或当前投影。
+        if let Some(expected) = expected_generation.as_deref() {
+            let snapshot = self.workspace.registry.inspect(&workspace_id)?;
+            validate_workspace_product_data_generation(Some(&snapshot), expected)?;
+        }
         let workspace = self
             .workspace
             .registry
             .open(&workspace_id)
             .map_err(anyhow::Error::msg)?;
+        if let Some(expected) = expected_generation.as_deref() {
+            validate_workspace_product_data_generation(Some(&workspace), expected)?;
+        }
         self.switch_workspace_inner_locked(workspace).await
     }
 

@@ -8,7 +8,7 @@ observed_at: 40fd80447cdf3d7627399af0b2069a8b4da5327a
 boundary_refs: [boundary.eko-conversation-collaboration]
 behavior_refs: [behavior.side-conversation-lifecycle, behavior.gui-conversation-fork, behavior.automatic-agent-collaboration-ui-boundary]
 rule_refs: [rule.conversation-collaboration-authorities]
-evidence_refs: [evidence.side-conversation-preflight, evidence.gui-conversation-fork, evidence.automatic-agent-collaboration-ui-retirement]
+evidence_refs: [evidence.side-conversation-preflight, evidence.gui-conversation-fork, evidence.automatic-agent-collaboration-ui-retirement, evidence.eko-im-cron-history-foreground-outcome, evidence.eko-performance-tool-adoption]
 finding_refs: [finding.manual-agent-collaboration-ui-retirement]
 audit_refs: [audit.automatic-agent-collaboration-ui-retirement]
 related_map_refs: []
@@ -77,7 +77,13 @@ Side Conversation 不增加本地权限门控。模型选择和内部消息不�
 
 ## 用户侧投影
 
-GUI 左侧树和完整对话表面呈现 Side Conversation；TUI、CLI/JSONL 与 channel 保持既有普通 conversation/Subagent 语义。内部消息默认不插入主 GUI transcript。
+GUI 左侧树和完整对话表面呈现 Side Conversation。依据用户提供的 Codex 参考，普通对话时间线只读呈现 typed Agent 来信与原工具发送事实：用户输入和 Agent 来信均右对齐，来信保留来源且可展开全文，发送行点击只导航到原目标会话。来源未知时明确显示未提供，不能猜成人类；canonical 接收时间与来源创建时间分别保留。GUI 不新增人工消息编排或投递收据管理台，Agent 来信不能批准 HITL、更新用户 Goal 或取得本人编辑权限。
+
+### 开发测试中的原生时间线接缝
+
+`web-frontend/src/testing/nativeChatTimeline.tsx` 只供性能测试入口导入，复用原事件 handler、ChatStore 和 MessageBubble／原生消息／工具组件，不进入 shipping index，也不拥有投递、持久化或完成权威。`web-frontend/src/testing/nativeChatTimeline.test.tsx` 在现有 Vitest 链验证该适配边界；其导出是开发测试 ABI，不是新增产品 API。输入、提交与见证的精确边界见 `docs/zh/architecture/performance-baseline.md`：JS 回归、DOM-ready、React layout-effect 和 WebKit transaction 都不能授予实际屏幕 paint 或完整原生性能资格；真实 capture、工具轨迹、冻结二进制及独占测量仍须分别取证。
+
+后端离线捕获仍由 `src/tauri/commands/native_timeline_actual_backend_capture.rs` 的原显式测试入口驱动，复用 `src/tauri/commands/conversations_native_history_tests.rs` 的资源链 producer；`src/tauri/commands/native_timeline_tool_backend_capture.rs` 只观察原 `bind_surface_chat_sink(Gui)` 之后的 journal／工具摘要回调，保其交错顺序、身份和真实 publication。新增模块不创建产品协议、renderer owner 或测量 runner。当前采用仅有源码审查和静态检查；准确最终 Framework／GUI 制品上的编译、五组真实原件、private reader、App／capability／quiet／paint 资格分别取得，不能沿用旧 unknown-only capture 或其它来源的绿色结果。
 
 ## 场景处置清单
 
@@ -86,3 +92,10 @@ GUI 左侧树和完整对话表面呈现 Side Conversation；TUI、CLI/JSONL 与
 ## 未展开项
 
 TaskRun formal Subagent、跨 Workspace handoff、默认 worktree 隔离和自动代码合并不属于本边界。
+
+
+### 逐role性能工程来源的独立采用边界
+
+普通原生时间线的开发测试接缝不改变产品owner。后继工程采用仅扩展既有runner／report的逐program来源，原report同目录纯模块负责capture／fixture身份，原producer和个人Root绝对路径不搬入正式scripts。相关便携合成测试不访问ignored归档，也不产生用户App或性能样本。
+
+080／F340三来源胶囊与派生fixture只保其历史Rust／headless受控来源；formal后继D修复不因旧view被迫回退，也不被其签成latestGUI。原原件、失败和成功后继分别保留；本段不新增scenario matched／after revision／status或Source绿色声明，本次新工具的来源与73项便携工程结果由独立当前工具Evidence记录，原Map观察与旧场景资格保持；不在此反填新脚本的历史引用。

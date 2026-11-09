@@ -201,7 +201,11 @@ impl ConnectionState {
 
 /// 配置状态：应用 / Web / 沙箱 / 权限
 pub struct ConfigState {
+    subagent_depth_defaults: Arc<crate::subagent_policy::SubagentDepthDefaults>,
     pub app_config: RwLock<crate::config::EkoConfig>,
+    // Published under app_config’s write guard; identifies the committed config,
+    // independently of any channel transport mutation epoch.
+    app_config_revision: std::sync::Mutex<String>,
     /// Runtime model currently published to primary and pooled agents. This
     /// remains distinct from the durable default when startup used `--model`.
     active_model_id: RwLock<String>,
@@ -217,6 +221,23 @@ pub struct ConfigState {
 
 type ModelMutationSettlement =
     Shared<BoxFuture<'static, Result<ModelMutationReceipt, ModelMutationError>>>;
+
+impl ConfigState {
+    /// Read one original committed snapshot and its publication identity.
+    pub async fn configuration_snapshot(&self) -> (crate::config::EkoConfig, String) {
+        let config = self.app_config.read().await;
+        (config.clone(), self.configuration_revision())
+    }
+
+    pub(crate) fn configuration_revision(&self) -> String {
+        // This lock protects only an opaque publication label, never a store
+        // mutation. Recovering poisoning cannot invent a committed config.
+        self.app_config_revision
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+}
 
 struct ModelMutationOwnerState {
     lifecycle: ModelMutationOwnerLifecycle,
@@ -254,6 +275,7 @@ pub struct ModelProviderMutation {
 #[derive(Clone)]
 pub struct ModelMutationReceipt {
     pub config: crate::config::EkoConfig,
+    pub configuration_revision: String,
     pub model_id: String,
     pub runtime: Option<crate::model_config::ModelRuntimeConfig>,
     pub activated: bool,
@@ -347,6 +369,10 @@ pub struct HistoryState {
 pub struct SchedulerState {
     pub runner: Option<Arc<crate::scheduler::SchedulerRunner>>,
     pub cancel_token: echo_agent::agent::CancellationToken,
+    /// EKO-only weak composition bridge; occurrences and receipts remain in
+    /// the original scheduler/TaskRuntime owners.
+    #[cfg(feature = "channels")]
+    pub(crate) weixin_notifications: Arc<crate::weixin_cron::WeixinCronBinding>,
     /// Owned scheduler loop. Keeping the framework handle lets every EKO
     /// surface cancel and await the same long-lived task during shutdown.
     handle: Mutex<Option<echo_agent::scheduler::SchedulerHandle>>,
@@ -534,6 +560,8 @@ pub(crate) mod scheduler_shutdown_tests {
                 scheduler: Some(SchedulerState {
                     runner: Some(runner),
                     cancel_token: cancel,
+                    #[cfg(feature = "channels")]
+                    weixin_notifications: Arc::new(crate::weixin_cron::WeixinCronBinding::default()),
                     handle: Mutex::new(Some(handle)),
                 }),
                 release,

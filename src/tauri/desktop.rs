@@ -1,9 +1,9 @@
-//! EKO — Tauri desktop runtime.
+//! Eclip — Tauri desktop runtime.
 //!
 //! Shared by the dedicated `echo-agent-tauri` binary and by the package-name
 //! binary when Tauri CLI builds the app with `--no-default-features --features gui`.
 
-use crate::{cli, infra};
+use crate::infra;
 use clap::Parser;
 use echo_agent_app_core::api::config;
 use std::ffi::OsString;
@@ -29,7 +29,7 @@ fn install_panic_hook() {
             let _ = std::fs::create_dir_all(parent);
         }
         let message = format!(
-            "EKO crashed at {}\n\
+            "Eclip crashed at {}\n\
              Location: {:?}\n\n\
              {}\n\n\
              Please report this issue or check your configuration.\n",
@@ -53,15 +53,45 @@ fn install_panic_hook() {
             let _ = Command::new("osascript")
                 .arg("-e")
                 .arg(
-                    "display dialog \"EKO crashed during startup.\\n\\n\
+                    "display dialog \"Eclip crashed during startup.\\n\\n\
                      Details have been written to the crash log.\\n\\n\
                      Run from Terminal to see full output:\\n\
-                     /Applications/EKO.app/Contents/MacOS/echo-agent-cli\" \
-                     with title \"EKO\" buttons {\"OK\"} default button \"OK\"",
+                     /Applications/Eclip.app/Contents/MacOS/echo-agent-tauri\" \
+                     with title \"Eclip\" buttons {\"OK\"} default button \"OK\"",
                 )
                 .output();
         }
     }));
+}
+
+/// Mutable holder of the ORIGINAL application owner and its phase-one receipt.
+/// Window/menu callbacks retain Weak references only; no second shutdown owner.
+pub struct DesktopLifecycleState {
+    services: Option<echo_agent_app_core::api::runtime::ApplicationServices>,
+    receipt: Option<echo_agent_app_core::api::runtime::ApplicationLifecycleReceipt>,
+}
+impl DesktopLifecycleState {
+    pub(crate) fn begin_shutdown(&mut self) -> anyhow::Result<()> {
+        if self.receipt.is_none() {
+            let services = self
+                .services
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("original desktop service owner unavailable"))?;
+            self.receipt = Some(services.begin_shutdown(
+                echo_agent_app_core::api::runtime::ApplicationLifecycleReason::Shutdown,
+                None,
+            )?);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn hide_requested_window<E>(
+    prevent: impl FnOnce(),
+    hide: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    prevent();
+    hide()
 }
 
 /// Run the Tauri desktop app and report lifecycle failures to a crash log.
@@ -80,10 +110,10 @@ pub async fn run_desktop_entry() -> anyhow::Result<()> {
         let _ = std::fs::write(
             &log_path,
             format!(
-                "EKO starting at {}\n\
+                "Eclip starting at {}\n\
                  If you see this file, the app is running but may have failed to display.\n\
                  Try running from Terminal:\n\
-                 /Applications/EKO.app/Contents/MacOS/echo-agent-cli\n",
+                 /Applications/Eclip.app/Contents/MacOS/echo-agent-tauri\n",
                 chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
             ),
         );
@@ -94,7 +124,7 @@ pub async fn run_desktop_entry() -> anyhow::Result<()> {
         Err(error) => {
             let log_path = crash_log_path();
             let message = format!(
-                "EKO failed at {}\n\nError: {:?}\n",
+                "Eclip failed at {}\n\nError: {:?}\n",
                 chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
                 error
             );
@@ -107,10 +137,10 @@ pub async fn run_desktop_entry() -> anyhow::Result<()> {
                 let _ = Command::new("osascript")
                     .arg("-e")
                     .arg(format!(
-                        "display dialog \"EKO failed.\\n\\n\
+                        "display dialog \"Eclip failed.\\n\\n\
                          Error: {}\\n\\n\
                          Crash log: {}\" \
-                         with title \"EKO\" buttons {{\"OK\"}} default button \"OK\"",
+                         with title \"Eclip\" buttons {{\"OK\"}} default button \"OK\"",
                         format!("{:?}", error).replace('"', "\\\""),
                         log_path.display()
                     ))
@@ -125,10 +155,10 @@ async fn run_desktop() -> anyhow::Result<()> {
     // Load project-local .env file (standard dotenvy behavior)
     dotenvy::dotenv().ok();
 
-    // The desktop binary accepts the same model/project/config overrides as
-    // TUI/CLI, including the canonical `--mcp-config` source.
+    // Desktop configuration overrides belong to this entry, independently of
+    // the console interaction modes and their arguments.
     let args = parse_desktop_args(std::env::args_os())?;
-    let mut app_config = config::load_config(args.config.as_deref());
+    let mut app_config = config::load_config(args.config.as_deref()).map_err(anyhow::Error::msg)?;
     // On macOS, GUI apps launched from Dock/Finder don't inherit shell env
     // vars. Import only names explicitly declared by configured providers.
     infra::load_shell_env(&app_config);
@@ -166,6 +196,7 @@ async fn run_desktop() -> anyhow::Result<()> {
         command_cell_runtime: None,
         product_data_io: None,
         execution_scope: None,
+        ..Default::default()
     };
 
     let runtime = echo_agent_app_core::api::runtime::AgentRuntime::bootstrap(
@@ -200,25 +231,80 @@ async fn run_desktop() -> anyhow::Result<()> {
         },
         async move { bridge_join.join().await },
     )?;
+    let channel_runtime = services.channel_runtime.clone();
+    let subagent_projection = services.subagent_projection.clone();
+    let lifecycle = Arc::new(std::sync::Mutex::new(DesktopLifecycleState {
+        services: Some(services),
+        receipt: None,
+    }));
     let builder = crate::tauri::build_tauri_app(
         state,
+        channel_runtime,
         runtime.browser_runtime.clone(),
-        services.subagent_projection.clone(),
+        subagent_projection,
         bridge_supervisor,
+        Arc::downgrade(&lifecycle),
     );
+    let on_exit = Arc::downgrade(&lifecycle);
     run_desktop_with_settlement(
         move || {
+            use tauri::Manager;
             let app = builder.build(tauri_context)?;
-            // App::run exits the process, bypassing our application owner.
-            // Returning the loop keeps Tokio alive until every accepted service
-            // settles. Repeated exit requests still produce only one return.
-            Ok(app.run_return(|_, _| {}))
+            let gui_host = Arc::new(app.handle().clone());
+            let gui_state = app.state::<crate::tauri::state::TauriState>();
+            gui_state.channel_runtime.install_gui_hitl_factory(
+                crate::tauri::commands::chat::channel_gui_hitl_factory(
+                    Arc::downgrade(&gui_host),
+                    Arc::downgrade(&gui_state.app_state),
+                ),
+            );
+            let channels = gui_state.channel_runtime.clone();
+            let channel_start = gui_state.bridge_supervisor.reserve()?;
+            channel_start.track(tokio::spawn(async move {
+                for error in channels.start_configured().await {
+                    tracing::warn!(%error,"Configured IM channel did not start");
+                }
+            }));
+            // Every explicit exit intent closes original admission once. The
+            // returning loop keeps Tokio alive for phase-two physical joins.
+            Ok(app.run_return(move |_, event| {
+                // The loop owns this host. Channel factories retain only Weak.
+                let _original_gui_host = &gui_host;
+                if matches!(event, tauri::RunEvent::ExitRequested { .. })
+                    && let Some(owner) = on_exit.upgrade()
+                    && let Err(error) = owner
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .begin_shutdown()
+                {
+                    tracing::error!(%error,"Unable to begin original desktop shutdown");
+                }
+            }))
         },
-        move |primary_error| {
-            services.settle(
-                echo_agent_app_core::api::runtime::ApplicationLifecycleReason::Shutdown,
-                primary_error,
-            )
+        move |primary_error| async move {
+            let (services, mut receipt) = {
+                let mut original = lifecycle.lock().unwrap_or_else(|error| error.into_inner());
+                (
+                    original.services.take().ok_or_else(|| {
+                        anyhow::anyhow!("original desktop service owner unavailable")
+                    })?,
+                    original.receipt.take(),
+                )
+            };
+            let settled = if let Some(mut receipt) = receipt.take() {
+                if let Some(error) = primary_error {
+                    receipt.primary_error = Some(error.to_string());
+                }
+                services.join(receipt).await
+            } else {
+                services
+                    .settle(
+                        echo_agent_app_core::api::runtime::ApplicationLifecycleReason::Shutdown,
+                        primary_error,
+                    )
+                    .await
+            };
+            Ok(settled)
         },
     )
     .await
@@ -231,7 +317,9 @@ async fn run_desktop_with_settlement<Run, Settle, Settlement>(
 where
     Run: FnOnce() -> anyhow::Result<i32>,
     Settle: FnOnce(Option<anyhow::Error>) -> Settlement,
-    Settlement: std::future::Future<Output = echo_agent_app_core::api::runtime::ApplicationLifecycleReceipt>,
+    Settlement: std::future::Future<
+            Output = anyhow::Result<echo_agent_app_core::api::runtime::ApplicationLifecycleReceipt>,
+        >,
 {
     let primary_error = match run() {
         Ok(0) => None,
@@ -244,17 +332,43 @@ where
     };
     // The same boundary handles builder failures and normal loop completion;
     // neither path may return before the existing service owner joins.
-    let receipt = settle(primary_error).await;
+    // A bounded retained observation is useful to interactive callers, but
+    // returning it here would drop Tokio while original channel owners remain.
+    let receipt = settle(primary_error).await?.wait_final().await;
     receipt.into_result().map_err(anyhow::Error::new)
 }
 
-fn parse_desktop_args(args: impl IntoIterator<Item = OsString>) -> Result<cli::Args, clap::Error> {
+/// Configuration inputs consumed by the existing desktop bootstrap. Console
+/// interaction flags are deliberately absent rather than silently ignored.
+#[derive(Parser, Debug)]
+#[command(name = "echo-agent-tauri", version, about = "Eclip desktop assistant")]
+struct DesktopArgs {
+    /// Configured model ID or unique model name; otherwise use the default.
+    #[arg(long, short = 'm', env = "MODEL_NAME")]
+    model: Option<String>,
+
+    /// Project directory whose instructions the desktop Agent loads.
+    #[arg(long)]
+    project: Option<String>,
+
+    /// MCP configuration file override.
+    #[arg(long)]
+    mcp_config: Option<String>,
+
+    /// Eclip configuration file (eko.yaml).
+    #[arg(long)]
+    config: Option<String>,
+}
+
+fn parse_desktop_args(
+    args: impl IntoIterator<Item = OsString>,
+) -> Result<DesktopArgs, clap::Error> {
     let args = args
         .into_iter()
         // Finder may add a process-serial-number argument when launching a
-        // macOS application bundle. It is platform metadata, not an EKO flag.
+        // macOS application bundle. It is platform metadata, not an Eclip flag.
         .filter(|arg| !arg.to_string_lossy().starts_with("-psn_"));
-    cli::Args::try_parse_from(args)
+    DesktopArgs::try_parse_from(args)
 }
 
 #[cfg(test)]
@@ -270,6 +384,21 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+    #[test]
+    fn window_close_is_prevented_before_hide_even_when_hide_fails() -> anyhow::Result<()> {
+        let order = std::cell::RefCell::new(Vec::new());
+        let result = hide_requested_window(
+            || order.borrow_mut().push("prevent"),
+            || {
+                order.borrow_mut().push("hide");
+                Err::<(), _>("native hide failed")
+            },
+        );
+        assert_eq!(result, Err("native hide failed"));
+        assert_eq!(*order.borrow(), vec!["prevent", "hide"]);
+        Ok(())
+    }
 
     #[test]
     fn desktop_args_preserve_explicit_mcp_override() -> anyhow::Result<()> {
@@ -296,6 +425,52 @@ mod tests {
         )?;
         assert_eq!(args.mcp_config.as_deref(), Some("/tmp/eko-mcp.json"));
         Ok(())
+    }
+
+    #[test]
+    fn desktop_args_preserve_all_configuration_overrides() -> anyhow::Result<()> {
+        let args = parse_desktop_args(
+            [
+                "echo-agent-tauri",
+                "-m",
+                "configured-model",
+                "--project",
+                "/tmp/项目",
+                "--mcp-config",
+                "/tmp/工具.json",
+                "--config",
+                "/tmp/eko.yaml",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )?;
+        assert_eq!(args.model.as_deref(), Some("configured-model"));
+        assert_eq!(args.project.as_deref(), Some("/tmp/项目"));
+        assert_eq!(args.mcp_config.as_deref(), Some("/tmp/工具.json"));
+        assert_eq!(args.config.as_deref(), Some("/tmp/eko.yaml"));
+        Ok(())
+    }
+
+    #[test]
+    fn desktop_args_reject_console_interaction_flags() {
+        for flag in [
+            "--tui",
+            "--cli",
+            "--jsonl",
+            "--web",
+            "--channels",
+            "--continue",
+            "--resume",
+            "--port",
+            "--verbose",
+        ] {
+            let result =
+                parse_desktop_args(["echo-agent-tauri", flag].into_iter().map(OsString::from));
+            assert!(matches!(
+                result,
+                Err(error) if error.kind() == clap::error::ErrorKind::UnknownArgument
+            ));
+        }
     }
 
     #[tokio::test]
@@ -330,7 +505,11 @@ mod tests {
                 }
                 Ok(0)
             },
-            |error| owner.settle(ApplicationLifecycleReason::Shutdown, error),
+            |error| async move {
+                Ok(owner
+                    .settle(ApplicationLifecycleReason::Shutdown, error)
+                    .await)
+            },
         )
         .await?;
 
@@ -368,7 +547,11 @@ mod tests {
         );
         let exit = tokio::spawn(run_desktop_with_settlement(
             || Ok(0),
-            |error| owner.settle(ApplicationLifecycleReason::Shutdown, error),
+            |error| async move {
+                Ok(owner
+                    .settle(ApplicationLifecycleReason::Shutdown, error)
+                    .await)
+            },
         ));
 
         timeout(TEST_TIMEOUT, cancel_seen_rx).await??;
@@ -396,7 +579,11 @@ mod tests {
 
         let error = run_desktop_with_settlement(
             || Err(anyhow::anyhow!("desktop builder failed")),
-            |error| owner.settle(ApplicationLifecycleReason::Shutdown, error),
+            |error| async move {
+                Ok(owner
+                    .settle(ApplicationLifecycleReason::Shutdown, error)
+                    .await)
+            },
         )
         .await
         .err()
@@ -435,7 +622,11 @@ mod tests {
 
         let error = run_desktop_with_settlement(
             || Ok(0),
-            |error| owner.settle(ApplicationLifecycleReason::Shutdown, error),
+            |error| async move {
+                Ok(owner
+                    .settle(ApplicationLifecycleReason::Shutdown, error)
+                    .await)
+            },
         )
         .await
         .err()
@@ -459,7 +650,11 @@ mod tests {
         let owner = ApplicationLifecycleOwner::new(cancel.clone());
         let error = run_desktop_with_settlement(
             || Ok(17),
-            |error| owner.settle(ApplicationLifecycleReason::Shutdown, error),
+            |error| async move {
+                Ok(owner
+                    .settle(ApplicationLifecycleReason::Shutdown, error)
+                    .await)
+            },
         )
         .await
         .err()

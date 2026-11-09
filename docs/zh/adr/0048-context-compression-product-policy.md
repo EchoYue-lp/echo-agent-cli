@@ -23,9 +23,11 @@ manual_compression。永久保留所有用户输入会破坏活动窗口的上�
   各入口传入同一个可选 focus；GUI 提供压缩重点输入框，TUI 接受命令后的文本。
 - app-core 持有 foreground/AgentPool/workspace I/O owner，取消传给框架并等待结果。
   变换前取消保留上下文；变换成功后即使 caller drop/cancel，journal safe point 仍完成。
-- Goal contract 与 recovery capsule 来自唯一的 TaskRuntimeStore。最近四个已记录 user steer
-  按时间顺序保留其完整有界 excerpt，不再在 projection 上二次截成 200 字符。
-  它们不是新请求或新的 canonical system policy，退出 run scope 时删除 projection。
+- Goal contract 与 recovery capsule 来自唯一的 TaskRuntimeStore。journal 保留 user steer
+  全文；最近四条的活动投影按时间顺序保留短原文或 400 字符预览与完整 SHA 的稳定引用。
+  长原文沿原 PreparedUserTurn/InputResourceRef 落在 host 产品数据目录，缓存缺失/篡改
+  只能从原 journal 再物化，不把尾部丢弃后宣称约束完整。它们不是新请求或新的
+  canonical system policy，退出 run scope 时删除 projection。最近四条只是呈现预览；完整历史通过同journal派生来源入口按需读取，不产生独立有效要求账本。
 - ConversationStore 保存完整 transcript，ContextManager 保存活动窗口，RuntimeStateStore
   保存恢复 checkpoint，TaskRuntimeStore 保存 goal/执行事实，Trace/ChatEventLog 保存诊断和事件。
 
@@ -40,3 +42,106 @@ manual_compression。永久保留所有用户输入会破坏活动窗口的上�
 四类 surface focus 都产生一份 checkpoint 和一条 journal 事件；取消、caller drop 和 journal
 失败保留原结算合同。真实压缩后 goal 和 steer 的末尾限制仍在，重复刷新不累积 projection。
 Rust、GUI 与前端验证分别报告，不能把 mock 测试当作原生窗口或外部模型验收。
+
+## 补充决策：必要原文不可达时保留可恢复任务
+
+原 Framework required projector/final request 接缝负责通用错误传播。EKO 的原
+TaskRuntime projector 使用它，把本机 artifact 读取策略留在应用：原 reader 在
+snapshot 的 host 根下校验 SHA/文件，SSH 项目的 read_file 不承担本机产品数据读取。
+真正的最终模型请求必须含 read_artifact；非空 allowed_tools 移除它时不能自动加回，
+empty allowed_tools 仍为原 unrestricted 语义。物化、验证或读取资格失败不能只发送预览。
+
+原 typed AgentFailure 的 code=required_context_unavailable 由同一 helper 分类，
+不解析 message、不将 retryable 改 true。正式 PlanTask 原 exact-claim interruption/CAS
+暂停任务和 Run；普通 GUI/IM 的原 RunTurn owner 用 NeedsInput 暂停原 Run。两条路径
+保留原物理失败和 Goal，修复后通过原 expected-resume 恢复，retry 不增加。
+Cancelled、旧 claim 与 ExecutionNotSettled 的原优先级保持，不新增 store/状态机。
+
+仅内联全文会越窗；仅截预览会丢尾部；仅查工具注册表会漏本次 hard W。所选方案复用
+原 journal、spill、read_artifact 与 TaskRuntime owner，不新建权限或错误共享旗。
+行为模式参考框架 ADR0081 所列 LangChain 官方 middleware 显式 handler/异常传播，
+本项目的 required 与暂停政策是本地工程推论，不声称外部提供同名 API。
+
+验收须真实走超过8000 token的 ContextManager、冷重开/重复压缩、损坏缓存重建，
+以及 execute_run 和 drive_chat 的暂停后恢复。SSH read_file-only 控制须证明最终工具
+范围不变、模型/脚本/远端FileSystem均不调用。必要历史和完整原文仍须由主模型在真实压缩/恢复后读取；最近四条预览不代表完整历史。
+2026-10-27用户裁决已撤销独立意图分类与强制有效要求/计划/验收链，不再为这些旧方案建立后续切片。
+
+
+## 2026-10-27 裁决：Steer 由主模型理解，已有 Goal 仅用户可改
+
+用户明确：普通Steer由主模型结合历史理解并在执行中按需更新计划，不先调用独立模型，
+也不强制串联“有效要求更新 → 计划调整 → 验收调整”。该裁决替换旧Plan14的独立理解和
+强制传播承诺，旧原文修复、接纳、幂等、错误与恢复证据保留各自真实范围，不改称全部通过。
+
+TaskRun.goal是必填字段，未建立该运行目标时复用原初始化设置初始Goal。已有Run的重试、
+ensure_scope与create_run重入返回原目标；普通Steer接纳/消费和模型task_update不能改写已有
+Goal、goal_revision或goal_hash。用户通过GUI目标编辑或IM `/task-goal` 显式修改，继续使用
+原RunGoalActorSource、expected_goal_revision/CAS和安全点；用户目标变更的原版本失效规则保留。
+
+用户“结束并删除当前目标”沿原结束/取消入口退出活动目标呈现，不向后端写空Goal或抹去
+历史事实。普通执行取消同样按原生命周期结算并保留goal/revision/hash，不能把取消运行等同
+修改或历史删除Goal而另加权限门控。原Stop、HITL、恢复与物理结算owner不变。
+
+必要历史、完整长原文及末尾限制继续沿原journal、压缩投影与read_artifact读取；缺失或
+校验失败时原required_context_unavailable暂停相关新副作用，原Goal和可恢复owner保留。
+这里不新增GoalStore、要求解释器、第二份队列/状态机或结构化模型协议，也不裁剪通用框架/SDK API。
+
+## 2026-10-27 可发现的完整原文入口
+
+保留原Goal/Steer产品权限：普通追加输入只交主模型结合历史理解；已有Goal只由用户显式更新或结束，不引入独立意图模型或统一强制要求/计划/验收流程。压缩后可读原文不等于全部原文常驻上下文。
+
+原TaskRuntime的原始输入来源族从同一个journal派生，原始接纳与投递事实分别保留。模型在有界恢复capsule中取得准确Run、journal identity及固定序号前缀的不可变引用，通过既有`read_artifact`按需分页恢复十三条以上输入前的原文及末尾限制。完整来源由原有界journal读取覆盖到切点，不能把近期4/8条或一个256事件结果页当作全集。
+
+派生来源缓存可重建，不拥有Goal、计划、要求或输入生命周期状态。每个已发布文件按真实源内容和原journal代际稳定命名；无新来源的重复刷新保留inode/mtime，后继追加不覆盖旧文件。最终请求校验的是模型实际看到的固定前缀，因此并发新输入不会混入旧页；下一安全点刷新为新引用。旧引用的Run、代际、SHA和cursor仍由原reader核验。
+
+关键来源读取、物化、校验或最终`read_artifact`资格缺失时保留原required-context失败→暂停→expected-resume链，不以降空历史、放宽工具范围或重放未知副作用替代恢复。原文文件固定落在本机产品data-root，SSH项目的FileSystem/read_file不能冒充本机原文读取。
+
+验证必须检查真实压缩后的模型请求可发现入口，以及真实tool结果逐页进入后继模型调用并覆盖早期全文/末尾；fixture本地回读或把旧正文再次当当前输入不构成此资格。
+
+### canonical长Goal与原文历史分别保持来源
+
+当前长Goal沿原GoalContract接缝物化到host artifacts，并携带原Goal revision/hash及Run/journal代际；原tasks/objective仅归档。legacy无Accepted的长初始化目标及用户后来改过的长目标都可由原host read_artifact读取，不为它们添加伪输入或扩展raw来源事件类别，也不把新Goal写入旧raw前缀。短目标按原内联方式；实际已完整呈现的必要原文不因派生引用新增reader要求，NoTools/限定read_file正常正控继续成立。真正被省略的必要长Goal或早期原文缺reader则沿原暂停/expected-resume，不放宽W。
+
+完整可见性的判断以最终实际模型请求为准：既有 GoalContract 能内联的边界与未启用 continuation 时的恢复预览边界分别沿用；预览会省略的 canonical Goal 发布 host 引用。当前 PreparedUserTurn 已完整内联的中段文字（超过预览长度但未到 spill 边界）保持 NoTools／read_file-only 正常执行。此前真实配对 read_artifact 调用和 Tool 结果若仍完整留在请求中，按分页字节范围、全文覆盖及原 SHA 核对后也算全文可见；缺页、重叠不一致或 SHA 不符不算。核对不会从本地文件补入缺失模型文字，也不把“文件存在”当作“模型已读取”。同一 Goal 的已发布引用资格仍绑定 Run、journal、revision 与 hash，不随当前投影显示模式改变。
+
+### 分页消费者测试的真实封包边界
+
+分页测试必须绑定实际模型请求里的 assistant 调用、原 ToolCall 和 ToolResult 的同一调用 ID。
+`read_artifact` 的第一页省略可选 string 参数 `cursor`；发送 JSON null 会被原 schema 校验
+拒绝，此时模型中的 `[Error]` 是错误结果，不构成原文页或原文截断的证据。
+
+成功页按原 reader 在真实输出末尾附加的分页 notice 解包，不按 expected 字符数截取首部。
+验证模型 Tool 文本与原 ToolResult 完整输出相同，再核对文件坐标、原 SHA、连续字节范围、
+每页完整 UTF-8 内容与 SHA，并从实际模型页重构整个来源文件。只出现短 marker、fixture
+本地可读或 sidecar preview 均不等于全文进入模型。验收继续使用原 8000-token 上限和
+2000-token 页预算；本节约束验证方法，具体通过资格以对应实际命令与快照回执为准。
+
+## 2026-11-06 补充确认：轮次自然收尾对照总 Goal
+
+启用 continuation 的 TaskRun 在既有 Goal contract（`[eko_run_goal_contract]`）中增加一段
+轮次收尾要求；它仍由同一个 TaskRuntime 投影在每次模型安全点发布，不新增轮次 Goal、
+要求账本、总结 store、完成判定或独立反思模型调用。
+
+- 总 Goal 对模型只读：模型可以选择本轮执行重点、更新计划或撰写总结，但不能改写 Goal
+  原文、revision 或 hash，也不能用本轮较小的执行重点替换或缩小总 Goal。本轮执行重点是
+  从总 Goal、剩余义务和当前证据派生的可变工作选择，不是第二份目标权威。
+- 自然收尾时用短段落说明：本轮推进了哪项原目标义务、实际证据及其验证层级、仍保留的
+  未完成项、当前障碍（若有）和下一步。允许合并表达，不要求机械五标题，也不重复计划；
+  用户明确指定了输出格式时遵循该格式，不因收尾提示禁止标题。
+- 优先推进可执行工作，不能用写总结代替执行。本轮没有新增验收证据（例如只整理材料）时
+  明确说明；材料整理、测试通过、原生操作与发布状态互不冒充，未验证事项不写成已完成。
+- 下一轮执行重点可根据新证据调整，但上轮总结和下一步建议都不能替代总 Goal，也不能让
+  未完成义务消失。当前 Goal 与历史总结冲突时，以 canonical Goal 和当前运行事实为准；
+  普通 Steer 不自动修改 Goal。
+- 只有用户显式修改目标才沿既有 revision/CAS 与安全点路径产生新版本，并在 journal 保留
+  历史原文。既有完成门禁、取消、预算和重复阻塞规则继续决定运行终态；助手写出“完成”
+  或总结缺项都不会自行修改运行状态。
+- 条件继续沿用 `continuation.enabled`；共享投影是唯一提示来源，续接指令只引用它，不复制
+  第二份总结规则、不重放用户输入。普通无持续 Goal 或未启用 continuation 的聊天不套用该
+  固定模板。
+
+该要求是模型行为提示策略，不保证任何具体模型必然遵循固定格式，也不靠 Stop 强制循环或
+额外模型请求补齐格式。确定性测试只能证明真实模型请求中包含该合同、只出现一份，且原终态
+规则未改变；具体模型的遵循情况须由另行授权的真实模型样本单独验收，不能用模板测试或
+mock 输出代替。

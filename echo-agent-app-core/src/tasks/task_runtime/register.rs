@@ -1,18 +1,14 @@
 //! Register the full task-management tool suite on an existing agent.
 //!
-//! Shared by GUI (`echo-agent-cli/src/tauri/desktop.rs`) and TUI
-//! (`echo-agent-cli/src/main.rs`): the primary agent is created before the
-//! `TaskRuntimeStore` exists (bootstrap builds it later), so task tools can't
-//! be injected at construction time — they're registered post-hoc once the
-//! store is ready. Pooled agents instead get the tools via
-//! `SharedResources.task_runtime_store`.
+//! Shared post-bootstrap composition for retained GUI/IM/cron capabilities.
+//! The primary agent is built before AppState exposes its TaskRuntimeStore;
+//! ApplicationServices then installs these tools with the canonical store.
+//! Pool initialization passes that same store through SharedResources.
+//! Legacy entrypoints still call this existing hook during console retirement;
+//! those current callers do not establish a permanent surface-parity contract.
 //!
 //! Registers the revisioned TaskCreate/TaskUpdate/TaskList contract plus
 //! CreateComplexTask / CheckRunStatus / CancelRun and `task_execute`.
-//!
-//! TUI/GUI functional parity (AGENTS.md): both entry points call this so the
-//! primary agent can drive complex tasks (plan / subagent / run lifecycle) via
-//! `drive_chat` — TUI is a full Agent, not a lightweight chat.
 
 use std::sync::Arc;
 
@@ -31,7 +27,11 @@ pub async fn task_revision_service_for_agent(
     subagent_catalog: Arc<SubagentCatalogSnapshot>,
 ) -> Arc<echo_agent::tasks::TaskRevisionService> {
     let tool_names = agent_handle.read(|agent| agent.tool_names()).await;
-    let capabilities = Arc::new(TaskCapabilityCatalog::new(subagent_catalog, tool_names));
+    let registry = agent_handle
+        .read(|agent| agent.subagent_registry().clone())
+        .await;
+    let capabilities =
+        Arc::new(TaskCapabilityCatalog::new(subagent_catalog, tool_names).with_registry(registry));
     super::revisioned_runtime::build_task_revision_service(store, capabilities)
 }
 
@@ -51,10 +51,12 @@ pub async fn register_task_tools_on_agent(
         })
         .await;
     let tool_names = agent_handle.read(|agent| agent.tool_names()).await;
-    let capabilities = Arc::new(TaskCapabilityCatalog::new(
-        subagent_catalog.clone(),
-        tool_names,
-    ));
+    let registry = agent_handle
+        .read(|agent| agent.subagent_registry().clone())
+        .await;
+    let capabilities = Arc::new(
+        TaskCapabilityCatalog::new(subagent_catalog.clone(), tool_names).with_registry(registry),
+    );
     let revision_service =
         super::revisioned_runtime::build_task_revision_service(store.clone(), capabilities);
     let added = agent_handle
@@ -80,8 +82,8 @@ pub async fn register_task_tools_on_agent(
     }
 
     // Also register task_execute tool (only on main agent per §10.2).
-    // Use ParallelReadonlyDelegation as the default route; the route is
-    // resolved per-run by the router at the orchestration layer.
+    // The existing router resolves each run's route; constructing this tool
+    // does not select a fixed delegation policy.
     let tool = ExecuteTaskTool::new(store.clone(), agent_handle.clone());
     let ep_added = agent_handle
         .write(|agent| {

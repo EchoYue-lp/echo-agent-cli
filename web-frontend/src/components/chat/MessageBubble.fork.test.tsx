@@ -1,6 +1,13 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.hoisted(() => {
+  Object.defineProperty(window, 'matchMedia', {
+    configurable: true,
+    value: () => ({ matches: false }),
+  });
+});
 import { useSubagentRunStore } from '../../stores/subagentRunStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import type { ChatMessage } from '../../types/api';
@@ -12,6 +19,7 @@ const reply: ChatMessage = {
   content: '已经完成的回复',
   timestamp: 1,
   isStreaming: false,
+  finalAnswerConfirmed: true,
 };
 
 describe('reply Fork action', () => {

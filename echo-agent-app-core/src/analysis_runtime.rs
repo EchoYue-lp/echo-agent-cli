@@ -76,6 +76,7 @@ pub struct AnalyticsRuntime {
     cache_root: PathBuf,
     uv_program: PathBuf,
     product_data_io: crate::product_data_io::ProductDataIoService,
+    project_environment: Option<crate::tasks::task_runtime::store::ProjectExecutionEnvironment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +106,7 @@ impl Default for AnalyticsRuntime {
             cache_root: crate::data_root::user_data_path("runtimes").join("analytics"),
             uv_program,
             product_data_io: crate::product_data_io::ProductDataIoService::new(),
+            project_environment: None,
         }
     }
 }
@@ -116,6 +118,7 @@ impl AnalyticsRuntime {
             cache_root,
             uv_program: PathBuf::from("uv"),
             product_data_io: crate::product_data_io::ProductDataIoService::new(),
+            project_environment: None,
         }
     }
 
@@ -129,7 +132,16 @@ impl AnalyticsRuntime {
             cache_root: crate::data_root::user_data_path("runtimes").join("analytics"),
             uv_program,
             product_data_io,
+            project_environment: None,
         }
+    }
+
+    pub fn with_project_environment(
+        mut self,
+        environment: Option<crate::tasks::task_runtime::store::ProjectExecutionEnvironment>,
+    ) -> Self {
+        self.project_environment = environment;
+        self
     }
 
     pub async fn prepare_python(&self) -> AnalyticsRuntimeResult<PreparedAnalyticsRuntime> {
@@ -156,6 +168,15 @@ impl AnalyticsRuntime {
         cancel: Option<Arc<CancellationToken>>,
     ) -> AnalyticsRuntimeResult<PreparedAnalyticsRuntime> {
         ensure_not_cancelled(cancel.as_ref(), "before acquiring the runtime lock")?;
+        if let Some(environment) = self.project_environment.as_ref()
+            && let crate::workspace::ProjectLocation::Ssh { path, .. } = &environment.location
+        {
+            // The local managed uv cache is an EKO product resource, not an
+            // executable installed on another machine. Probe the target's
+            // existing runtime; never provision locally and send that path to
+            // SSH or silently install packages outside the chosen project.
+            return prepare_project_python(environment, path, cancel).await;
+        }
         let profile_hash = runtime_hash();
         let _profile_guard = acquire_profile_gate(&profile_hash, cancel.as_ref()).await?;
         let cache_root = self.cache_root.clone();
@@ -475,10 +496,7 @@ async fn probe_python(
     python: &Path,
     cancel: Option<Arc<CancellationToken>>,
 ) -> AnalyticsRuntimeResult<ProbeOutput> {
-    let packages = serde_json::to_string(PACKAGE_NAMES)?;
-    let script = format!(
-        "import importlib.metadata as m, json, sys; names={packages}; print(json.dumps({{'python': sys.version.split()[0], 'executable': sys.executable, 'base_prefix': sys.base_prefix, 'packages': {{name: m.version(name) for name in names}}}}))"
-    );
+    let script = python_probe_script()?;
     let mut command = tokio::process::Command::new(python);
     command.arg("-c").arg(script);
     let output = command_raw_output(
@@ -490,6 +508,68 @@ async fn probe_python(
     )
     .await?;
     serde_json::from_str(&output.stdout).map_err(AnalyticsRuntimeError::InvalidMetadata)
+}
+
+fn python_probe_script() -> AnalyticsRuntimeResult<String> {
+    let packages = serde_json::to_string(PACKAGE_NAMES)?;
+    Ok(format!(
+        "import importlib.metadata as m, json, sys; names={packages}; print(json.dumps({{'python': sys.version.split()[0], 'executable': sys.executable, 'base_prefix': sys.base_prefix, 'packages': {{name: m.version(name) for name in names}}}}))"
+    ))
+}
+
+async fn prepare_project_python(
+    environment: &crate::tasks::task_runtime::store::ProjectExecutionEnvironment,
+    working_dir: &str,
+    cancel: Option<Arc<CancellationToken>>,
+) -> AnalyticsRuntimeResult<PreparedAnalyticsRuntime> {
+    let command =
+        SandboxCommand::program("python3", vec!["-c".to_string(), python_probe_script()?])
+            .with_working_dir(PathBuf::from(working_dir))
+            .with_timeout(PYTHON_PROBE_TIMEOUT);
+    let mut limits = ResourceLimits::unrestricted();
+    limits.max_output_bytes = Some(MAX_COMMAND_OUTPUT_BYTES);
+    let output = environment
+        .executor
+        .execute_with_limits_and_cancel(command, limits, cancel)
+        .await
+        .map_err(|error| AnalyticsRuntimeError::ProbeFailed(error.to_string()))?;
+    if !output.success() || output.output_truncated {
+        return Err(AnalyticsRuntimeError::ProbeFailed(format!(
+            "target analytics Python is unavailable (exit={}): {}",
+            output.exit_code,
+            bounded_text(&output.stderr, MAX_COMMAND_OUTPUT_CHARS),
+        )));
+    }
+    let probe: ProbeOutput = serde_json::from_str(&output.stdout)?;
+    if !probe.executable.starts_with('/') || !probe.base_prefix.starts_with('/') {
+        return Err(AnalyticsRuntimeError::ProbeFailed(
+            "target Python returned a non-absolute executable or prefix".to_string(),
+        ));
+    }
+    let identity = serde_json::to_vec(&serde_json::json!({
+        "project": environment.binding,
+        "executable": probe.executable,
+        "python": probe.python,
+        "packages": probe.packages,
+    }))?;
+    let id = format!("project-python-{}", hex::encode(Sha256::digest(identity)));
+    let mut facts = BTreeMap::from([
+        ("analytics.profile".to_string(), id.clone()),
+        ("python".to_string(), probe.python),
+        ("python.executable".to_string(), probe.executable.clone()),
+    ]);
+    for (name, version) in probe.packages {
+        facts.insert(format!("python.package.{name}"), version);
+    }
+    let profile = ScriptExecutionProfile::new(id, "python", PathBuf::from(probe.executable))
+        .with_env("PYTHONUTF8", "1")
+        .with_env("MPLBACKEND", "Agg")
+        .with_env("MPLCONFIGDIR", ".matplotlib")
+        .with_read_only_path(PathBuf::from(probe.base_prefix));
+    Ok(PreparedAnalyticsRuntime {
+        profile: Arc::new(profile),
+        environment: facts,
+    })
 }
 
 async fn command_output<F>(
@@ -594,6 +674,104 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> AnalyticsRuntimeResult<()
 
 #[cfg(test)]
 mod tests {
+    struct TargetPythonProbe {
+        cwd: PathBuf,
+        available: bool,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SandboxExecutor for TargetPythonProbe {
+        fn name(&self) -> &str {
+            "target-python-probe-fixture"
+        }
+        fn isolation_level(&self) -> echo_agent::sandbox::IsolationLevel {
+            echo_agent::sandbox::IsolationLevel::None
+        }
+        fn is_available(&self) -> futures::future::BoxFuture<'_, bool> {
+            Box::pin(async { true })
+        }
+        fn execute(
+            &self,
+            command: SandboxCommand,
+        ) -> futures::future::BoxFuture<
+            '_,
+            echo_agent::error::Result<echo_agent::sandbox::ExecutionResult>,
+        > {
+            Box::pin(async move {
+                if command.working_dir.as_ref() != Some(&self.cwd) {
+                    return Err(ReactError::Other(
+                        "Python probe used the wrong project cwd".to_string(),
+                    ));
+                }
+                let echo_agent::sandbox::CommandKind::Program { program, args } = command.kind
+                else {
+                    return Err(ReactError::Other(
+                        "Python probe must use structured execution".to_string(),
+                    ));
+                };
+                if program != "python3" || args.first().map(String::as_str) != Some("-c") {
+                    return Err(ReactError::Other(
+                        "Python probe used a local managed runtime".to_string(),
+                    ));
+                }
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let stdout = serde_json::json!({ "python":"3.12.8", "executable":"/opt/target/python3", "base_prefix":"/opt/target", "packages":PACKAGE_NAMES.iter().map(|name| ((*name).to_string(), "fixture".to_string())).collect::<BTreeMap<_,_>>() }).to_string();
+                Ok(echo_agent::sandbox::ExecutionResult {
+                    exit_code: if self.available { 0 } else { 127 },
+                    stdout,
+                    stderr: if self.available {
+                        String::new()
+                    } else {
+                        "target python missing".to_string()
+                    },
+                    duration: Duration::ZERO,
+                    sandbox_type: self.name().to_string(),
+                    timed_out: false,
+                    cancelled: false,
+                    output_truncated: false,
+                    stdout_bytes: 0,
+                    stderr_bytes: 0,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_analytics_profile_never_prepares_or_falls_back_to_local_uv()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for available in [true, false] {
+            let mut fixture =
+                crate::tasks::task_runtime::project_environment_tests::EnvironmentFixture::new()?;
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            fixture.executor = Arc::new(TargetPythonProbe {
+                cwd: fixture.visible_root.clone(),
+                available,
+                calls: calls.clone(),
+            });
+            let store = fixture.open("target.invalid", 3)?;
+            let local_cache = fixture.data_root.join("must-not-provision-local-uv");
+            let mut runtime = AnalyticsRuntime::with_cache_root(local_cache.clone())
+                .with_project_environment(store.project_environment());
+            runtime.uv_program = PathBuf::from("/must-not-run-local-uv");
+            let result = runtime.prepare_python().await;
+            assert_eq!(calls.load(std::sync::atomic::Ordering::Acquire), 1);
+            assert!(!local_cache.exists());
+            if available {
+                let prepared = result?;
+                assert_eq!(
+                    prepared.profile.program,
+                    PathBuf::from("/opt/target/python3")
+                );
+                assert!(prepared.profile.id.starts_with("project-python-"));
+            } else {
+                assert!(
+                    result
+                        .is_err_and(|error| error.to_string().contains("target analytics Python"))
+                );
+            }
+        }
+        Ok(())
+    }
     use super::*;
 
     #[test]
@@ -652,6 +830,7 @@ mod tests {
     async fn unavailable_uv_returns_an_actionable_error() -> AnalyticsRuntimeResult<()> {
         let root = tempfile::tempdir()?;
         let runtime = AnalyticsRuntime {
+            project_environment: None,
             cache_root: root.path().to_path_buf(),
             uv_program: root.path().join("missing-uv"),
             product_data_io: crate::product_data_io::ProductDataIoService::new(),
@@ -670,6 +849,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let product_data_io = crate::product_data_io::ProductDataIoService::new();
         let runtime = AnalyticsRuntime {
+            project_environment: None,
             cache_root: root.path().join("cache"),
             uv_program: root.path().join("missing-uv"),
             product_data_io: product_data_io.clone(),
@@ -733,6 +913,7 @@ mod tests {
         permissions.set_mode(0o700);
         fs::set_permissions(&uv, permissions)?;
         let runtime = AnalyticsRuntime {
+            project_environment: None,
             cache_root: root.path().join("cache"),
             uv_program: uv,
             product_data_io: crate::product_data_io::ProductDataIoService::new(),
@@ -763,6 +944,7 @@ mod tests {
         let external_lock = open_prepare_lock(&runtime_dir)?;
         external_lock.lock_exclusive()?;
         let runtime = AnalyticsRuntime {
+            project_environment: None,
             cache_root: root.path().join("cache"),
             uv_program: root.path().join("missing-uv"),
             product_data_io: crate::product_data_io::ProductDataIoService::new(),

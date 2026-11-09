@@ -3,8 +3,6 @@ mod tests {
     use super::*;
     use echo_agent::agent::ReactAgentBuilder;
     use echo_agent::testing::MockLlmClient;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[derive(Default)]
@@ -78,61 +76,7 @@ mod tests {
             "monitors:\n  - name: daily-review\n    cron: \"0 0 * * * *\"\n    prompt: Review pending work\n",
         )
         .map_err(|error| error.to_string())?;
-        #[cfg(unix)]
-        write_fake_lsp(&plugin, name)?;
         Ok(plugin)
-    }
-
-    #[cfg(unix)]
-    fn write_fake_lsp(plugin: &Path, plugin_name: &str) -> Result<(), String> {
-        let server = plugin.join("fake-lsp.sh");
-        std::fs::write(
-            &server,
-            r#"#!/bin/sh
-while IFS= read -r raw_line; do
-  line=$(printf '%s' "$raw_line" | tr -d '\r')
-  case "$line" in
-    Content-Length:*) length=${line#Content-Length: } ;;
-    "")
-      request=$(dd bs=1 count="$length" 2>/dev/null)
-      id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-      if [ -n "$id" ]; then
-        response=$(printf '{"jsonrpc":"2.0","id":%s,"result":{"capabilities":{}}}' "$id")
-        printf 'Content-Length: %s\r\n\r\n%s' "${#response}" "$response"
-      fi
-      ;;
-  esac
-done
-"#,
-        )
-        .map_err(|error| error.to_string())?;
-        let mut permissions = std::fs::metadata(&server)
-            .map_err(|error| error.to_string())?
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&server, permissions).map_err(|error| error.to_string())?;
-
-        let language = if plugin_name == "runtime-fixture" {
-            "fixture".to_string()
-        } else {
-            format!("{plugin_name}-fixture")
-        };
-        let lsp = serde_yaml::to_string(&echo_agent::lsp::LspConfigFile {
-            languages: HashMap::from([(
-                language.clone(),
-                echo_agent::lsp::LspServerConfig {
-                    language,
-                    command: server.display().to_string(),
-                    args: Vec::new(),
-                    extensions: vec![".fixture".to_string()],
-                    env: HashMap::new(),
-                    initialization_options: None,
-                    max_restarts: 0,
-                },
-            )]),
-        })
-        .map_err(|error| error.to_string())?;
-        std::fs::write(plugin.join("lsp.yaml"), lsp).map_err(|error| error.to_string())
     }
 
     async fn service(root: &Path) -> Result<Arc<PluginRuntimeService>, String> {
@@ -286,15 +230,9 @@ done
             .working_dir(root)
             .build()
             .map_err(|error| error.to_string())?;
-        let manager = Arc::new(RwLock::new(LspManager::new()));
-        let lsp = PluginLspRuntime::new(
-            manager,
-            PluginLspRuntime::config_for_workspace(root),
-            root.to_path_buf(),
-        );
         PluginRuntimeService::new_owned(
             AgentHandle::new(agent),
-            lsp,
+            root.to_path_buf(),
             McpNameOwnershipRegistry::new(Vec::<String>::new()),
         )
         .await
@@ -363,6 +301,260 @@ done
     }
 
     #[tokio::test]
+    async fn reload_summary_preserves_complete_frozen_diagnostics() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let plugin = write_fixture(temp.path())?;
+        let runtime = service(temp.path()).await?;
+        std::fs::write(plugin.join("mcp.json"), "{").map_err(|error| error.to_string())?;
+        let hooks = plugin.join("hooks/hooks.yaml");
+        std::fs::remove_file(&hooks).map_err(|error| error.to_string())?;
+        std::fs::create_dir(&hooks).map_err(|error| error.to_string())?;
+        let mut registry = runtime.registry_for(temp.path().to_path_buf());
+        runtime
+            .scan_registry(&mut registry)
+            .map_err(|error| error.to_string())?;
+        let prepared = runtime.integrator.prepare(&mut registry).await;
+        assert!(
+            prepared.diagnostics().iter().any(|diagnostic| {
+                diagnostic.component() == "mcp"
+                    && diagnostic.severity() == echo_agent::plugin::PluginDiagnosticSeverity::Error
+            }),
+            "current MCP source must produce a real frozen Error"
+        );
+        assert!(
+            prepared.diagnostics().iter().any(|diagnostic| {
+                diagnostic.severity() == echo_agent::plugin::PluginDiagnosticSeverity::Warning
+            }),
+            "current wrong-kind component must retain its generic Warning"
+        );
+        let components =
+            prepare_application_components(&prepared, "diagnostic-contract", &registry)
+                .map_err(|errors| errors.join("; "))?;
+        let summary = ReloadSummary::from_components(1, 1, None, Some(&prepared), &components);
+        assert_eq!(summary.errors.len(), prepared.diagnostics().len());
+        for diagnostic in prepared.diagnostics() {
+            assert!(summary.errors.iter().any(|message| {
+                message == &format!("{:?}: {diagnostic}", diagnostic.severity())
+            }));
+        }
+        runtime
+            .shutdown()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn current_component_error_rejects_reload_and_keeps_original_published_generation()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let plugin = write_fixture(temp.path())?;
+        let runtime = service(temp.path()).await?;
+        let (revision, identity, domain) = {
+            let state = runtime.state.lock().await;
+            let prepared = state
+                .framework_generation
+                .as_ref()
+                .ok_or("published generation missing")?;
+            (
+                state.generation,
+                prepared.identity().to_string(),
+                state
+                    .prepared
+                    .domains
+                    .plugins
+                    .get("runtime-fixture")
+                    .ok_or("domain provider missing")?
+                    .identity
+                    .clone(),
+            )
+        };
+        std::fs::write(plugin.join("mcp.json"), "{").map_err(|error| error.to_string())?;
+        let error = runtime
+            .reload()
+            .await
+            .err()
+            .ok_or("invalid MCP candidate was published")?;
+        assert!(error.to_string().contains("mcp"));
+        {
+            let state = runtime.state.lock().await;
+            assert_eq!(state.generation, revision);
+            assert_eq!(
+                state
+                    .framework_generation
+                    .as_ref()
+                    .map(|generation| generation.identity()),
+                Some(identity.as_str())
+            );
+            assert_eq!(
+                state
+                    .prepared
+                    .domains
+                    .plugins
+                    .get("runtime-fixture")
+                    .map(|plugin| &plugin.identity),
+                Some(&domain)
+            );
+        }
+        agent_has_plugin_generation(&runtime.agent_handle, "runtime-fixture", true).await?;
+        runtime
+            .shutdown()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn current_diagnostics_follow_same_prepared_generation_not_live_files()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let plugin = write_fixture(temp.path())?;
+        let runtime = service(temp.path()).await?;
+        let source = plugin.join("mcp.json");
+        std::fs::write(&source, "{").map_err(|error| error.to_string())?;
+        let mut registry = runtime.registry_for(temp.path().to_path_buf());
+        runtime
+            .scan_registry(&mut registry)
+            .map_err(|error| error.to_string())?;
+        let prepared = runtime.integrator.prepare(&mut registry).await;
+        let diagnostic = prepared
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.component() == "mcp")
+            .ok_or("frozen current document Error missing")?;
+        assert_eq!(diagnostic.path(), Some(source.as_path()));
+        assert_eq!(diagnostic.plugin_id(), Some("runtime-fixture"));
+        assert_eq!(
+            diagnostic.severity(),
+            echo_agent::plugin::PluginDiagnosticSeverity::Error
+        );
+        std::fs::write(&source, serde_json::json!({"$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json", "mcpServers": {}}).to_string())
+            .map_err(|error| error.to_string())?;
+        let cached = runtime.integrator.prepare(&mut registry).await;
+        assert!(Arc::ptr_eq(&prepared, &cached));
+        assert_eq!(cached.identity(), prepared.identity());
+        assert_eq!(cached.diagnostics(), prepared.diagnostics());
+        let components = prepare_application_components(&prepared, "snapshot-test", &registry)
+            .map_err(|errors| errors.join("; "))?;
+        let observed = ReloadSummary::from_components(1, 1, None, Some(&prepared), &components);
+        assert_eq!(
+            observed.errors,
+            prepared
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| format!("{:?}: {diagnostic}", diagnostic.severity()))
+                .collect::<Vec<_>>()
+        );
+        let mut fresh_registry = runtime.registry_for(temp.path().to_path_buf());
+        runtime
+            .scan_registry(&mut fresh_registry)
+            .map_err(|error| error.to_string())?;
+        let fresh = runtime.integrator.prepare(&mut fresh_registry).await;
+        assert!(fresh.diagnostics().is_empty());
+        assert!(fresh.generation() > prepared.generation());
+        assert_ne!(fresh.identity(), prepared.identity());
+        std::fs::write(&source, "[").map_err(|error| error.to_string())?;
+        let fresh_components =
+            prepare_application_components(&fresh, "snapshot-test", &fresh_registry)
+                .map_err(|errors| errors.join("; "))?;
+        let observed = ReloadSummary::from_components(1, 1, None, Some(&fresh), &fresh_components);
+        assert!(
+            observed.errors.is_empty(),
+            "summary must not reread a later corrupt file"
+        );
+        let cached_fresh = runtime.integrator.prepare(&mut fresh_registry).await;
+        assert!(Arc::ptr_eq(&fresh, &cached_fresh));
+        runtime.integrator.invalidate(&fresh_registry);
+        let changed = runtime.integrator.prepare(&mut fresh_registry).await;
+        assert!(changed.generation() > fresh.generation());
+        let components = prepare_application_components(&changed, "snapshot-test", &fresh_registry)
+            .map_err(|errors| errors.join("; "))?;
+        let observed = ReloadSummary::from_components(1, 1, None, Some(&changed), &components);
+        assert_eq!(observed.errors.len(), changed.diagnostics().len());
+        assert!(
+            observed
+                .errors
+                .iter()
+                .any(|message| message.starts_with("Error:"))
+        );
+        assert!(require_applicable_generation(changed).is_err());
+        runtime
+            .shutdown()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn obsolete_plugin_sidecar_does_not_change_current_domain_or_component_identity()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let plugin = write_fixture(temp.path())?;
+        let runtime = service(temp.path()).await?;
+        let (framework_identity, diagnostics, domain_identity) = {
+            let state = runtime.state.lock().await;
+            let framework = state
+                .framework_generation
+                .as_ref()
+                .ok_or("published generation missing")?;
+            (
+                framework.identity().to_string(),
+                framework.diagnostics().to_vec(),
+                state
+                    .prepared
+                    .domains
+                    .plugins
+                    .get("runtime-fixture")
+                    .ok_or("domain provider missing")?
+                    .identity
+                    .clone(),
+            )
+        };
+        let obsolete = plugin.join("lsp.yaml");
+        let validation_before = PluginRuntimeService::validate(&plugin);
+        assert!(validation_before.valid);
+        let original_bytes = [0xff, 0xfe];
+        std::fs::write(&obsolete, original_bytes).map_err(|error| error.to_string())?;
+        let validation_after = PluginRuntimeService::validate(&plugin);
+        assert!(validation_after.valid);
+        assert_eq!(validation_after.components, validation_before.components);
+        assert_eq!(validation_after.errors, validation_before.errors);
+        let summary = runtime.reload().await.map_err(|error| error.to_string())?;
+        assert_eq!(summary.agents_loaded, 1);
+        assert_eq!(summary.monitors_loaded, 1);
+        assert_eq!(summary.themes_loaded, 1);
+        assert!(summary.skills_loaded > 0);
+        {
+            let state = runtime.state.lock().await;
+            let framework = state
+                .framework_generation
+                .as_ref()
+                .ok_or("published generation missing")?;
+            assert_eq!(framework.identity(), framework_identity);
+            assert_eq!(framework.diagnostics(), diagnostics);
+            assert_eq!(
+                state
+                    .prepared
+                    .domains
+                    .plugins
+                    .get("runtime-fixture")
+                    .map(|plugin| &plugin.identity),
+                Some(&domain_identity)
+            );
+        }
+        assert_eq!(
+            std::fs::read(&obsolete).map_err(|error| error.to_string())?,
+            original_bytes
+        );
+        agent_has_plugin_generation(&runtime.agent_handle, "runtime-fixture", true).await?;
+        runtime
+            .shutdown()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn real_plugin_load_disable_and_unload_are_live() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let plugin = write_fixture(temp.path())?;
@@ -370,8 +562,7 @@ done
         let summary = runtime.reload().await.map_err(|error| error.to_string())?;
         assert_eq!(summary.total, 1);
         assert_eq!(summary.agents_loaded, 1);
-        #[cfg(unix)]
-        assert_eq!(summary.lsp_languages_loaded, 1);
+
         assert_eq!(summary.monitors_loaded, 1);
         assert_eq!(summary.themes_loaded, 1);
         assert_eq!(summary.output_styles_loaded, 1);
@@ -382,11 +573,6 @@ done
         assert!(registry.contains("runtime-fixture-specialist").await);
         assert_eq!(runtime.themes().await.len(), 1);
         assert_eq!(runtime.output_styles().await.len(), 1);
-        #[cfg(unix)]
-        assert_eq!(
-            runtime.lsp.manager.read().await.running_servers(),
-            ["fixture"]
-        );
 
         let cron_store =
             crate::scheduler::CronTaskStore::new().with_path(temp.path().join("cron-tasks.json"));
@@ -433,16 +619,7 @@ done
         assert!(runtime.themes().await.is_empty());
         assert!(runtime.output_styles().await.is_empty());
         assert!(scheduler.list_tasks().await.is_empty());
-        #[cfg(unix)]
-        assert!(
-            runtime
-                .lsp
-                .manager
-                .read()
-                .await
-                .running_servers()
-                .is_empty()
-        );
+
         let projected = runtime
             .agent_handle
             .read_async(|agent| Box::pin(async move { agent.get_messages().await }))
@@ -719,7 +896,7 @@ done
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn lsp_readers_wait_for_plugin_generation_settlement() -> Result<(), String> {
+    async fn component_readers_wait_for_plugin_generation_settlement() -> Result<(), String> {
         let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
         let runtime = service(temporary.path()).await?;
         let _plugin = write_fixture(temporary.path())?;
@@ -730,13 +907,12 @@ done
         wait_until_mutation_holds_state(&runtime).await?;
 
         let reader_runtime = Arc::clone(&runtime);
-        let mut reader =
-            tokio::spawn(async move { reader_runtime.lsp_configured_languages().await });
+        let mut reader = tokio::spawn(async move { reader_runtime.themes().await });
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), &mut reader)
                 .await
                 .is_err(),
-            "LSP reader observed a plugin generation before settlement"
+            "Component reader observed a plugin generation before settlement"
         );
 
         drop(ownership);
@@ -744,8 +920,8 @@ done
             .await
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())?;
-        let languages = reader.await.map_err(|error| error.to_string())?;
-        assert!(!languages.is_empty());
+        let themes = reader.await.map_err(|error| error.to_string())?;
+        assert!(!themes.is_empty());
         runtime.shutdown().await.map_err(|error| error.to_string())
     }
 
@@ -880,7 +1056,8 @@ done
     }
 
     #[tokio::test]
-    async fn workspace_rebind_replaces_project_plugins_and_lsp_generation() -> Result<(), String> {
+    async fn workspace_rebind_replaces_project_plugins_and_preserves_root_authority()
+    -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let first = temp.path().join("first");
         let second = temp.path().join("second");
@@ -911,15 +1088,7 @@ done
         assert!(!registry.contains("runtime-fixture-specialist").await);
         assert_eq!(lifecycle.deactivate.load(Ordering::SeqCst), 1);
         assert_eq!(lifecycle.shutdown.load(Ordering::SeqCst), 1);
-        assert!(
-            runtime
-                .lsp
-                .manager
-                .read()
-                .await
-                .running_servers()
-                .is_empty()
-        );
+
         Ok(())
     }
 
@@ -996,15 +1165,7 @@ done
         assert!(!registry.contains("runtime-fixture-specialist").await);
         assert_eq!(lifecycle.deactivate.load(Ordering::SeqCst), 1);
         assert_eq!(lifecycle.shutdown.load(Ordering::SeqCst), 1);
-        assert!(
-            runtime
-                .lsp
-                .manager
-                .read()
-                .await
-                .running_servers()
-                .is_empty()
-        );
+
         assert!(runtime.reload().await.is_err());
         Ok(())
     }
@@ -1212,15 +1373,7 @@ done
         assert!(!registry.contains("target-fixture-specialist").await);
         assert!(!registry.contains("user-fixture-specialist").await);
         assert!(scheduler.list_tasks().await.is_empty());
-        assert!(
-            runtime
-                .lsp
-                .manager
-                .read()
-                .await
-                .running_servers()
-                .is_empty()
-        );
+
         assert!(runtime.list().await.is_empty());
         assert_eq!(lifecycle.shutdown.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.cleanup_debt_roots().await, vec![first.clone()]);
@@ -1305,11 +1458,7 @@ done
             Some("runtime-fixture-concise")
         );
         assert_eq!(scheduler.list_tasks().await.len(), 1);
-        #[cfg(unix)]
-        assert_eq!(
-            runtime.lsp.manager.read().await.running_servers(),
-            ["fixture"]
-        );
+
         Ok(())
     }
 
@@ -1450,16 +1599,7 @@ done
         assert_eq!(counts.init.load(Ordering::SeqCst), 1);
         assert_eq!(counts.activate.load(Ordering::SeqCst), 2);
         assert_eq!(counts.deactivate.load(Ordering::SeqCst), 2);
-        #[cfg(unix)]
-        assert!(
-            runtime
-                .lsp
-                .manager
-                .read()
-                .await
-                .running_servers()
-                .is_empty()
-        );
+
         Ok(())
     }
 
@@ -1504,6 +1644,14 @@ done
         )?;
         let task_root = WorkspaceLayout::tasks(&workspace.root);
         let store = TaskRuntimeStore::open_for_workspace(&task_root, workspace.id.to_string())?;
+        // Capture the same current binding at original admission, never invent it during cold resume.
+        store.bind_project_environment(
+            workspace.id.as_str(),
+            workspace.execution_location(),
+            workspace.metadata.project_root_revision,
+            Arc::new(echo_agent::tools::files::LocalFileSystem),
+            Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox()),
+        )?;
         store.create_run_with_profile(
             "cold-original",
             &workspace.id.to_string(),
@@ -2337,7 +2485,6 @@ done
             "agents/example.md",
             "hooks/hooks.yaml",
             "mcp.json",
-            "lsp.yaml",
             "monitors.yaml",
             "themes/example.json",
             "output-styles/scaffolded-concise.md",
@@ -2349,6 +2496,7 @@ done
             );
         }
         assert!(plugin.join("scripts").is_dir());
+        assert!(!plugin.join("lsp.yaml").exists());
         assert!(!plugin.join(".echo-plugin").exists());
         assert!(!plugin.join(".mcp.json").exists());
         let report = PluginRuntimeService::validate(&plugin);
@@ -2358,7 +2506,6 @@ done
             "agents",
             "hooks",
             "mcp_servers",
-            "lsp_servers",
             "monitors",
             "themes",
             "output_styles",
@@ -3312,6 +3459,159 @@ done
         // fixture; the test owns and removes that debt after proving admission.
         let retained = take_parked_cleanup_receipts(temp.path());
         assert_eq!(retained.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn domain_identity_uses_published_eko_definitions_not_runtime_timestamps_or_theme()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let plugin = write_fixture(temp.path())?;
+        let runtime = service(temp.path()).await?;
+        let mut registry = runtime.registry_for(temp.path().to_path_buf());
+        runtime
+            .scan_registry(&mut registry)
+            .map_err(|error| error.to_string())?;
+        let generation = runtime.integrator.prepare(&mut registry).await;
+        let prepare = || {
+            prepare_application_components(&generation, "identity-fixture", &registry)
+                .map_err(|errors| errors.join("; "))
+        };
+        let first = prepare()?;
+        let identity = first
+            .domains
+            .plugins
+            .get("runtime-fixture")
+            .ok_or("domain package missing")?
+            .identity
+            .clone();
+        assert_eq!(identity.version.as_deref(), Some("0.1.0"));
+        assert_eq!(
+            prepare()?
+                .domains
+                .plugins
+                .get("runtime-fixture")
+                .ok_or("domain package missing")?
+                .identity,
+            identity
+        );
+        std::fs::create_dir_all(plugin.join("themes")).map_err(|error| error.to_string())?;
+        std::fs::write(
+            plugin.join("themes/example.json"),
+            r##"{"name":"example","colors":{"background":"#222"}}"##,
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(
+            prepare()?
+                .domains
+                .plugins
+                .get("runtime-fixture")
+                .ok_or("domain package missing")?
+                .identity,
+            identity
+        );
+        std::fs::write(plugin.join("monitors.yaml"), "monitors:\n  - name: daily-review\n    cron: \"0 0 * * * *\"\n    prompt: A different automated instruction\n").map_err(|error| error.to_string())?;
+        let changed_monitor = prepare()?
+            .domains
+            .plugins
+            .get("runtime-fixture")
+            .ok_or("domain package missing")?
+            .identity
+            .clone();
+        assert_ne!(changed_monitor, identity);
+        std::fs::create_dir_all(plugin.join("output-styles")).map_err(|error| error.to_string())?;
+        std::fs::write(
+            plugin.join("output-styles/evidence.md"),
+            "---\nname: evidence\n---\nCite exact evidence.\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let changed_style = prepare()?
+            .domains
+            .plugins
+            .get("runtime-fixture")
+            .ok_or("domain package missing")?
+            .identity
+            .clone();
+        assert_ne!(changed_style, changed_monitor);
+        assert_eq!(
+            generation.identity(),
+            runtime.integrator.prepare(&mut registry).await.identity()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn domain_prepare_blocks_persisting_decoded_sensitive_values_with_escapes()
+    -> Result<(), String> {
+        for secret in ["fixture\nprivate", "fixture\"private", "fixture\\private"] {
+            let temp = tempfile::tempdir().map_err(|_| "fixture directory unavailable")?;
+            let plugin = write_fixture(temp.path())?;
+            let path = plugin.join("plugin.json");
+            let mut manifest: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&path).map_err(|_| "fixture manifest read failed")?,
+            )
+            .map_err(|_| "fixture manifest parse failed")?;
+            manifest.as_object_mut().ok_or("fixture manifest must be an object")?.insert("config".to_string(), serde_json::json!({
+                "credential": { "type": "string", "title": "Fixture credential", "sensitive": true, "default": secret }
+            }));
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&manifest).map_err(|_| "fixture manifest encoding failed")?,
+            )
+            .map_err(|_| "fixture manifest write failed")?;
+            let mut declaration = crate::domain_plugin::DomainDeclaration {
+                schema_version: 1,
+                method: format!("Private method: {secret}"),
+                default_subagent_roles: Default::default(),
+                allowed_tools: Vec::new(),
+                required_artifacts: Vec::new(),
+                execution_checks: Vec::new(),
+                acceptance_criteria: Vec::new(),
+                review_checklist: Vec::new(),
+                inputs: Vec::new(),
+            };
+            for private_rules in [false, true] {
+                if private_rules {
+                    declaration.method = "Safe method".to_string();
+                    declaration.review_checklist = vec![secret.to_string()];
+                }
+                std::fs::write(
+                    plugin.join("domain.yaml"),
+                    serde_yaml::to_string(&declaration)
+                        .map_err(|_| "fixture declaration encoding failed")?,
+                )
+                .map_err(|_| "fixture declaration write failed")?;
+                let runtime = service(temp.path()).await?;
+                let mut registry = runtime.registry_for(temp.path().to_path_buf());
+                runtime
+                    .scan_registry(&mut registry)
+                    .map_err(|_| "fixture registry scan failed")?;
+                let generation = runtime.integrator.prepare(&mut registry).await;
+                let prepared = prepare_application_components(
+                    &generation,
+                    "private-domain-fixture",
+                    &registry,
+                )
+                .map_err(|_| "fixture prepare failed")?;
+                assert!(
+                    prepared
+                        .domains
+                        .bind("runtime-fixture", None, &[])
+                        .is_err_and(
+                            |error| error.contains("contains sensitive configuration content")
+                        ),
+                    "sensitive declaration must not reach a persistable binding"
+                );
+                assert!(
+                    !prepared
+                        .domains
+                        .catalog_prompt()
+                        .unwrap_or_default()
+                        .contains(secret),
+                    "domain catalog must not expose a configured credential"
+                );
+            }
+        }
         Ok(())
     }
 }

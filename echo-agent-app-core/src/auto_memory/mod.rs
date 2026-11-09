@@ -14,6 +14,11 @@ pub use policy::{
     format_observations_for_memory,
 };
 
+/// One process-global EKO auto-memory policy shared by every interaction adapter.
+/// It starts enabled and is not persisted or scoped to a workspace generation.
+pub static AUTO_MEMORY_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
 /// Queue inferred observations in the unified workspace inbox.
 pub fn queue_observations(
     store: &EvidenceStore,

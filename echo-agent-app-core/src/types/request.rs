@@ -61,15 +61,18 @@ pub struct UpdateConfigRequest {
     pub model: Option<String>,
     pub system_prompt: Option<String>,
     pub token_limit: Option<usize>,
-    /// ReAct loop ceiling for the running agents (EKO `0` = unlimited
-    /// sentinel; resolved before reaching the framework).
-    pub max_iterations: Option<usize>,
 }
 
 /// PUT /api/config/full — 完整配置更新
 #[derive(Debug, Deserialize, Default, TS)]
 #[ts(export, rename = "UpdateFullConfigRequest")]
 pub struct UpdateFullConfigRequest {
+    #[serde(
+        default,
+        deserialize_with = "crate::subagent_policy::deserialize_optional_depth"
+    )]
+    #[ts(optional, type = "number")]
+    pub max_subagent_depth: Option<crate::subagent_policy::SubagentDepthLimit>,
     pub model: Option<ModelUpdate>,
     pub agent: Option<AgentUpdate>,
     pub mcp: Option<McpUpdate>,
@@ -82,7 +85,6 @@ pub struct UpdateFullConfigRequest {
 #[ts(export, rename = "ModelUpdate")]
 pub struct ModelUpdate {
     pub max_tokens: Option<u32>,
-    pub temperature: Option<f32>,
 }
 
 #[derive(Debug, Deserialize, TS)]
@@ -90,7 +92,6 @@ pub struct ModelUpdate {
 pub struct AgentUpdate {
     pub name: Option<String>,
     pub system_prompt: Option<String>,
-    pub max_iterations: Option<usize>,
     pub memory_path: Option<String>,
 }
 

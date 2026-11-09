@@ -54,6 +54,8 @@ struct ProductDataOperationSupervisor {
         std::sync::RwLock<std::sync::Weak<crate::runtime::ApplicationLifecycleRetention>>,
     #[cfg(test)]
     barrier: Mutex<Option<ProductDataIoTestBarrier>>,
+    #[cfg(test)]
+    delivery_signal: Mutex<Option<ProductDataIoDeliveryTestSignal>>,
 }
 
 #[cfg(test)]
@@ -61,6 +63,12 @@ struct ProductDataIoTestBarrier {
     operation: &'static str,
     entered: tokio::sync::oneshot::Sender<()>,
     release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+struct ProductDataIoDeliveryTestSignal {
+    operation: &'static str,
+    sent: tokio::sync::oneshot::Sender<bool>,
 }
 
 impl ProductDataOperationSupervisor {
@@ -91,6 +99,8 @@ impl ProductDataOperationSupervisor {
             lifecycle_retention: std::sync::RwLock::new(std::sync::Weak::new()),
             #[cfg(test)]
             barrier: Mutex::new(None),
+            #[cfg(test)]
+            delivery_signal: Mutex::new(None),
         }
     }
 
@@ -187,6 +197,25 @@ impl ProductDataOperationSupervisor {
             .is_some_and(|candidate| candidate.operation == operation);
         if matches { barrier.take() } else { None }
     }
+
+    #[cfg(test)]
+    fn take_delivery_signal(
+        &self,
+        operation: &'static str,
+    ) -> Option<tokio::sync::oneshot::Sender<bool>> {
+        let mut signal = self
+            .delivery_signal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if signal
+            .as_ref()
+            .is_some_and(|signal| signal.operation == operation)
+        {
+            signal.take().map(|signal| signal.sent)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -211,6 +240,65 @@ impl ProductDataIoService {
         F: FnOnce() -> T + Send + 'static,
     {
         run_with(Arc::clone(&self.supervisor), operation, function).await
+    }
+
+    /// Bound only the caller's wait. The original admitted operation, permit
+    /// and closure resources survive an unconfirmed or dropped observation.
+    /// A returned Unconfirmed is neither cancellation nor permission to retry.
+    pub async fn run_observed<T, E, F>(
+        &self,
+        operation: &'static str,
+        wait: Duration,
+        function: F,
+    ) -> Result<ProductDataIoObservation<Result<T, E>>, ProductDataIoError>
+    where
+        T: Send + 'static,
+        E: std::fmt::Display + Send + 'static,
+        F: FnOnce() -> Result<T, E> + Send + 'static,
+    {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(wait)
+            .ok_or_else(|| ProductDataIoError::Admission {
+                operation,
+                error: "observation wait exceeds the monotonic clock range".to_string(),
+            })?;
+        let owner = self.supervisor.admit(operation)?;
+        let operation_id = owner.id;
+        // Admission precedes waiting for the existing semaphore in this
+        // explicit observer path, so the feedback bound also covers its queue.
+        // The default run path keeps its previous permit/admission ordering.
+        let mut result = spawn_product_data_operation(
+            owner,
+            None,
+            function,
+            Some(observed_result_failure::<T, E>),
+        );
+        // Declared after the receiver so cancellation drops this bookmark
+        // first and records the original id before closing that receiver.
+        let mut observation = ProductDataObservationGuard {
+            supervisor: self.supervisor.clone(),
+            operation,
+            operation_id,
+            finished: false,
+        };
+        match tokio::time::timeout_at(deadline, &mut result).await {
+            Ok(result) => {
+                observation.finished = true;
+                result
+                    .map_err(|_| ProductDataIoError::OwnerClosed { operation })?
+                    .acknowledge()
+                    .map(ProductDataIoObservation::Completed)
+            }
+            Err(_) => {
+                observation
+                    .retain("bounded observation elapsed; original operation remains unconfirmed");
+                observation.finished = true;
+                Ok(ProductDataIoObservation::Unconfirmed {
+                    operation,
+                    operation_id,
+                })
+            }
+        }
     }
 
     pub fn begin_shutdown(&self) -> Result<(), String> {
@@ -424,6 +512,44 @@ impl ProductDataOperation {
     }
 }
 
+/// The same admitted operation travels with a physically completed result.
+/// Sending into a oneshot buffer is not observation: the original owner only
+/// settles when this envelope is acknowledged or dropped without observation.
+/// The default run path has already settled and carries no owner here.
+struct ProductDataOperationResult<T> {
+    operation: &'static str,
+    result: Option<Result<T, ProductDataIoError>>,
+    owner: Option<ProductDataOperation>,
+    infrastructure_failure: Option<String>,
+    unobserved_failure: Option<String>,
+}
+
+impl<T> ProductDataOperationResult<T> {
+    fn acknowledge(mut self) -> Result<T, ProductDataIoError> {
+        if let Some(owner) = self.owner.take() {
+            // An observed business Err is returned normally, not retained as
+            // an unobserved shutdown failure. Infrastructure errors keep the
+            // original supervisor's failure semantics.
+            owner.settle(self.infrastructure_failure.take());
+        }
+        self.result.take().ok_or(ProductDataIoError::OwnerClosed {
+            operation: self.operation,
+        })?
+    }
+}
+
+impl<T> Drop for ProductDataOperationResult<T> {
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner.take() {
+            owner.settle(
+                self.infrastructure_failure
+                    .take()
+                    .or_else(|| self.unobserved_failure.take()),
+            );
+        }
+    }
+}
+
 impl Drop for ProductDataOperation {
     fn drop(&mut self) {
         if self.settled {
@@ -453,6 +579,55 @@ pub enum ProductDataIoError {
     OwnerClosed { operation: &'static str },
 }
 
+/// Observation of the original operation, not an additional execution state.
+#[derive(Debug)]
+pub enum ProductDataIoObservation<T> {
+    Completed(T),
+    Unconfirmed {
+        operation: &'static str,
+        operation_id: u64,
+    },
+}
+
+// This bookmark retains no physical resources and creates no operation. It
+// only marks the existing u64 entry when its caller stops observing that entry.
+struct ProductDataObservationGuard {
+    supervisor: Arc<ProductDataOperationSupervisor>,
+    operation: &'static str,
+    operation_id: u64,
+    finished: bool,
+}
+
+impl ProductDataObservationGuard {
+    fn retain(&self, reason: &str) {
+        let mut state = self
+            .supervisor
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(retained) = state.active.get_mut(&self.operation_id) {
+            *retained = Some(format!(
+                "{} #{}: {reason}",
+                self.operation, self.operation_id
+            ));
+        }
+        drop(state);
+        self.supervisor.notify_progress();
+    }
+}
+
+impl Drop for ProductDataObservationGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.retain("caller dropped its observation; original operation remains unconfirmed");
+        }
+    }
+}
+
+fn observed_result_failure<T, E: std::fmt::Display>(value: &Result<T, E>) -> Option<String> {
+    value.as_ref().err().map(ToString::to_string)
+}
+
 async fn run_with<T, F>(
     supervisor: Arc<ProductDataOperationSupervisor>,
     operation: &'static str,
@@ -471,31 +646,84 @@ where
             error: error.to_string(),
         })?;
     let owner = supervisor.admit(operation)?;
+    spawn_product_data_operation(owner, Some(permit), function, None)
+        .await
+        .map_err(|_| ProductDataIoError::OwnerClosed { operation })?
+        .acknowledge()
+}
+
+fn spawn_product_data_operation<T, F>(
+    owner: ProductDataOperation,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    function: F,
+    late_failure: Option<fn(&T) -> Option<String>>,
+) -> tokio::sync::oneshot::Receiver<ProductDataOperationResult<T>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let operation = owner.operation;
     #[cfg(test)]
-    let barrier = supervisor.take_barrier(operation);
+    let barrier = owner.supervisor.take_barrier(operation);
+    #[cfg(test)]
+    let delivery_signal = owner.supervisor.take_delivery_signal(operation);
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
+        let permit = match permit {
+            Some(permit) => Ok(permit),
+            None => PROCESS_PRODUCT_DATA_IO
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|error| ProductDataIoError::Admission {
+                    operation,
+                    error: error.to_string(),
+                }),
+        };
         #[cfg(test)]
         if let Some(barrier) = barrier {
             let _entered = barrier.entered.send(());
             let _released = barrier.release.await;
         }
-        let result = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            function()
-        })
-        .await
-        .map_err(|error| ProductDataIoError::Join {
-            operation,
-            error: error.to_string(),
-        });
+        let result = match permit {
+            Ok(permit) => tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                function()
+            })
+            .await
+            .map_err(|error| ProductDataIoError::Join {
+                operation,
+                error: error.to_string(),
+            }),
+            Err(error) => Err(error),
+        };
         let failure = result.as_ref().err().map(ToString::to_string);
-        owner.settle(failure);
-        let _delivered = result_tx.send(result);
+        let delivery = if let Some(inspect) = late_failure {
+            let undelivered_failure = result.as_ref().ok().and_then(inspect);
+            ProductDataOperationResult {
+                operation,
+                result: Some(result),
+                owner: Some(owner),
+                infrastructure_failure: failure,
+                unobserved_failure: undelivered_failure,
+            }
+        } else {
+            owner.settle(failure);
+            ProductDataOperationResult {
+                operation,
+                result: Some(result),
+                owner: None,
+                infrastructure_failure: None,
+                unobserved_failure: None,
+            }
+        };
+        let _delivered = result_tx.send(delivery).is_ok();
+        #[cfg(test)]
+        if let Some(signal) = delivery_signal {
+            let _ = signal.send(_delivered);
+        }
     });
     result_rx
-        .await
-        .map_err(|_| ProductDataIoError::OwnerClosed { operation })?
 }
 
 async fn run_nested_with<T, F>(
@@ -1964,6 +2192,335 @@ mod tests {
     use std::time::Duration;
 
     use tokio_util::sync::CancellationToken;
+
+    async fn wait_product_operation_removed(
+        service: &super::ProductDataIoService,
+        id: u64,
+    ) -> anyhow::Result<()> {
+        let mut progress = service.supervisor.settled.subscribe();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let present = service
+                    .supervisor
+                    .state
+                    .lock()
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?
+                    .active
+                    .contains_key(&id);
+                if !present {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                progress.changed().await?;
+            }
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_observation_retains_workspace_control_until_original_finish()
+    -> anyhow::Result<()> {
+        let service = super::ProductDataIoService::new();
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("observed-workspace");
+        std::fs::create_dir(&root)?;
+        let workspace = crate::workspace::Workspace {
+            id: crate::workspace::WorkspaceId::from_name("observed-workspace"),
+            name: "observed-workspace".to_string(),
+            root: root.clone(),
+            project_root: None,
+            kind: crate::workspace::WorkspaceKind::General,
+            metadata: crate::workspace::WorkspaceMetadata::new(
+                crate::workspace::ProjectLocation::Local { path: root.clone() },
+            ),
+            product_data_generation: String::new(),
+            created_at: chrono::Utc::now(),
+            last_active: chrono::Utc::now(),
+        };
+        let id = workspace.id.clone();
+        let registry =
+            crate::workspace::runtime::WorkspaceRuntimeRegistry::new_with_product_data_io(
+                service.clone(),
+            );
+        let (host, control) = registry.get_or_open_control(workspace).await?;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let observed = service
+            .run_observed("remote control fixture", Duration::ZERO, move || {
+                let _control = control;
+                let _ = entered_tx.send(());
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>("physical completion")
+            })
+            .await?;
+        let super::ProductDataIoObservation::Unconfirmed { operation_id, .. } = observed else {
+            anyhow::bail!("blocked physical operation was reported completed");
+        };
+        tokio::time::timeout(Duration::from_secs(2), entered_rx).await??;
+        assert!(service.has_unsettled_flows());
+        assert!(
+            service
+                .join_shutdown()
+                .await
+                .is_err_and(|error| error.contains("remote control fixture"))
+        );
+        // These are the same idle gates used by reconnect/relink/host close.
+        // Ordinary sidebar focus changes are not host retirement.
+        let blocked = registry.shutdown_and_evict_if_idle(&id).await;
+        assert!(blocked.is_err_and(|error| error.to_string().contains("controls: 1")));
+        let still_registered = registry.acquire_control_for_host(&host).await?;
+        drop(still_registered);
+        release_tx.send(())?;
+        wait_product_operation_removed(&service, operation_id).await?;
+        assert!(!service.has_unsettled_flows());
+        service.join_shutdown().await.map_err(anyhow::Error::msg)?;
+        assert!(registry.shutdown_and_evict_if_idle(&id).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropped_observation_retains_original_owner_without_aborting_physical_work()
+    -> anyhow::Result<()> {
+        let service = super::ProductDataIoService::new();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let caller_service = service.clone();
+        let caller = tokio::spawn(async move {
+            caller_service
+                .run_observed(
+                    "dropped remote observer",
+                    Duration::from_secs(60),
+                    move || {
+                        let _ = entered_tx.send(());
+                        release_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .map_err(|error| error.to_string())?;
+                        Ok::<_, String>(())
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered_rx).await??;
+        caller.abort();
+        assert!(caller.await.is_err_and(|error| error.is_cancelled()));
+        let operation_id = {
+            let state = service
+                .supervisor
+                .state
+                .lock()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            assert_eq!(state.active.len(), 1);
+            let (id, retained) = state
+                .active
+                .first_key_value()
+                .ok_or_else(|| anyhow::anyhow!("original id disappeared"))?;
+            assert!(
+                retained
+                    .as_ref()
+                    .is_some_and(|reason| reason.contains("caller dropped"))
+            );
+            *id
+        };
+        assert!(service.join_shutdown().await.is_err());
+        release_tx.send(())?;
+        wait_product_operation_removed(&service, operation_id).await?;
+        service.join_shutdown().await.map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn late_error_is_observed_without_releasing_another_operation_id() -> anyhow::Result<()> {
+        let service = super::ProductDataIoService::new();
+        let (first_tx, first_rx) = std::sync::mpsc::channel();
+        let (second_tx, second_rx) = std::sync::mpsc::channel();
+        let first = service
+            .run_observed("late remote failure", Duration::ZERO, move || {
+                first_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?;
+                Err::<(), _>("late physical failure".to_string())
+            })
+            .await?;
+        let second = service
+            .run_observed("independent remote operation", Duration::ZERO, move || {
+                second_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>(())
+            })
+            .await?;
+        let super::ProductDataIoObservation::Unconfirmed {
+            operation_id: first_id,
+            ..
+        } = first
+        else {
+            anyhow::bail!("first operation completed before release");
+        };
+        let super::ProductDataIoObservation::Unconfirmed {
+            operation_id: second_id,
+            ..
+        } = second
+        else {
+            anyhow::bail!("second operation completed before release");
+        };
+        assert_ne!(first_id, second_id);
+        first_tx.send(())?;
+        wait_product_operation_removed(&service, first_id).await?;
+        {
+            let state = service
+                .supervisor
+                .state
+                .lock()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            assert!(!state.active.contains_key(&first_id));
+            assert!(state.active.get(&second_id).is_some_and(Option::is_some));
+            assert!(
+                state
+                    .failure_receipt()
+                    .iter()
+                    .any(|failure| failure.contains("late physical failure"))
+            );
+        }
+        let retained = service
+            .join_shutdown()
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("another original operation was called idle"))?;
+        assert!(retained.contains("independent remote operation"));
+        second_tx.send(())?;
+        wait_product_operation_removed(&service, second_id).await?;
+        assert!(!service.has_unsettled_flows());
+        assert!(
+            service
+                .join_shutdown()
+                .await
+                .is_err_and(|error| error.contains("late physical failure"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn buffered_business_error_dropped_before_receive_keeps_original_failure()
+    -> anyhow::Result<()> {
+        let service = super::ProductDataIoService::new();
+        let (release_other, wait_other) = std::sync::mpsc::channel();
+        let other = service
+            .run_observed("other retained id", Duration::ZERO, move || {
+                wait_other
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>(())
+            })
+            .await?;
+        let super::ProductDataIoObservation::Unconfirmed {
+            operation_id: other_id,
+            ..
+        } = other
+        else {
+            anyhow::bail!("controlled other operation completed without release");
+        };
+        let (buffered_tx, buffered_rx) = tokio::sync::oneshot::channel();
+        *service
+            .supervisor
+            .delivery_signal
+            .lock()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))? =
+            Some(super::ProductDataIoDeliveryTestSignal {
+                operation: "buffered unobserved failure",
+                sent: buffered_tx,
+            });
+        let physical_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let physical_marker = physical_finished.clone();
+        let mut observation = Box::pin(service.run_observed(
+            "buffered unobserved failure",
+            Duration::from_secs(60),
+            move || {
+                physical_marker.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err::<(), _>("buffered business error".to_string())
+            },
+        ));
+        assert!(futures::poll!(observation.as_mut()).is_pending());
+        // Poll only the send notification, never the original observation.
+        // The physical task must finish and successfully buffer its result
+        // before the receiver/observation is dropped below.
+        let sent = tokio::time::timeout(Duration::from_secs(2), buffered_rx).await??;
+        assert!(sent);
+        assert!(physical_finished.load(std::sync::atomic::Ordering::SeqCst));
+        let buffered_id = {
+            let state = service
+                .supervisor
+                .state
+                .lock()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            assert_eq!(state.active.len(), 2);
+            let id = state
+                .active
+                .keys()
+                .copied()
+                .find(|id| *id != other_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("completed result discarded its original id before observation")
+                })?;
+            assert!(state.active.get(&id).is_some_and(Option::is_none));
+            id
+        };
+        {
+            let join = service.join_shutdown();
+            tokio::pin!(join);
+            assert!(futures::poll!(join.as_mut()).is_pending());
+        }
+        drop(observation);
+        {
+            let state = service
+                .supervisor
+                .state
+                .lock()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            assert!(!state.active.contains_key(&buffered_id));
+            assert!(state.active.get(&other_id).is_some_and(Option::is_some));
+            assert!(
+                state
+                    .failure_receipt()
+                    .iter()
+                    .any(|failure| failure.contains("buffered business error"))
+            );
+        }
+        let retained =
+            service.join_shutdown().await.err().ok_or_else(|| {
+                anyhow::anyhow!("buffered unobserved error was reported successful")
+            })?;
+        assert!(retained.contains("buffered business error"));
+        assert!(retained.contains("other retained id"));
+        release_other.send(())?;
+        wait_product_operation_removed(&service, other_id).await?;
+        assert!(
+            service
+                .join_shutdown()
+                .await
+                .is_err_and(|error| error.contains("buffered business error"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completed_business_error_is_returned_without_retained_shutdown_debt()
+    -> anyhow::Result<()> {
+        let service = super::ProductDataIoService::new();
+        let observed = service
+            .run_observed("visible remote failure", Duration::from_secs(2), || {
+                Err::<(), _>("visible failure")
+            })
+            .await?;
+        assert!(matches!(
+            observed,
+            super::ProductDataIoObservation::Completed(Err("visible failure"))
+        ));
+        assert!(!service.has_unsettled_flows());
+        service.join_shutdown().await.map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn product_data_shutdown_drains_normal_nested_work_before_retained_flow_observation()

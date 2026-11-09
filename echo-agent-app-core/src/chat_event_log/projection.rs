@@ -1,3 +1,593 @@
+// 查询/追平只读一个固定原journal batch；调用者可用Pending中的cursor续接，
+// 不能把tail4096或尚未追平的投影冒充完整history。
+const NATIVE_HISTORY_PROJECTION_BATCH: usize = REPLAY_BATCH_SIZE;
+const NATIVE_HISTORY_DIRECTORY: &str = "native-publications";
+
+fn native_history_message_requires_publications(message: &echo_agent::llm::types::Message) -> bool {
+    message.role == echo_agent::llm::types::Role::Assistant
+        && (message
+            .approved_assistant_blocks
+            .as_ref()
+            .is_some_and(|blocks| !blocks.is_empty())
+            || message.execution_status.is_some())
+}
+
+fn native_publication_key<T: Serialize>(
+    kind: &str,
+    value: &T,
+) -> Result<String, ChatEventLogError> {
+    let bytes = echo_agent::utils::canonical_json::canonical_json_bytes(value)
+        .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?;
+    Ok(format!("{kind}-{}", digest(&bytes)))
+}
+
+fn native_product_key(event: &ChatEventEnvelope) -> Result<String, ChatEventLogError> {
+    native_publication_key(
+        "product",
+        &(
+            &event.workspace_id,
+            &event.conversation_id,
+            &event.root_turn_id,
+            &event.turn_id,
+            &event.message_id,
+        ),
+    )
+}
+
+fn native_publication_fact_key(
+    event: &ChatEventEnvelope,
+) -> Result<Option<String>, ChatEventLogError> {
+    use echo_agent::agent::{AgentEvent, ExecutionStatusKind};
+    match &event.payload {
+        ChatDriverEvent::Agent(agent) => match &agent.payload {
+            AgentEvent::AssistantMessage { block } => {
+                native_publication_key("block", block).map(Some)
+            }
+            AgentEvent::FinalAnswer(_) => agent
+                .execution_id
+                .as_ref()
+                .map(|execution| native_publication_key("final", &execution.as_str()))
+                .transpose(),
+            AgentEvent::ExecutionStatus(status)
+                if matches!(
+                    status.status,
+                    ExecutionStatusKind::Settled
+                        | ExecutionStatusKind::Failed
+                        | ExecutionStatusKind::Cancelled
+                ) =>
+            {
+                agent
+                    .execution_id
+                    .as_ref()
+                    .map(|execution| native_publication_key("terminal", &execution.as_str()))
+                    .transpose()
+            }
+            _ => Ok(None),
+        },
+        ChatDriverEvent::TurnStatus { status }
+            if matches!(status.as_str(), "completed" | "failed" | "cancelled") =>
+        {
+            native_product_key(event).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn native_execution_scope_key(
+    event: &ChatEventEnvelope,
+) -> Result<Option<String>, ChatEventLogError> {
+    match &event.payload {
+        ChatDriverEvent::Agent(agent) => agent
+            .execution_id
+            .as_ref()
+            .map(|execution| native_publication_key("scope", &execution.as_str()))
+            .transpose(),
+        _ => Ok(None),
+    }
+}
+
+fn native_publication_same_scope(left: &ChatEventEnvelope, right: &ChatEventEnvelope) -> bool {
+    left.workspace_id == right.workspace_id
+        && left.conversation_id == right.conversation_id
+        && left.root_turn_id == right.root_turn_id
+        && left.turn_id == right.turn_id
+        && left.message_id == right.message_id
+}
+
+fn native_history_checkpoint<S>(authority: &StreamAuthority, name: &str) -> FileCheckpointStore<S> {
+    FileCheckpointStore::open(
+        authority
+            .journal
+            .directory()
+            .join(NATIVE_HISTORY_DIRECTORY)
+            .join(format!("{name}.json")),
+    )
+}
+
+fn validate_native_anchor(
+    authority: &StreamAuthority,
+    expected_key: &str,
+    frame: &echo_agent::state::journal::CheckpointFrame<NativePublicationAnchor>,
+) -> Result<(), ChatEventLogError> {
+    let path = authority.journal.directory();
+    if &frame.journal_identity != authority.journal.journal_identity()
+        || frame.sequence > authority.journal.last_sequence()
+        || frame.state.key != expected_key
+        || frame.state.records.len() > 2
+    {
+        return Err(corrupt(
+            path,
+            "native publication checkpoint identity/key/coverage mismatch",
+        ));
+    }
+    for event in &frame.state.records {
+        if event.stream_id != authority.expected_stream_id
+            || event.sequence > frame.sequence
+            || (native_publication_fact_key(event)?.as_deref() != Some(expected_key)
+                && native_execution_scope_key(event)?.as_deref() != Some(expected_key)
+                && !usage_anchor_keys(event)?
+                    .iter()
+                    .any(|key| key == expected_key))
+        {
+            return Err(corrupt(
+                path,
+                "native publication checkpoint contains a foreign original record",
+            ));
+        }
+        validate_driver_event(&event.payload)?;
+        validate_event_stream_identity(
+            &event.workspace_id,
+            event.conversation_id.as_deref(),
+            &event.root_turn_id,
+            &event.payload,
+        )?;
+    }
+    Ok(())
+}
+
+fn preserve_native_publication(
+    authority: &StreamAuthority,
+    event: &ChatEventEnvelope,
+    confirmed_through: u64,
+) -> Result<(), ChatEventLogError> {
+    // 原statusful validator检查同execution全部Agent事件的outer scope。
+    // 每个不同scope保原record见证，不能丢掉Token/ToolCall中的跨owner拒绝依据。
+    let mut keys = Vec::new();
+    if let Some(key) = native_publication_fact_key(event)? {
+        keys.push(key);
+    }
+    if let Some(key) = native_execution_scope_key(event)? {
+        keys.push(key);
+    }
+    for key in keys {
+        preserve_native_publication_key(authority, event, &key, confirmed_through)?;
+    }
+    Ok(())
+}
+
+fn preserve_native_publication_key(
+    authority: &StreamAuthority,
+    event: &ChatEventEnvelope,
+    key: &str,
+    confirmed_through: u64,
+) -> Result<(), ChatEventLogError> {
+    let checkpoint = native_history_checkpoint::<NativePublicationAnchor>(authority, key);
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(authority, "anchor_load", "attempt");
+    let load_result = checkpoint.load();
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(
+        authority,
+        "anchor_load",
+        if load_result.is_ok() {
+            "success"
+        } else {
+            "failure"
+        },
+    );
+    let loaded =
+        load_result.map_err(|error| journal_error(authority.journal.directory(), error))?;
+    let mut state = if let Some(frame) = loaded.as_ref() {
+        validate_native_anchor(authority, key, frame)?;
+        frame.state.clone()
+    } else {
+        NativePublicationAnchor {
+            key: key.to_string(),
+            records: Vec::new(),
+            ambiguous: false,
+        }
+    };
+    let through = loaded
+        .as_ref()
+        .filter(|frame| &frame.journal_identity == authority.journal.journal_identity())
+        .map_or(event.sequence, |frame| frame.sequence.max(event.sequence));
+    let identical = if key.starts_with("usage-") {
+        // usage 锚只用于首次身份/冲突见证，重复运输不扩张锚或重复收费。
+        state.records.iter().any(|previous| {
+            if key.starts_with("usage-turn-")
+                || key.starts_with("usage-call-")
+                || key.starts_with("usage-start-")
+            {
+                true
+            } else {
+                usage_fact(previous)
+                    .ok()
+                    .flatten()
+                    .zip(usage_fact(event).ok().flatten())
+                    .is_some_and(|(a, b)| {
+                        serde_json::to_value(a.usage).ok() == serde_json::to_value(b.usage).ok()
+                    })
+            }
+        })
+    } else if key.starts_with("scope-") {
+        state
+            .records
+            .iter()
+            .any(|previous| native_publication_same_scope(previous, event))
+    } else {
+        let encoded = echo_agent::utils::canonical_json::canonical_json_bytes(event)
+            .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?;
+        state
+            .records
+            .iter()
+            .map(echo_agent::utils::canonical_json::canonical_json_bytes)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?
+            .contains(&encoded)
+    };
+    if identical
+        && loaded
+            .as_ref()
+            .is_some_and(|frame| frame.sequence <= confirmed_through)
+    {
+        // 此原record的barrier已由先前成功投影/当前有界batch确认，无须每个Token重写快照。
+        return Ok(());
+    }
+    if !identical {
+        if key.starts_with("product-") {
+            // 原validator本来取同scope最后一个真实product terminal；不保整条状态流。
+            if state
+                .records
+                .first()
+                .is_none_or(|previous| event.sequence > previous.sequence)
+            {
+                state.records = vec![event.clone()];
+            }
+        } else if state.records.len() < 2 {
+            // 唯一许可需要原全记录；两个不同见证已足以暴露非唯一来源。
+            state.records.push(event.clone());
+        } else {
+            state.ambiguous = true;
+        }
+    }
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(authority, "anchor_save", "attempt");
+    let save_result = checkpoint.save(authority.journal.journal_identity(), &state, through);
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(
+        authority,
+        "anchor_save",
+        if save_result.is_ok() {
+            "success"
+        } else {
+            "failure"
+        },
+    );
+    save_result.map_err(|error| journal_error(authority.journal.directory(), error))
+}
+
+fn advance_native_publication_projection(
+    authority: &StreamAuthority,
+) -> Result<(u64, u64), ChatEventLogError> {
+    advance_native_publication_projection_through(authority, authority.journal.last_sequence())
+}
+
+fn advance_native_publication_projection_through(
+    authority: &StreamAuthority,
+    frozen_head: u64,
+) -> Result<(u64, u64), ChatEventLogError> {
+    let path = authority.journal.directory();
+    // 先确认原journal，不从仅存在于checkpoint的内容创造事实。
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(authority, "journal_sync", "attempt");
+    let sync_result = authority.journal.sync_data();
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(
+        authority,
+        "journal_sync",
+        if sync_result.is_ok() {
+            "success"
+        } else {
+            "failure"
+        },
+    );
+    sync_result.map_err(|error| journal_error(path, error))?;
+    let floor = authority.journal.retention_metadata().retained_floor;
+    let actual_head = authority.journal.last_sequence();
+    if frozen_head > actual_head {
+        return Err(ChatEventLogError::NativeHistoryReadChanged);
+    }
+    let head = frozen_head;
+    let checkpoint = native_history_checkpoint::<NativePublicationCoverage>(authority, "coverage");
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(authority, "coverage_load", "attempt");
+    let load_result = checkpoint.load();
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(
+        authority,
+        "coverage_load",
+        if load_result.is_ok() {
+            "success"
+        } else {
+            "failure"
+        },
+    );
+    let loaded = load_result.map_err(|error| journal_error(path, error))?;
+    let (mut through, mut coverage) = if let Some(frame) = loaded {
+        if &frame.journal_identity != authority.journal.journal_identity() {
+            return Err(corrupt(
+                path,
+                "native publication coverage belongs to a foreign journal generation",
+            ));
+        }
+        if frame.sequence > actual_head
+            || frame.state.first_observed_sequence == 0
+            || frame.state.first_observed_sequence > frame.sequence.saturating_add(1)
+        {
+            return Err(corrupt(
+                path,
+                "native publication coverage exceeds original journal",
+            ));
+        }
+        if frame.sequence < floor.saturating_sub(1) {
+            return Err(ChatEventLogError::NativeHistoryGap {
+                retained_floor: floor,
+                key: "coverage".into(),
+            });
+        }
+        (frame.sequence, frame.state)
+    } else {
+        (
+            floor.saturating_sub(1),
+            NativePublicationCoverage {
+                first_observed_sequence: floor,
+                usage: None,
+                presentation: None,
+            },
+        )
+    };
+    // 原前缀未受此generation的可靠coverage覆盖，就不能证明后缀没有漏掉第二owner。
+    // 这不是空checkpoint：保留原journal并明确gap，不静默重建唯一性或成功。
+    if coverage.first_observed_sequence != 1 {
+        return Err(ChatEventLogError::NativeHistoryGap {
+            retained_floor: floor,
+            key: "original-prefix-uncovered".into(),
+        });
+    }
+    let (usage_through, presentation_through) = {
+        let usage = coverage
+            .usage
+            .get_or_insert_with(|| ConversationUsageProjection {
+                first_observed_sequence: floor,
+                through_sequence: floor.saturating_sub(1),
+                turns_known: floor == 1,
+                ..ConversationUsageProjection::default()
+            });
+        let presentation =
+            coverage
+                .presentation
+                .get_or_insert_with(|| NativePresentationCoverage {
+                    first_observed_sequence: floor,
+                    through_sequence: floor.saturating_sub(1),
+                });
+        for (first, cursor) in [
+            (usage.first_observed_sequence, usage.through_sequence),
+            (
+                presentation.first_observed_sequence,
+                presentation.through_sequence,
+            ),
+        ] {
+            if first == 0
+                || first > cursor.saturating_add(1)
+                || cursor > actual_head
+                || cursor < floor.saturating_sub(1)
+            {
+                return Err(corrupt(
+                    path,
+                    "derived coverage exceeds its original journal",
+                ));
+            }
+        }
+        if through > head || usage.through_sequence > head || presentation.through_sequence > head {
+            return Err(ChatEventLogError::NativeHistorySnapshotAdvanced {
+                frozen_head: head,
+                latest_sequence: actual_head,
+            });
+        }
+        let mut replayed = through
+            .min(usage.through_sequence)
+            .min(presentation.through_sequence);
+        if replayed < head {
+            // 一个固定原batch服务发布、费用和展示，避免每项派生投影另扫4096条。
+            let batch = authority
+                .journal
+                .replay_after(replayed, NATIVE_HISTORY_PROJECTION_BATCH)
+                .map_err(|error| journal_error(path, error))?;
+            if batch.is_empty() {
+                return Err(corrupt(
+                    path,
+                    "native bounded replay did not reach original head",
+                ));
+            }
+            for record in batch {
+                if record.sequence > head {
+                    break;
+                }
+                if record.sequence != replayed.saturating_add(1) {
+                    return Err(corrupt(
+                        path,
+                        "native bounded replay skipped original sequence",
+                    ));
+                }
+                let event = envelope_from_record(record, path, &authority.expected_stream_id)?;
+                if event.sequence > through {
+                    preserve_native_publication(authority, &event, through)?;
+                    through = event.sequence;
+                }
+                if event.sequence > usage.through_sequence {
+                    fold_usage_event(authority, usage, &event)?;
+                }
+                if event.sequence > presentation.through_sequence {
+                    fold_presentation_event(authority, presentation, &event)?;
+                }
+                replayed = event.sequence;
+            }
+        }
+        (usage.through_sequence, presentation.through_sequence)
+    };
+    // 所有原pub原子落盘以后才提交coverage；任何barrier错误都阻止后续prune。
+    // 即使load已见rename，也重新save以确认本次父目录barrier，不把degraded当成功。
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(authority, "coverage_save", "attempt");
+    let save_result = checkpoint.save(authority.journal.journal_identity(), &coverage, through);
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(
+        authority,
+        "coverage_save",
+        if save_result.is_ok() {
+            "success"
+        } else {
+            "failure"
+        },
+    );
+    save_result.map_err(|error| journal_error(path, error))?;
+    Ok((through.min(usage_through).min(presentation_through), head))
+}
+
+fn read_native_publication_anchor(
+    authority: &StreamAuthority,
+    key: &str,
+    frozen_head: Option<u64>,
+) -> Result<Vec<ChatEventEnvelope>, ChatEventLogError> {
+    let checkpoint = native_history_checkpoint::<NativePublicationAnchor>(authority, key);
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(authority, "anchor_load", "attempt");
+    let load_result = checkpoint.load();
+    #[cfg(feature = "test-utils")]
+    native_history_perf_io_event(
+        authority,
+        "anchor_load",
+        if load_result.is_ok() {
+            "success"
+        } else {
+            "failure"
+        },
+    );
+    let loaded =
+        load_result.map_err(|error| journal_error(authority.journal.directory(), error))?;
+    let Some(frame) = loaded else {
+        // 完整coverage下未出现的事实是权威缺席；例如Candidate不保证真的发过Settled。
+        // 原前缀缺coverage已由advance明确Gap，不能按当前floor误判为事实丢失。
+        return Ok(Vec::new());
+    };
+    validate_native_anchor(authority, key, &frame)?;
+    if let Some(head) = frozen_head
+        && (frame
+            .state
+            .records
+            .iter()
+            .any(|event| event.sequence > head)
+            || (frame.state.ambiguous && frame.sequence > head))
+    {
+        // product最后状态等投影已越过冻结读点，不能拼接不同head的事实。
+        return Err(ChatEventLogError::NativeHistorySnapshotAdvanced {
+            frozen_head: head,
+            latest_sequence: authority.journal.last_sequence(),
+        });
+    }
+    if frame.state.ambiguous {
+        return Err(corrupt(
+            authority.journal.directory(),
+            "native publication has more than one original source",
+        ));
+    }
+    Ok(frame.state.records)
+}
+
+fn native_publications_for_message(
+    authority: &StreamAuthority,
+    message: &echo_agent::llm::types::Message,
+    frozen_head: Option<u64>,
+) -> Result<Vec<ChatEventEnvelope>, ChatEventLogError> {
+    let mut keys = Vec::new();
+    for block in message
+        .approved_assistant_blocks
+        .as_deref()
+        .unwrap_or_default()
+    {
+        keys.push(native_publication_key("block", block)?);
+    }
+    if let Some(status) = message.execution_status.as_ref() {
+        keys.push(native_publication_key("final", &status.execution_id)?);
+        keys.push(native_publication_key("terminal", &status.execution_id)?);
+        keys.push(native_publication_key("scope", &status.execution_id)?);
+    }
+    keys.sort();
+    keys.dedup();
+    let mut events = Vec::new();
+    let mut scope_missing = false;
+    for key in keys {
+        let records = read_native_publication_anchor(authority, &key, frozen_head)?;
+        if key.starts_with("scope-") && records.is_empty() {
+            scope_missing = true;
+        }
+        events.extend(records);
+    }
+    if let Some(status) = message.execution_status.as_ref()
+        && scope_missing
+        && events.iter().any(|event| {
+            matches!(&event.payload, ChatDriverEvent::Agent(agent)
+            if agent.execution_id.as_ref().is_some_and(|id| id.as_str() == status.execution_id))
+        })
+    {
+        // 已有同exec原事实却没scope见证，不能过滤掉跨消息拒绝依据后授权成功。
+        return Err(ChatEventLogError::NativeHistoryGap {
+            retained_floor: authority.journal.retention_metadata().retained_floor,
+            key: "required-execution-scope".into(),
+        });
+    }
+    // product terminal按原outer scope读，绝不用Message/Candidate推断它是否存在。
+    if message.execution_status.is_some() {
+        let products = events
+            .iter()
+            .filter(|event| {
+                matches!(&event.payload, ChatDriverEvent::Agent(agent)
+                if matches!(&agent.payload, echo_agent::agent::AgentEvent::FinalAnswer(_)
+                    | echo_agent::agent::AgentEvent::ExecutionStatus(_)))
+            })
+            .map(native_product_key)
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+        for key in products {
+            events.extend(read_native_publication_anchor(
+                authority,
+                &key,
+                frozen_head,
+            )?);
+        }
+    }
+    events.sort_by_key(|event| event.sequence);
+    let mut seen = HashSet::new();
+    let mut original = Vec::new();
+    for event in events {
+        let encoded = echo_agent::utils::canonical_json::canonical_json_bytes(&event)
+            .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?;
+        if seen.insert(encoded) {
+            original.push(event);
+        }
+    }
+    Ok(original)
+}
+
 struct EnumeratedStream {
     stream_id: String,
     path: PathBuf,
@@ -9,6 +599,9 @@ fn open_stream_authority(
     expected_stream_id: &str,
     retention: ChatEventRetention,
 ) -> Result<StreamAuthority, ChatEventLogError> {
+    // Framework ADR0007 verifies the complete committed prefix. Only an
+    // unterminated incomplete active-tail frame is discarded; it could not
+    // admit an effect through our confirmed InputLifecycle claim barrier.
     let journal = StreamJournal::open(
         path,
         retention.segment_rollover_bytes,
@@ -22,6 +615,8 @@ fn open_stream_authority(
         journal,
         pins,
         barrier_pending: false,
+        #[cfg(any(test, feature = "channels"))]
+        weixin_control_active: false,
     })
 }
 
@@ -99,7 +694,9 @@ impl RetentionPins {
     fn apply(&mut self, sequence: u64, event: &PersistedChatEvent) {
         self.cursor = sequence;
         if let Some(fact_key) = command_cell_watch_fact_key(&event.payload) {
-            self.command_cell_watch_facts.entry(fact_key).or_insert(sequence);
+            self.command_cell_watch_facts
+                .entry(fact_key)
+                .or_insert(sequence);
         }
         match &event.payload {
             ChatDriverEvent::CommandCellStarted { cell } => {
@@ -140,6 +737,10 @@ impl RetentionPins {
                     .remove(&key)
                     .map(|(sequence, _)| sequence);
                 self.refresh_earliest_if_removed(pending.or(started));
+            }
+            ChatDriverEvent::WeixinControlDelivery(_) => {
+                self.weixin_control_first.get_or_insert(sequence);
+                self.refresh_earliest();
             }
             ChatDriverEvent::InputLifecycle(fact) => {
                 self.apply_conversation_input_fact(sequence, fact, true);
@@ -183,9 +784,14 @@ impl RetentionPins {
         self.earliest = self
             .pending_command_cell_watches
             .values()
-            .chain(self.started_command_cell_watches.values().map(|(sequence, _)| sequence))
+            .chain(
+                self.started_command_cell_watches
+                    .values()
+                    .map(|(sequence, _)| sequence),
+            )
             .chain(self.active_cells.values())
             .chain(conversation_input_earliest.iter())
+            .chain(self.weixin_control_first.iter())
             .copied()
             .min();
     }
@@ -199,6 +805,14 @@ impl RetentionPins {
         self.queue_revision = self.queue_revision.max(sequence);
         match fact {
             ConversationInputFact::Persisted { identity, payload } => {
+                let previous_position = self
+                    .queue_order
+                    .iter()
+                    .position(|queued| queued == &identity.input_id);
+                let previous_first_sequence = self
+                    .conversation_inputs
+                    .get(&identity.input_id)
+                    .map(|entry| entry.first_sequence);
                 let receipt = ConversationInputReceipt {
                     identity: identity.clone(),
                     phase: ConversationInputPhase::Persisted,
@@ -216,20 +830,41 @@ impl RetentionPins {
                     FoldedConversationInput {
                         projection: ConversationInputProjection {
                             receipt,
-                            payload: payload.clone(),
+                            payload: payload.as_ref().clone(),
+                            task_target: self
+                                .conversation_inputs
+                                .get(&identity.input_id)
+                                .and_then(|entry| entry.projection.task_target.clone()),
+                            claimed_before_current: self
+                                .conversation_inputs
+                                .get(&identity.input_id)
+                                .is_some_and(|entry| entry.ever_claimed),
                             active_attempt: None,
                         },
-                        first_sequence: sequence,
+                        first_sequence: previous_first_sequence.unwrap_or(sequence),
                         last_sequence: sequence,
                         terminal_fact_self_contained: false,
+                        ever_claimed: self
+                            .conversation_inputs
+                            .get(&identity.input_id)
+                            .is_some_and(|entry| entry.ever_claimed),
                     },
                 );
                 self.queue_order
                     .retain(|queued| queued != &identity.input_id);
-                self.queue_order.push(identity.input_id.clone());
+                if let Some(position) = previous_position {
+                    self.queue_order.insert(
+                        position.min(self.queue_order.len()),
+                        identity.input_id.clone(),
+                    );
+                } else {
+                    self.queue_order.push(identity.input_id.clone());
+                }
             }
             ConversationInputFact::AttemptStarted { attempt, .. } => {
                 if let Some(entry) = self.conversation_inputs.get_mut(&attempt.identity.input_id) {
+                    entry.projection.claimed_before_current = entry.ever_claimed;
+                    entry.ever_claimed = true;
                     entry.projection.receipt.phase = ConversationInputPhase::AttemptStarted;
                     entry.projection.receipt.attempt = Some(attempt.attempt);
                     entry.projection.receipt.attempt_id = Some(attempt.attempt_id.clone());
@@ -246,6 +881,36 @@ impl RetentionPins {
                 self.queue_order
                     .insert(0, attempt.identity.input_id.clone());
             }
+            ConversationInputFact::TaskRunTargetBound {
+                attempt, run_id, ..
+            } => {
+                if let Some(entry) = self.conversation_inputs.get_mut(&attempt.identity.input_id) {
+                    let receipt = &entry.projection.receipt;
+                    let exact = receipt.phase == ConversationInputPhase::AttemptStarted
+                        && receipt.identity == attempt.identity
+                        && receipt.attempt == Some(attempt.attempt)
+                        && receipt.attempt_id.as_deref() == Some(attempt.attempt_id.as_str())
+                        && receipt.turn_id.as_deref() == Some(attempt.turn_id.as_str())
+                        && !entry.projection.task_target.as_ref().is_some_and(|target| {
+                            target.run_id != *run_id
+                                || target.turn_id != attempt.turn_id
+                                || target.identity != attempt.identity
+                        });
+                    if exact {
+                        entry.projection.task_target =
+                            Some(crate::conversation_input::ConversationInputTaskTarget {
+                                run_id: run_id.clone(),
+                                turn_id: attempt.turn_id.clone(),
+                                identity: attempt.identity.clone(),
+                            });
+                    } else {
+                        entry.projection.receipt.phase = ConversationInputPhase::RecoveryRequired;
+                        entry.projection.receipt.reason =
+                            Some("原输入任务归属事实与原attempt冲突，禁止重投".to_string());
+                    }
+                    entry.last_sequence = sequence;
+                }
+            }
             ConversationInputFact::MailboxAccepted { attempt, .. } => {
                 self.update_attempt_receipt(
                     sequence,
@@ -256,7 +921,8 @@ impl RetentionPins {
                     None,
                 );
             }
-            ConversationInputFact::Drained { attempt, .. } => {
+            ConversationInputFact::Drained { attempt, .. }
+            | ConversationInputFact::DriverAccepted { attempt, .. } => {
                 self.ensure_terminal_tombstone(
                     sequence,
                     &attempt.identity,
@@ -336,6 +1002,21 @@ impl RetentionPins {
                     Some(reason.clone()),
                 );
             }
+            ConversationInputFact::RecoveryUncertain {
+                identity, reason, ..
+            } => {
+                if let Some(entry) = self.conversation_inputs.get_mut(&identity.input_id)
+                    // A terminal cancellation is authoritative: a delayed
+                    // uncertainty fact from an older owner cannot turn it back
+                    // into a blocking recovery item.
+                    && entry.projection.receipt.phase != ConversationInputPhase::Cancelled
+                {
+                    entry.projection.receipt.phase = ConversationInputPhase::RecoveryRequired;
+                    entry.projection.receipt.reason = Some(reason.clone());
+                    entry.projection.receipt.duplicate = false;
+                    entry.last_sequence = sequence;
+                }
+            }
             ConversationInputFact::Cancelled {
                 identity,
                 attempt,
@@ -395,6 +1076,7 @@ impl RetentionPins {
         reason: Option<String>,
     ) {
         if let Some(entry) = self.conversation_inputs.get_mut(&attempt.identity.input_id) {
+            entry.ever_claimed = true;
             entry.projection.receipt.phase = phase;
             entry.projection.receipt.attempt = Some(attempt.attempt);
             entry.projection.receipt.attempt_id = Some(attempt.attempt_id.clone());
@@ -430,16 +1112,21 @@ impl RetentionPins {
                         queue_revision: self.queue_revision,
                     },
                     payload: ConversationInputPayload {
+                        channel_binding: None,
+                        domain_plugin: None,
                         text: String::new(),
                         attachments: Vec::new(),
                         submitted_at_ms: 0,
                         payload_sha256: identity.payload_sha256.clone(),
                     },
+                    task_target: None,
+                    claimed_before_current: true,
                     active_attempt: None,
                 },
                 first_sequence: sequence,
                 last_sequence: sequence,
                 terminal_fact_self_contained,
+                ever_claimed: true,
             });
     }
 }
@@ -452,7 +1139,11 @@ fn conversation_input_is_frontier(receipt: &ConversationInputReceipt) -> bool {
 }
 
 fn conversation_input_pin_sequence(entry: &FoldedConversationInput) -> u64 {
-    if conversation_input_is_frontier(&entry.projection.receipt) {
+    // A provider may replay after ACK loss. Preserve the original binding AND
+    // its complete lifecycle; a pruned tombstone is not a never-claimed proof.
+    if entry.projection.payload.channel_binding.is_some()
+        || conversation_input_is_frontier(&entry.projection.receipt)
+    {
         entry.first_sequence
     } else if entry.terminal_fact_self_contained {
         entry.last_sequence
@@ -532,6 +1223,17 @@ fn conversation_input_fact_is_duplicate(
                         | ConversationInputPhase::RecoveryRequired
                 )
         }
+        ConversationInputFact::TaskRunTargetBound {
+            attempt, run_id, ..
+        } => {
+            receipt.phase == ConversationInputPhase::AttemptStarted
+                && exact_attempt(attempt)
+                && current.task_target.as_ref().is_some_and(|target| {
+                    target.run_id == *run_id
+                        && target.turn_id == attempt.turn_id
+                        && target.identity == attempt.identity
+                })
+        }
         ConversationInputFact::MailboxAccepted { attempt, .. } => {
             exact_attempt(attempt)
                 && matches!(
@@ -541,7 +1243,10 @@ fn conversation_input_fact_is_duplicate(
                         | ConversationInputPhase::TurnSettled
                 )
         }
-        ConversationInputFact::Drained { attempt, .. } => exact_attempt(attempt) && receipt.drained,
+        ConversationInputFact::Drained { attempt, .. }
+        | ConversationInputFact::DriverAccepted { attempt, .. } => {
+            exact_attempt(attempt) && receipt.drained
+        }
         ConversationInputFact::TurnSettled {
             attempt,
             outcome,
@@ -570,6 +1275,13 @@ fn conversation_input_fact_is_duplicate(
                 && receipt.phase == ConversationInputPhase::RecoveryRequired
                 && receipt.reason.as_deref() == Some(reason.as_str())
                 && receipt.drained == *drained
+        }
+        ConversationInputFact::RecoveryUncertain {
+            identity, reason, ..
+        } => {
+            receipt.identity == *identity
+                && receipt.phase == ConversationInputPhase::RecoveryRequired
+                && receipt.reason.as_deref() == Some(reason.as_str())
         }
         ConversationInputFact::Cancelled {
             identity,
@@ -743,7 +1455,8 @@ fn should_mark_barrier_pending(
 fn append_durability(event: &ChatDriverEvent) -> FileDurability {
     match event {
         ChatDriverEvent::Agent(envelope) => match &envelope.payload {
-            echo_agent::agent::AgentEvent::ToolCall { .. }
+            echo_agent::agent::AgentEvent::LlmUsage { .. }
+            | echo_agent::agent::AgentEvent::ToolCall { .. }
             | echo_agent::agent::AgentEvent::ToolResult { .. }
             | echo_agent::agent::AgentEvent::FinalAnswer(_)
             | echo_agent::agent::AgentEvent::Cancelled
@@ -781,10 +1494,12 @@ fn append_durability(event: &ChatDriverEvent) -> FileDurability {
         | ChatDriverEvent::CommandCellWatchReady { .. }
         | ChatDriverEvent::CommandCellWatchDeliveryStarted { .. }
         | ChatDriverEvent::CommandCellWatchAcknowledged { .. }
+        | ChatDriverEvent::WeixinControlDelivery(_)
         | ChatDriverEvent::InputLifecycle(_)
         | ChatDriverEvent::ApprovalRequest { .. }
         | ChatDriverEvent::InputRequest { .. }
         | ChatDriverEvent::SelectionRequest { .. }
+        | ChatDriverEvent::HitlRequestReleased { .. }
         | ChatDriverEvent::ContextCompressed { .. } => FileDurability::SyncData,
         ChatDriverEvent::TurnStatus { .. } => FileDurability::Flush,
     }
@@ -846,6 +1561,26 @@ fn stream_id(
 
 fn event_identity(event: &ChatDriverEvent, root_turn_id: &str) -> (String, String) {
     match event {
+        ChatDriverEvent::ApprovalRequest {
+            identity: Some(identity),
+            ..
+        }
+        | ChatDriverEvent::InputRequest {
+            identity: Some(identity),
+            ..
+        }
+        | ChatDriverEvent::SelectionRequest {
+            identity: Some(identity),
+            ..
+        }
+        | ChatDriverEvent::HitlRequestReleased { identity } => (
+            identity
+                .scope
+                .turn_id
+                .clone()
+                .unwrap_or_else(|| root_turn_id.to_string()),
+            root_turn_id.to_string(),
+        ),
         ChatDriverEvent::Agent(envelope) => (
             envelope.turn_id.as_str().to_string(),
             envelope
@@ -894,15 +1629,18 @@ fn command_cell_watch_fact_key(event: &ChatDriverEvent) -> Option<String> {
         ChatDriverEvent::CommandCellSettled { cell } => {
             Some(format!("cell_settled:{}", cell.cell_id))
         }
-        ChatDriverEvent::CommandCellWatchReady { result } => {
-            Some(format!("ready:{}", command_cell_watch_receipt_key(&result.receipt)))
-        }
-        ChatDriverEvent::CommandCellWatchDeliveryStarted { acknowledgement } => {
-            Some(format!("started:{}", command_cell_watch_ack_key(acknowledgement)))
-        }
-        ChatDriverEvent::CommandCellWatchAcknowledged { acknowledgement } => {
-            Some(format!("ack:{}", command_cell_watch_ack_key(acknowledgement)))
-        }
+        ChatDriverEvent::CommandCellWatchReady { result } => Some(format!(
+            "ready:{}",
+            command_cell_watch_receipt_key(&result.receipt)
+        )),
+        ChatDriverEvent::CommandCellWatchDeliveryStarted { acknowledgement } => Some(format!(
+            "started:{}",
+            command_cell_watch_ack_key(acknowledgement)
+        )),
+        ChatDriverEvent::CommandCellWatchAcknowledged { acknowledgement } => Some(format!(
+            "ack:{}",
+            command_cell_watch_ack_key(acknowledgement)
+        )),
         _ => None,
     }
 }
@@ -914,6 +1652,52 @@ fn validate_event_stream_identity(
     event: &ChatDriverEvent,
 ) -> Result<(), ChatEventLogError> {
     match event {
+        ChatDriverEvent::ApprovalRequest {
+            identity: Some(identity),
+            ..
+        }
+        | ChatDriverEvent::InputRequest {
+            identity: Some(identity),
+            ..
+        }
+        | ChatDriverEvent::SelectionRequest {
+            identity: Some(identity),
+            ..
+        }
+        | ChatDriverEvent::HitlRequestReleased { identity } => {
+            let request_matches = match event {
+                ChatDriverEvent::ApprovalRequest { request_id, .. } => {
+                    request_id == &identity.request_id
+                        && identity.kind == crate::hitl::HitlRequestKind::Approval
+                }
+                ChatDriverEvent::InputRequest { request_id, .. } => {
+                    request_id == &identity.request_id
+                        && identity.kind == crate::hitl::HitlRequestKind::Input
+                }
+                ChatDriverEvent::SelectionRequest { request_id, .. } => {
+                    request_id == &identity.request_id
+                        && identity.kind == crate::hitl::HitlRequestKind::Selection
+                }
+                ChatDriverEvent::HitlRequestReleased { .. } => true,
+                _ => false,
+            };
+            if !request_matches
+                || identity.request_id.trim().is_empty()
+                || identity.scope.workspace_id.as_deref() != Some(workspace_id)
+                || identity.scope.conversation_id.as_deref() != conversation_id
+                || identity.scope.root_turn_id.as_deref() != Some(root_turn_id)
+                || identity
+                    .scope
+                    .turn_id
+                    .as_deref()
+                    .is_none_or(|turn| turn.trim().is_empty())
+                || identity.response_target.trim().is_empty()
+            {
+                return Err(ChatEventLogError::InvalidIdentity(
+                    "HITL identity does not match the original journal owner".to_string(),
+                ));
+            }
+        }
         ChatDriverEvent::Agent(envelope) => {
             let event_conversation_id = envelope
                 .conversation_id
@@ -934,9 +1718,11 @@ fn validate_event_stream_identity(
                 ));
             }
             if let Some(metadata) = execution.framework_event.as_ref()
-                && (metadata.message_id.as_deref().is_some_and(|id| id != root_turn_id)
-                    || execution.subagent_run_id.as_deref()
-                        != Some(metadata.execution_id.as_str())
+                && (metadata
+                    .message_id
+                    .as_deref()
+                    .is_some_and(|id| id != root_turn_id)
+                    || execution.subagent_run_id.as_deref() != Some(metadata.execution_id.as_str())
                     || execution.task_id.as_deref() != metadata.task_id.as_deref()
                     || execution.agent.as_deref() != Some(metadata.agent_name.as_str()))
             {
@@ -1089,6 +1875,11 @@ fn validate_conversation_input_event(
             "conversation input fact identity is incomplete".to_string(),
         ));
     }
+    if let ConversationInputFact::Persisted { payload, .. } = fact {
+        payload
+            .validate_channel_digest(&identity.address)
+            .map_err(|error| ChatEventLogError::InvalidEvent(error.to_string()))?;
+    }
     match fact {
         ConversationInputFact::Persisted { payload, .. }
             if (payload.text.trim().is_empty() && payload.attachments.is_empty())
@@ -1099,6 +1890,8 @@ fn validate_conversation_input_event(
             ))
         }
         ConversationInputFact::AttemptStarted { attempt, .. }
+        | ConversationInputFact::TaskRunTargetBound { attempt, .. }
+        | ConversationInputFact::DriverAccepted { attempt, .. }
         | ConversationInputFact::MailboxAccepted { attempt, .. }
         | ConversationInputFact::Drained { attempt, .. }
         | ConversationInputFact::TurnSettled { attempt, .. }
@@ -1112,8 +1905,14 @@ fn validate_conversation_input_event(
                 "conversation input attempt identity is incomplete".to_string(),
             ))
         }
+        ConversationInputFact::TaskRunTargetBound { run_id, .. } if run_id.trim().is_empty() => {
+            Err(ChatEventLogError::InvalidEvent(
+                "原输入任务去向为空".to_string(),
+            ))
+        }
         ConversationInputFact::Deferred { reason, .. }
         | ConversationInputFact::RecoveryRequired { reason, .. }
+        | ConversationInputFact::RecoveryUncertain { reason, .. }
             if reason.trim().is_empty() =>
         {
             Err(ChatEventLogError::InvalidEvent(
@@ -1182,4 +1981,134 @@ fn envelope_content_hash(integrity: EnvelopeIntegrity<'_>) -> Result<String, Cha
     let encoded = echo_agent::utils::canonical_json::canonical_json_bytes(&integrity)
         .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?;
     Ok(digest(&encoded))
+}
+
+fn validate_unclaimed_channel_input(
+    authority: &StreamAuthority,
+    current: &ConversationInputProjection,
+) -> Result<(), ConversationInputError> {
+    let receipt = &current.receipt;
+    let entry = authority
+        .pins
+        .conversation_inputs
+        .get(&receipt.identity.input_id)
+        .ok_or_else(|| ConversationInputError::StaleRevision {
+            input_id: receipt.identity.input_id.clone(),
+        })?;
+    let retention = authority.journal.retention_metadata();
+    if authority.barrier_pending
+        || retention.cleanup_pending
+        || retention.retained_floor > entry.first_sequence
+        || entry.ever_claimed
+        || receipt.phase != ConversationInputPhase::Persisted
+        || receipt.attempt.is_some()
+        || receipt.attempt_id.is_some()
+        || receipt.turn_id.is_some()
+        || receipt.drained
+        || current.active_attempt.is_some()
+        || current.payload.channel_binding.is_none()
+        || receipt.identity.payload_sha256 != current.payload.payload_sha256
+    {
+        return Err(ConversationInputError::Validation(
+            "channel input has no complete, confirmed never-claimed history".to_string(),
+        ));
+    }
+    if let Some(crate::conversation_input::ChannelInputBinding {
+        execution: crate::conversation_input::ChannelExecutionIntent::Resume { expected, .. },
+        ..
+    }) = current.payload.channel_binding.as_ref()
+    {
+        // A thin address conversion must be lossless for BOTH original resume
+        // drivers. Actual TaskRun revision/policy validation stays with them.
+        if expected.workspace_id != receipt.identity.address.workspace_id
+            || expected.conversation_id != receipt.identity.address.conversation_id
+        {
+            return Err(ConversationInputError::Validation(
+                "saved Resume intent does not match its original input address".to_string(),
+            ));
+        }
+    }
+    current
+        .payload
+        .validate_channel_digest(&receipt.identity.address)
+}
+
+// test-utils私有观测，产品默认构建不编译；跨blocking线程由原tracing dispatcher收集。
+// 记录调用尝试及Result结算，不把它解释为OS syscall、物理I/O字节或优化收益。
+#[cfg(feature = "test-utils")]
+fn native_history_perf_io_event(
+    authority: &StreamAuthority,
+    operation: &'static str,
+    stage: &'static str,
+) {
+    tracing::trace!(target: "eko::native_history::perf_io", path = %authority.journal.directory().display(), operation, stage);
+    #[cfg(test)]
+    native_history_perf_io::record(authority.journal.directory(), operation, stage);
+}
+
+#[cfg(all(test, feature = "test-utils"))]
+mod native_history_perf_io {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+    pub(super) struct Count {
+        pub(super) attempted: u64,
+        pub(super) succeeded: u64,
+        pub(super) failed: u64,
+    }
+    pub(super) type Counts = BTreeMap<&'static str, Count>;
+    static ACTIVE: Mutex<Option<(PathBuf, Counts)>> = Mutex::new(None);
+
+    pub(super) fn record(path: &Path, operation: &'static str, stage: &'static str) {
+        let mut active = ACTIVE.lock().unwrap_or_else(|error| error.into_inner());
+        let Some((root, counts)) = active.as_mut() else {
+            return;
+        };
+        if !path.starts_with(root) {
+            return;
+        }
+        let count = counts.entry(operation).or_default();
+        match stage {
+            "attempt" => count.attempted = count.attempted.saturating_add(1),
+            "success" => count.succeeded = count.succeeded.saturating_add(1),
+            "failure" => count.failed = count.failed.saturating_add(1),
+            _ => {}
+        }
+    }
+
+    pub(super) struct Observation {
+        root: PathBuf,
+        active: bool,
+    }
+    impl Observation {
+        pub(super) fn begin(root: PathBuf) -> Result<Self, String> {
+            let mut active = ACTIVE.lock().unwrap_or_else(|error| error.into_inner());
+            if active.is_some() {
+                return Err("native I/O observation already owned".into());
+            }
+            *active = Some((root.clone(), Counts::new()));
+            Ok(Self { root, active: true })
+        }
+        pub(super) fn finish(mut self) -> Result<Counts, String> {
+            let mut active = ACTIVE.lock().unwrap_or_else(|error| error.into_inner());
+            if active.as_ref().is_none_or(|(root, _)| *root != self.root) {
+                return Err("native I/O observation owner changed".into());
+            }
+            let (_, counts) = active.take().ok_or("I/O observation disappeared")?;
+            self.active = false;
+            Ok(counts)
+        }
+    }
+    impl Drop for Observation {
+        fn drop(&mut self) {
+            if self.active {
+                let mut active = ACTIVE.lock().unwrap_or_else(|error| error.into_inner());
+                if active.as_ref().is_some_and(|(root, _)| *root == self.root) {
+                    *active = None;
+                }
+            }
+        }
+    }
 }

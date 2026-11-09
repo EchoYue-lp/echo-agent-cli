@@ -1,8 +1,7 @@
-pub mod cli;
 pub mod logging;
 pub mod task_run_control;
 
-/// Configure EKO's process-wide data roots before any store is opened.
+/// Configure Eclip's process-wide data roots before any store is opened.
 /// `EKO_DATA_DIR` is primarily used by subprocess tests and local development;
 /// production keeps the branded `~/.eko` default.
 pub fn configure_data_root() -> anyhow::Result<()> {
@@ -13,7 +12,7 @@ pub fn configure_data_root() -> anyhow::Result<()> {
         }
         echo_agent_app_core::api::data_root::configure(root.clone()).map_err(|current| {
             anyhow::anyhow!(
-                "EKO data root was already initialized at {}",
+                "Eclip data root was already initialized at {}",
                 current.display()
             )
         })?;
@@ -27,7 +26,7 @@ pub fn configure_data_root() -> anyhow::Result<()> {
     )
     .map_err(|current| {
         anyhow::anyhow!(
-            "EKO data root was already initialized at {}",
+            "Eclip data root was already initialized at {}",
             current.display()
         )
     })?;
@@ -40,9 +39,6 @@ pub fn configure_data_root() -> anyhow::Result<()> {
 // remains covered by the workspace's strict panic lint gate.
 #[allow(clippy::unreachable)]
 pub mod tauri;
-
-#[cfg(feature = "tui")]
-pub mod tui;
 
 // Re-export from app-core
 pub use echo_agent_app_core::api::{

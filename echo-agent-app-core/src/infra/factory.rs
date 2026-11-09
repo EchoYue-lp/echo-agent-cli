@@ -66,18 +66,6 @@ fn resolved_max_tool_output_tokens(configured: usize) -> usize {
     }
 }
 
-/// Convert EKO's `0` iteration sentinel into the positive framework value that
-/// represents an effectively unlimited ReAct loop. The framework builder
-/// rejects zero, while EKO configuration intentionally documents zero as
-/// "until completion or cancellation".
-pub(crate) fn resolved_max_iterations(configured: usize) -> usize {
-    if configured == 0 {
-        usize::MAX
-    } else {
-        configured
-    }
-}
-
 /// Resolve the one context budget used by prompt assembly, the parent agent,
 /// and every subagent that inherits the selected runtime model.
 ///
@@ -102,7 +90,6 @@ struct SubagentRuntimeGeneration {
     model: String,
     llm_config: Option<LlmConfig>,
     llm_client: Option<Arc<dyn LlmClient>>,
-    temperature: Option<f32>,
     max_tokens: Option<u32>,
     token_limit: usize,
     /// Reasoning-depth knob carried with the generation. Inherited bindings
@@ -167,7 +154,7 @@ fn subagent_model_binding(
     } else {
         let mut generation = resolve_fixed_subagent_generation(spec, app_config, parent_generation);
         // Fixed: resolve the role's thinking spec once; without one keep the
-        // parent's thinking as of registration (mirrors temperature/max_tokens).
+        // parent's thinking as of registration (mirrors max_tokens).
         generation.thinking = subagent_build_thinking(thinking_spec, &generation);
         SubagentModelBinding::Fixed(Box::new(generation))
     }
@@ -216,7 +203,6 @@ fn resolve_fixed_subagent_generation(
         model: runtime.model.clone(),
         llm_config: Some(prepared.config),
         llm_client: Some(prepared.client),
-        temperature: runtime.temperature,
         max_tokens: runtime.max_tokens,
         token_limit: effective_token_limit(app_config, Some(&runtime)),
         thinking: prepared.thinking,
@@ -237,6 +223,10 @@ struct SubagentPromptPublication {
     compiler: Arc<dyn SubagentPromptCompiler>,
 }
 
+#[cfg(test)]
+type ForkMemoryStoreObservations =
+    Arc<tokio::sync::Mutex<Vec<(String, std::sync::Weak<dyn echo_agent::memory::Store>)>>>;
+
 /// EKO-owned model consumers attached to one parent agent generation.
 ///
 /// Only subagent definitions with omitted `model` frontmatter are included.
@@ -250,6 +240,9 @@ pub struct AgentModelConsumers {
     prompt_publications: Arc<Vec<SubagentPromptPublication>>,
     prompt_compiler: Arc<dyn SubagentPromptCompiler>,
     disabled_tools_projection: Arc<tokio::sync::RwLock<Option<std::collections::HashSet<String>>>>,
+    // 只弱观察实际 Fork 构建结果，不延长 Agent/Store owner 生命周期。
+    #[cfg(test)]
+    fork_memory_stores: ForkMemoryStoreObservations,
 }
 
 impl AgentModelConsumers {
@@ -369,7 +362,6 @@ impl AgentModelConsumers {
             model: runtime.model.clone(),
             llm_config: Some(prepared.config.clone()),
             llm_client: Some(prepared.client.clone()),
-            temperature: runtime.temperature,
             max_tokens: runtime.max_tokens,
             token_limit,
             thinking: prepared.thinking.clone(),
@@ -386,7 +378,6 @@ impl AgentModelConsumers {
         generation.model.clear();
         generation.llm_config = None;
         generation.llm_client = None;
-        generation.temperature = None;
         generation.max_tokens = None;
         generation.thinking = None;
     }
@@ -406,6 +397,20 @@ impl AgentModelConsumers {
                 }
             });
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn fork_memory_store_for_test(
+        &self,
+        name: &str,
+    ) -> Option<Arc<dyn echo_agent::memory::Store>> {
+        self.fork_memory_stores
+            .lock()
+            .await
+            .iter()
+            .rev()
+            .find(|(role, _)| role == name)
+            .and_then(|(_, store)| store.upgrade())
     }
 
     #[cfg(test)]
@@ -476,6 +481,19 @@ Use `create_complex_task` only for expensive multi-step work, architectural/mult
 /// Agent creation parameters (extracted from CLI args or config).
 #[derive(Default)]
 pub struct AgentCreateParams {
+    /// 池驱动的会话由实际 invocation 准备规则；构造只发现角色定义。
+    /// 独立构造及 primary 默认保持模型准入前的完整初始化。
+    /// 完整快照供 reflection 等直接消费者读取；产品模型循环仍须经过
+    /// drive_chat 的 invocation 准入，裸 chat 不能代替该入口。
+    pub context_prepared_by_invocation: bool,
+    /// Immutable host target; every invocation still supplies its actual cwd.
+    pub file_system: Option<Arc<dyn echo_agent::tools::filesystem::FileSystem>>,
+    pub sandbox_executor: Option<Arc<dyn echo_agent::sandbox::SandboxExecutor>>,
+    /// Borrowed original local executor for application/User Skill sources;
+    /// this is distinct from an SSH project's execution target.
+    pub local_skill_executor: Option<Arc<dyn echo_agent::sandbox::SandboxExecutor>>,
+    /// Local product data, deliberately separate from a remote project cwd.
+    pub workspace_data_root: Option<std::path::PathBuf>,
     pub model: Option<String>,
     pub system_prompt: Option<String>,
     pub project: Option<String>,
@@ -577,6 +595,7 @@ pub async fn create_agent_with_diagnostics(
         params,
         app_config,
         echo_agent::subagent::SubagentEventBus::new(),
+        None,
     )
     .await
 }
@@ -591,6 +610,7 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
     params: &AgentCreateParams,
     app_config: &EkoConfig,
     subagent_event_bus: echo_agent::subagent::SubagentEventBus,
+    memory_store: Option<Arc<dyn echo_agent::memory::Store>>,
 ) -> std::result::Result<CreatedAgent, String> {
     // EKO can boot before the user configures a provider. An explicit selector
     // must still resolve, while an absent selector leaves the Agent detached
@@ -608,9 +628,6 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
         .as_ref()
         .map(|runtime| runtime.model.as_str())
         .unwrap_or_default();
-    let temperature = runtime_model
-        .as_ref()
-        .and_then(|runtime| runtime.temperature);
     let max_tokens = runtime_model
         .as_ref()
         .and_then(|runtime| runtime.max_tokens);
@@ -637,14 +654,96 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
 
     // Resolve subagent .md scopes early so the role catalog can be injected
     // into the system prompt before build (same defs used by register_default_subagents).
-    let subagent_project_root = crate::project::context::resolve_project_root(
-        params.project.as_deref(),
-        params.working_dir.as_deref(),
-    );
+    let file_system: Arc<dyn echo_agent::tools::filesystem::FileSystem> = params
+        .file_system
+        .clone()
+        .unwrap_or_else(|| Arc::new(echo_agent::tools::files::LocalFileSystem));
+    let project_candidate = params
+        .project
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| params.working_dir.clone());
     let subagent_user_home = dirs::home_dir();
-    let discovered_subagents = crate::subagent_loader::discover_subagents(
-        subagent_project_root.as_deref(),
-        subagent_user_home.as_deref(),
+    let prepare_files = file_system.clone();
+    let file_preparation_started = std::time::Instant::now();
+    let state_dir = params
+        .workspace_data_root
+        .as_deref()
+        .map(crate::workspace::layout::WorkspaceLayout::state_dir);
+    let default_local_files = params.file_system.is_none();
+    let context_prepared_by_invocation = params.context_prepared_by_invocation;
+    let instruction_cwd = params
+        .working_dir
+        .clone()
+        .or_else(|| project_candidate.clone());
+    let (
+        subagent_project_root,
+        discovered_subagents,
+        mut project_context,
+        instruction_snapshot,
+        project_state_dir,
+    ) = tokio::task::spawn_blocking(move || {
+        crate::project::context::with_read_session(prepare_files.as_ref(), |prepare_files| {
+            let root = project_candidate
+                .map(|path| {
+                    crate::utils::find_project_root_with_file_system(&path, prepare_files)
+                        .map(|root| root.unwrap_or(path))
+                })
+                .transpose()?;
+            let instruction_cwd = crate::project::context::project_context_working_dir(
+                root.as_deref(),
+                instruction_cwd.as_deref(),
+            );
+            let state_dir = state_dir.or_else(|| {
+                default_local_files
+                    .then(|| {
+                        root.as_deref()
+                            .map(crate::workspace::layout::WorkspaceLayout::state_dir)
+                    })
+                    .flatten()
+            });
+            let subagents = crate::subagent_loader::discover_subagents_with_file_system(
+                root.as_deref(),
+                subagent_user_home.as_deref(),
+                prepare_files,
+            )?;
+            let context = root
+                .as_deref()
+                .filter(|_| !context_prepared_by_invocation)
+                .map(|root| {
+                    crate::project::context::load_project_context_with_file_system(
+                        root,
+                        prepare_files,
+                    )
+                })
+                .transpose()?;
+            let instructions = if context_prepared_by_invocation {
+                None
+            } else {
+                Some(crate::unified_memory::load_resolved_instruction_projection(
+                    instruction_cwd.as_deref(),
+                    root.as_deref(),
+                    state_dir.as_deref(),
+                    prepare_files,
+                )?)
+            };
+            Ok::<_, echo_agent::error::ReactError>((
+                root,
+                subagents,
+                context,
+                instructions,
+                state_dir,
+            ))
+        })
+    })
+    .await
+    .map_err(|error| format!("Project context preparation task failed: {error}"))?
+    .map_err(|error| format!("Project context preparation failed: {error}"))?;
+    tracing::info!(
+        conversation_id = params.conversation_id.as_deref(),
+        elapsed_ms = file_preparation_started.elapsed().as_millis(),
+        deferred_to_invocation = params.context_prepared_by_invocation,
+        "agent project definitions prepared"
     );
     let subagent_catalog_snapshot = Arc::new(
         crate::subagent_loader::SubagentCatalogSnapshot::from_definitions(&discovered_subagents),
@@ -661,7 +760,35 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
     let token_limit = effective_token_limit(app_config, runtime_model.as_ref());
     let max_tool_output_tokens =
         resolved_max_tool_output_tokens(app_config.agent.max_tool_output_tokens);
-    let sandbox_manager = Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox());
+    let local_sandbox: Arc<dyn echo_agent::sandbox::SandboxExecutor> = params
+        .local_skill_executor
+        .clone()
+        .unwrap_or_else(|| Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox()));
+    let run_code_available = match params.sandbox_executor.as_ref() {
+        Some(executor) => {
+            executor
+                .is_available_at(echo_agent::sandbox::IsolationLevel::OsSandbox)
+                .await
+        }
+        None => {
+            local_sandbox
+                .is_available_at(echo_agent::sandbox::IsolationLevel::OsSandbox)
+                .await
+        }
+    };
+    let sandbox_manager: Arc<dyn echo_agent::sandbox::SandboxExecutor> = params
+        .sandbox_executor
+        .clone()
+        .unwrap_or_else(|| local_sandbox.clone());
+    if let Some(context) = project_context.as_mut() {
+        crate::project::context::load_project_git_context(
+            context,
+            sandbox_manager.as_ref(),
+            Vec::new(),
+        )
+        .await
+        .map_err(|error| format!("Project Git context preparation failed: {error}"))?;
+    }
     let product_data_io = match params.product_data_io.clone() {
         Some(product_data_io) => product_data_io,
         #[cfg(test)]
@@ -676,7 +803,13 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
     let script_execution_profile_resolver: Arc<
         dyn echo_agent::tools::ScriptExecutionProfileResolver,
     > = Arc::new(
-        crate::analysis_runtime::AnalyticsRuntime::with_product_data_io(product_data_io.clone()),
+        crate::analysis_runtime::AnalyticsRuntime::with_product_data_io(product_data_io.clone())
+            .with_project_environment(
+                params
+                    .task_runtime_store
+                    .as_ref()
+                    .and_then(|store| store.project_environment()),
+            ),
     );
     let command_cell_runtime = match params.command_cell_runtime.clone() {
         Some(runtime) => runtime,
@@ -694,16 +827,18 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
                 .unwrap_or_else(|| std::path::PathBuf::from(".")),
         )
     });
-    let command_cells =
-        command_cell_runtime.scoped(execution_scope.clone(), params.task_runtime_store.clone());
+    let command_cells = command_cell_runtime.scoped_with_executor(
+        execution_scope.clone(),
+        params.task_runtime_store.clone(),
+        sandbox_manager.clone(),
+    );
     let subagent_prompt_compiler: Arc<dyn SubagentPromptCompiler> =
         Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler);
     let subagent_registry = Arc::new(echo_agent::subagent::SubagentRegistry::with_event_bus(
         subagent_event_bus,
     ));
-    let run_code_available = sandbox_manager.has_local_os_sandbox().await;
     if !run_code_available {
-        tracing::warn!("OS sandbox unavailable; run_code will be disabled for this EKO runtime");
+        tracing::warn!("OS sandbox unavailable; run_code will be disabled for this Eclip runtime");
     }
 
     // Use ReactAgentBuilder — mode is resolved at the CLI layer,
@@ -713,6 +848,11 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
         .name(&app_config.agent.name)
         .system_prompt(&system_prompt)
         .enable_tools()
+        .file_system(file_system.clone())
+        // EKO has already prepared its complete fallible instruction snapshot
+        // above. Framework's synchronous local resolver must not read a local
+        // namesake for a remote project on a later render.
+        .auto_project_rules(false)
         .enable_memory()
         .command_cells(command_cells.clone())
         // EKO owns planning through TaskRuntime. Background command cells
@@ -724,19 +864,33 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
         .subagent_prompt_compiler(subagent_prompt_compiler.clone())
         .register_agent_dispatch_tool() // Phase 0: ad-hoc agent_tool alongside task_execute
         .enable_human_in_loop()
-        .max_iterations(resolved_max_iterations(app_config.agent.max_iterations))
+        // EKO 主 Agent 持续工作到完成或取消，不设置产品层固定轮数预算。
+        .max_iterations(usize::MAX)
         .token_limit(token_limit)
         .visibility_horizon(eko_visibility_horizon(token_limit))
         .max_tool_output_tokens(max_tool_output_tokens)
-        .tool_output_artifacts(tool_output_artifact_config(params.working_dir.as_deref()))
+        .tool_output_artifacts(tool_output_artifact_config(
+            params
+                .workspace_data_root
+                .as_deref()
+                .or(params.working_dir.as_deref()),
+        ))
         .max_tokens(Some(max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)))
-        .temperature(temperature)
+        // 产品不请求temperature，显式None防止框架builder默认重新注入。
+        .temperature(None)
         .tool_execution(echo_agent::tools::ToolExecutionConfig {
             timeout_ms: app_config.agent.tool_timeout_ms,
             ..Default::default()
-        })
-        .sandbox_manager(sandbox_manager.clone())
-        .enable_cot();
+        });
+
+    // SSH 项目的 `file_system` 不是本机原生命名空间：`grep` 若走框架默认遍历，
+    // 会把整棵候选树的正文经 SFTP 拉回本机。这里把内容搜索接到目标机器上执行，
+    // 只回传结果记录。本机原生文件系统保持 `None`，行为与未接入接缝时一致。
+    builder = with_remote_content_search(
+        builder,
+        file_system.paths_are_native(),
+        sandbox_manager.clone(),
+    );
 
     // ── Pass the resolved configured model to the LLM client ──
     // Without this, the agent falls back to env vars + echo-agent-models.yaml,
@@ -796,23 +950,33 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
     // Subagents must share the workspace memory instead of each opening the
     // framework default at an empty `memory_path` (which always fails its
     // authority lease and logs "authority path has no parent" per Subagent).
-    let memory_workspace_root = params.working_dir.as_deref().map(std::path::Path::new);
-    #[cfg(not(test))]
-    let (memory_store_path, _) = resolve_memory_store_paths(memory_workspace_root);
-    #[cfg(not(test))]
-    let subagent_memory_store = create_memory_store_at(&memory_store_path);
-    // Tests without an explicit workspace need no durable side effect. Tests
-    // that exercise workspace persistence pass a TempDir-backed working_dir
-    // and continue to use the real FileStore path inside that owned scope.
-    #[cfg(test)]
-    let subagent_memory_store: Option<Arc<dyn echo_agent::memory::Store>> =
-        match memory_workspace_root {
-            Some(root) => {
-                let (memory_store_path, _) = resolve_memory_store_paths(Some(root));
+    let memory_workspace_root = params
+        .workspace_data_root
+        .as_deref()
+        .or(params.working_dir.as_deref());
+    // 池已选定的 generation Store 必须在注册工具、继承实例和 Fork 闭包前进入
+    // 原 builder；不能先捕获临时 Store，再在池里替换父 Agent 的注入通道。
+    let subagent_memory_store = match memory_store {
+        Some(store) => Some(store),
+        None => {
+            #[cfg(not(test))]
+            {
+                let (memory_store_path, _) = resolve_memory_store_paths(memory_workspace_root);
                 create_memory_store_at(&memory_store_path)
             }
-            None => Some(Arc::new(echo_agent::memory::InMemoryStore::new())),
-        };
+            #[cfg(test)]
+            {
+                match memory_workspace_root {
+                    Some(root) => {
+                        let (memory_store_path, _) = resolve_memory_store_paths(Some(root));
+                        create_memory_store_at(&memory_store_path)
+                    }
+                    None => Some(Arc::new(echo_agent::memory::InMemoryStore::new())
+                        as Arc<dyn echo_agent::memory::Store>),
+                }
+            }
+        }
+    };
     if let Some(store) = subagent_memory_store.clone() {
         builder = builder.store(store);
     }
@@ -850,13 +1014,21 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
     // EKO owns the concrete worktree/workspace policies behind one framework
     // isolation boundary. A requested kind that cannot be established fails
     // rather than silently sharing the primary workspace.
-    let repo_root = subagent_project_root
-        .as_ref()
-        .and_then(|root| crate::tasks::task_runtime::worktree::git_repo_root(root).ok());
     let isolation_provider: std::sync::Arc<dyn echo_agent::subagent::IsolationProvider> =
-        std::sync::Arc::new(
-            crate::tasks::task_runtime::worktree::EkoIsolationProvider::new(repo_root),
-        );
+        if let Some(store) = params.task_runtime_store.as_ref() {
+            Arc::new(store.project_isolation_provider(subagent_project_root.clone()))
+        } else {
+            if params.file_system.is_some() {
+                return Err(
+                    "Project provider requires its original TaskRuntime environment binding"
+                        .to_string(),
+                );
+            }
+            let repo_root = subagent_project_root
+                .as_ref()
+                .and_then(|root| crate::tasks::task_runtime::worktree::git_repo_root(root).ok());
+            Arc::new(crate::tasks::task_runtime::worktree::EkoIsolationProvider::new(repo_root))
+        };
     let builder = builder.subagent_isolation_provider(isolation_provider);
 
     // Reuse one canonical checkpoint store for ReAct and compiled team task
@@ -885,11 +1057,30 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
     // the fallback path where the workspace FileStore could not be opened and
     // the framework installed its configured default store instead.
     let subagent_memory_store = agent.store().cloned();
+    agent.set_sandbox_executor(sandbox_manager.clone());
+    agent.set_default_skill_source(
+        echo_agent::skills::external::loader::SkillFileSource::local(Some(local_sandbox.clone())),
+    );
     install_eko_shell_policy(&mut agent, sandbox_manager.clone(), command_cells.clone());
     agent
         .tool_manager()
         .apply_script_execution_profile_resolver(script_execution_profile_resolver.clone());
-    refresh_dynamic_context(&mut agent, subagent_project_root.as_deref()).await;
+    if let Some(instruction_snapshot) = instruction_snapshot.as_ref() {
+        crate::unified_memory::apply_instruction_projection_snapshot(
+            &mut agent,
+            instruction_snapshot,
+        )
+        .await;
+    }
+    let project_message = crate::project::prompt::project_context_message(
+        project_context.as_ref(),
+        agent.config().get_token_limit(),
+        sandbox_manager.name(),
+    );
+    agent.context().lock().await.replace_projection(
+        crate::project::prompt::PROJECT_CONTEXT_PROJECTION,
+        project_message,
+    );
     configure_run_code_capability(&mut agent, run_code_available);
     agent.set_pre_model_context_projector(Some(std::sync::Arc::new(
         crate::turn_context::EkoContextProjector::new(
@@ -905,14 +1096,17 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
         browser_runtime
             .register_workspace_root(
                 execution_scope.workspace_id().to_string(),
-                execution_scope.root().to_path_buf(),
+                params
+                    .workspace_data_root
+                    .clone()
+                    .unwrap_or_else(|| execution_scope.root().to_path_buf()),
             )
             .await;
         browser_runtime.install_tools(&mut agent);
     }
 
     // Inject LlmCritic for self-verification. The critic scores the agent's
-    // final_answer; if below threshold (7.0), feedback is injected and the
+    // 原生最终回答候选；低于阈值（7.0）时注入反馈并继续原循环。
     // agent retries (up to verifier_max_retries=2).
     // The critic consumes the exact prepared transport used by the parent;
     // it never re-resolves global config or assumes Chat Completions.
@@ -948,7 +1142,6 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
             llm_client: prepared_llm
                 .as_ref()
                 .map(|prepared| prepared.client.clone()),
-            temperature,
             max_tokens,
             token_limit,
             thinking: prepared_llm
@@ -967,6 +1160,9 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
         script_execution_profile_resolver,
         run_code_available,
         subagent_memory_store,
+        file_system.clone(),
+        project_state_dir,
+        params.working_dir.clone().or(subagent_project_root),
     )
     .await;
     crate::tasks::task_runtime::command_cells::install_watch_cell_tool(
@@ -993,10 +1189,10 @@ pub(crate) async fn create_agent_with_diagnostics_and_event_bus(
         use crate::tasks::task_runtime::task_tools::TaskCapabilityCatalog;
         let store = Arc::clone(store);
         let tool_names = agent.tool_names();
-        let capabilities = Arc::new(TaskCapabilityCatalog::new(
-            subagent_catalog_snapshot.clone(),
-            tool_names,
-        ));
+        let capabilities = Arc::new(
+            TaskCapabilityCatalog::new(subagent_catalog_snapshot.clone(), tool_names)
+                .with_registry(agent.subagent_registry().clone()),
+        );
         let revision_service =
             crate::tasks::task_runtime::build_task_revision_service(store, capabilities);
         echo_agent::tasks::register_task_tools(&mut agent, revision_service);
@@ -1027,6 +1223,181 @@ pub async fn refresh_dynamic_context(agent: &mut ReactAgent, root: Option<&std::
     crate::project::prompt::refresh_project_context_projection(agent, root).await;
 }
 
+/// Fallible original-invocation preparation after its actual checkout cwd is
+/// known. Callers must propagate this result before entering the first model.
+/// No projection is changed until both file and command reads have settled.
+pub async fn refresh_dynamic_context_with_file_system(
+    agent: &mut ReactAgent,
+    working_dir: Option<&std::path::Path>,
+    local_state_dir: Option<&std::path::Path>,
+    files: Arc<dyn echo_agent::tools::filesystem::FileSystem>,
+    executor: Arc<dyn echo_agent::sandbox::SandboxExecutor>,
+    resource_guards: Vec<echo_agent::tools::InvocationResourceGuard>,
+) -> Result<(), String> {
+    let prepared = prepare_dynamic_project_context(
+        working_dir,
+        local_state_dir,
+        files,
+        executor,
+        resource_guards,
+        agent.config().get_token_limit(),
+    )
+    .await?;
+    prepared.publish_projections(agent).await;
+    Ok(())
+}
+
+pub(crate) struct PreparedProjectContext {
+    instructions: crate::unified_memory::InstructionProjectionSnapshot,
+    project: Option<echo_agent::llm::types::Message>,
+}
+
+impl PreparedProjectContext {
+    pub(crate) async fn publish_projections(self, agent: &mut ReactAgent) {
+        crate::unified_memory::apply_instruction_projection_snapshot(agent, &self.instructions)
+            .await;
+        agent.context().lock().await.replace_projection(
+            crate::project::prompt::PROJECT_CONTEXT_PROJECTION,
+            self.project,
+        );
+    }
+
+    pub(crate) fn projections(&self) -> Vec<echo_agent::compression::ContextProjection> {
+        vec![
+            self.instructions.projection(),
+            echo_agent::compression::ContextProjection::replacing(
+                crate::project::prompt::PROJECT_CONTEXT_PROJECTION,
+                self.project.clone(),
+            ),
+        ]
+    }
+
+    /// Fresh default/Plugin Subagents share the original Domain-only renderer
+    /// with these prepared project values, through one model projection slot.
+    /// Strict reads already succeeded at the invocation's fallible entry. This
+    /// immutable projection republishes those same facts after Execute resets
+    /// or checkpoint restoration, preserving the original role root and using
+    /// existing envelopes to replace older checkpoint facts without duplicates.
+    pub(crate) async fn publish_for_fresh_subagent(self, agent: &mut ReactAgent) {
+        agent
+            .context()
+            .lock()
+            .await
+            .apply_projections(&self.projections());
+        agent.set_pre_model_context_projector(Some(Arc::new(self)));
+    }
+}
+
+impl echo_agent::compression::PreModelContextProjector for PreparedProjectContext {
+    fn project<'a>(
+        &'a self,
+        context: &'a echo_agent::compression::ProjectionContext,
+    ) -> BoxFuture<'a, echo_agent::error::Result<Vec<echo_agent::compression::ContextProjection>>>
+    {
+        // No I/O or fallible preparation is deferred to the framework's
+        // warning-only projector path. Its sole job is publishing read values.
+        Box::pin(async move {
+            let domain = crate::tasks::task_runtime::compact_context::TaskRuntimeContextProjector::domain_only(
+                crate::tasks::task_runtime::compact_context::task_runtime_projection_registry(),
+            );
+            // The original Domain-only renderer reads its already-admitted,
+            // fixed method from the same registry. It performs no file I/O.
+            let mut projections =
+                echo_agent::compression::PreModelContextProjector::project(&domain, context)
+                    .await?;
+            projections.extend(self.projections());
+            Ok(projections)
+        })
+    }
+}
+
+pub(crate) async fn prepare_dynamic_project_context(
+    working_dir: Option<&std::path::Path>,
+    local_state_dir: Option<&std::path::Path>,
+    files: Arc<dyn echo_agent::tools::filesystem::FileSystem>,
+    executor: Arc<dyn echo_agent::sandbox::SandboxExecutor>,
+    resource_guards: Vec<echo_agent::tools::InvocationResourceGuard>,
+    model_window: usize,
+) -> Result<PreparedProjectContext, String> {
+    prepare_project_context_at_location(
+        None,
+        working_dir,
+        local_state_dir,
+        files,
+        executor,
+        resource_guards,
+        model_window,
+    )
+    .await
+}
+
+/// 显式项目的根权威与实际cwd分开携带；raw补全不能被嵌套仓库重定向。
+pub(crate) async fn prepare_project_context_at_location(
+    project: Option<&std::path::Path>,
+    working_dir: Option<&std::path::Path>,
+    local_state_dir: Option<&std::path::Path>,
+    files: Arc<dyn echo_agent::tools::filesystem::FileSystem>,
+    executor: Arc<dyn echo_agent::sandbox::SandboxExecutor>,
+    resource_guards: Vec<echo_agent::tools::InvocationResourceGuard>,
+    model_window: usize,
+) -> Result<PreparedProjectContext, String> {
+    let project = project.map(std::path::Path::to_path_buf);
+    let working_dir = working_dir.map(std::path::Path::to_path_buf);
+    let local_state_dir = local_state_dir.map(std::path::Path::to_path_buf);
+    let command_guards = resource_guards.clone();
+    let (snapshot, mut context) = tokio::task::spawn_blocking(move || {
+        let _physical_guards = resource_guards;
+        crate::project::context::with_read_session(files.as_ref(), |files| {
+            let root = project
+                .as_deref()
+                .or(working_dir.as_deref())
+                .map(|path| {
+                    crate::utils::find_project_root_with_file_system(path, files)
+                        .map(|root| root.unwrap_or_else(|| path.to_path_buf()))
+                })
+                .transpose()?;
+            let working_dir = crate::project::context::project_context_working_dir(
+                root.as_deref(),
+                working_dir.as_deref(),
+            );
+            let snapshot = crate::unified_memory::load_resolved_instruction_projection(
+                working_dir.as_deref(),
+                root.as_deref(),
+                local_state_dir.as_deref(),
+                files,
+            )?;
+            let context = root
+                .as_deref()
+                .map(|root| {
+                    crate::project::context::load_project_context_with_file_system(root, files)
+                })
+                .transpose()?;
+            Ok::<_, echo_agent::error::ReactError>((snapshot, context))
+        })
+    })
+    .await
+    .map_err(|error| format!("Project context preparation task failed: {error}"))?
+    .map_err(|error| format!("Project context preparation failed: {error}"))?;
+    if let Some(context) = context.as_mut() {
+        crate::project::context::load_project_git_context(
+            context,
+            executor.as_ref(),
+            command_guards,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    let message = crate::project::prompt::project_context_message(
+        context.as_ref(),
+        model_window,
+        executor.name(),
+    );
+    Ok(PreparedProjectContext {
+        instructions: snapshot,
+        project: message,
+    })
+}
+
 fn configure_run_code_capability(agent: &mut ReactAgent, available: bool) {
     if available {
         return;
@@ -1047,11 +1418,10 @@ fn configure_run_code_capability(agent: &mut ReactAgent, available: bool) {
 /// compiled into the binary (`src/subagents/coding/*.md`). Editing a `.md`
 /// prompt therefore takes effect on next agent build without recompiling.
 ///
-/// Only `readonly` subagents are registered here (the 4 generic capability
-/// roles: explorer/reviewer/planner/summarizer). Domain specialization lives
-/// in the context/skill layer, not separate agent definitions — aligns with
-/// industry consensus (Claude Code ~3 subagents, OpenHands microagents,
-/// Devin single-agent). Used by the main agent for L2 delegation.
+/// 按原定义注册只读和writer角色。readonly与can_delegate分别控制能力与委派：
+/// 声明可委派的只读角色仍由只读工厂装配，框架在原builder选择受限dispatch实例，
+/// 不通过删除readonly开关或更换角色来放行。每次调用的工具正上界与深度仍由原scope收窄。
+/// 领域方法继续来自原context/Skill，而不是由本注册函数另造运行权威。
 #[allow(clippy::too_many_arguments)]
 async fn register_default_subagents(
     agent: &mut ReactAgent,
@@ -1064,13 +1434,19 @@ async fn register_default_subagents(
     prompt_compiler: Arc<dyn SubagentPromptCompiler>,
     subagent_registry: Arc<echo_agent::subagent::SubagentRegistry>,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
-    sandbox_manager: Arc<echo_agent::sandbox::SandboxManager>,
+    sandbox_manager: Arc<dyn echo_agent::sandbox::SandboxExecutor>,
     command_cells: Arc<dyn echo_agent::tools::cell::CommandCellRegistry>,
     script_execution_profile_resolver: Arc<dyn echo_agent::tools::ScriptExecutionProfileResolver>,
     run_code_available: bool,
     memory_store: Option<Arc<dyn echo_agent::memory::Store>>,
+    file_system: Arc<dyn echo_agent::tools::filesystem::FileSystem>,
+    local_state_dir: Option<std::path::PathBuf>,
+    default_cwd: Option<std::path::PathBuf>,
 ) -> AgentModelConsumers {
+    #[cfg(test)]
+    let fork_memory_stores = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let tool_output_artifacts = agent.tool_output_artifacts();
+    let local_skill_source = agent.default_skill_source();
     tracing::info!(
         count = subagents.len(),
         names = ?subagents.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(),
@@ -1122,7 +1498,6 @@ async fn register_default_subagents(
                 &initial_generation.model,
                 initial_generation.llm_config.clone(),
                 initial_generation.llm_client.clone(),
-                initial_generation.temperature,
                 initial_generation.max_tokens,
                 initial_generation.token_limit,
                 initial_thinking,
@@ -1134,8 +1509,10 @@ async fn register_default_subagents(
                 prompt_compiler.clone(),
                 subagent_registry.clone(),
                 browser_runtime.clone(),
+                sandbox_manager.clone(),
                 command_cells.clone(),
                 memory_store.clone(),
+                file_system.clone(),
             )
         } else {
             build_writer_subagent_agent(
@@ -1144,7 +1521,6 @@ async fn register_default_subagents(
                 &initial_generation.model,
                 initial_generation.llm_config.clone(),
                 initial_generation.llm_client.clone(),
-                initial_generation.temperature,
                 initial_generation.max_tokens,
                 initial_generation.token_limit,
                 initial_thinking,
@@ -1161,10 +1537,18 @@ async fn register_default_subagents(
                 script_execution_profile_resolver.clone(),
                 run_code_available,
                 memory_store.clone(),
+                file_system.clone(),
             )
         };
         match build_result {
             Ok(mut subagent) => {
+                // Readonly is a capability projection, not a local target.
+                subagent.set_sandbox_executor(sandbox_manager.clone());
+                subagent.tool_manager().set_native_execution_admission(Some(
+                    crate::tasks::task_runtime::executor::process_execution_governor()
+                        .native_shell_admission(),
+                ));
+                subagent.set_default_skill_source(local_skill_source.clone());
                 let disabled_tools: std::collections::HashSet<String> = disabled_tools_projection
                     .read()
                     .await
@@ -1280,7 +1664,13 @@ async fn register_default_subagents(
                 let factory_tool_output_artifacts = tool_output_artifacts.clone();
                 let factory_prompt_compiler = prompt_compiler.clone();
                 let factory_subagent_registry = subagent_registry.clone();
+                #[cfg(test)]
+                let factory_fork_memory_stores = fork_memory_stores.clone();
                 let factory_memory_store = memory_store.clone();
+                let factory_file_system = file_system.clone();
+                let factory_local_skill_source = local_skill_source.clone();
+                let factory_state_dir = local_state_dir.clone();
+                let factory_default_cwd = default_cwd.clone();
                 let factory_disabled_tools = Arc::clone(&disabled_tools_projection);
                 let fork_factory = Arc::new(FnAgentFactory::new(
                     move || -> BoxFuture<'static, echo_agent::error::Result<Box<dyn Agent>>> {
@@ -1295,7 +1685,13 @@ async fn register_default_subagents(
                         let tool_output_artifacts = factory_tool_output_artifacts.clone();
                         let prompt_compiler = factory_prompt_compiler.clone();
                         let subagent_registry = factory_subagent_registry.clone();
+                        #[cfg(test)]
+                        let fork_memory_stores = factory_fork_memory_stores.clone();
                         let memory_store = factory_memory_store.clone();
+                        let file_system = factory_file_system.clone();
+                        let local_skill_source = factory_local_skill_source.clone();
+                        let local_state_dir = factory_state_dir.clone();
+                        let default_cwd = factory_default_cwd.clone();
                         let disabled_tools = Arc::clone(&factory_disabled_tools);
                         Box::pin(async move {
                             let model_generation = model_binding.snapshot().await;
@@ -1315,7 +1711,6 @@ async fn register_default_subagents(
                                     &model_generation.model,
                                     model_generation.llm_config,
                                     model_generation.llm_client,
-                                    model_generation.temperature,
                                     model_generation.max_tokens,
                                     model_generation.token_limit,
                                     thinking,
@@ -1327,8 +1722,10 @@ async fn register_default_subagents(
                                     prompt_compiler.clone(),
                                     subagent_registry,
                                     browser_runtime,
+                                    sandbox_manager.clone(),
                                     command_cells,
                                     memory_store,
+                                    file_system.clone(),
                                 )?
                             } else {
                                 build_writer_subagent_agent(
@@ -1337,7 +1734,6 @@ async fn register_default_subagents(
                                     &model_generation.model,
                                     model_generation.llm_config,
                                     model_generation.llm_client,
-                                    model_generation.temperature,
                                     model_generation.max_tokens,
                                     model_generation.token_limit,
                                     thinking,
@@ -1349,13 +1745,20 @@ async fn register_default_subagents(
                                     prompt_compiler.clone(),
                                     subagent_registry,
                                     browser_runtime,
-                                    sandbox_manager,
+                                    sandbox_manager.clone(),
                                     command_cells,
                                     script_execution_profile_resolver,
                                     run_code_available,
                                     memory_store,
+                                    file_system.clone(),
                                 )?
                             };
+                            subagent.set_sandbox_executor(sandbox_manager.clone());
+                            subagent.tool_manager().set_native_execution_admission(Some(
+                                crate::tasks::task_runtime::executor::process_execution_governor()
+                                    .native_shell_admission(),
+                            ));
+                            subagent.set_default_skill_source(local_skill_source);
                             let disabled_tools: std::collections::HashSet<String> =
                                 disabled_tools.read().await.clone().unwrap_or_default();
                             subagent.set_disabled_tools(
@@ -1394,7 +1797,21 @@ async fn register_default_subagents(
                                 &subagent,
                             )
                             .await;
-                            Ok(Box::new(subagent) as Box<dyn Agent>)
+                            #[cfg(test)]
+                            if let Some(store) = subagent.store() {
+                                fork_memory_stores
+                                    .lock()
+                                    .await
+                                    .push((subagent_def.name.clone(), Arc::downgrade(store)));
+                            }
+                            Ok(crate::project::agent_adapter::boxed_project_agent(
+                                crate::agent_handle::AgentHandle::new(subagent),
+                                file_system,
+                                sandbox_manager,
+                                local_state_dir,
+                                default_cwd,
+                            )
+                            .await)
                         })
                     },
                 )) as Arc<dyn AgentFactory>;
@@ -1425,7 +1842,14 @@ async fn register_default_subagents(
     for built in &built_subagents {
         agent.register_subagent_with_definition(
             built.definition.clone(),
-            built.handle.to_boxed_agent().await,
+            crate::project::agent_adapter::boxed_project_agent(
+                built.handle.clone(),
+                file_system.clone(),
+                sandbox_manager.clone(),
+                local_state_dir.clone(),
+                default_cwd.clone(),
+            )
+            .await,
         );
         agent.register_subagent_factory(built.definition.clone(), built.fork_factory.clone());
         tracing::info!(
@@ -1476,6 +1900,8 @@ async fn register_default_subagents(
         prompt_publications: Arc::new(prompt_publications),
         prompt_compiler,
         disabled_tools_projection,
+        #[cfg(test)]
+        fork_memory_stores,
     }
 }
 
@@ -1491,7 +1917,6 @@ fn build_writer_subagent_agent(
     model: &str,
     llm_config: Option<LlmConfig>,
     mut llm_client: Option<Arc<dyn LlmClient>>,
-    temperature: Option<f32>,
     max_tokens: Option<u32>,
     token_limit: usize,
     thinking: Option<echo_agent::llm::ThinkingConfig>,
@@ -1503,11 +1928,12 @@ fn build_writer_subagent_agent(
     prompt_compiler: Arc<dyn SubagentPromptCompiler>,
     subagent_registry: Arc<echo_agent::subagent::SubagentRegistry>,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
-    sandbox_manager: Arc<echo_agent::sandbox::SandboxManager>,
+    sandbox_manager: Arc<dyn echo_agent::sandbox::SandboxExecutor>,
     command_cells: Arc<dyn echo_agent::tools::cell::CommandCellRegistry>,
     script_execution_profile_resolver: Arc<dyn echo_agent::tools::ScriptExecutionProfileResolver>,
     run_code_available: bool,
     memory_store: Option<Arc<dyn echo_agent::memory::Store>>,
+    file_system: Arc<dyn echo_agent::tools::filesystem::FileSystem>,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
     // Mirror build_readonly_subagent_agent, but OMIT `.readonly_tools()` → the
     // default `readonly_tools: false` triggers `register_all_tools`, giving the
@@ -1515,27 +1941,31 @@ fn build_writer_subagent_agent(
     // by the worktree (Sprint 8): the subagent's working_dir is bound to its own
     // worktree checkout, so writes can't reach the main workspace even though
     // the tools could.
+    // `file_system` 会在 builder 链里被消费，先取出路径命名空间事实。
+    let paths_are_native = file_system.paths_are_native();
     let mut builder = ReactAgentBuilder::new()
         .model(model)
         .name(name)
         .system_prompt(prompt)
         .enable_tools()
+        .file_system(file_system)
+        .auto_project_rules(false)
         // NO .readonly_tools() → full tool set (write capability).
         .register_subagent_message_tools()
-        .enable_cot()
         .token_limit(token_limit)
         .visibility_horizon(eko_visibility_horizon(token_limit))
         .max_tool_output_tokens(max_tool_output_tokens)
         .max_tokens(max_tokens.or(Some(DEFAULT_MAX_TOKENS)))
-        .temperature(temperature)
+        .temperature(None)
         .tool_execution(echo_agent::tools::ToolExecutionConfig {
             timeout_ms: tool_timeout_ms,
             ..Default::default()
         })
-        .sandbox_manager(sandbox_manager.clone())
         // 与主智能体共享同一进程级 registry；cell 自身通过同一个 sandbox
         // executor 执行，不会从前台策略静默降级为宿主机直连。
         .command_cells(command_cells.clone());
+
+    builder = with_remote_content_search(builder, paths_are_native, sandbox_manager.clone());
 
     // Share the parent's workspace memory store. Without one the Subagent
     // runs without memory tools — the framework default would open an empty
@@ -1549,6 +1979,9 @@ fn build_writer_subagent_agent(
     }
 
     if can_delegate {
+        // Role capability is static. The original invocation's bound policy
+        // controls current depth/visibility; consulting today's GUI default
+        // here would break simultaneous old/new runs with different limits.
         builder = builder
             .enable_subagent()
             .subagent_registry(subagent_registry)
@@ -1579,6 +2012,8 @@ fn build_writer_subagent_agent(
     }
 
     let mut subagent = builder.build()?;
+    crate::tasks::task_runtime::compact_context::install_domain_context_projection(&mut subagent);
+    subagent.set_sandbox_executor(sandbox_manager.clone());
     install_eko_shell_policy(&mut subagent, sandbox_manager, command_cells);
     subagent
         .tool_manager()
@@ -1607,9 +2042,12 @@ fn build_writer_subagent_agent(
 
 fn install_eko_shell_policy(
     agent: &mut ReactAgent,
-    sandbox_manager: Arc<echo_agent::sandbox::SandboxManager>,
+    sandbox_manager: Arc<dyn echo_agent::sandbox::SandboxExecutor>,
     command_cells: Arc<dyn echo_agent::tools::cell::CommandCellRegistry>,
 ) {
+    agent.tool_manager().set_native_execution_admission(Some(
+        crate::tasks::task_runtime::executor::process_execution_governor().native_shell_admission(),
+    ));
     // EKO is a local personal assistant. The application PermissionService is
     // the authority for automatic tool policy; retaining the framework's
     // generic fixed whitelist here would reject harmless full-auto commands
@@ -1624,6 +2062,25 @@ fn install_eko_shell_policy(
     ));
 }
 
+/// 把 `grep` 的内容搜索接到项目实际所在的执行环境。
+///
+/// 只在本机原生命名空间之外注入：本机文件系统必须保持 `None`，否则框架会把
+/// 一次本机遍历改走远端命令，行为与未接入接缝时不再逐字一致。Subagent 与
+/// 主 Agent 共享同一注入规则，否则同一 SSH 会话里不同角色的 `grep` 会走两条
+/// 语义不同（虽然结果应相同）的路径。
+fn with_remote_content_search(
+    builder: ReactAgentBuilder,
+    paths_are_native: bool,
+    executor: Arc<dyn echo_agent::sandbox::SandboxExecutor>,
+) -> ReactAgentBuilder {
+    if paths_are_native {
+        return builder;
+    }
+    builder.content_search_provider(Some(Arc::new(crate::terminal::RemoteContentSearch::new(
+        executor,
+    ))))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_readonly_subagent_agent(
     name: &str,
@@ -1631,7 +2088,6 @@ fn build_readonly_subagent_agent(
     model: &str,
     llm_config: Option<LlmConfig>,
     mut llm_client: Option<Arc<dyn LlmClient>>,
-    temperature: Option<f32>,
     max_tokens: Option<u32>,
     token_limit: usize,
     thinking: Option<echo_agent::llm::ThinkingConfig>,
@@ -1643,24 +2099,30 @@ fn build_readonly_subagent_agent(
     prompt_compiler: Arc<dyn SubagentPromptCompiler>,
     subagent_registry: Arc<echo_agent::subagent::SubagentRegistry>,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
+    sandbox_manager: Arc<dyn echo_agent::sandbox::SandboxExecutor>,
     command_cells: Arc<dyn echo_agent::tools::cell::CommandCellRegistry>,
     memory_store: Option<Arc<dyn echo_agent::memory::Store>>,
+    file_system: Arc<dyn echo_agent::tools::filesystem::FileSystem>,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
+    // `file_system` 会在 builder 链里被消费，先取出路径命名空间事实。
+    let paths_are_native = file_system.paths_are_native();
     let mut builder = ReactAgentBuilder::new()
         .model(model)
         .name(name)
         .system_prompt(prompt)
         .enable_tools()
-        .readonly_tools() // SA-2: physical enforcement — no shell/write tools
+        .file_system(file_system)
+        .auto_project_rules(false)
+        // 工具快照落实只读；合法后代委派由框架受限实例继续承接同一调用上界。
+        .readonly_tools()
         // In-tree communication tools: report/escalate to the run driver and
         // queue-only sibling messaging (uplink read from ToolContext).
         .register_subagent_message_tools()
-        .enable_cot()
         .token_limit(token_limit)
         .visibility_horizon(eko_visibility_horizon(token_limit))
         .max_tool_output_tokens(max_tool_output_tokens)
         .max_tokens(max_tokens.or(Some(DEFAULT_MAX_TOKENS)))
-        .temperature(temperature)
+        .temperature(None)
         .tool_execution(echo_agent::tools::ToolExecutionConfig {
             timeout_ms: tool_timeout_ms,
             ..Default::default()
@@ -1668,6 +2130,8 @@ fn build_readonly_subagent_agent(
         // Read-only Subagents cannot launch shell work, but may inspect command
         // cells already owned by their invocation scope.
         .command_cells(command_cells);
+
+    builder = with_remote_content_search(builder, paths_are_native, sandbox_manager);
 
     // Share the parent's workspace memory store. Without one the Subagent
     // runs without memory tools — the framework default would open an empty
@@ -1681,6 +2145,8 @@ fn build_readonly_subagent_agent(
     }
 
     if can_delegate {
+        // Keep the role menu reusable across bound limits 1/2/3. Runtime
+        // invocation scope, not a global factory flag, authorizes descendants.
         builder = builder
             .enable_subagent()
             .subagent_registry(subagent_registry)
@@ -1710,6 +2176,7 @@ fn build_readonly_subagent_agent(
     }
 
     let mut subagent = builder.build()?;
+    crate::tasks::task_runtime::compact_context::install_domain_context_projection(&mut subagent);
     if let Some(client) = llm_client {
         subagent.set_llm_client(client);
     }
@@ -1729,4 +2196,104 @@ fn build_readonly_subagent_agent(
     );
     subagent.config_mut().set_cache_user_id(cache_user_id);
     Ok(subagent)
+}
+
+#[cfg(test)]
+mod current_source_factory_tests {
+    use super::*;
+    use echo_agent::agent::{Agent, AgentEvent};
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn actual_eko_factory_current_custom_tool_executes_once() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut created = create_agent_with_diagnostics(
+            &AgentCreateParams {
+                conversation_id: Some("fresh-factory-custom".into()),
+                session_id: Some("fresh-factory-custom".into()),
+                working_dir: Some(dir.path().to_path_buf()),
+                workspace_data_root: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+            &EkoConfig::default(),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        let llm = Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .then_tool_call(
+                    "fresh-factory-call",
+                    "final_answer",
+                    r#"{"answer":"custom payload"}"#,
+                )
+                .with_response("after custom effect"),
+        );
+        created.agent.set_llm_client(llm.clone());
+        created.agent.add_tool(Box::new(
+            echo_agent::testing::MockTool::new("final_answer")
+                .with_response("actual factory custom result"),
+        ));
+        let raw = created
+            .agent
+            .execute_stream("new custom")
+            .await?
+            .collect::<Vec<_>>()
+            .await;
+        let events = raw
+            .into_iter()
+            .collect::<echo_agent::error::Result<Vec<_>>>()?;
+        assert!(events.iter().any(|event|matches!(event,AgentEvent::ToolResult{call_id,result,..} if call_id=="fresh-factory-call"&&result.success&&result.output=="actual factory custom result")));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::FinalAnswer(_)))
+                .count(),
+            1
+        );
+        assert_eq!(llm.call_count(), 2);
+        assert!(
+            matches!(events.last(),Some(AgentEvent::ExecutionStatus(status)) if status.status==echo_agent::agent::ExecutionStatusKind::Settled)
+        );
+        created.agent.close().await?;
+        Ok(())
+    }
+
+    #[test]
+    fn current_provider_tool_coordinates_survive_canonical_projection() -> anyhow::Result<()> {
+        let source = echo_agent::llm::types::ProviderOutputSource {
+            protocol: echo_agent::llm::LlmApiProtocol::Responses,
+            request_id: "native-response".into(),
+            item_id: "native-call".into(),
+            output_index: 0,
+            content_index: None,
+            content_kind: Some("function_call".into()),
+            phase: None,
+        };
+        let message = echo_agent::llm::types::Message::assistant_with_tools(vec![
+            echo_agent::llm::types::ToolCall {
+                provider_source: Some(source),
+                id: "current-provider-call".into(),
+                call_type: "function".into(),
+                function: echo_agent::llm::types::FunctionCall {
+                    name: "final_answer".into(),
+                    arguments: r#"{"answer":"current custom payload"}"#.into(),
+                },
+            },
+        ]);
+        let stored = echo_agent::memory::project_message("current-provider", &message)?;
+        let restored = echo_agent::memory::restore_message(&stored)?;
+        assert_eq!(
+            serde_json::to_value(&restored)?,
+            serde_json::to_value(&message)?
+        );
+        assert!(
+            restored
+                .tool_calls
+                .as_ref()
+                .and_then(|calls| calls.first())
+                .and_then(|call| call.provider_source.as_ref())
+                .is_some()
+        );
+        Ok(())
+    }
 }

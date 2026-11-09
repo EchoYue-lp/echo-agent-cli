@@ -1,0 +1,721 @@
+{
+  "cold": {
+    "first_observed_sequence": 1,
+    "journal_identity": "72bbf4cd-7908-4ee7-8511-7aca825acf6a",
+    "prefix_complete": true,
+    "records": [
+      {
+        "content_hash": "sha256_48f191aa2fb09aedd8c1a5578bfc78b4ac6cb90250c75c6f36d9e40761021f04",
+        "cursor": {
+          "sequence": 3,
+          "stream_id": "[\"workspace\",\"conversation\"]"
+        },
+        "event_id": "chat_evt_f6be4194a7b4c287cde01d7490a79a9c745ed026a048fcdc5d158ae6d0ec2d9b",
+        "payload": {
+          "data": {
+            "call_id": "call-1",
+            "execution_id": "main-execution",
+            "name": "agent_tool",
+            "publication_event_id": "evt_cc2be0f183a3a0c9ab0f43686fb11dfeb0c144930a05fafd22a44c8c5b0d879b"
+          },
+          "kind": "tool_call"
+        },
+        "scope": {
+          "conversation_id": "conversation",
+          "message_id": "turn",
+          "root_turn_id": "turn",
+          "turn_id": "turn",
+          "workspace_id": "workspace"
+        },
+        "timestamp": "2026-11-07T15:11:07.195212Z"
+      },
+      {
+        "content_hash": "sha256_d92663b4ec21746c7dcde8a28a46e8cad6e1655b093403e706316f50e8ca38ee",
+        "cursor": {
+          "sequence": 4,
+          "stream_id": "[\"workspace\",\"conversation\"]"
+        },
+        "event_id": "chat_evt_dc87251f1bebb09c7579e0badf0646e335c046405a5f2586f0e7e3ee474121b7",
+        "payload": {
+          "data": {
+            "event": {
+              "agent": "child-agent",
+              "conversation_id": "conversation",
+              "event": "started",
+              "framework_event": {
+                "agent_name": "child-agent",
+                "agent_path": null,
+                "attempt": 1,
+                "content_hash": "controlled-hash-1",
+                "event_id": "child-native-1",
+                "execution_id": "child-execution",
+                "message_id": "turn",
+                "parent_agent": "main",
+                "parent_event_id": "evt_cc2be0f183a3a0c9ab0f43686fb11dfeb0c144930a05fafd22a44c8c5b0d879b",
+                "parent_execution_id": "main-execution",
+                "plan_revision": 1,
+                "schema_version": 5,
+                "sequence": 1,
+                "stream_id": "child-stream",
+                "task_id": "task",
+                "timestamp": "2026-11-07T15:11:07.295999+00:00",
+                "turn_id": "child-execution"
+              },
+              "payload": {
+                "agent": "child-agent",
+                "message_id": "turn",
+                "task": "核对原记录"
+              },
+              "run_id": "run",
+              "scope": "subagent",
+              "subagent_run_id": "child-execution",
+              "task_id": "task",
+              "workspace_id": "workspace"
+            }
+          },
+          "kind": "subagent"
+        },
+        "scope": {
+          "conversation_id": "conversation",
+          "message_id": "turn",
+          "root_turn_id": "turn",
+          "turn_id": "child-execution",
+          "workspace_id": "workspace"
+        },
+        "timestamp": "2026-11-07T15:11:07.296631Z"
+      },
+      {
+        "content_hash": "sha256_c3ef31af34179b5e6601f5a170a63d47d691cb8d4bdf6f8c001e09e69933bc10",
+        "cursor": {
+          "sequence": 5,
+          "stream_id": "[\"workspace\",\"conversation\"]"
+        },
+        "event_id": "chat_evt_dce75ed3ba1343fd2263e9d4dbd7bae94dd612b70be318cef9c7ce657617605e",
+        "payload": {
+          "data": {
+            "execution_id": "main-execution",
+            "publication_event_id": "evt_c0e14f49284dd896225813246a87d2e596f63c98f1220cf59d7f8b61867e0e48",
+            "spec": {
+              "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+              "data": {
+                "values": [
+                  {
+                    "name": "原图表🙂",
+                    "value": 7
+                  }
+                ]
+              },
+              "mark": "bar"
+            }
+          },
+          "kind": "chart"
+        },
+        "scope": {
+          "conversation_id": "conversation",
+          "message_id": "turn",
+          "root_turn_id": "turn",
+          "turn_id": "turn",
+          "workspace_id": "workspace"
+        },
+        "timestamp": "2026-11-07T15:11:07.354969Z"
+      },
+      {
+        "content_hash": "sha256_36204d0baf2a484199728abb0b9a55940cedb78b71e11c2f4cb3e48f3bf867ac",
+        "cursor": {
+          "sequence": 7,
+          "stream_id": "[\"workspace\",\"conversation\"]"
+        },
+        "event_id": "chat_evt_280587a493066f15036b5ee8ab3144184cdb01fc543ee02df6b13cdcd0444ebe",
+        "payload": {
+          "data": {
+            "event": {
+              "agent": "child-agent",
+              "conversation_id": "conversation",
+              "event": "completed",
+              "framework_event": {
+                "agent_name": "child-agent",
+                "agent_path": null,
+                "attempt": 1,
+                "content_hash": "controlled-hash-2",
+                "event_id": "child-native-2",
+                "execution_id": "child-execution",
+                "message_id": "turn",
+                "parent_agent": "main",
+                "parent_event_id": "evt_cc2be0f183a3a0c9ab0f43686fb11dfeb0c144930a05fafd22a44c8c5b0d879b",
+                "parent_execution_id": "main-execution",
+                "plan_revision": 1,
+                "schema_version": 5,
+                "sequence": 2,
+                "stream_id": "child-stream",
+                "task_id": "task",
+                "timestamp": "2026-11-07T15:11:07.372830+00:00",
+                "turn_id": "child-execution"
+              },
+              "payload": {
+                "agent": "child-agent",
+                "duration_ms": 1,
+                "message_id": "turn",
+                "output": "原子代理结果🙂"
+              },
+              "run_id": "run",
+              "scope": "subagent",
+              "subagent_run_id": "child-execution",
+              "task_id": "task",
+              "workspace_id": "workspace"
+            }
+          },
+          "kind": "subagent"
+        },
+        "scope": {
+          "conversation_id": "conversation",
+          "message_id": "turn",
+          "root_turn_id": "turn",
+          "turn_id": "child-execution",
+          "workspace_id": "workspace"
+        },
+        "timestamp": "2026-11-07T15:11:07.373331Z"
+      }
+    ],
+    "source": {
+      "conversation_id": "conversation",
+      "execution_id": "main-execution",
+      "root_turn_id": "turn",
+      "turn_id": "turn",
+      "workspace_id": "workspace"
+    },
+    "through_sequence": 4110
+  },
+  "live": {
+    "first_observed_sequence": 1,
+    "journal_identity": "72bbf4cd-7908-4ee7-8511-7aca825acf6a",
+    "prefix_complete": true,
+    "records": [
+      {
+        "content_hash": "sha256_48f191aa2fb09aedd8c1a5578bfc78b4ac6cb90250c75c6f36d9e40761021f04",
+        "cursor": {
+          "sequence": 3,
+          "stream_id": "[\"workspace\",\"conversation\"]"
+        },
+        "event_id": "chat_evt_f6be4194a7b4c287cde01d7490a79a9c745ed026a048fcdc5d158ae6d0ec2d9b",
+        "payload": {
+          "data": {
+            "call_id": "call-1",
+            "execution_id": "main-execution",
+            "name": "agent_tool",
+            "publication_event_id": "evt_cc2be0f183a3a0c9ab0f43686fb11dfeb0c144930a05fafd22a44c8c5b0d879b"
+          },
+          "kind": "tool_call"
+        },
+        "scope": {
+          "conversation_id": "conversation",
+          "message_id": "turn",
+          "root_turn_id": "turn",
+          "turn_id": "turn",
+          "workspace_id": "workspace"
+        },
+        "timestamp": "2026-11-07T15:11:07.195212Z"
+      },
+      {
+        "content_hash": "sha256_d92663b4ec21746c7dcde8a28a46e8cad6e1655b093403e706316f50e8ca38ee",
+        "cursor": {
+          "sequence": 4,
+          "stream_id": "[\"workspace\",\"conversation\"]"
+        },
+        "event_id": "chat_evt_dc87251f1bebb09c7579e0badf0646e335c046405a5f2586f0e7e3ee474121b7",
+        "payload": {
+          "data": {
+            "event": {
+              "agent": "child-agent",
+              "conversation_id": "conversation",
+              "event": "started",
+              "framework_event": {
+                "agent_name": "child-agent",
+                "agent_path": null,
+                "attempt": 1,
+                "content_hash": "controlled-hash-1",
+                "event_id": "child-native-1",
+                "execution_id": "child-execution",
+                "message_id": "turn",
+                "parent_agent": "main",
+                "parent_event_id": "evt_cc2be0f183a3a0c9ab0f43686fb11dfeb0c144930a05fafd22a44c8c5b0d879b",
+                "parent_execution_id": "main-execution",
+                "plan_revision": 1,
+                "schema_version": 5,
+                "sequence": 1,
+                "stream_id": "child-stream",
+                "task_id": "task",
+                "timestamp": "2026-11-07T15:11:07.295999+00:00",
+                "turn_id": "child-execution"
+              },
+              "payload": {
+                "agent": "child-agent",
+                "message_id": "turn",
+                "task": "核对原记录"
+              },
+              "run_id": "run",
+              "scope": "subagent",
+              "subagent_run_id": "child-execution",
+              "task_id": "task",
+              "workspace_id": "workspace"
+            }
+          },
+          "kind": "subagent"
+        },
+        "scope": {
+          "conversation_id": "conversation",
+          "message_id": "turn",
+          "root_turn_id": "turn",
+          "turn_id": "child-execution",
+          "workspace_id": "workspace"
+        },
+        "timestamp": "2026-11-07T15:11:07.296631Z"
+      },
+      {
+        "content_hash": "sha256_c3ef31af34179b5e6601f5a170a63d47d691cb8d4bdf6f8c001e09e69933bc10",
+        "cursor": {
+          "sequence": 5,
+          "stream_id": "[\"workspace\",\"conversation\"]"
+        },
+        "event_id": "chat_evt_dce75ed3ba1343fd2263e9d4dbd7bae94dd612b70be318cef9c7ce657617605e",
+        "payload": {
+          "data": {
+            "execution_id": "main-execution",
+            "publication_event_id": "evt_c0e14f49284dd896225813246a87d2e596f63c98f1220cf59d7f8b61867e0e48",
+            "spec": {
+              "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+              "data": {
+                "values": [
+                  {
+                    "name": "原图表🙂",
+                    "value": 7
+                  }
+                ]
+              },
+              "mark": "bar"
+            }
+          },
+          "kind": "chart"
+        },
+        "scope": {
+          "conversation_id": "conversation",
+          "message_id": "turn",
+          "root_turn_id": "turn",
+          "turn_id": "turn",
+          "workspace_id": "workspace"
+        },
+        "timestamp": "2026-11-07T15:11:07.354969Z"
+      },
+      {
+        "content_hash": "sha256_36204d0baf2a484199728abb0b9a55940cedb78b71e11c2f4cb3e48f3bf867ac",
+        "cursor": {
+          "sequence": 7,
+          "stream_id": "[\"workspace\",\"conversation\"]"
+        },
+        "event_id": "chat_evt_280587a493066f15036b5ee8ab3144184cdb01fc543ee02df6b13cdcd0444ebe",
+        "payload": {
+          "data": {
+            "event": {
+              "agent": "child-agent",
+              "conversation_id": "conversation",
+              "event": "completed",
+              "framework_event": {
+                "agent_name": "child-agent",
+                "agent_path": null,
+                "attempt": 1,
+                "content_hash": "controlled-hash-2",
+                "event_id": "child-native-2",
+                "execution_id": "child-execution",
+                "message_id": "turn",
+                "parent_agent": "main",
+                "parent_event_id": "evt_cc2be0f183a3a0c9ab0f43686fb11dfeb0c144930a05fafd22a44c8c5b0d879b",
+                "parent_execution_id": "main-execution",
+                "plan_revision": 1,
+                "schema_version": 5,
+                "sequence": 2,
+                "stream_id": "child-stream",
+                "task_id": "task",
+                "timestamp": "2026-11-07T15:11:07.372830+00:00",
+                "turn_id": "child-execution"
+              },
+              "payload": {
+                "agent": "child-agent",
+                "duration_ms": 1,
+                "message_id": "turn",
+                "output": "原子代理结果🙂"
+              },
+              "run_id": "run",
+              "scope": "subagent",
+              "subagent_run_id": "child-execution",
+              "task_id": "task",
+              "workspace_id": "workspace"
+            }
+          },
+          "kind": "subagent"
+        },
+        "scope": {
+          "conversation_id": "conversation",
+          "message_id": "turn",
+          "root_turn_id": "turn",
+          "turn_id": "child-execution",
+          "workspace_id": "workspace"
+        },
+        "timestamp": "2026-11-07T15:11:07.373331Z"
+      }
+    ],
+    "source": {
+      "conversation_id": "conversation",
+      "execution_id": "main-execution",
+      "root_turn_id": "turn",
+      "turn_id": "turn",
+      "workspace_id": "workspace"
+    },
+    "through_sequence": 10
+  },
+  "messages": [
+    {
+      "assistant_blocks": [
+        {
+          "block": {
+            "block_id": "a",
+            "complete": true,
+            "delta": "先核对来源",
+            "phase": "commentary",
+            "provider": "controlled-fixture",
+            "reasoning": null,
+            "request_id": "request-a",
+            "sequence": 0
+          },
+          "content": "先核对来源",
+          "execution_id": "main-execution",
+          "journal_source": {
+            "sequence": 2,
+            "stream_id": "[\"workspace\",\"conversation\"]"
+          },
+          "publication_event_id": "evt_f6f3579e2a624215f1567e5e030ee9d971a328cdf14453efea09ad33873d2f27"
+        }
+      ],
+      "content": null,
+      "created_at": "2026-11-07T15:17:06.634102+00:00",
+      "execution_steps": [
+        {
+          "index": 0,
+          "type": "assistant"
+        },
+        {
+          "call_id": "call-1",
+          "type": "tool"
+        }
+      ],
+      "message_id": "a",
+      "native_presentation": {
+        "first_observed_sequence": 1,
+        "journal_identity": "72bbf4cd-7908-4ee7-8511-7aca825acf6a",
+        "prefix_complete": true,
+        "records": [
+          {
+            "content_hash": "sha256_48f191aa2fb09aedd8c1a5578bfc78b4ac6cb90250c75c6f36d9e40761021f04",
+            "cursor": {
+              "sequence": 3,
+              "stream_id": "[\"workspace\",\"conversation\"]"
+            },
+            "event_id": "chat_evt_f6be4194a7b4c287cde01d7490a79a9c745ed026a048fcdc5d158ae6d0ec2d9b",
+            "payload": {
+              "data": {
+                "call_id": "call-1",
+                "execution_id": "main-execution",
+                "name": "agent_tool",
+                "publication_event_id": "evt_cc2be0f183a3a0c9ab0f43686fb11dfeb0c144930a05fafd22a44c8c5b0d879b"
+              },
+              "kind": "tool_call"
+            },
+            "scope": {
+              "conversation_id": "conversation",
+              "message_id": "turn",
+              "root_turn_id": "turn",
+              "turn_id": "turn",
+              "workspace_id": "workspace"
+            },
+            "timestamp": "2026-11-07T15:11:07.195212Z"
+          },
+          {
+            "content_hash": "sha256_d92663b4ec21746c7dcde8a28a46e8cad6e1655b093403e706316f50e8ca38ee",
+            "cursor": {
+              "sequence": 4,
+              "stream_id": "[\"workspace\",\"conversation\"]"
+            },
+            "event_id": "chat_evt_dc87251f1bebb09c7579e0badf0646e335c046405a5f2586f0e7e3ee474121b7",
+            "payload": {
+              "data": {
+                "event": {
+                  "agent": "child-agent",
+                  "conversation_id": "conversation",
+                  "event": "started",
+                  "framework_event": {
+                    "agent_name": "child-agent",
+                    "agent_path": null,
+                    "attempt": 1,
+                    "content_hash": "controlled-hash-1",
+                    "event_id": "child-native-1",
+                    "execution_id": "child-execution",
+                    "message_id": "turn",
+                    "parent_agent": "main",
+                    "parent_event_id": "evt_cc2be0f183a3a0c9ab0f43686fb11dfeb0c144930a05fafd22a44c8c5b0d879b",
+                    "parent_execution_id": "main-execution",
+                    "plan_revision": 1,
+                    "schema_version": 5,
+                    "sequence": 1,
+                    "stream_id": "child-stream",
+                    "task_id": "task",
+                    "timestamp": "2026-11-07T15:11:07.295999+00:00",
+                    "turn_id": "child-execution"
+                  },
+                  "payload": {
+                    "agent": "child-agent",
+                    "message_id": "turn",
+                    "task": "核对原记录"
+                  },
+                  "run_id": "run",
+                  "scope": "subagent",
+                  "subagent_run_id": "child-execution",
+                  "task_id": "task",
+                  "workspace_id": "workspace"
+                }
+              },
+              "kind": "subagent"
+            },
+            "scope": {
+              "conversation_id": "conversation",
+              "message_id": "turn",
+              "root_turn_id": "turn",
+              "turn_id": "child-execution",
+              "workspace_id": "workspace"
+            },
+            "timestamp": "2026-11-07T15:11:07.296631Z"
+          },
+          {
+            "content_hash": "sha256_c3ef31af34179b5e6601f5a170a63d47d691cb8d4bdf6f8c001e09e69933bc10",
+            "cursor": {
+              "sequence": 5,
+              "stream_id": "[\"workspace\",\"conversation\"]"
+            },
+            "event_id": "chat_evt_dce75ed3ba1343fd2263e9d4dbd7bae94dd612b70be318cef9c7ce657617605e",
+            "payload": {
+              "data": {
+                "execution_id": "main-execution",
+                "publication_event_id": "evt_c0e14f49284dd896225813246a87d2e596f63c98f1220cf59d7f8b61867e0e48",
+                "spec": {
+                  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+                  "data": {
+                    "values": [
+                      {
+                        "name": "原图表🙂",
+                        "value": 7
+                      }
+                    ]
+                  },
+                  "mark": "bar"
+                }
+              },
+              "kind": "chart"
+            },
+            "scope": {
+              "conversation_id": "conversation",
+              "message_id": "turn",
+              "root_turn_id": "turn",
+              "turn_id": "turn",
+              "workspace_id": "workspace"
+            },
+            "timestamp": "2026-11-07T15:11:07.354969Z"
+          },
+          {
+            "content_hash": "sha256_36204d0baf2a484199728abb0b9a55940cedb78b71e11c2f4cb3e48f3bf867ac",
+            "cursor": {
+              "sequence": 7,
+              "stream_id": "[\"workspace\",\"conversation\"]"
+            },
+            "event_id": "chat_evt_280587a493066f15036b5ee8ab3144184cdb01fc543ee02df6b13cdcd0444ebe",
+            "payload": {
+              "data": {
+                "event": {
+                  "agent": "child-agent",
+                  "conversation_id": "conversation",
+                  "event": "completed",
+                  "framework_event": {
+                    "agent_name": "child-agent",
+                    "agent_path": null,
+                    "attempt": 1,
+                    "content_hash": "controlled-hash-2",
+                    "event_id": "child-native-2",
+                    "execution_id": "child-execution",
+                    "message_id": "turn",
+                    "parent_agent": "main",
+                    "parent_event_id": "evt_cc2be0f183a3a0c9ab0f43686fb11dfeb0c144930a05fafd22a44c8c5b0d879b",
+                    "parent_execution_id": "main-execution",
+                    "plan_revision": 1,
+                    "schema_version": 5,
+                    "sequence": 2,
+                    "stream_id": "child-stream",
+                    "task_id": "task",
+                    "timestamp": "2026-11-07T15:11:07.372830+00:00",
+                    "turn_id": "child-execution"
+                  },
+                  "payload": {
+                    "agent": "child-agent",
+                    "duration_ms": 1,
+                    "message_id": "turn",
+                    "output": "原子代理结果🙂"
+                  },
+                  "run_id": "run",
+                  "scope": "subagent",
+                  "subagent_run_id": "child-execution",
+                  "task_id": "task",
+                  "workspace_id": "workspace"
+                }
+              },
+              "kind": "subagent"
+            },
+            "scope": {
+              "conversation_id": "conversation",
+              "message_id": "turn",
+              "root_turn_id": "turn",
+              "turn_id": "child-execution",
+              "workspace_id": "workspace"
+            },
+            "timestamp": "2026-11-07T15:11:07.373331Z"
+          }
+        ],
+        "source": {
+          "conversation_id": "conversation",
+          "execution_id": "main-execution",
+          "root_turn_id": "turn",
+          "turn_id": "turn",
+          "workspace_id": "workspace"
+        },
+        "through_sequence": 4110
+      },
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{}",
+            "name": "agent_tool"
+          },
+          "id": "call-1",
+          "type": "function"
+        }
+      ],
+      "turn_source": {
+        "conversation_id": "conversation",
+        "execution_id": "main-execution",
+        "root_turn_id": "turn",
+        "turn_id": "turn",
+        "workspace_id": "workspace"
+      }
+    },
+    {
+      "assistant_blocks": [
+        {
+          "block": {
+            "block_id": "b",
+            "complete": true,
+            "delta": "已得到子运行记录",
+            "phase": "partial_answer",
+            "provider": "controlled-fixture",
+            "reasoning": null,
+            "request_id": "request-b",
+            "sequence": 0
+          },
+          "content": "已得到子运行记录",
+          "execution_id": "main-execution",
+          "journal_source": {
+            "sequence": 6,
+            "stream_id": "[\"workspace\",\"conversation\"]"
+          },
+          "publication_event_id": "evt_58f6137ce63900be0c9070939132c69fafdcc153f0d740a1256d9c166d5b5c1b"
+        }
+      ],
+      "content": null,
+      "created_at": "2026-11-07T15:17:06.661011+00:00",
+      "execution_steps": [
+        {
+          "index": 0,
+          "type": "assistant"
+        }
+      ],
+      "message_id": "b",
+      "role": "assistant",
+      "tool_calls": null,
+      "turn_source": {
+        "conversation_id": "conversation",
+        "execution_id": "main-execution",
+        "root_turn_id": "turn",
+        "turn_id": "turn",
+        "workspace_id": "workspace"
+      }
+    },
+    {
+      "assistant_blocks": [
+        {
+          "block": {
+            "block_id": "final",
+            "complete": true,
+            "delta": "最终结果独立显示",
+            "phase": "final_answer",
+            "provider": "controlled-fixture",
+            "reasoning": null,
+            "request_id": "request-final",
+            "sequence": 0
+          },
+          "content": "最终结果独立显示",
+          "execution_id": "main-execution",
+          "journal_source": {
+            "sequence": 8,
+            "stream_id": "[\"workspace\",\"conversation\"]"
+          },
+          "publication_event_id": "evt_f08441c170992fa8f3361cf6224afd4db76de731808bc0feee8b1f72d1e9fbe1"
+        }
+      ],
+      "content": "最终结果独立显示",
+      "created_at": "2026-11-07T15:17:06.700291+00:00",
+      "execution_status": {
+        "execution_id": "main-execution",
+        "phase": "Terminal",
+        "reason": null,
+        "request_id": "request-final",
+        "sequence": 2,
+        "status": "settled"
+      },
+      "execution_steps": [
+        {
+          "index": 0,
+          "type": "assistant"
+        }
+      ],
+      "final_answer_confirmed": true,
+      "final_answer_source": {
+        "blocks": [
+          {
+            "block_id": "final",
+            "publication_event_id": "evt_f08441c170992fa8f3361cf6224afd4db76de731808bc0feee8b1f72d1e9fbe1",
+            "request_id": "request-final",
+            "sequence": 0
+          }
+        ],
+        "execution_id": "main-execution",
+        "request_id": "request-final",
+        "sequence": 2
+      },
+      "message_id": "final",
+      "role": "assistant",
+      "tool_calls": null,
+      "turn_source": {
+        "conversation_id": "conversation",
+        "execution_id": "main-execution",
+        "root_turn_id": "turn",
+        "turn_id": "turn",
+        "workspace_id": "workspace"
+      }
+    }
+  ],
+  "verification": "controlled original ChatEventLog -> real checkpoint/prune/cold DTO; not live provider/native App"
+}

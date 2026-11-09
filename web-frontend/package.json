@@ -19,7 +19,7 @@
   "dependencies": {
     "@codemirror/language-data": "^6.5.2",
     "@tailwindcss/vite": "^4.1.4",
-    "@tauri-apps/api": "^2.11.0",
+    "@tauri-apps/api": "2.12.4",
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-shell": "^2.3.5",
     "@uiw/react-codemirror": "^4.25.11",
@@ -31,6 +31,10 @@
     "react-dom": "^19.1.0",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
+    "vega": "6.4.0",
+    "vega-embed": "7.3.0",
+    "vega-interpreter": "2.3.2",
+    "vega-lite": "6.4.1",
     "zustand": "^5.0.6"
   },
   "devDependencies": {
@@ -55,5 +59,10 @@
     "typescript-eslint": "^8.67.0",
     "vite": "^6.3.5",
     "vitest": "^4.1.10"
+  },
+  "overrides": {
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": "11.0.1"
+    }
   }
 }

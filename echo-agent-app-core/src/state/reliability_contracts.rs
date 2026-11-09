@@ -1800,10 +1800,12 @@ async fn f1_cold_acceptance_waits_for_real_context_drain() -> anyhow::Result<()>
         .pool()
         .ok_or_else(|| anyhow::anyhow!("fixture AgentPool is missing"))?;
     pool.apply_state_store(barrier.clone()).await;
-    pool.set_llm_client_override_for_test(Arc::new(
-        MockLlmClient::new().with_responses(["barrier preflight", "barrier answer"]),
-    ))
-    .await;
+    let model = Arc::new(MockLlmClient::new().with_responses([
+        r#"{"intent":"FALLBACK","skill":null,"confidence":1.0}"#,
+        "barrier answer",
+        r#"{"score":9.0,"passed":true,"feedback":"Original reply verified","suggestions":[]}"#,
+    ]));
+    pool.set_llm_client_override_for_test(model.clone()).await;
 
     let message = f0_router_message(&target, "f1-cold-barrier", "wait for context");
     state.agent_router.enqueue(message).await?;
@@ -1833,6 +1835,12 @@ async fn f1_cold_acceptance_waits_for_real_context_drain() -> anyhow::Result<()>
     );
     barrier.release();
     assert!(tokio::time::timeout(COLD_DELIVERY_TEST_TIMEOUT, delivery).await???);
+    assert_eq!(
+        model.call_count(),
+        3,
+        "original classifier, answer and Critic must all execute"
+    );
+    assert_eq!(model.all_calls().len(), 3);
     let terminal = state
         .agent_router
         .records(&target)

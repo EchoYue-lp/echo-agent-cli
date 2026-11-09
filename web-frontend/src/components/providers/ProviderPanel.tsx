@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AudioLines,
   Brain,
@@ -51,7 +51,6 @@ interface ModelDraft {
   imageInput: boolean;
   audioInput: boolean;
   videoInput: boolean;
-  temperature: string;
   maxTokens: string;
   contextWindow: string;
 }
@@ -71,8 +70,7 @@ type DeleteTarget =
 
 type Notice = { success: boolean; message: string } | null;
 
-const fieldClass =
-  'mt-1 min-h-9 w-full rounded-md border border-[var(--border-primary)] bg-[var(--bg-input)] px-3 text-sm text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)] focus:border-[var(--border-focus)]';
+const fieldClass = 'input mt-2 min-h-10 w-full text-sm';
 const iconButtonClass =
   'flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:opacity-40';
 const dangerIconButtonClass = `${iconButtonClass} hover:bg-red-500/10 hover:text-red-600`;
@@ -91,7 +89,6 @@ const emptyModel = (protocol: LlmApiProtocol = 'chat_completions'): ModelDraft =
   imageInput: false,
   audioInput: false,
   videoInput: false,
-  temperature: '',
   maxTokens: '',
   contextWindow: '',
 });
@@ -103,7 +100,6 @@ const modelDraft = (model: ConfiguredModel): ModelDraft => ({
   imageInput: model.input_modalities.includes('image'),
   audioInput: model.input_modalities.includes('audio'),
   videoInput: model.input_modalities.includes('video'),
-  temperature: model.temperature == null ? '' : String(model.temperature),
   maxTokens: model.max_tokens == null ? '' : String(model.max_tokens),
   contextWindow: model.context_window == null ? '' : String(model.context_window),
 });
@@ -137,7 +133,7 @@ function ProtocolControl({
           onClick={() => onChange(protocol)}
           className={`min-h-8 min-w-0 rounded px-2 text-xs transition-colors ${
             value === protocol
-              ? 'bg-[var(--accent)] text-white'
+              ? 'bg-[var(--accent)] text-[var(--text-on-accent)]'
               : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
           }`}
         >
@@ -150,7 +146,7 @@ function ProtocolControl({
 
 function DialogHeader({ title, onClose }: { title: string; onClose: () => void }) {
   return (
-    <div className="flex min-h-12 items-center justify-between border-b border-[var(--border-primary)] px-4">
+    <div className="flex min-h-16 items-center justify-between border-b border-[var(--border-secondary)] px-5">
       <h3 className="text-sm font-semibold text-[var(--text-primary)]">{title}</h3>
       <button type="button" aria-label="关闭" onClick={onClose} className={iconButtonClass}>
         <X size={16} />
@@ -176,6 +172,9 @@ function InlineNotice({ notice }: { notice: Notice }) {
 }
 
 export function ProviderPanel() {
+  // 由原Modal在记录触发控件后集中聚焦，避免autoFocus抢先覆盖返回焦点。
+  const providerNameInput = useRef<HTMLInputElement>(null);
+  const modelNameInput = useRef<HTMLInputElement>(null);
   const [providers, setProviders] = useState<ModelProviderView[]>([]);
   const [models, setModels] = useState<ConfiguredModel[]>([]);
   const [providerForm, setProviderForm] = useState<ProviderDraft>(emptyProvider);
@@ -268,7 +267,6 @@ export function ProviderPanel() {
         model: modelForm.model.trim(),
         api_protocol: modelForm.protocol,
         input_modalities: modalities(),
-        temperature: modelForm.temperature ? Number(modelForm.temperature) : undefined,
         max_tokens: modelForm.maxTokens ? Number(modelForm.maxTokens) : undefined,
         context_window: modelForm.contextWindow ? Number(modelForm.contextWindow) : undefined,
         set_default: false,
@@ -337,15 +335,15 @@ export function ProviderPanel() {
   if (loading) return <div className="p-4 text-sm text-[var(--text-tertiary)]">加载中...</div>;
 
   return (
-    <div className="p-3">
-      <div className="mb-3 flex min-h-9 items-center justify-between gap-3">
+    <div className="settings-provider-panel space-y-5">
+      <div className="settings-panel-toolbar flex min-h-10 flex-wrap items-center justify-between gap-3">
         <p className="text-xs text-[var(--text-tertiary)]">
           {providers.length} 个 Provider · {models.length} 个模型
         </p>
         <button
           type="button"
           onClick={() => openProviderEditor(null)}
-          className="flex min-h-8 items-center gap-1.5 rounded-md bg-[var(--accent)] px-3 text-xs font-medium text-white"
+          className="btn btn-primary min-h-9"
         >
           <Plus size={14} /> 添加 Provider
         </button>
@@ -354,7 +352,7 @@ export function ProviderPanel() {
       <InlineNotice notice={notice} />
 
       <div
-        className={`overflow-hidden rounded-md border border-[var(--border-primary)] ${notice ? 'mt-3' : ''}`}
+        className={`overflow-hidden rounded-xl border border-[var(--border-secondary)] ${notice ? 'mt-3' : ''}`}
       >
         {providers.length === 0 ? (
           <div className="flex min-h-40 flex-col items-center justify-center gap-3 text-[var(--text-tertiary)]">
@@ -362,20 +360,20 @@ export function ProviderPanel() {
             <span className="text-xs">暂无 Provider</span>
           </div>
         ) : (
-          <div className="divide-y divide-[var(--border-primary)]">
+          <div className="divide-y divide-[var(--border-secondary)]">
             {providers.map((provider) => {
               const providerModels = modelsByProvider.get(provider.id) ?? [];
               return (
                 <section key={provider.id}>
-                  <div className="flex min-h-16 items-center gap-3 bg-[var(--bg-secondary)] px-4 py-2">
-                    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-[var(--border-secondary)] text-[var(--text-secondary)]">
+                  <div className="flex min-h-18 items-center gap-3 px-4 py-4">
+                    <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[var(--bg-secondary)] text-[var(--text-secondary)]">
                       <Server size={16} />
                     </span>
                     <div className="min-w-0 flex-1">
                       <div className="truncate text-sm font-medium text-[var(--text-primary)]">
                         {provider.name}
                       </div>
-                      <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-[var(--text-tertiary)]">
+                      <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-[var(--text-secondary)]">
                         <span>{providerHost(provider.base_url)}</span>
                         <span>·</span>
                         <span>{providerModels.length} 个模型</span>
@@ -430,11 +428,11 @@ export function ProviderPanel() {
                       {providerModels.map((model) => (
                         <div
                           key={model.id}
-                          className="flex min-h-14 items-center gap-3 px-4 py-2 pl-16"
+                          className="flex min-h-16 items-center gap-3 px-5 py-4 sm:pl-16"
                         >
                           <div className="min-w-0 flex-1">
                             <div className="flex min-w-0 flex-wrap items-center gap-2">
-                              <span className="truncate text-xs font-medium text-[var(--text-primary)]">
+                              <span className="truncate text-sm font-medium text-[var(--text-primary)]">
                                 {modelName(model)}
                               </span>
                               {model.is_default && (
@@ -443,7 +441,7 @@ export function ProviderPanel() {
                                 </span>
                               )}
                             </div>
-                            <div className="mt-1 flex flex-wrap items-center gap-2 text-[10px] text-[var(--text-tertiary)]">
+                            <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-[var(--text-secondary)]">
                               <span>{PROTOCOL_LABELS[model.api_protocol]}</span>
                               {model.input_modalities.includes('image') && (
                                 <span className="flex items-center gap-1" title="支持图片输入">
@@ -505,19 +503,20 @@ export function ProviderPanel() {
       {providerEditor && (
         <Modal
           ariaLabel={providerEditor.provider ? '编辑 Provider' : '新增 Provider'}
+          initialFocusRef={providerNameInput}
           onClose={() => setProviderEditor(null)}
-          className="w-[min(520px,calc(100vw-32px))] overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-xl"
+          className="settings-editor-surface w-[min(520px,calc(100vw-32px))] overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-xl"
         >
           <DialogHeader
             title={providerEditor.provider ? '编辑 Provider' : '新增 Provider'}
             onClose={() => setProviderEditor(null)}
           />
-          <div className="space-y-3 p-4">
+          <div className="space-y-5 p-5">
             <InlineNotice notice={dialogNotice} />
-            <label className="block text-xs text-[var(--text-secondary)]">
+            <label className="block text-sm font-medium text-[var(--text-primary)]">
               Provider 名称
               <input
-                autoFocus
+                ref={providerNameInput}
                 value={providerForm.name}
                 onChange={(event) =>
                   setProviderForm((value) => ({ ...value, name: event.target.value }))
@@ -526,7 +525,7 @@ export function ProviderPanel() {
                 className={fieldClass}
               />
             </label>
-            <label className="block text-xs text-[var(--text-secondary)]">
+            <label className="block text-sm font-medium text-[var(--text-primary)]">
               API 根地址
               <input
                 value={providerForm.baseUrl}
@@ -537,7 +536,7 @@ export function ProviderPanel() {
                 className={fieldClass}
               />
             </label>
-            <label className="block text-xs text-[var(--text-secondary)]">
+            <label className="block text-sm font-medium text-[var(--text-primary)]">
               API Key（可选）
               <input
                 type="password"
@@ -554,7 +553,7 @@ export function ProviderPanel() {
               />
             </label>
           </div>
-          <div className="flex justify-end gap-2 border-t border-[var(--border-primary)] px-4 py-3">
+          <div className="flex justify-end gap-2 border-t border-[var(--border-primary)] px-5 py-4">
             <button
               type="button"
               onClick={() => setProviderEditor(null)}
@@ -570,7 +569,7 @@ export function ProviderPanel() {
                 !providerForm.name.trim() ||
                 !providerForm.baseUrl.trim()
               }
-              className="flex min-h-8 items-center gap-1.5 rounded-md bg-[var(--accent)] px-3 text-xs font-medium text-white disabled:opacity-40"
+              className="flex min-h-8 items-center gap-1.5 rounded-md bg-[var(--accent)] px-3 text-xs font-medium text-[var(--text-on-accent)] disabled:opacity-40"
             >
               <Save size={14} /> {busy === 'save-provider' ? '保存中...' : '保存 Provider'}
             </button>
@@ -581,20 +580,21 @@ export function ProviderPanel() {
       {modelEditor && (
         <Modal
           ariaLabel={modelEditor.model ? '编辑模型' : '新增模型'}
+          initialFocusRef={modelNameInput}
           onClose={() => setModelEditor(null)}
-          className="flex max-h-[min(760px,calc(100vh-32px))] w-[min(600px,calc(100vw-32px))] flex-col overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-xl"
+          className="settings-editor-surface flex max-h-[min(760px,calc(100vh-32px))] w-[min(600px,calc(100vw-32px))] flex-col overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-xl"
         >
           <DialogHeader
             title={modelEditor.model ? '编辑模型' : '新增模型'}
             onClose={() => setModelEditor(null)}
           />
-          <div className="min-h-0 space-y-3 overflow-y-auto p-4">
+          <div className="min-h-0 space-y-5 overflow-y-auto p-5">
             <p className="text-xs text-[var(--text-tertiary)]">{modelEditor.provider.name}</p>
             <InlineNotice notice={dialogNotice} />
-            <label className="block text-xs text-[var(--text-secondary)]">
+            <label className="block text-sm font-medium text-[var(--text-primary)]">
               API 模型名称
               <input
-                autoFocus
+                ref={modelNameInput}
                 value={modelForm.model}
                 onChange={(event) =>
                   setModelForm((value) => ({ ...value, model: event.target.value }))
@@ -658,9 +658,8 @@ export function ProviderPanel() {
               高级参数
             </button>
             {advancedOpen && (
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 {[
-                  ['Temperature', 'temperature'],
                   ['Max tokens', 'maxTokens'],
                   ['Context window', 'contextWindow'],
                 ].map(([label, key]) => (
@@ -668,8 +667,8 @@ export function ProviderPanel() {
                     {label}
                     <input
                       type="number"
-                      step={key === 'temperature' ? '0.1' : '1'}
-                      value={modelForm[key as 'temperature' | 'maxTokens' | 'contextWindow']}
+                      step="1"
+                      value={modelForm[key as 'maxTokens' | 'contextWindow']}
                       onChange={(event) =>
                         setModelForm((value) => ({ ...value, [key]: event.target.value }))
                       }
@@ -680,7 +679,7 @@ export function ProviderPanel() {
               </div>
             )}
           </div>
-          <div className="flex flex-wrap justify-end gap-2 border-t border-[var(--border-primary)] px-4 py-3">
+          <div className="flex flex-wrap justify-end gap-2 border-t border-[var(--border-primary)] px-5 py-4">
             <button
               type="button"
               onClick={() => void testConnection()}
@@ -700,7 +699,7 @@ export function ProviderPanel() {
               type="button"
               onClick={() => void saveModel()}
               disabled={busy === 'save-model' || !modelForm.model.trim()}
-              className="flex min-h-8 items-center gap-1.5 rounded-md bg-[var(--accent)] px-3 text-xs font-medium text-white disabled:opacity-40"
+              className="flex min-h-8 items-center gap-1.5 rounded-md bg-[var(--accent)] px-3 text-xs font-medium text-[var(--text-on-accent)] disabled:opacity-40"
             >
               <Save size={14} /> {busy === 'save-model' ? '保存中...' : '保存模型'}
             </button>
@@ -712,7 +711,7 @@ export function ProviderPanel() {
         <Modal
           ariaLabel={deleteTarget.kind === 'provider' ? '删除 Provider' : '删除模型'}
           onClose={() => setDeleteTarget(null)}
-          className="w-[min(420px,calc(100vw-32px))] overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-xl"
+          className="settings-editor-surface w-[min(420px,calc(100vw-32px))] overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-xl"
         >
           <DialogHeader
             title={deleteTarget.kind === 'provider' ? '删除 Provider' : '删除模型'}
@@ -728,7 +727,7 @@ export function ProviderPanel() {
               <p>确定删除“{modelName(deleteTarget.model)}”吗？</p>
             )}
           </div>
-          <div className="flex justify-end gap-2 border-t border-[var(--border-primary)] px-4 py-3">
+          <div className="flex justify-end gap-2 border-t border-[var(--border-primary)] px-5 py-4">
             <button
               type="button"
               onClick={() => setDeleteTarget(null)}

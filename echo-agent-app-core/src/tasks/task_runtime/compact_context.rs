@@ -8,10 +8,12 @@
 //! `TaskRuntimeStore`; the framework projection envelope protects it.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, RwLock, Weak};
 
 use echo_agent::agent::ReactAgent;
-use echo_agent::compression::{ContextProjection, PreModelContextProjector, ProjectionContext};
+use echo_agent::compression::{
+    ContextProjection, PreModelContextProjector, ProjectionContext, projection_content_version,
+};
 use echo_agent::error::Result as AgentResult;
 use echo_agent::llm::types::Message;
 use futures::future::BoxFuture;
@@ -22,17 +24,41 @@ use super::types::{BackgroundCellState, PlanTask, TaskExecutionSummary, TodoItem
 
 /// Stable application marker identifying the run-level recovery projection.
 pub const RUNTIME_RECOVERY_MARKER: &str = "[eko_runtime_recovery_capsule]";
+const RAW_INPUT_HISTORY_MARKER: &str = "[eko_original_input_history]";
+const CANONICAL_GOAL_REFERENCE_MARKER: &str = "[eko_canonical_goal_reference]";
 /// Stable objective contract projected separately from volatile recovery state.
 pub const RUNTIME_GOAL_MARKER: &str = "[eko_run_goal_contract]";
+/// 有界预算的近似剩余量投影（追加式版本，按 5% 台阶变化）。
+pub const RUNTIME_BUDGET_MARKER: &str = "[eko_run_budget]";
+pub(crate) const DOMAIN_METHOD_MARKER: &str = "[eko_bound_domain_method]";
+
+/// 共用原 typed failure 的 machine code 分类，不能解析展示文字或改自动重试语义。
+pub(crate) fn is_required_context_unavailable(failure: &echo_agent::error::AgentFailure) -> bool {
+    failure.category == echo_agent::error::AgentFailureCategory::Other
+        && failure.code == "required_context_unavailable"
+}
 
 /// Marker emitted by the EKO Subagent prompt compiler for planned invocations.
 /// Protecting it keeps the per-task brief alive if a Subagent compact runs
 /// before the Subagent finishes.
 pub const TASK_CONTEXT_MARKER: &str = "[task_context]";
 
-const MAX_GOAL_CHARS: usize = 420;
+pub(crate) const MAX_GOAL_CHARS: usize = 420;
 const MAX_GOAL_CONTRACT_CHARS: usize = 8_000;
-const MAX_TASK_TITLE_CHARS: usize = 96;
+
+/// 应用层轮次收尾要求：只扩展现有共享 Goal 合同的措辞，不新增独立轮次
+/// Goal、总结存储、完成判定或额外模型调用。总 Goal 对模型只读，本轮执行
+/// 重点只是模型从剩余义务中派生的可变选择；收尾说明仍是当前 turn 的正常
+/// 回复，运行时终态继续由 TaskRuntime 完成门禁决定。
+const GOAL_ROUND_REVIEW_RULES: &str = "\
+Round review (part of this turn's normal reply, not a separate model call, store, or completion signal):\n\
+- The user Goal above is read-only for you. Only an explicit user change creates a new Goal revision through the existing path. Your focus for this turn is your own selection from its remaining obligations; that focus is never a new, smaller goal and never retires an obligation.\n\
+- Before you close this turn naturally, briefly state which Goal obligation this turn advanced, the concrete evidence and its verification level, the obligations still open, the current blocker if any, and the next step. One short paragraph may cover all of it; do not repeat the plan. No fixed five-heading template is required; follow the user's explicitly requested output format.\n\
+- Prefer executable progress over writing a summary. If this turn produced no new acceptance evidence (for example, only organizing material), say so plainly instead of implying completion.\n\
+- Do not let material organization, passing tests, native operations, or publication status stand in for one another, and never present unverified work as done.\n\
+- The canonical Goal and current runtime facts outrank earlier summaries, plan text, and your own next-step suggestion; earlier summaries never retire unfinished obligations. An ordinary Steer does not modify the Goal.\n\
+- This wording adds no independent reflection model call, no summary store, and no completion authority. TaskRuntime completion blockers still decide the run terminal.\n";
+pub(crate) const MAX_TASK_TITLE_CHARS: usize = 96;
 const MAX_TASK_DESC_CHARS: usize = 220;
 const MAX_SUMMARY_CHARS: usize = 260;
 const MAX_ITEMS_PER_FIELD: usize = 3;
@@ -40,17 +66,38 @@ const MAX_ITEMS_PER_FIELD: usize = 3;
 /// Projects the authoritative file-backed TaskRuntime state at every model boundary.
 pub struct TaskRuntimeContextProjector {
     registry: Arc<TaskRuntimeProjectionRegistry>,
+    domain_only: bool,
 }
 
 impl TaskRuntimeContextProjector {
     pub fn new(registry: Arc<TaskRuntimeProjectionRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            domain_only: false,
+        }
     }
+
+    pub(crate) fn domain_only(registry: Arc<TaskRuntimeProjectionRegistry>) -> Self {
+        Self {
+            registry,
+            domain_only: true,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct DomainMethodProjection {
+    binding: crate::domain_plugin::DomainBindingRef,
+    instructions: String,
 }
 
 struct ProjectionRegistration {
     id: uuid::Uuid,
     store: Arc<TaskRuntimeStore>,
+    retention: Weak<TaskRuntimeProjectionRegistrationInner>,
+    // A projection of already admitted immutable RunCreated data. This dies
+    // with the original registration token; it is not another mutable store.
+    domain_method: Option<DomainMethodProjection>,
 }
 
 /// Process-stable registry bridging application run ownership across framework spawns.
@@ -70,25 +117,109 @@ impl TaskRuntimeProjectionRegistry {
         run_id: impl Into<String>,
         store: Arc<TaskRuntimeStore>,
     ) -> TaskRuntimeProjectionRegistration {
-        let run_id = run_id.into();
-        let id = uuid::Uuid::new_v4();
-        self.registrations
+        let mut registrations = self
+            .registrations
             .write()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(run_id.clone(), ProjectionRegistration { id, store });
-        TaskRuntimeProjectionRegistration {
-            registry: Arc::clone(self),
-            run_id,
-            id,
-        }
+            .unwrap_or_else(|error| error.into_inner());
+        self.register_locked(run_id.into(), store, &mut registrations)
     }
 
-    fn store(&self, run_id: &str) -> Option<Arc<TaskRuntimeStore>> {
+    fn register_locked(
+        self: &Arc<Self>,
+        run_id: String,
+        store: Arc<TaskRuntimeStore>,
+        registrations: &mut HashMap<String, ProjectionRegistration>,
+    ) -> TaskRuntimeProjectionRegistration {
+        let id = uuid::Uuid::new_v4();
+        let inner = Arc::new(TaskRuntimeProjectionRegistrationInner {
+            registry: self.clone(),
+            run_id: run_id.clone(),
+            id,
+        });
+        registrations.insert(
+            run_id,
+            ProjectionRegistration {
+                id,
+                store,
+                retention: Arc::downgrade(&inner),
+                domain_method: None,
+            },
+        );
+        TaskRuntimeProjectionRegistration { _inner: inner }
+    }
+
+    /// Reuse the actual run owner's registration rather than overwriting its
+    /// token when a task tool or cross-workspace physical invocation retains it.
+    pub(crate) fn retain_for_invocation(
+        self: &Arc<Self>,
+        run_id: &str,
+        store: Arc<TaskRuntimeStore>,
+    ) -> Result<TaskRuntimeProjectionRegistration, String> {
+        // Capture before publishing an invocation guard. The framework's
+        // pre-model projector is observational (errors do not stop execution),
+        // so a required method cannot depend on another fallible disk/operation
+        // read after this original, fallible application admission boundary.
+        let domain_method = store
+            .get_run_state(run_id)
+            .map_err(|error| error.to_string())?
+            .and_then(|snapshot| {
+                snapshot
+                    .domain_binding
+                    .map(|binding| (snapshot.run.domain_binding, binding))
+            })
+            .map(|(reference, binding)| {
+                binding.validate()?;
+                if reference.as_ref() != Some(&binding.reference()) {
+                    return Err(
+                        "TaskRun method projection does not match its original binding".to_string(),
+                    );
+                }
+                Ok(DomainMethodProjection {
+                    binding: binding.reference(),
+                    instructions: binding.prompt_instructions(),
+                })
+            })
+            .transpose()?;
+        let mut registrations = self
+            .registrations
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(existing) = registrations.get_mut(run_id) {
+            if !Arc::ptr_eq(&existing.store, &store) {
+                return Err("TaskRun projection is owned by another original store".to_string());
+            }
+            if existing.domain_method.is_some() && existing.domain_method != domain_method {
+                return Err(
+                    "TaskRun method projection cannot change its original binding".to_string(),
+                );
+            }
+            if let Some(inner) = existing.retention.upgrade() {
+                existing.domain_method = domain_method;
+                return Ok(TaskRuntimeProjectionRegistration { _inner: inner });
+            }
+        }
+        let token = self.register_locked(run_id.to_string(), store, &mut registrations);
+        if let Some(registration) = registrations.get_mut(run_id) {
+            registration.domain_method = domain_method;
+        }
+        Ok(token)
+    }
+
+    pub(crate) fn store(&self, run_id: &str) -> Option<Arc<TaskRuntimeStore>> {
         self.registrations
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .get(run_id)
             .map(|registration| Arc::clone(&registration.store))
+    }
+
+    fn domain_method(&self, run_id: &str) -> Option<String> {
+        self.registrations
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(run_id)
+            .and_then(|registration| registration.domain_method.as_ref())
+            .map(|projection| format!("{DOMAIN_METHOD_MARKER}\n{}", projection.instructions))
     }
 
     pub fn contains(&self, run_id: &str) -> bool {
@@ -105,13 +236,18 @@ impl Default for TaskRuntimeProjectionRegistry {
     }
 }
 
+#[derive(Clone)]
 pub struct TaskRuntimeProjectionRegistration {
+    _inner: Arc<TaskRuntimeProjectionRegistrationInner>,
+}
+
+struct TaskRuntimeProjectionRegistrationInner {
     registry: Arc<TaskRuntimeProjectionRegistry>,
     run_id: String,
     id: uuid::Uuid,
 }
 
-impl Drop for TaskRuntimeProjectionRegistration {
+impl Drop for TaskRuntimeProjectionRegistrationInner {
     fn drop(&mut self) {
         let mut registrations = self
             .registry
@@ -135,6 +271,196 @@ pub fn task_runtime_projection_registry() -> Arc<TaskRuntimeProjectionRegistry> 
 }
 
 impl PreModelContextProjector for TaskRuntimeContextProjector {
+    fn validate_model_request<'a>(
+        &'a self,
+        context: &'a ProjectionContext,
+        request: &'a echo_agent::llm::ChatRequest,
+        artifacts: Option<&'a echo_agent::tools::artifact::ToolOutputArtifactConfig>,
+    ) -> BoxFuture<'a, AgentResult<()>> {
+        Box::pin(async move {
+            if self.domain_only {
+                return Ok(());
+            }
+            let derived = context
+                .turn_id
+                .as_deref()
+                .map(super::task_tools::formal_run_id_for_turn);
+            let Some(run_id) = context.run_id.as_deref().or(derived.as_deref()) else {
+                return Ok(());
+            };
+            let Some(store) = self.registry.store(run_id) else {
+                return Ok(());
+            };
+            let run_id = run_id.to_string();
+            let model_tools = request
+                .tools
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|tool| tool.function.name.clone())
+                .collect::<std::collections::HashSet<_>>();
+            let artifacts = artifacts.cloned();
+            let advertised = raw_history_reference_from_request(request, &run_id);
+            let goals = goal_references_from_request(request, &run_id);
+            let observed_reads = observed_artifact_reads(request);
+            let visible = request
+                .messages
+                .iter()
+                .filter(|message| message.role == echo_agent::llm::types::Role::User)
+                .filter_map(|message| message.content.as_text())
+                .collect::<Vec<_>>();
+            super::executor::TaskRuntimeOperation::new(store)
+                .run_store(
+                    "qualify TaskRuntime source references against final model request",
+                    move |store| {
+                        let mut required = Vec::new();
+                        let mut visible = visible;
+                        if let Some(goal) = store.canonical_goal_reference(&run_id)?
+                            && let Some(text) =
+                                verified_artifact_text(&goal.artifact, &observed_reads)
+                        {
+                            visible.push(text);
+                        }
+                        for reference in &advertised {
+                            if store
+                                .qualify_raw_input_history_reference(&run_id, reference)
+                                .is_ok()
+                                && let Some(artifact) = &reference.artifact
+                                && let Some(text) =
+                                    verified_artifact_text(artifact, &observed_reads)
+                            {
+                                for line in text.lines().skip(1) {
+                                    if let Ok(record) =
+                                        serde_json::from_str::<serde_json::Value>(line)
+                                        && let Some(body) = record
+                                            .pointer("/event/payload/input_snapshot/payload/text")
+                                            .or_else(|| record.pointer("/event/payload/text"))
+                                            .and_then(serde_json::Value::as_str)
+                                    {
+                                        visible.push(body.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        let current = store
+                            .get_run(&run_id)?
+                            .ok_or_else(|| super::store::StoreError::RunNotFound(run_id.clone()))?;
+                        let goal_visible = visible.iter().any(|message| {
+                            message == &current.goal
+                                || message.contains(&format!("Goal: {}\n", current.goal))
+                                || message.contains(&format!(
+                                    "Objective:\n{}\nContinuation contract:",
+                                    current.goal
+                                ))
+                        });
+                        if !goal_visible {
+                            let mut current_goal = None;
+                            for goal in goals {
+                                if store
+                                    .qualify_canonical_goal_reference(&run_id, &goal)
+                                    .is_ok()
+                                {
+                                    current_goal = Some(goal);
+                                    break;
+                                }
+                            }
+                            let goal = current_goal.ok_or_else(|| {
+                                super::store::StoreError::InvalidPlan(
+                                    "最终主模型请求缺少准确当前Goal版本的host可读全文引用"
+                                        .to_string(),
+                                )
+                            })?;
+                            required.push(goal.artifact);
+                        }
+                        let mut qualified = None;
+                        let mut rejected = None;
+                        for candidate in advertised {
+                            match store.qualify_raw_input_history_reference(&run_id, &candidate) {
+                                Ok(()) => {
+                                    qualified = Some(candidate);
+                                    break;
+                                }
+                                Err(error) => rejected = Some(error),
+                            }
+                        }
+                        match qualified {
+                            Some(reference) if reference.source_records != 0 => {
+                                let omitted = store.raw_input_history_needs_reader(
+                                    &run_id, &reference, &visible,
+                                )?;
+                                if omitted || model_tools.contains("read_artifact") {
+                                    required.push(reference.artifact.ok_or_else(|| {
+                                        super::store::StoreError::InvalidPlan(
+                                            "原文历史缺文件引用".to_string(),
+                                        )
+                                    })?);
+                                }
+                            }
+                            Some(_) => {}
+                            None => {
+                                if store
+                                    .raw_input_history_reference(&run_id, None)?
+                                    .source_records
+                                    != 0
+                                {
+                                    return Err(rejected.unwrap_or_else(|| {
+                                        super::store::StoreError::InvalidPlan(
+                                            "最终主模型请求缺少完整原始输入历史入口".to_string(),
+                                        )
+                                    }));
+                                }
+                            }
+                        }
+                        if required.is_empty() {
+                            return Ok(());
+                        }
+                        if !model_tools.contains("read_artifact") {
+                            return Err(super::store::StoreError::InvalidPlan(
+                                "本次最终模型工具范围无法读取必要原文；保持原工具上界并等待恢复"
+                                    .to_string(),
+                            ));
+                        }
+                        let config = artifacts.ok_or_else(|| {
+                            super::store::StoreError::InvalidPlan(
+                                "本次执行缺少原host artifact配置，不能读取必要原文".to_string(),
+                            )
+                        })?;
+                        for artifact in required {
+                            let descriptor = echo_agent::tools::artifact::ToolOutputArtifactRef {
+                                path: artifact.path,
+                                artifact_bytes: artifact.bytes,
+                                payload_bytes: artifact.bytes,
+                                sha256: artifact.sha256.ok_or_else(|| {
+                                    super::store::StoreError::InvalidPlan(
+                                        "必要原文SHA缺失".to_string(),
+                                    )
+                                })?,
+                                retention: config.retention.clone(),
+                            };
+                            echo_agent::tools::files::artifact::read_artifact_page(
+                                &config,
+                                &descriptor,
+                                None,
+                                echo_agent::tools::files::artifact::ArtifactPageLimit::Bytes(1),
+                            )
+                            .map_err(|error| {
+                                super::store::StoreError::InvalidPlan(format!(
+                                    "本次调用无法读取必要原文：{error}"
+                                ))
+                            })?;
+                        }
+                        Ok(())
+                    },
+                )
+                .await
+                .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))
+        })
+    }
+
+    fn is_required(&self) -> bool {
+        !self.domain_only
+    }
+
     fn project<'a>(
         &'a self,
         context: &'a ProjectionContext,
@@ -145,49 +471,430 @@ impl PreModelContextProjector for TaskRuntimeContextProjector {
                 .as_deref()
                 .map(super::task_tools::formal_run_id_for_turn);
             let run_id = context.run_id.as_deref().or(derived_run_id.as_deref());
+            let domain = run_id.and_then(|run_id| self.registry.domain_method(run_id));
+            if self.domain_only {
+                // Actual invocation resources retain this same registration.
+                // General None still clears an earlier domain marker.
+                return Ok(vec![ContextProjection::replacing(
+                    DOMAIN_METHOD_MARKER,
+                    domain.map(Message::user),
+                )]);
+            }
             let store = run_id.and_then(|run_id| self.registry.store(run_id));
-            let (goal, recovery) = match (run_id, store) {
+            let (goal, recovery, budget, raw_history) = match (run_id, store) {
                 (Some(run_id), Some(store)) => {
                     let run_id = run_id.to_string();
                     super::executor::TaskRuntimeOperation::new(store)
                         .run_store("project TaskRuntime model context", move |store| {
+                            let recovery =
+                                match build_runtime_recovery_capsule_checked(&store, &run_id)? {
+                                    Some(recovery) => recovery,
+                                    None => {
+                                        let run = store.get_run(&run_id)?.ok_or_else(|| {
+                                            super::store::StoreError::RunNotFound(run_id.clone())
+                                        })?;
+                                        format!(
+                                            "{RUNTIME_RECOVERY_MARKER}\nGoal: {}\n",
+                                            truncate_chars(&run.goal, MAX_GOAL_CHARS),
+                                        )
+                                    }
+                                };
                             Ok((
-                                build_runtime_goal_contract(&store, &run_id),
-                                build_runtime_recovery_capsule(&store, &run_id),
+                                build_runtime_goal_contract_checked(&store, &run_id)?,
+                                Some(recovery),
+                                build_runtime_budget_projection_checked(&store, &run_id)?,
+                                Some(store.raw_input_history_reference(&run_id, None)?),
                             ))
                         })
                         .await
-                        .unwrap_or((None, None))
+                        .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?
                 }
-                _ => (None, None),
+                _ => (None, None, None, None),
             };
-            Ok(vec![
-                ContextProjection {
-                    marker: RUNTIME_GOAL_MARKER.to_string(),
-                    message: goal.map(Message::user),
-                },
-                ContextProjection {
-                    marker: RUNTIME_RECOVERY_MARKER.to_string(),
-                    message: recovery.map(Message::user),
-                },
-            ])
+            // 固定指令留在 boundary；运行事实按语义版本追加在已见历史之后，使
+            // provider 前缀在同一 generation 内保持逐字节稳定。
+            let mut projections = Vec::with_capacity(5);
+            projections.push(ContextProjection::replacing(
+                RUNTIME_GOAL_MARKER,
+                goal.map(Message::user),
+            ));
+            for (marker, text) in [
+                (RUNTIME_RECOVERY_MARKER, recovery),
+                (RUNTIME_BUDGET_MARKER, budget),
+            ] {
+                projections.push(ContextProjection::versioned(
+                    marker,
+                    projection_content_version(&[
+                        run_id.unwrap_or_default(),
+                        if text.is_some() { "present" } else { "cleared" },
+                        text.as_deref().unwrap_or_default(),
+                    ]),
+                    text.map(Message::user),
+                ));
+            }
+            if let Some(reference) = raw_history {
+                let text = format_raw_history_reference(&reference)
+                    .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
+                projections.push(ContextProjection::versioned(
+                    RAW_INPUT_HISTORY_MARKER,
+                    raw_history_source_version(&reference)
+                        .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?,
+                    Some(Message::user(text)),
+                ));
+            } else {
+                projections.push(ContextProjection::versioned(
+                    RAW_INPUT_HISTORY_MARKER,
+                    projection_content_version(&[run_id.unwrap_or_default(), "cleared"]),
+                    None,
+                ));
+            }
+            projections.push(ContextProjection::replacing(
+                DOMAIN_METHOD_MARKER,
+                domain.map(Message::user),
+            ));
+            Ok(projections)
         })
     }
+}
+
+fn format_raw_history_reference(
+    reference: &super::store::RawInputHistoryReference,
+) -> Result<String, super::store::StoreError> {
+    let mut rendered = format!(
+        "{RAW_INPUT_HISTORY_MARKER}\nreference: {}\n",
+        serde_json::to_string(reference)?
+    );
+    if let Some(artifact) = &reference.artifact {
+        rendered.push_str(&format!(
+            "path: {}\nbytes: {}\nsha256: {}\n",
+            artifact.path.display(),
+            artifact.bytes,
+            artifact
+                .sha256
+                .as_deref()
+                .ok_or_else(|| super::store::StoreError::InvalidPlan(
+                    "原文历史引用SHA缺失".to_string()
+                ))?
+        ));
+    }
+    rendered.push_str("这是准确Run/原journal前缀的原始输入来源记录，包含接纳与投递事实；Accepted不等于已理解或已执行。用read_artifact分页读取必要早期原文，结合历史理解，不自动改Goal或计划。\n[eko_original_input_history_end]\n\n");
+    Ok(rendered)
+}
+
+/// 原始输入历史引用的**来源身份**版本。
+///
+/// 只排除观察 frontier；其余完整来源、scope 与 locator 字段都属于语义身份。
+/// 同内容恢复到新 host 路径时，也必须让模型获得可重新资格校验的当前引用。
+fn raw_history_source_version(
+    reference: &super::store::RawInputHistoryReference,
+) -> Result<String, super::store::StoreError> {
+    let mut identity = serde_json::to_value(reference)?;
+    let fields = identity
+        .as_object_mut()
+        .ok_or_else(|| super::store::StoreError::InvalidPlan("原文来源引用不是对象".into()))?;
+    fields.remove("observed_through_sequence");
+    let canonical = echo_agent::utils::canonical_json::canonical_json_bytes(&identity)?;
+    Ok(format!("{:x}", Sha256::digest(canonical)))
+}
+
+/// 有界预算的近似剩余量，按 5% 台阶量化。
+///
+/// 精确的每步用量会持续改写此前已经送入模型的 capsule；按台阶量化把"可见变化"
+/// 限制在有限次数内，同时仍向模型传达还剩多少额度。无界预算不产生任何投影。
+fn build_runtime_budget_projection_checked(
+    store: &TaskRuntimeStore,
+    run_id: &str,
+) -> Result<Option<String>, super::store::StoreError> {
+    let Some(state) = store.get_run_state(run_id)? else {
+        return Ok(None);
+    };
+    let Some(continuation) = state.continuation.as_ref() else {
+        return Ok(None);
+    };
+    if !continuation.enabled {
+        return Ok(None);
+    }
+    if continuation.token_budget.is_none() && continuation.time_budget_seconds.is_none() {
+        return Ok(None);
+    }
+
+    let mut out = String::new();
+    out.push_str(RUNTIME_BUDGET_MARKER);
+    out.push('\n');
+    out.push_str(
+        "Approximate remaining allowance, coarsened to 5% steps on purpose: exact per-step \
+         numbers would invalidate the prompt cache on every iteration. Use it only to pace \
+         effort; completion is decided by TaskRuntime blockers, not by these numbers.\n",
+    );
+    if let Some(budget) = continuation.token_budget {
+        let percent = coarsened_remaining_percent(continuation.tokens_used, budget);
+        out.push_str(&format!(
+            "- tokens: about {percent}% remaining (limit: {} tokens)\n",
+            budget
+        ));
+    }
+    if let Some(budget) = continuation.time_budget_seconds {
+        let percent = coarsened_remaining_percent(continuation.time_used_seconds, budget);
+        out.push_str(&format!(
+            "- time: about {percent}% remaining (limit: {}s)\n",
+            budget
+        ));
+    }
+    out.push_str("[eko_run_budget_end]\n");
+    Ok(Some(out))
+}
+
+/// 剩余额度百分比，向下取整到 5% 台阶。
+fn coarsened_remaining_percent(used: u64, budget: u64) -> u64 {
+    if budget == 0 {
+        return 0;
+    }
+    let remaining = budget.saturating_sub(used);
+    // u128 中间值可容纳任意 u64 预算乘 100，避免饱和乘法错误显示剩余量。
+    let remaining_percent = ((u128::from(remaining) * 100) / u128::from(budget)) as u64;
+    (remaining_percent / 5) * 5
+}
+
+type ObservedArtifactRead = (Option<String>, String);
+
+fn observed_artifact_reads(request: &echo_agent::llm::ChatRequest) -> Vec<ObservedArtifactRead> {
+    let mut calls = std::collections::HashMap::<String, Option<String>>::new();
+    let mut reads = Vec::new();
+    for message in &request.messages {
+        if message.role == echo_agent::llm::types::Role::Assistant
+            && let Some(tool_calls) = &message.tool_calls
+        {
+            for call in tool_calls {
+                calls.remove(&call.id);
+                if call.function.name == "read_artifact"
+                    && let Ok(parameters) =
+                        serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                {
+                    calls.insert(
+                        call.id.clone(),
+                        parameters
+                            .get("expected_sha256")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                    );
+                }
+            }
+        }
+        if message.role == echo_agent::llm::types::Role::Tool
+            && message
+                .name
+                .as_deref()
+                .is_none_or(|name| name == "read_artifact")
+            && let Some(call) = message
+                .tool_call_id
+                .as_ref()
+                .and_then(|id| calls.remove(id))
+            && let Some(output) = message.content.as_text_ref()
+        {
+            reads.push((call, output.to_string()));
+        }
+    }
+    reads
+}
+
+fn utf8_segment(text: &str, start: u64, end: u64) -> Option<String> {
+    let start = usize::try_from(start).ok()?;
+    let end = usize::try_from(end).ok()?;
+    // 原artifact范围是字节坐标；保字节长度和双侧字符边界，实际取文仍沿字符迭代器。
+    if start > end
+        || end > text.len()
+        || !text.is_char_boundary(start)
+        || !text.is_char_boundary(end)
+    {
+        return None;
+    }
+    Some(
+        text.char_indices()
+            .skip_while(|(offset, _)| *offset < start)
+            .take_while(|(offset, _)| *offset < end)
+            .map(|(_, ch)| ch)
+            .collect(),
+    )
+}
+
+/// 只承认实际请求中已配对reader结果的完整字节覆盖及同一SHA，不把本地缓存内容冒模型可见。
+fn verified_artifact_text(
+    artifact: &crate::prepared_turn::InputResourceRef,
+    reads: &[ObservedArtifactRead],
+) -> Option<String> {
+    let expected = artifact.sha256.as_deref()?;
+    let mut pages = Vec::new();
+    for (sha, output) in reads {
+        if sha
+            .as_deref()
+            .is_some_and(|sha| !sha.eq_ignore_ascii_case(expected))
+        {
+            continue;
+        }
+        let Some((body, notice)) = output.rsplit_once("\n\n[Artifact ") else {
+            continue;
+        };
+        let Some(range) = notice
+            .strip_prefix("page: bytes ")
+            .or_else(|| notice.strip_prefix("complete: bytes "))
+        else {
+            continue;
+        };
+        let Some((offsets, rest)) = range.split_once(" of ") else {
+            continue;
+        };
+        let Some((start, end)) = offsets.split_once('-') else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (start.parse::<u64>(), end.parse::<u64>()) else {
+            continue;
+        };
+        let Some(total) = rest
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>()
+            .parse::<u64>()
+            .ok()
+        else {
+            continue;
+        };
+        if total != artifact.bytes
+            || end > total
+            || end.checked_sub(start) != u64::try_from(body.len()).ok()
+        {
+            continue;
+        }
+        pages.push((start, end, body));
+    }
+    pages.sort_by_key(|(start, end, _)| (*start, *end));
+    let mut text = String::new();
+    let mut covered = 0_u64;
+    for (start, end, body) in pages {
+        if start > covered {
+            return None;
+        }
+        let overlap = covered.min(end).checked_sub(start)?;
+        if utf8_segment(&text, start, covered.min(end))? != utf8_segment(body, 0, overlap)? {
+            return None;
+        }
+        if end > covered {
+            text.push_str(&utf8_segment(body, overlap, end.checked_sub(start)?)?);
+            covered = end;
+        }
+    }
+    if covered != artifact.bytes || hex::encode(Sha256::digest(text.as_bytes())) != expected {
+        return None;
+    }
+    Some(text)
+}
+
+fn format_goal_reference(
+    reference: &super::store::CanonicalGoalReference,
+) -> Result<String, super::store::StoreError> {
+    Ok(format!(
+        "\n{CANONICAL_GOAL_REFERENCE_MARKER}\nreference: {}\npath: {}\nbytes: {}\nsha256: {}\n这是原TaskRuntime当前Goal的host全文引用；原goal_revision/SHA仍由用户CAS拥有，不代表新的输入或目标。\n[eko_canonical_goal_reference_end]\n",
+        serde_json::to_string(reference)?,
+        reference.artifact.path.display(),
+        reference.artifact.bytes,
+        reference.goal_sha256
+    ))
+}
+
+fn goal_references_from_request(
+    request: &echo_agent::llm::ChatRequest,
+    run_id: &str,
+) -> Vec<super::store::CanonicalGoalReference> {
+    let mut references = Vec::new();
+    for message in &request.messages {
+        let Some(text) = message.content.as_text_ref() else {
+            continue;
+        };
+        let Some((_, block)) = text.split_once(CANONICAL_GOAL_REFERENCE_MARKER) else {
+            continue;
+        };
+        let Some(encoded) = block
+            .lines()
+            .find_map(|line| line.strip_prefix("reference: "))
+        else {
+            continue;
+        };
+        if let Ok(reference) = serde_json::from_str::<super::store::CanonicalGoalReference>(encoded)
+            && reference.run_id == run_id
+        {
+            references.push(reference);
+        }
+    }
+    references.sort_by_key(|reference| std::cmp::Reverse(reference.goal_revision));
+    references
+}
+
+fn raw_history_reference_from_request(
+    request: &echo_agent::llm::ChatRequest,
+    run_id: &str,
+) -> Vec<super::store::RawInputHistoryReference> {
+    let mut references = Vec::new();
+    for message in &request.messages {
+        let Some(text) = message.content.as_text_ref() else {
+            continue;
+        };
+        // 引用现在是独立投影，不再要求它与 recovery capsule 同一条消息。
+        let Some((_, block)) = text.split_once(RAW_INPUT_HISTORY_MARKER) else {
+            continue;
+        };
+        let Some(encoded) = block
+            .lines()
+            .find_map(|line| line.strip_prefix("reference: "))
+        else {
+            continue;
+        };
+        // 用户历史也可能引用过capsule示例；只收可解码候选，再由原store核精确来源。
+        if let Ok(reference) =
+            serde_json::from_str::<super::store::RawInputHistoryReference>(encoded)
+            && reference.run_id == run_id
+        {
+            references.push(reference);
+        }
+    }
+    references.sort_by_key(|reference| std::cmp::Reverse(reference.observed_through_sequence));
+    references
 }
 
 /// Protect the dynamic task brief for the current Subagent invocation.
 pub async fn install_task_context_protection(agent: &ReactAgent) {
     let mut ctx = agent.context().lock().await;
     ctx.add_replaceable_protected_marker(TASK_CONTEXT_MARKER.to_string());
+    ctx.add_replaceable_protected_marker(DOMAIN_METHOD_MARKER.to_string());
+}
+
+/// Adhoc factory Agents consume the same persisted rules without inheriting
+/// another turn's transient selection or adding General planning instructions.
+pub(crate) fn install_domain_context_projection(agent: &mut ReactAgent) {
+    agent.set_pre_model_context_projector(Some(Arc::new(
+        TaskRuntimeContextProjector::domain_only(task_runtime_projection_registry()),
+    )));
 }
 
 /// Derive a compact, compression-safe view of the active runtime state.
 pub fn build_runtime_goal_contract(store: &TaskRuntimeStore, run_id: &str) -> Option<String> {
-    let state = store.get_run_state(run_id).ok().flatten()?;
-    let continuation = state.continuation.as_ref()?;
+    build_runtime_goal_contract_checked(store, run_id)
+        .ok()
+        .flatten()
+}
+
+fn build_runtime_goal_contract_checked(
+    store: &TaskRuntimeStore,
+    run_id: &str,
+) -> Result<Option<String>, super::store::StoreError> {
+    let Some(state) = store.get_run_state(run_id)? else {
+        return Ok(None);
+    };
+    let Some(continuation) = state.continuation.as_ref() else {
+        return Ok(None);
+    };
     if !continuation.enabled {
-        return None;
+        return Ok(None);
     }
+    let goal_reference = store.canonical_goal_reference(run_id)?;
     let run = state.run;
     let mut hasher = Sha256::new();
     hasher.update(run.goal.as_bytes());
@@ -198,21 +905,9 @@ pub fn build_runtime_goal_contract(store: &TaskRuntimeStore, run_id: &str) -> Op
         .take(MAX_GOAL_CONTRACT_CHARS)
         .collect::<String>();
     let objective_truncated = run.goal.chars().count() > MAX_GOAL_CONTRACT_CHARS;
-    let plan_revision = store
-        .get_plan(run_id)
-        .ok()
-        .flatten()
-        .map(|plan| plan.revision);
-    let remaining_tokens = continuation
-        .token_budget
-        .map(|budget| budget.saturating_sub(continuation.tokens_used));
-    let remaining_time_seconds = continuation
-        .time_budget_seconds
-        .map(|budget| budget.saturating_sub(continuation.time_used_seconds));
-
-    Some(format!(
+    let mut contract = format!(
         "{RUNTIME_GOAL_MARKER}\n\
-         Run: id={}, status={}, objective_sha256={}, plan_revision={}\n\
+         Run: id={}, objective_sha256={}\n\
          Objective{}:\n{}\n\
          Continuation contract:\n\
          - This finite Turn ending is not evidence that the TaskRun Goal is complete.\n\
@@ -220,50 +915,50 @@ pub fn build_runtime_goal_contract(store: &TaskRuntimeStore, run_id: &str) -> Op
          - Before completion, audit the original objective, current plan, artifacts, and verification evidence.\n\
          - TaskRuntime completion blockers are authoritative; final wording never overrides them.\n\
          - On a recoverable blocker, record the concrete blocker and preserve resumable state.\n\
-         Budget: tokens_used={}, token_budget={}, tokens_remaining={}; time_used_seconds={}, time_budget_seconds={}, time_remaining_seconds={}\n",
+         {round_review}\n",
         run.run_id,
-        run.status.as_str(),
         goal_hash,
-        plan_revision
-            .map(|revision| revision.to_string())
-            .unwrap_or_else(|| "none".to_string()),
         if objective_truncated {
-            let artifact = store
-                .objective_artifact_path(run_id)
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "unavailable".to_string());
+            let artifact = goal_reference.as_ref().ok_or_else(|| {
+                super::store::StoreError::InvalidPlan("长Goal缺本机可读引用".to_string())
+            })?;
             format!(
-                " (bounded here; recover the full objective artifact before acting: {artifact})"
+                " (bounded here; recover the full current Goal with host read_artifact: {}; sha256={})",
+                artifact.artifact.path.display(),
+                artifact.goal_sha256
             )
         } else {
             String::new()
         },
         objective,
-        continuation.tokens_used,
-        continuation
-            .token_budget
-            .map(|budget| budget.to_string())
-            .unwrap_or_else(|| "none".to_string()),
-        remaining_tokens
-            .map(|tokens| tokens.to_string())
-            .unwrap_or_else(|| "unbounded".to_string()),
-        continuation.time_used_seconds,
-        continuation
-            .time_budget_seconds
-            .map(|budget| budget.to_string())
-            .unwrap_or_else(|| "none".to_string()),
-        remaining_time_seconds
-            .map(|seconds| seconds.to_string())
-            .unwrap_or_else(|| "unbounded".to_string()),
-    ))
+        round_review = GOAL_ROUND_REVIEW_RULES,
+    );
+    if let Some(reference) = goal_reference {
+        contract.push_str(&format_goal_reference(&reference)?);
+    }
+    Ok(Some(contract))
 }
 
 /// Derive a compact, compression-safe view of the active runtime state.
 pub fn build_runtime_recovery_capsule(store: &TaskRuntimeStore, run_id: &str) -> Option<String> {
-    let state = store.get_run_state(run_id).ok().flatten()?;
+    build_runtime_recovery_capsule_checked(store, run_id)
+        .ok()
+        .flatten()
+}
+
+/// 执行投影必须观察真实原文/物化错误，不能降为空投影后继续模型调用。
+fn build_runtime_recovery_capsule_checked(
+    store: &TaskRuntimeStore,
+    run_id: &str,
+) -> Result<Option<String>, super::store::StoreError> {
+    let state = store
+        .get_run_state(run_id)?
+        .ok_or_else(|| super::store::StoreError::RunNotFound(run_id.to_string()))?;
     let run = state.run;
     let continuation = state.continuation;
     let recent_constraints = state.recent_constraints;
+    let raw_history = store.raw_input_history_reference(run_id, None)?;
+    let goal_reference = store.canonical_goal_reference(run_id)?;
     let plan = store.get_plan(run_id).unwrap_or_default();
     let todos = store.list_todos(run_id).unwrap_or_default();
     let cells = store.list_background_cells(run_id).unwrap_or_default();
@@ -276,10 +971,12 @@ pub fn build_runtime_recovery_capsule(store: &TaskRuntimeStore, run_id: &str) ->
     if !has_plan_tasks
         && !has_runtime_todos
         && recent_constraints.is_empty()
+        && raw_history.source_records == 0
+        && goal_reference.is_none()
         && cells.is_empty()
         && continuation.as_ref().is_none_or(|state| !state.enabled)
     {
-        return None;
+        return Ok(None);
     }
 
     let mut out = String::new();
@@ -291,7 +988,7 @@ pub fn build_runtime_recovery_capsule(store: &TaskRuntimeStore, run_id: &str) ->
          The file-backed TaskRuntimeStore remains authoritative.\n",
     );
     out.push_str(&format!(
-        "Run: id={}, status={}, route={}, domain={}, goal={}\n",
+        "Run: id={}, status={}, route={}, domain={}\nGoal: {}\n",
         run.run_id,
         run.status.as_str(),
         run.route,
@@ -307,8 +1004,11 @@ pub fn build_runtime_recovery_capsule(store: &TaskRuntimeStore, run_id: &str) ->
         ));
     }
     if let Some(continuation) = continuation {
+        // 每步精确的 tokens_used/剩余时间不再写进这个已被模型看过的快照：它们
+        // 会随每一步变化，从而让整段 prompt 的早部前缀失效。有界预算的近似剩余量
+        // 由独立的 `RUNTIME_BUDGET_MARKER` 追加式投影承载。
         out.push_str(&format!(
-            "Continuation: active_turn={}, last_turn={}, turns_next={}, tokens_used={}, token_budget={}, tokens_remaining={}, time_used_seconds={}, time_budget_seconds={}, time_remaining_seconds={}, compactions={}, deferred={}, pause={}\n",
+            "Continuation: active_turn={}, last_turn={}, turns_next={}, compactions={}, deferred={}, pause={}\n",
             continuation
                 .active_turn
                 .as_ref()
@@ -320,28 +1020,6 @@ pub fn build_runtime_recovery_capsule(store: &TaskRuntimeStore, run_id: &str) ->
                 .map(|turn| format!("{}:{}", turn.turn_id, turn.status.as_str()))
                 .unwrap_or_else(|| "none".to_string()),
             continuation.next_turn_ordinal,
-            continuation.tokens_used,
-            continuation
-                .token_budget
-                .map(|budget| budget.to_string())
-                .unwrap_or_else(|| "none".to_string()),
-            continuation
-                .token_budget
-                .map(|budget| budget.saturating_sub(continuation.tokens_used).to_string())
-                .unwrap_or_else(|| "unbounded".to_string()),
-            continuation.time_used_seconds,
-            continuation
-                .time_budget_seconds
-                .map(|budget| budget.to_string())
-                .unwrap_or_else(|| "none".to_string()),
-            continuation
-                .time_budget_seconds
-                .map(|budget| {
-                    budget
-                        .saturating_sub(continuation.time_used_seconds)
-                        .to_string()
-                })
-                .unwrap_or_else(|| "unbounded".to_string()),
             continuation.compaction_count,
             continuation.deferred,
             continuation
@@ -354,8 +1032,9 @@ pub fn build_runtime_recovery_capsule(store: &TaskRuntimeStore, run_id: &str) ->
 
     if let Some(plan) = &plan {
         out.push_str(&format!(
-            "Plan: id={}, execution_mode={}, tasks={}\n",
+            "Plan: id={}, revision={}, execution_mode={}, tasks={}\n",
             plan.plan_id,
+            plan.revision,
             plan.execution_mode.as_str(),
             plan.tasks.len()
         ));
@@ -368,10 +1047,8 @@ pub fn build_runtime_recovery_capsule(store: &TaskRuntimeStore, run_id: &str) ->
     // narrowed context cannot silently drop them.
     if !recent_constraints.is_empty() {
         out.push_str("Recent user constraints:\n");
-        // The journal already bounds user-authored steers. A second 200-char
-        // cut here could remove the actual restriction after a long preamble.
-        // Retain the last four recorded excerpts in chronological order so
-        // later corrections remain visibly later than the instruction they amend.
+        // journal 保留全文；受保护 capsule 只放有界预览和可恢复原文引用。
+        // 最近四条仍仅是本切片展示，不代表全部有效要求已得到覆盖。
         for steer in recent_constraints
             .iter()
             .rev()
@@ -380,9 +1057,22 @@ pub fn build_runtime_recovery_capsule(store: &TaskRuntimeStore, run_id: &str) ->
             .into_iter()
             .rev()
         {
-            out.push_str(&format!("- (turn {}) {}\n", steer.turn_id, steer.text));
+            let turn_preview = truncate_chars(&steer.turn_id, MAX_TASK_TITLE_CHARS);
+            if steer.text.chars().count() <= crate::prepared_turn::PREVIEW_CHARS {
+                out.push_str(&format!("- (turn {turn_preview}) {}\n", steer.text));
+                continue;
+            }
+            let artifact = store.recorded_user_steer_artifact(run_id, steer)?;
+            out.push_str(&format!(
+                "- (turn {turn_preview}) {}\n",
+                crate::prepared_turn::build_original_message_reference(&steer.text, &artifact),
+            ));
         }
         out.push('\n');
+    }
+
+    if let Some(reference) = goal_reference {
+        out.push_str(&format_goal_reference(&reference)?);
     }
 
     push_task_group(
@@ -432,7 +1122,7 @@ pub fn build_runtime_recovery_capsule(store: &TaskRuntimeStore, run_id: &str) ->
     );
     push_background_cells(&mut out, &cells);
 
-    Some(out)
+    Ok(Some(out))
 }
 
 fn push_background_cells(out: &mut String, cells: &[BackgroundCellState]) {
@@ -712,6 +1402,8 @@ mod tests {
             .transition_run("r1", TaskRunStatus::Running)
             .map_err(|err| format!("seed transition failed: {err}"))?;
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
             revision: 1,
@@ -813,6 +1505,190 @@ mod tests {
     }
 
     #[test]
+    fn goal_contract_omits_per_step_budget_and_capsule_omits_usage() -> Result<(), String> {
+        let store = seed_store()?;
+        store
+            .configure_run_continuation("r1", true, false, Some(10_000), Some(600))
+            .map_err(|err| format!("configure continuation failed: {err}"))?;
+        let contract = build_runtime_goal_contract(&store, "r1")
+            .ok_or_else(|| "goal contract should be built".to_string())?;
+        if contract.contains("Budget:") || contract.contains("tokens_used=") {
+            return Err(format!(
+                "goal contract must not embed per-step budget numbers: {contract}"
+            ));
+        }
+        let capsule = build_runtime_recovery_capsule(&store, "r1")
+            .ok_or_else(|| "capsule should be built".to_string())?;
+        if capsule.contains("tokens_used=") || capsule.contains("time_used_seconds=") {
+            return Err(format!(
+                "recovery capsule must not embed per-step usage numbers: {capsule}"
+            ));
+        }
+        if capsule.contains(RAW_INPUT_HISTORY_MARKER) {
+            return Err("original-input reference must be its own projection".to_string());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn budget_projection_is_bounded_only_and_coarsened() -> Result<(), String> {
+        let store = seed_store()?;
+        // 无界预算：不发送任何预算投影。
+        store
+            .configure_run_continuation("r1", true, false, None, None)
+            .map_err(|err| format!("configure continuation failed: {err}"))?;
+        if build_runtime_budget_projection_checked(&store, "r1")
+            .map_err(|err| format!("budget projection failed: {err}"))?
+            .is_some()
+        {
+            return Err("unbounded budget must not be projected".to_string());
+        }
+        // 有界预算：只在剩余额度跨 5% 台阶时产生新版本。
+        store
+            .configure_run_continuation("r1", true, false, Some(10_000), Some(600))
+            .map_err(|err| format!("configure continuation failed: {err}"))?;
+        let budget = build_runtime_budget_projection_checked(&store, "r1")
+            .map_err(|err| format!("budget projection failed: {err}"))?
+            .ok_or_else(|| "bounded budget should be projected".to_string())?;
+        if !budget.contains(RUNTIME_BUDGET_MARKER) || !budget.contains("about 100% remaining") {
+            return Err(format!("unexpected bounded budget text: {budget}"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn remaining_percent_is_coarsened_to_five_percent_steps() {
+        assert_eq!(coarsened_remaining_percent(0, 1000), 100);
+        assert_eq!(coarsened_remaining_percent(10, 1000), 95);
+        assert_eq!(coarsened_remaining_percent(24, 1000), 95);
+        assert_eq!(coarsened_remaining_percent(240, 1000), 75);
+        assert_eq!(coarsened_remaining_percent(u64::MAX, u64::MAX), 0);
+        assert_eq!(coarsened_remaining_percent(999, 1000), 0);
+        assert_eq!(coarsened_remaining_percent(1, 0), 0);
+    }
+
+    #[tokio::test]
+    async fn growing_runtime_requests_preserve_prefix_and_coarsened_budget() -> Result<(), String> {
+        use super::super::types::{RunTurnOrigin, TurnVisibility};
+        let store = seed_projection_store("cache-run", "original objective")?;
+        store
+            .configure_run_continuation("cache-run", true, false, Some(10_000), None)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("cache-run", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        let claim = store
+            .claim_run_turn(
+                "cache-run",
+                "cache-turn",
+                RunTurnOrigin::User,
+                TurnVisibility::Visible,
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(
+            matches!(claim, super::super::store::RunTurnClaimOutcome::Started(_)),
+            "记账前必须通过原RunTurn实际启动路径"
+        );
+        let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
+        let _registration = registry.register("cache-run", Arc::clone(&store));
+        let projector = TaskRuntimeContextProjector::new(registry);
+        let mut context = ContextManager::builder(16_000).build();
+        context.push(Message::user("original request".into()));
+        let mut previous = Vec::new();
+        let mut budget = None;
+        for iteration in 1..=3 {
+            store
+                .account_run_turn_usage(
+                    "cache-run",
+                    "cache-turn",
+                    &format!("usage-{iteration}"),
+                    1,
+                    0,
+                )
+                .map_err(|error| error.to_string())?;
+            let projections = projector
+                .project(&projection_context(Some("cache-run")))
+                .await
+                .map_err(|error| error.to_string())?;
+            let current_budget = projections
+                .iter()
+                .find(|projection| projection.marker == RUNTIME_BUDGET_MARKER)
+                .and_then(|projection| projection.message.as_ref())
+                .and_then(|message| message.content.as_text());
+            if let Some(expected) = &budget {
+                assert_eq!(&current_budget, expected);
+            }
+            budget = Some(current_budget);
+            context.apply_projection_scope("pre-model", &projections);
+            for (index, message) in previous.iter().enumerate() {
+                assert_eq!(
+                    serde_json::to_value(context.messages().get(index))
+                        .map_err(|error| error.to_string())?,
+                    serde_json::to_value(Some(message)).map_err(|error| error.to_string())?
+                );
+            }
+            previous = context.messages().to_vec();
+            context.push(Message::assistant(format!("output-{iteration}")));
+        }
+        assert!(context.protected_message_count() <= 4);
+        Ok(())
+    }
+
+    #[test]
+    fn raw_history_source_version_ignores_observed_frontier() -> Result<(), String> {
+        let store = seed_store()?;
+        store
+            .record_run_steer("r1", "turn-1", "保留原始输入历史")
+            .map_err(|err| format!("record steer failed: {err}"))?;
+        let first = store
+            .raw_input_history_reference("r1", None)
+            .map_err(|err| format!("reference failed: {err}"))?;
+        let version_first =
+            raw_history_source_version(&first).map_err(|error| error.to_string())?;
+        // 观察 frontier 增长但来源内容不变：版本必须保持稳定。
+        let mut second = first.clone();
+        second.observed_through_sequence = second.observed_through_sequence.saturating_add(1);
+        assert_eq!(
+            version_first,
+            raw_history_source_version(&second).map_err(|error| error.to_string())?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_history_source_version_tracks_locator_and_inline_source() -> Result<(), String> {
+        let store = seed_store()?;
+        store
+            .record_run_steer("r1", "locator-turn", "原文来源")
+            .map_err(|error| error.to_string())?;
+        let reference = store
+            .raw_input_history_reference("r1", None)
+            .map_err(|error| error.to_string())?;
+        let expected = raw_history_source_version(&reference).map_err(|error| error.to_string())?;
+        // 版本键反控：内容 SHA 不变、host locator 变化仍须产生新版本。
+        // 这里只验证来源键，不把它当作完整目录迁移的 runtime 验收。
+        let mut relocated = reference.clone();
+        let artifact = relocated
+            .artifact
+            .as_mut()
+            .ok_or("原文定位反控缺少物化引用")?;
+        artifact.path = artifact
+            .path
+            .with_file_name("restored-original-history.txt");
+        assert_ne!(
+            expected,
+            raw_history_source_version(&relocated).map_err(|error| error.to_string())?
+        );
+        let mut changed = reference.clone();
+        changed.inline_initial_text = Some("另一份原始输入".into());
+        assert_ne!(
+            expected,
+            raw_history_source_version(&changed).map_err(|error| error.to_string())?
+        );
+        Ok(())
+    }
+
+    #[test]
     fn ordinary_chat_run_without_plan_gets_no_capsule() -> Result<(), String> {
         let store =
             TaskRuntimeStore::new_in_memory().map_err(|err| format!("seed store failed: {err}"))?;
@@ -830,6 +1706,10 @@ mod tests {
             .map_err(|err| format!("seed create_run failed: {err}"))?;
         if build_runtime_recovery_capsule(&store, "r2").is_some() {
             return Err("ordinary chat run should not get a capsule".to_string());
+        }
+        // 普通聊天没有持续 Goal/continuation，不获得轮次收尾模板。
+        if build_runtime_goal_contract(&store, "r2").is_some() {
+            return Err("ordinary chat run should not get a goal contract".to_string());
         }
         Ok(())
     }
@@ -856,7 +1736,9 @@ mod tests {
         store
             .record_run_steer("r3", "turn-1", "不要引入新依赖,优先修改现有实现")
             .map_err(|err| format!("record steer failed: {err}"))?;
-        let capsule = build_runtime_recovery_capsule(&store, "r3")
+        // 保留底层错误，避免间歇失败时被公开 Option helper 折叠成缺失摘要。
+        let capsule = build_runtime_recovery_capsule_checked(&store, "r3")
+            .map_err(|error| format!("recorded steer projection failed: {error}"))?
             .ok_or_else(|| "capsule should be built after a recorded steer".to_string())?;
         if !capsule.contains("Recent user constraints") || !capsule.contains("不要引入新依赖")
         {
@@ -903,11 +1785,19 @@ mod tests {
         );
         let contract = build_runtime_goal_contract(&store, "r4")
             .ok_or_else(|| "goal contract should be built".to_string())?;
-        if !contract.contains("objective artifact before acting")
-            || !contract.contains("objective-r1-")
-        {
-            return Err("goal contract should point at the spilled objective artifact".to_string());
-        }
+        let canonical = store
+            .canonical_goal_reference("r4")
+            .map_err(|error| error.to_string())?
+            .ok_or("长Goal缺原authority的host引用")?;
+        // 已批准的当前Goal由原GoalState持有，旧objective是归档，不能继续
+        // 用旧提示语/文件名要求模型把归档当作当前目标的权威入口。
+        assert!(contract.contains("host read_artifact"));
+        assert!(contract.contains(&canonical.artifact.path.display().to_string()));
+        assert!(contract.contains(&canonical.goal_sha256));
+        assert_eq!(
+            std::fs::read_to_string(&canonical.artifact.path).map_err(|error| error.to_string())?,
+            long_goal
+        );
         let capsule = build_runtime_recovery_capsule(&store, "r4")
             .ok_or_else(|| "capsule should be built".to_string())?;
         assert!(
@@ -922,7 +1812,13 @@ mod tests {
         );
         let degraded_contract = build_runtime_goal_contract(&store, "r4")
             .ok_or_else(|| "goal contract should survive artifact degradation".to_string())?;
-        assert!(degraded_contract.contains("unavailable"));
+        assert!(degraded_contract.contains(&canonical.artifact.path.display().to_string()));
+        assert!(degraded_contract.contains(&canonical.goal_sha256));
+        assert_eq!(
+            std::fs::read_to_string(&canonical.artifact.path).map_err(|error| error.to_string())?,
+            long_goal,
+            "损坏旧归档不能把原当前Goal降成不可用"
+        );
         Ok(())
     }
 
@@ -959,6 +1855,8 @@ mod tests {
             .map_err(|err| format!("seed projection run failed: {err}"))?;
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+
                 plan_id: format!("plan-{run_id}"),
                 run_id: run_id.to_string(),
                 revision: 1,
@@ -993,6 +1891,33 @@ mod tests {
             .project(&projection_context(Some(run_id)))
             .await
             .map_err(|err| err.to_string())
+    }
+
+    #[test]
+    fn invocation_retains_original_projection_token_and_rejects_foreign_store() -> Result<(), String>
+    {
+        let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
+        let store = seed_projection_store("retained-run", "original run")?;
+        let original = registry.register("retained-run", store.clone());
+        let retained = registry.retain_for_invocation("retained-run", store.clone())?;
+        assert!(Arc::ptr_eq(&original._inner, &retained._inner));
+        let other = seed_projection_store("retained-run", "other owner")?;
+        assert!(
+            registry
+                .retain_for_invocation("retained-run", other)
+                .is_err()
+        );
+        assert!(
+            registry
+                .store("retained-run")
+                .as_ref()
+                .is_some_and(|actual| Arc::ptr_eq(actual, &store))
+        );
+        drop(original);
+        assert!(registry.contains("retained-run"));
+        drop(retained);
+        assert!(!registry.contains("retained-run"));
+        Ok(())
     }
 
     #[tokio::test]
@@ -1046,7 +1971,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projector_after_registration_drop_removes_existing_capsule() -> Result<(), String> {
+    async fn projector_after_registration_drop_invalidates_existing_capsule() -> Result<(), String>
+    {
         let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
         let projector = Arc::new(TaskRuntimeContextProjector::new(Arc::clone(&registry)));
         let store = seed_projection_store("run-a", "alpha task")?;
@@ -1067,9 +1993,2071 @@ mod tests {
             .await
             .map_err(|err| err.to_string())?;
         context.apply_projections(&outside);
-        if context.has_projection(RUNTIME_RECOVERY_MARKER) {
-            return Err("outside scope must remove the runtime capsule".to_string());
+        let cleared_version = outside
+            .iter()
+            .find(|projection| projection.marker == RUNTIME_RECOVERY_MARKER)
+            .and_then(|projection| projection.version.as_deref());
+        assert!(
+            context.has_projection(RUNTIME_RECOVERY_MARKER),
+            "immutable history must survive"
+        );
+        assert_eq!(
+            context.projection_version(RUNTIME_RECOVERY_MARKER),
+            cleared_version
+        );
+        let after_clear =
+            serde_json::to_value(context.messages()).map_err(|error| error.to_string())?;
+        context.apply_projections(&outside);
+        assert_eq!(
+            serde_json::to_value(context.messages()).map_err(|error| error.to_string())?,
+            after_clear
+        );
+        Ok(())
+    }
+
+    struct UnreachableSshFiles(std::sync::atomic::AtomicUsize);
+
+    impl UnreachableSshFiles {
+        fn attempted<T>(&self) -> echo_agent::error::Result<T> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(echo_agent::error::ReactError::Other(
+                "本机原文引用不应触达 SSH FileSystem".to_owned(),
+            ))
         }
+    }
+
+    impl echo_agent::tools::filesystem::FileSystem for UnreachableSshFiles {
+        fn current_dir(&self) -> echo_agent::error::Result<std::path::PathBuf> {
+            self.attempted()
+        }
+        fn canonicalize(
+            &self,
+            _: &std::path::Path,
+        ) -> echo_agent::error::Result<std::path::PathBuf> {
+            self.attempted()
+        }
+        fn metadata(
+            &self,
+            _: &std::path::Path,
+        ) -> echo_agent::error::Result<echo_agent::tools::filesystem::FileMetadata> {
+            self.attempted()
+        }
+        fn symlink_metadata(
+            &self,
+            _: &std::path::Path,
+        ) -> echo_agent::error::Result<echo_agent::tools::filesystem::FileMetadata> {
+            self.attempted()
+        }
+        fn read(&self, _: &std::path::Path) -> echo_agent::error::Result<Vec<u8>> {
+            self.attempted()
+        }
+        fn open_read(
+            &self,
+            _: &std::path::Path,
+        ) -> echo_agent::error::Result<Box<dyn std::io::Read + Send>> {
+            self.attempted()
+        }
+        fn read_dir(
+            &self,
+            _: &std::path::Path,
+        ) -> echo_agent::error::Result<Vec<echo_agent::tools::filesystem::FileEntry>> {
+            self.attempted()
+        }
+        fn create_dir_all(&self, _: &std::path::Path) -> echo_agent::error::Result<()> {
+            self.attempted()
+        }
+        fn create_file(&self, _: &std::path::Path) -> echo_agent::error::Result<()> {
+            self.attempted()
+        }
+        fn write(&self, _: &std::path::Path, _: &[u8]) -> echo_agent::error::Result<()> {
+            self.attempted()
+        }
+        fn append(&self, _: &std::path::Path, _: &[u8]) -> echo_agent::error::Result<()> {
+            self.attempted()
+        }
+        fn rename(
+            &self,
+            _: &std::path::Path,
+            _: &std::path::Path,
+        ) -> echo_agent::error::Result<()> {
+            self.attempted()
+        }
+        fn remove_file(&self, _: &std::path::Path) -> echo_agent::error::Result<()> {
+            self.attempted()
+        }
+        fn remove_dir(&self, _: &std::path::Path) -> echo_agent::error::Result<()> {
+            self.attempted()
+        }
+        fn remove_dir_all(&self, _: &std::path::Path) -> echo_agent::error::Result<()> {
+            self.attempted()
+        }
+        fn set_mode(&self, _: &std::path::Path, _: u32) -> echo_agent::error::Result<()> {
+            self.attempted()
+        }
+        fn atomic_write(&self, _: &std::path::Path, _: &[u8]) -> echo_agent::error::Result<()> {
+            self.attempted()
+        }
+        fn checkpoint(&self, _: &std::path::Path) -> echo_agent::error::Result<Option<String>> {
+            self.attempted()
+        }
+    }
+
+    fn seed_bounded_steer_run(
+        root: &std::path::Path,
+        run_id: &str,
+        original: &str,
+    ) -> Result<TaskRuntimeStore, String> {
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(root)
+            .map_err(|error| error.to_string())?;
+        store
+            .create_run(
+                run_id,
+                &store.active_workspace_id(),
+                "bounded-conversation",
+                "root-message",
+                DomainProfile::General,
+                "保留原要求并继续当前任务",
+                "agent_task_plan",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation(run_id, true, false, None, None)
+            .map_err(|error| error.to_string())?;
+        store
+            .record_run_steer(run_id, "oversized-steer", original)
+            .map_err(|error| error.to_string())?;
+        Ok(store)
+    }
+
+    // 此用例只依赖 raw 两源已有 API，可先作为 test-only 反例采用再运行。
+    #[tokio::test]
+    async fn oversized_steer_capsule_fits_real_context_after_cold_reopen() -> Result<(), String> {
+        use echo_agent::compression::compressor::SlidingWindowCompressor;
+        use echo_agent::tokenizer::{HeuristicTokenizer, Tokenizer};
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let original = format!("{}末尾必须保留：禁止推送🚀", "大段背景说明 ".repeat(12_000));
+        assert!(HeuristicTokenizer.count_tokens(&original) > 8_000);
+        let root = temporary.path().join(".eko/tasks");
+        let store = seed_bounded_steer_run(&root, "oversized-context", &original)?;
+        drop(store);
+        let reopened = Arc::new(
+            TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+                .map_err(|error| error.to_string())?,
+        );
+        let state = reopened
+            .get_run_state("oversized-context")
+            .map_err(|error| error.to_string())?
+            .ok_or("冷重开原 Run 缺失")?;
+        assert_eq!(
+            state
+                .recent_constraints
+                .first()
+                .map(|steer| steer.text.as_str()),
+            Some(original.as_str())
+        );
+        let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
+        let _registration = registry.register("oversized-context", reopened);
+        let projector = TaskRuntimeContextProjector::new(registry);
+        let mut context = ContextManager::builder(8_000)
+            .compressor(SlidingWindowCompressor::new(20).with_recent_token_budget(400))
+            .build();
+        for _ in 0..3 {
+            context.apply_projections(
+                &projector
+                    .project(&projection_context(Some("oversized-context")))
+                    .await
+                    .map_err(|error| error.to_string())?,
+            );
+            context.push(Message::assistant("历史执行输出 ".repeat(12_000)));
+            context.push(Message::user("继续当前任务".to_owned()));
+            assert!(context.token_estimate() > 8_000);
+            let prepared = context
+                .prepare(Some("继续当前任务"))
+                .await
+                .map_err(|error| error.to_string())?;
+            assert!(prepared.compressed.is_some(), "必须真正进入原压缩路径");
+            assert!(context.token_estimate() <= 8_000);
+            let capsule = prepared
+                .messages
+                .iter()
+                .filter_map(|message| message.content.as_text())
+                .find(|text| text.contains(RUNTIME_RECOVERY_MARKER))
+                .ok_or("模型上下文缺恢复引用")?;
+            assert!(!capsule.contains(&original));
+            assert!(capsule.contains(&hex::encode(Sha256::digest(original.as_bytes()))));
+        }
+        Ok(())
+    }
+
+    fn verify_actual_model_artifact_pages(
+        reference: &echo_agent::tools::artifact::ToolOutputArtifactRef,
+        expected_pages: Vec<(String, echo_agent::tools::files::artifact::ArtifactPage)>,
+        actual_calls: &[Vec<Message>],
+        actual_read_calls: &std::collections::HashMap<String, echo_agent::agent::ToolInvocation>,
+        actual_read_results: &std::collections::HashMap<
+            String,
+            (String, echo_agent::tools::ToolResult),
+        >,
+    ) -> Result<String, String> {
+        let path = reference.path.clone();
+        let sha256 = reference.sha256.clone();
+        let bytes = reference.artifact_bytes;
+        let mut actual_source = String::new();
+        let mut expected_start = 0_u64;
+        for (call_id, expected) in expected_pages {
+            let (expected_page, reader_start, reader_end) =
+                (expected.content, expected.start_byte, expected.end_byte);
+            let (messages, message_index, actual_message) = actual_calls
+                .iter()
+                .flat_map(|messages| {
+                    messages
+                        .iter()
+                        .enumerate()
+                        .map(move |(index, message)| (messages, index, message))
+                })
+                .find(|(_, _, message)| message.tool_call_id.as_deref() == Some(call_id.as_str()))
+                .ok_or_else(|| {
+                    let requests = actual_calls.iter().enumerate().map(|(index, messages)| {
+                        let messages = messages.iter().map(|message| {
+                            let text = message.content.as_text_ref().unwrap_or("");
+                            serde_json::json!({
+                                "role": format!("{:?}", message.role),
+                                "call_id": message.tool_call_id,
+                                "calls": message.tool_calls,
+                                "bytes": text.len(),
+                                "sha256": hex::encode(Sha256::digest(text.as_bytes())),
+                                "prefix": text.chars().take(160).collect::<String>(),
+                            })
+                        }).collect::<Vec<_>>();
+                        serde_json::json!({"request":index,"messages":messages})
+                    }).collect::<Vec<_>>();
+                    format!("真实工具结果未进入下一主模型请求：{}", serde_json::json!({
+                        "missing_call_id":call_id,
+                        "reader_start":reader_start,"reader_end":reader_end,
+                        "expected_page_bytes":expected_page.len(),
+                        "expected_page_sha256":hex::encode(Sha256::digest(expected_page.as_bytes())),
+                        "actual_reader_result":actual_read_results.get(&call_id),
+                        "actual_reader_call":actual_read_calls.get(&call_id),
+                        "actual_model_requests":requests,
+                    }))
+                })?;
+            let paired_call = messages
+                .iter()
+                .take(message_index)
+                .flat_map(|message| message.tool_calls.iter().flatten())
+                .find(|call| call.id == call_id)
+                .ok_or("真实模型Tool结果缺同请求中的原assistant调用")?;
+            let invocation = actual_read_calls
+                .get(&call_id)
+                .ok_or("实际reader缺原ToolCall事件")?;
+            assert_eq!(paired_call.function.name, "read_artifact");
+            assert_eq!(invocation.name, "read_artifact");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&paired_call.function.arguments)
+                    .map_err(|error| error.to_string())?,
+                invocation.requested_args
+            );
+            assert_eq!(
+                invocation
+                    .args
+                    .get("expected_sha256")
+                    .and_then(serde_json::Value::as_str),
+                Some(sha256.as_str())
+            );
+            assert_eq!(
+                invocation
+                    .args
+                    .get("max_tokens")
+                    .and_then(serde_json::Value::as_u64),
+                Some(2_000)
+            );
+            assert_eq!(
+                invocation
+                    .args
+                    .get("path")
+                    .and_then(serde_json::Value::as_str),
+                path.to_str()
+            );
+            let (name, result) = actual_read_results
+                .get(&call_id)
+                .ok_or("实际reader缺原ToolResult事件")?;
+            assert_eq!(name, "read_artifact");
+            assert!(result.success, "原reader失败，不能计为原文页：{result:?}");
+            assert!(result.error.is_none());
+            assert!(
+                result.artifact.is_none(),
+                "不能把结果sidecar的preview当原文入模"
+            );
+            assert_eq!(result.metadata.get("sha256"), Some(&sha256));
+            let result_path = result
+                .metadata
+                .get("artifact_path")
+                .ok_or("实际reader结果缺原文件坐标")?;
+            assert_eq!(
+                std::path::Path::new(result_path)
+                    .canonicalize()
+                    .map_err(|error| error.to_string())?,
+                path.canonicalize().map_err(|error| error.to_string())?
+            );
+            let number = |key: &str| -> Result<u64, String> {
+                result
+                    .metadata
+                    .get(key)
+                    .ok_or_else(|| format!("原reader结果缺{key}"))?
+                    .parse::<u64>()
+                    .map_err(|error| error.to_string())
+            };
+            let start = number("start_byte")?;
+            let end = number("end_byte")?;
+            let total = number("total_bytes")?;
+            assert_eq!((start, end), (reader_start, reader_end));
+            assert_eq!(start, expected_start, "真实页范围必须连续");
+            assert!(end >= start && end <= total);
+            assert_eq!(total, bytes);
+            let suffix = if let Some(next) = result.metadata.get("next_cursor") {
+                format!(
+                    "\n\n[Artifact page: bytes {start}-{end} of {total}; continue with cursor={next}.]"
+                )
+            } else {
+                format!("\n\n[Artifact complete: bytes {start}-{end} of {total}.]")
+            };
+            // 先按原reader真实封包解出模型实际正文，再校验整页字节。
+            // 不按expected字符数截首部，也不把fixture原文拼入实际输出。
+            let actual = actual_message
+                .content
+                .as_text_ref()
+                .ok_or("实际模型Tool消息没有文本正文")?;
+            assert_eq!(actual_message.role, echo_agent::llm::types::Role::Tool);
+            assert_eq!(actual, result.output, "模型页必须等于原ToolResult完整输出");
+            let payload = actual
+                .strip_suffix(&suffix)
+                .ok_or_else(|| format!("真实模型页不符合原reader封包：{call_id}"))?;
+            let page_bytes = u64::try_from(payload.len()).map_err(|error| error.to_string())?;
+            assert_eq!(page_bytes, end.saturating_sub(start));
+            assert_eq!(
+                hex::encode(Sha256::digest(payload.as_bytes())),
+                hex::encode(Sha256::digest(expected_page.as_bytes())),
+                "真实整页UTF-8 SHA不匹配"
+            );
+            assert_eq!(payload, expected_page);
+            actual_source.push_str(payload);
+            expected_start = end;
+        }
+        assert_eq!(expected_start, bytes);
+        assert_eq!(
+            hex::encode(Sha256::digest(actual_source.as_bytes())),
+            sha256
+        );
+        assert_eq!(
+            actual_source,
+            std::fs::read_to_string(&path).map_err(|error| error.to_string())?
+        );
+        Ok(actual_source)
+    }
+
+    #[tokio::test]
+    async fn earliest_steer_after_twelve_inputs_reaches_model_through_original_history()
+    -> Result<(), String> {
+        use echo_agent::agent::{
+            Agent, AgentInvocationContext, CancellationToken, ReactAgentBuilder,
+        };
+        use echo_agent::compression::compressor::SlidingWindowCompressor;
+        use echo_agent::tools::files::artifact::{ArtifactPageLimit, read_artifact_page};
+        use futures::StreamExt;
+        for repetitions in [2_000, 1] {
+            let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let run_id = "thirteen-original-inputs";
+            let original = format!(
+                "{}EARLY_ORIGINAL_TAIL_7461🧭",
+                "早期仍有效的完整背景 ".repeat(repetitions)
+            );
+            let store =
+                seed_bounded_steer_run(&temporary.path().join(".eko/tasks"), run_id, &original)?;
+            let original_goal = store
+                .get_run(run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("原Goal缺失")?;
+            let original_input = crate::prepared_turn::PreparedUserTurn::build(
+                crate::prepared_turn::UserTurnInput {
+                    text: &original,
+                    attachments: &[],
+                    spill_dir: &crate::prepared_turn::resolve_user_input_spill_dir(Some(
+                        temporary.path(),
+                    )),
+                    conversation_id: Some("bounded-conversation"),
+                    turn_id: Some("oversized-steer"),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            let mut history = vec![
+                original_input
+                    .to_message()
+                    .map_err(|error| error.to_string())?,
+            ];
+            for index in 0..12 {
+                let later = format!("后续普通输入{index}：继续当前任务，不改Goal。");
+                store
+                    .record_run_steer(run_id, &format!("later-{index}"), &later)
+                    .map_err(|error| error.to_string())?;
+                history.push(Message::assistant("旧执行输出 ".repeat(2_000)));
+                history.push(Message::user(later));
+            }
+            drop(store);
+            let store = Arc::new(
+                TaskRuntimeStore::new_in_memory_with_shadow_root(
+                    temporary.path().join(".eko/tasks"),
+                )
+                .map_err(|error| error.to_string())?,
+            );
+            let state = store
+                .get_run_state(run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("原Run缺失")?;
+            assert_eq!(state.recent_constraints.len(), 8);
+            assert!(
+                state
+                    .recent_constraints
+                    .iter()
+                    .all(|steer| steer.turn_id != "oversized-steer")
+            );
+            let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
+            let _registration = registry.register(run_id, store.clone());
+            let config = crate::infra::tool_output_artifact_config(Some(temporary.path()));
+            let remote = Arc::new(UnreachableSshFiles(std::sync::atomic::AtomicUsize::new(0)));
+            let make_agent = |llm: Arc<echo_agent::testing::MockLlmClient>| {
+                ReactAgentBuilder::new()
+                    .enable_tools()
+                    .file_system(remote.clone())
+                    .auto_project_rules(false)
+                    .tool_output_artifacts(config.clone())
+                    .model("mock-model")
+                    .system_prompt("保留用户原文，按需读取历史")
+                    .llm_client(llm)
+                    .token_limit(8_000)
+                    .max_iterations(32)
+                    .build()
+                    .map_err(|error| error.to_string())
+            };
+            let invocation = AgentInvocationContext {
+                history: Some(history),
+                allowed_tools: Some(["read_artifact".to_string()].into_iter().collect()),
+                runtime: Some(echo_agent::tools::ExternalRunContext {
+                    conversation_id: Some("bounded-conversation".to_string()),
+                    run_id: Some(run_id.to_string()),
+                    turn_id: Some("continue-turn".to_string()),
+                    execution_id: Some("continue-turn".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let first_model = Arc::new(
+                echo_agent::testing::MockLlmClient::new().with_response("先找回原始输入。"),
+            );
+            let first_agent = make_agent(first_model.clone())?;
+            first_agent.set_pre_model_context_projector(Some(Arc::new(
+                TaskRuntimeContextProjector::new(registry.clone()),
+            )));
+            *first_agent.context().lock().await = ContextManager::builder(8_000)
+                .compressor(SlidingWindowCompressor::new(20).with_recent_token_budget(400))
+                .build();
+            let mut events = first_agent
+                .execute_stream_message_with_invocation_context(
+                    Message::user("继续".to_string()),
+                    CancellationToken::new(),
+                    invocation.clone(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut compressed = false;
+            while let Some(event) = events.next().await {
+                compressed |= matches!(
+                    event.map_err(|error| error.to_string())?,
+                    echo_agent::agent::AgentEvent::ContextCompressed { .. }
+                );
+            }
+            assert!(compressed, "必须通过真实压缩，不能只查询fixture里的原文");
+            let first_calls = first_model.all_calls();
+            assert_eq!(first_calls.len(), 1);
+            let first_request = first_calls.first().ok_or("实际主模型请求缺失")?;
+            let advertised = first_request
+                .iter()
+                .filter_map(|message| message.content.as_text_ref())
+                .find_map(|text| {
+                    text.split_once("[eko_original_input_history]")
+                        .map(|(_, reference)| reference)
+                });
+            assert!(
+                advertised.is_some(),
+                "十三条后的早期原文必须在真实主模型请求中有可发现入口；recent4不能替代完整来源"
+            );
+            let advertised = advertised.ok_or("实际模型没有原文历史入口")?;
+            let field = |name: &str| {
+                advertised
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix(name))
+                    .map(str::trim)
+            };
+            let path = std::path::PathBuf::from(field("path:").ok_or("模型可见原文路径缺失")?);
+            let sha256 = field("sha256:").ok_or("模型可见原文SHA缺失")?.to_string();
+            let bytes = field("bytes:")
+                .ok_or("模型可见原文大小缺失")?
+                .parse::<u64>()
+                .map_err(|error| error.to_string())?;
+            let reference = echo_agent::tools::artifact::ToolOutputArtifactRef {
+                path: path.clone(),
+                artifact_bytes: bytes,
+                payload_bytes: bytes,
+                sha256: sha256.clone(),
+                retention: config.retention.clone(),
+            };
+            // 只使用实际模型请求已经收到的引用；reader仅生成同文件的opaque cursor脚本。
+            let mut script = echo_agent::testing::MockLlmClient::new();
+            let mut cursor = None;
+            let mut expected_pages = Vec::new();
+            for ordinal in 0..31 {
+                let call_id = format!("raw-history-page-{ordinal}");
+                // cursor 是可省略的 string 字段；第一页省略它，不能发 JSON null。
+                let mut args = serde_json::json!({
+                    "path": path.clone(),
+                    "expected_sha256": sha256.clone(),
+                    "max_tokens": 2_000,
+                });
+                if let Some(cursor) = cursor.as_ref() {
+                    args.as_object_mut()
+                        .ok_or("原reader脚本参数不是对象")?
+                        .insert("cursor".to_string(), serde_json::json!(cursor));
+                }
+                script = script.then_tool_call(&call_id, "read_artifact", args.to_string());
+                let page = read_artifact_page(
+                    &config,
+                    &reference,
+                    cursor.as_deref(),
+                    ArtifactPageLimit::Tokens(2_000),
+                )
+                .map_err(|error| error.to_string())?;
+                let complete = page.complete;
+                let next = page.next_cursor.clone();
+                expected_pages.push((call_id, page));
+                if complete {
+                    break;
+                }
+                cursor = Some(next.ok_or("原reader缺下一页cursor")?);
+                if ordinal == 30 {
+                    return Err("同原32轮夹具不足完成原文分页".to_string());
+                }
+            }
+            let final_model = Arc::new(script.with_response("已按原文完成核对。"));
+            let final_agent = make_agent(final_model.clone())?;
+            final_agent.set_pre_model_context_projector(Some(Arc::new(
+                TaskRuntimeContextProjector::new(registry.clone()),
+            )));
+            *final_agent.context().lock().await = ContextManager::builder(8_000)
+                .compressor(SlidingWindowCompressor::new(20).with_recent_token_budget(400))
+                .build();
+            let mut events = final_agent
+                .execute_stream_message_with_invocation_context(
+                    Message::user("继续".to_string()),
+                    CancellationToken::new(),
+                    invocation,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut actual_read_calls = std::collections::HashMap::new();
+            let mut actual_read_results = std::collections::HashMap::new();
+            while let Some(event) = events.next().await {
+                match event.map_err(|error| error.to_string())? {
+                    echo_agent::agent::AgentEvent::ToolCall {
+                        call_id,
+                        invocation,
+                    } => {
+                        actual_read_calls.insert(call_id, invocation);
+                    }
+                    echo_agent::agent::AgentEvent::ToolResult {
+                        call_id,
+                        name,
+                        result,
+                    } => {
+                        actual_read_results.insert(call_id, (name, result));
+                    }
+                    _ => {}
+                }
+            }
+            let actual_calls = final_model.all_calls();
+            assert_eq!(actual_calls.len(), expected_pages.len().saturating_add(1));
+            assert!(
+                final_model
+                    .all_tool_counts()
+                    .iter()
+                    .all(|count| *count == 1)
+            );
+            let actual_source = verify_actual_model_artifact_pages(
+                &reference,
+                expected_pages,
+                &actual_calls,
+                &actual_read_calls,
+                &actual_read_results,
+            )?;
+            assert!(actual_source.contains(&original));
+            assert!(
+                actual_calls
+                    .iter()
+                    .any(|messages| messages.iter().any(|message| message
+                        .content
+                        .as_text_ref()
+                        .is_some_and(|text| text.contains("EARLY_ORIGINAL_TAIL_7461🧭"))))
+            );
+            let after = store
+                .get_run(run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("原Goal缺失")?;
+            assert_eq!(
+                (after.goal, after.goal_revision, after.goal_sha256),
+                (
+                    original_goal.goal,
+                    original_goal.goal_revision,
+                    original_goal.goal_sha256
+                )
+            );
+            if repetitions == 1 {
+                // 复用模型实际收到的配对ToolCall/Tool结果，不能从fixture文件补入全文。
+                let read_history = actual_calls
+                    .last()
+                    .cloned()
+                    .ok_or("原文读取后模型历史缺失")?;
+                for missing_page in [false, true] {
+                    let mut requested_history = read_history.clone();
+                    if missing_page {
+                        let position = requested_history
+                            .iter()
+                            .position(|message| message.role == echo_agent::llm::types::Role::Tool)
+                            .ok_or("缺页负控没有实际Tool页可移除")?;
+                        requested_history.remove(position);
+                    }
+                    let summary_model = Arc::new(
+                        echo_agent::testing::MockLlmClient::new()
+                            .with_response("按已读取原文总结。"),
+                    );
+                    let summary_agent = ReactAgentBuilder::new()
+                        .file_system(remote.clone())
+                        .auto_project_rules(false)
+                        .tool_output_artifacts(config.clone())
+                        .model("mock-model")
+                        .llm_client(summary_model.clone())
+                        .token_limit(8_000)
+                        .build()
+                        .map_err(|error| error.to_string())?;
+                    summary_agent.set_pre_model_context_projector(Some(Arc::new(
+                        TaskRuntimeContextProjector::new(registry.clone()),
+                    )));
+                    let summary_invocation = AgentInvocationContext {
+                        history: Some(requested_history),
+                        runtime: Some(echo_agent::tools::ExternalRunContext {
+                            conversation_id: Some("bounded-conversation".to_string()),
+                            run_id: Some(run_id.to_string()),
+                            turn_id: Some("summary-turn".to_string()),
+                            execution_id: Some("summary-turn".to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    };
+                    let mut rejected = false;
+                    match summary_agent
+                        .execute_stream_message_with_invocation_context(
+                            Message::user("总结已经读过的原文".to_string()),
+                            CancellationToken::new(),
+                            summary_invocation,
+                        )
+                        .await
+                    {
+                        Err(error) if missing_page => {
+                            rejected = error.to_string().contains("必要原文");
+                        }
+                        Err(error) => return Err(error.to_string()),
+                        Ok(mut events) => {
+                            while let Some(event) = events.next().await {
+                                match event {
+                                    Ok(echo_agent::agent::AgentEvent::Error {
+                                        failure, ..
+                                    }) if missing_page => {
+                                        rejected |= is_required_context_unavailable(&failure);
+                                    }
+                                    Err(error) if missing_page => {
+                                        rejected |= error.to_string().contains("必要原文");
+                                    }
+                                    other => {
+                                        other.map_err(|error| error.to_string())?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if missing_page {
+                        assert!(rejected, "实际Tool页不完整时不能把本地完整缓存冒模型已见");
+                        assert_eq!(summary_model.call_count(), 0);
+                        continue;
+                    }
+                    assert_eq!(
+                        summary_model.call_count(),
+                        1,
+                        "必要原文已由真实reader进入请求，NoTools总结不应重新要求reader"
+                    );
+                    assert!(
+                        summary_model
+                            .all_tool_counts()
+                            .iter()
+                            .all(|count| *count == 0)
+                    );
+                    assert!(
+                        summary_model
+                            .all_calls()
+                            .iter()
+                            .any(|messages| messages.iter().any(|message| message.role
+                                == echo_agent::llm::types::Role::Tool
+                                && message.content.as_text_ref().is_some_and(
+                                    |text| text.contains("EARLY_ORIGINAL_TAIL_7461🧭")
+                                )))
+                    );
+                }
+            }
+            assert_eq!(remote.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_steer_reference_reaches_actual_model_and_verified_reader()
+    -> Result<(), String> {
+        use echo_agent::agent::{
+            Agent, AgentEvent, AgentInvocationContext, CancellationToken, ReactAgentBuilder,
+        };
+        use echo_agent::compression::compressor::SlidingWindowCompressor;
+        use echo_agent::tools::ToolContext;
+        use echo_agent::tools::files::artifact::{ArtifactPageLimit, read_artifact_page};
+        use futures::StreamExt;
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let original = format!(
+            "{}独立尾部约束：禁止发布🚀",
+            "实际模型边界背景 ".repeat(12_000)
+        );
+        let root = temporary.path().join(".eko/tasks");
+        let store = seed_bounded_steer_run(&root, "actual-model-context", &original)?;
+        let original_state = store
+            .get_run_state("actual-model-context")
+            .map_err(|error| error.to_string())?
+            .ok_or("原 Run 缺失")?;
+        let original_steer = original_state
+            .recent_constraints
+            .first()
+            .ok_or("原约束缺失")?;
+        let before_reopen = store
+            .recorded_user_steer_artifact("actual-model-context", original_steer)
+            .map_err(|error| error.to_string())?;
+        drop(store);
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+                .map_err(|error| error.to_string())?,
+        );
+        let state = store
+            .get_run_state("actual-model-context")
+            .map_err(|error| error.to_string())?
+            .ok_or("冷恢复原文缺失")?;
+        let steer = state.recent_constraints.first().ok_or("原约束缺失")?;
+        let artifact = store
+            .recorded_user_steer_artifact("actual-model-context", steer)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(before_reopen.path, artifact.path);
+        assert_eq!(before_reopen.sha256, artifact.sha256);
+        let sha256 = artifact.sha256.clone().ok_or("原文摘要缺失")?;
+        let config = crate::infra::tool_output_artifact_config(Some(temporary.path()));
+        let input =
+            crate::prepared_turn::PreparedUserTurn::build(crate::prepared_turn::UserTurnInput {
+                text: &original,
+                attachments: &[],
+                spill_dir: &crate::prepared_turn::resolve_user_input_spill_dir(Some(
+                    temporary.path(),
+                )),
+                conversation_id: Some("bounded-conversation"),
+                turn_id: Some("original-message"),
+            })
+            .map_err(|error| error.to_string())?;
+        assert!(
+            !input.instruction.contains(&original),
+            "原长输入仍须经过 PreparedUserTurn spill"
+        );
+        let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
+        let _registration = registry.register("actual-model-context", store);
+        let llm =
+            Arc::new(echo_agent::testing::MockLlmClient::new().with_response("继续处理原要求。"));
+        let remote = Arc::new(UnreachableSshFiles(std::sync::atomic::AtomicUsize::new(0)));
+        let agent = ReactAgentBuilder::new()
+            .enable_tools()
+            .file_system(remote.clone())
+            .auto_project_rules(false)
+            .tool_output_artifacts(config.clone())
+            .model("mock-model")
+            .system_prompt("保留用户约束")
+            .llm_client(llm.clone())
+            .token_limit(8_000)
+            .max_iterations(2)
+            .build()
+            .map_err(|error| error.to_string())?;
+        agent.set_pre_model_context_projector(Some(Arc::new(TaskRuntimeContextProjector::new(
+            registry,
+        ))));
+        {
+            let mut context = agent.context().lock().await;
+            *context = ContextManager::builder(8_000)
+                .compressor(SlidingWindowCompressor::new(20).with_recent_token_budget(400))
+                .build();
+        }
+        let invocation = AgentInvocationContext {
+            // Execute 会先重置活动消息；同一历史必须沿原 invocation 在恢复后重放。
+            history: Some(vec![
+                Message::user("之前的任务".to_owned()),
+                Message::assistant("过期执行信息 ".repeat(12_000)),
+            ]),
+            allowed_tools: Some(["read_artifact".to_owned()].into_iter().collect()),
+            runtime: Some(echo_agent::tools::ExternalRunContext {
+                conversation_id: Some("bounded-conversation".to_owned()),
+                run_id: Some("actual-model-context".to_owned()),
+                turn_id: Some("model-turn".to_owned()),
+                execution_id: Some("model-turn".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut events = agent
+            .execute_stream_message_with_invocation_context(
+                input.to_message().map_err(|error| error.to_string())?,
+                CancellationToken::new(),
+                invocation,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut compressed = false;
+        while let Some(event) = events.next().await {
+            compressed |= matches!(
+                event.map_err(|error| error.to_string())?,
+                AgentEvent::ContextCompressed { .. }
+            );
+        }
+        assert!(compressed, "实际 Agent 必须观测到原压缩完成事件");
+        let requests = llm.all_calls();
+        assert_eq!(requests.len(), 1, "不得以未命中模型的零请求通过");
+        let actual = requests.first().ok_or("实际模型请求缺失")?;
+        let texts = actual
+            .iter()
+            .filter_map(|message| message.content.as_text())
+            .collect::<Vec<_>>();
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains(RUNTIME_RECOVERY_MARKER) && text.contains(&sha256))
+        );
+        assert!(!texts.iter().any(|text| text.contains(&original)));
+        assert!(agent.context().lock().await.token_estimate() <= 8_000);
+        // 独立走真实注册工具的读取实现与路径/SHA gate，不以内存字符串拼接互证。
+        let parameters = serde_json::from_value(serde_json::json!({
+            "path": artifact.path.clone(), "expected_sha256": sha256.clone(), "max_tokens": 256,
+        }))
+        .map_err(|error| error.to_string())?;
+        let tool = agent
+            .tool_manager()
+            .get_tool("read_artifact")
+            .ok_or("原注册目录缺少 read_artifact")?;
+        let tool_result = tool
+            .execute_with_context(
+                parameters,
+                &ToolContext {
+                    output_artifacts: Some(config.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(tool_result.success);
+        assert_eq!(tool_result.metadata.get("sha256"), Some(&sha256));
+        let reference = echo_agent::tools::artifact::ToolOutputArtifactRef {
+            path: artifact.path.clone(),
+            artifact_bytes: artifact.bytes,
+            payload_bytes: artifact.bytes,
+            sha256,
+            retention: config.retention.clone(),
+        };
+        let mut restored = String::new();
+        let mut cursor = None;
+        loop {
+            let page = read_artifact_page(
+                &config,
+                &reference,
+                cursor.as_deref(),
+                ArtifactPageLimit::Tokens(1_000),
+            )
+            .map_err(|error| error.to_string())?;
+            restored.push_str(&page.content);
+            if page.complete {
+                break;
+            }
+            cursor = Some(page.next_cursor.ok_or("原分页未给 cursor")?);
+        }
+        assert_eq!(restored, original);
+        assert!(restored.ends_with("独立尾部约束：禁止发布🚀"));
+        assert_eq!(
+            remote.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "真实原文分页读取必须留在 host 本机，不能转给 SSH 文件系统"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn user_updated_long_goal_reaches_real_model_via_host_reader_after_cold_reopen()
+    -> Result<(), String> {
+        use echo_agent::agent::{
+            Agent, AgentInvocationContext, CancellationToken, ReactAgentBuilder,
+        };
+        use echo_agent::tools::files::artifact::{ArtifactPageLimit, read_artifact_page};
+        use futures::StreamExt;
+        for continuation in [false, true] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let root = directory.path().join(".eko/tasks");
+            let run_id = "updated-long-goal-model";
+            let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+                .map_err(|error| error.to_string())?;
+            store
+                .create_run(
+                    run_id,
+                    &store.active_workspace_id(),
+                    "goal-conversation",
+                    "initial-turn",
+                    DomainProfile::General,
+                    "initial short goal",
+                    "agent_task_plan",
+                    AttendedMode::Attended,
+                )
+                .map_err(|error| error.to_string())?;
+            store
+                .configure_run_continuation(run_id, continuation, false, None, None)
+                .map_err(|error| error.to_string())?;
+            store
+                .transition_run(run_id, TaskRunStatus::Running)
+                .map_err(|error| error.to_string())?;
+            store
+                .transition_run(run_id, TaskRunStatus::Paused)
+                .map_err(|error| error.to_string())?;
+            let revised = format!(
+                "{}CURRENT_USER_GOAL_TAIL_9134🧭",
+                "current user goal detail ".repeat(if continuation { 600 } else { 25 })
+            );
+            assert!(revised.chars().count() > MAX_GOAL_CHARS);
+            assert_eq!(
+                revised.chars().count() > MAX_GOAL_CONTRACT_CHARS,
+                continuation
+            );
+            let user_goal = store
+                .update_run_goal(
+                    run_id,
+                    1,
+                    &revised,
+                    "用户显式长Goal",
+                    super::super::types::RunGoalActorSource::Gui,
+                )
+                .map_err(|error| error.to_string())?;
+            drop(store);
+            let store = Arc::new(
+                TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+                    .map_err(|error| error.to_string())?,
+            );
+            assert_eq!(
+                store
+                    .raw_input_history_reference(run_id, None)
+                    .map_err(|error| error.to_string())?
+                    .source_records,
+                0
+            );
+            let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
+            let _registration = registry.register(run_id, store.clone());
+            let config = crate::infra::tool_output_artifact_config(Some(directory.path()));
+            let remote = Arc::new(UnreachableSshFiles(std::sync::atomic::AtomicUsize::new(0)));
+            let make_agent = |llm: Arc<echo_agent::testing::MockLlmClient>| {
+                ReactAgentBuilder::new()
+                    .enable_tools()
+                    .file_system(remote.clone())
+                    .auto_project_rules(false)
+                    .tool_output_artifacts(config.clone())
+                    .model("mock-model")
+                    .system_prompt("按用户当前Goal读取原文并核对")
+                    .llm_client(llm)
+                    .token_limit(8_000)
+                    .max_iterations(32)
+                    .build()
+                    .map_err(|error| error.to_string())
+            };
+            let invocation = AgentInvocationContext {
+                history: Some(vec![Message::assistant("过期执行输出 ".repeat(12_000))]),
+                allowed_tools: Some(["read_artifact".to_string()].into_iter().collect()),
+                runtime: Some(echo_agent::tools::ExternalRunContext {
+                    run_id: Some(run_id.to_string()),
+                    conversation_id: Some("goal-conversation".to_string()),
+                    turn_id: Some("inspect-goal".to_string()),
+                    execution_id: Some("inspect-goal".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let blocked_model = Arc::new(
+                echo_agent::testing::MockLlmClient::new().with_response("不应调用缺reader的模型"),
+            );
+            let blocked = make_agent(blocked_model.clone())?;
+            blocked.set_pre_model_context_projector(Some(Arc::new(
+                TaskRuntimeContextProjector::new(registry.clone()),
+            )));
+            *blocked.context().lock().await = ContextManager::builder(8_000)
+                .compressor(
+                    echo_agent::compression::compressor::SlidingWindowCompressor::new(20)
+                        .with_recent_token_budget(400),
+                )
+                .build();
+            let mut narrow = invocation.clone();
+            narrow.allowed_tools = Some(["read_file".to_string()].into_iter().collect());
+            let mut rejected = false;
+            match blocked
+                .execute_stream_message_with_invocation_context(
+                    Message::user("继续".to_string()),
+                    CancellationToken::new(),
+                    narrow,
+                )
+                .await
+            {
+                Err(error) => rejected = error.to_string().contains("必要原文"),
+                Ok(mut events) => {
+                    while let Some(event) = events.next().await {
+                        match event {
+                            Ok(echo_agent::agent::AgentEvent::Error { failure, .. }) => {
+                                rejected |= is_required_context_unavailable(&failure)
+                            }
+                            Err(error) => rejected |= error.to_string().contains("必要原文"),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            assert!(rejected, "长Goal必要原文不能用远端read_file替代host reader");
+            assert_eq!(blocked_model.call_count(), 0);
+            assert_eq!(remote.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+            let first = Arc::new(
+                echo_agent::testing::MockLlmClient::new().with_response("先读取当前Goal全文。"),
+            );
+            let probe = make_agent(first.clone())?;
+            probe.set_pre_model_context_projector(Some(Arc::new(
+                TaskRuntimeContextProjector::new(registry.clone()),
+            )));
+            *probe.context().lock().await = ContextManager::builder(8_000)
+                .compressor(
+                    echo_agent::compression::compressor::SlidingWindowCompressor::new(20)
+                        .with_recent_token_budget(400),
+                )
+                .build();
+            let mut events = probe
+                .execute_stream_message_with_invocation_context(
+                    Message::user("继续".to_string()),
+                    CancellationToken::new(),
+                    invocation.clone(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut compressed = false;
+            while let Some(event) = events.next().await {
+                compressed |= matches!(
+                    event.map_err(|error| error.to_string())?,
+                    echo_agent::agent::AgentEvent::ContextCompressed { .. }
+                );
+            }
+            assert!(compressed);
+            let calls = first.all_calls();
+            assert_eq!(calls.len(), 1);
+            let messages = calls.first().ok_or("实际Goal模型请求缺失")?;
+            let round_review_contracts = messages
+                .iter()
+                .filter(|message| {
+                    message.content.as_text_ref().is_some_and(|text| {
+                        text.contains(RUNTIME_GOAL_MARKER)
+                            && text.contains("which Goal obligation this turn advanced")
+                            && text.contains("read-only for you")
+                    })
+                })
+                .count();
+            if continuation {
+                assert_eq!(
+                    round_review_contracts, 1,
+                    "启用continuation的首轮真实请求必须带共享Goal和轮次收尾要求"
+                );
+            } else {
+                assert_eq!(
+                    round_review_contracts, 0,
+                    "未启用continuation的普通聊天不得套用固定轮次总结模板"
+                );
+                assert!(
+                    !messages
+                        .iter()
+                        .any(|message| message.content.as_text_ref().is_some_and(
+                            |text| text.contains("which Goal obligation this turn advanced")
+                        )),
+                    "普通聊天请求里不能残留轮次收尾模板"
+                );
+            }
+            assert!(
+                !messages.iter().any(|message| message
+                    .content
+                    .as_text_ref()
+                    .is_some_and(|text| text.contains("CURRENT_USER_GOAL_TAIL_9134🧭"))),
+                "尾部只能经真实host reader进入模型，不能预先重送当前消息"
+            );
+            let encoded = messages
+                .iter()
+                .filter_map(|message| message.content.as_text_ref())
+                .find_map(|text| {
+                    text.split_once(CANONICAL_GOAL_REFERENCE_MARKER)
+                        .and_then(|(_, block)| {
+                            block
+                                .lines()
+                                .find_map(|line| line.strip_prefix("reference: "))
+                        })
+                })
+                .ok_or("实际模型缺当前Goal可读ref")?;
+            let reference: super::super::store::CanonicalGoalReference =
+                serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+            assert_eq!(reference.goal_revision, 2);
+            assert_eq!(reference.goal_sha256, user_goal.goal_sha256);
+            // macOS 上 tempdir 可能是 /var 而物化路径已解析为 /private/var，
+            // 比较 canonical 根而不是原始前缀，避免把真实落点误判成越界。
+            let artifacts_root = std::fs::canonicalize(directory.path().join(".eko/artifacts"))
+                .map_err(|error| error.to_string())?;
+            assert!(
+                reference.artifact.path.starts_with(&artifacts_root),
+                "当前Goal原文必须落在本Run的host artifacts下: {:?}",
+                reference.artifact.path
+            );
+            let descriptor = echo_agent::tools::artifact::ToolOutputArtifactRef {
+                path: reference.artifact.path.clone(),
+                artifact_bytes: reference.artifact.bytes,
+                payload_bytes: reference.artifact.bytes,
+                sha256: reference.goal_sha256.clone(),
+                retention: config.retention.clone(),
+            };
+            let mut script = echo_agent::testing::MockLlmClient::new();
+            let mut cursor = None;
+            let mut pages = Vec::new();
+            for ordinal in 0..31 {
+                let call = format!("canonical-goal-page-{ordinal}");
+                let mut args = serde_json::json!({
+                    "path": descriptor.path.clone(),
+                    "expected_sha256": descriptor.sha256.clone(),
+                    "max_tokens": 2_000,
+                });
+                if let Some(cursor) = cursor.as_ref() {
+                    args.as_object_mut()
+                        .ok_or_else(|| "reader script args not object".to_string())?
+                        .insert("cursor".to_string(), serde_json::json!(cursor));
+                }
+                script = script.then_tool_call(&call, "read_artifact", args.to_string());
+                let page = read_artifact_page(
+                    &config,
+                    &descriptor,
+                    cursor.as_deref(),
+                    ArtifactPageLimit::Tokens(2_000),
+                )
+                .map_err(|error| error.to_string())?;
+                let complete = page.complete;
+                let next = page.next_cursor.clone();
+                pages.push((call, page));
+                if complete {
+                    break;
+                }
+                cursor = Some(next.ok_or("Goal原文页缺cursor")?);
+                if ordinal == 30 {
+                    return Err("原32轮夹具无法完成Goal原文分页".to_string());
+                }
+            }
+            let model = Arc::new(script.with_response("已读到当前用户Goal尾部。"));
+            let agent = make_agent(model.clone())?;
+            agent.set_pre_model_context_projector(Some(Arc::new(
+                TaskRuntimeContextProjector::new(registry),
+            )));
+            *agent.context().lock().await = ContextManager::builder(8_000)
+                .compressor(
+                    echo_agent::compression::compressor::SlidingWindowCompressor::new(20)
+                        .with_recent_token_budget(400),
+                )
+                .build();
+            let mut events = agent
+                .execute_stream_message_with_invocation_context(
+                    Message::user("继续".to_string()),
+                    CancellationToken::new(),
+                    invocation,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut actual_read_calls = std::collections::HashMap::new();
+            let mut actual_read_results = std::collections::HashMap::new();
+            while let Some(event) = events.next().await {
+                match event.map_err(|error| error.to_string())? {
+                    echo_agent::agent::AgentEvent::ToolCall {
+                        call_id,
+                        invocation,
+                    } => {
+                        actual_read_calls.insert(call_id, invocation);
+                    }
+                    echo_agent::agent::AgentEvent::ToolResult {
+                        call_id,
+                        name,
+                        result,
+                    } => {
+                        actual_read_results.insert(call_id, (name, result));
+                    }
+                    _ => {}
+                }
+            }
+            let actual_calls = model.all_calls();
+            assert_eq!(actual_calls.len(), pages.len().saturating_add(1));
+            let actual_goal = verify_actual_model_artifact_pages(
+                &descriptor,
+                pages,
+                &actual_calls,
+                &actual_read_calls,
+                &actual_read_results,
+            )?;
+            assert_eq!(actual_goal, revised);
+            assert!(
+                actual_calls
+                    .iter()
+                    .any(|messages| messages.iter().any(|message| message
+                        .content
+                        .as_text_ref()
+                        .is_some_and(|text| text.contains("CURRENT_USER_GOAL_TAIL_9134🧭"))))
+            );
+            assert_eq!(remote.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+            let after = store
+                .get_run(run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("原Goal缺失")?;
+            assert_eq!(
+                (after.goal, after.goal_revision, after.goal_sha256),
+                (
+                    user_goal.goal,
+                    user_goal.goal_revision,
+                    user_goal.goal_sha256
+                )
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn short_user_goal_and_inline_input_do_not_require_a_reader_in_narrow_scopes()
+    -> Result<(), String> {
+        use echo_agent::agent::{
+            Agent, AgentInvocationContext, CancellationToken, ReactAgentBuilder,
+        };
+        use futures::StreamExt;
+        for inline_middle in [false, true] {
+            for (reader_only, continuation) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let initial = if inline_middle {
+                    format!(
+                        "{}CURRENT_INLINE_MIDDLE_TAIL_6321🧭",
+                        "当前用户完整内联文本 ".repeat(45)
+                    )
+                } else {
+                    "最初短Goal".to_string()
+                };
+                if inline_middle {
+                    assert!(initial.chars().count() > crate::prepared_turn::PREVIEW_CHARS);
+                    assert!(initial.chars().count() < MAX_GOAL_CONTRACT_CHARS);
+                }
+                let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+                let root = directory.path().join(".eko/tasks");
+                let store = Arc::new(
+                    TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+                        .map_err(|error| error.to_string())?,
+                );
+                let address = crate::conversation_input::ConversationInputAddress {
+                    workspace_id: store.active_workspace_id(),
+                    conversation_id: "short-goal-conversation".to_string(),
+                };
+                let payload = crate::conversation_input::ConversationInputPayload::new(
+                    initial.clone(),
+                    Vec::new(),
+                )
+                .map_err(|error| error.to_string())?;
+                let input = super::super::types::RunInputSnapshot {
+                    source: crate::conversation_input::ConversationInputSource::Gui,
+                    identity: crate::conversation_input::ConversationInputIdentity {
+                        address,
+                        input_id: "short-goal-source".to_string(),
+                        revision: 1,
+                        payload_sha256: payload.payload_sha256.clone(),
+                    },
+                    payload,
+                };
+                store
+                    .create_run_for_active_workspace_with_source(
+                        "short-goal-run",
+                        "short-goal-conversation",
+                        "initial-turn",
+                        DomainProfile::General,
+                        &initial,
+                        "agent_task_plan",
+                        AttendedMode::Attended,
+                        super::super::types::TaskRunExecutionProfile::conversation_turn(),
+                        None,
+                        &input,
+                    )
+                    .map_err(|error| error.to_string())?;
+                store
+                    .configure_run_continuation("short-goal-run", continuation, false, None, None)
+                    .map_err(|error| error.to_string())?;
+                store
+                    .transition_run("short-goal-run", TaskRunStatus::Running)
+                    .map_err(|error| error.to_string())?;
+                store
+                    .transition_run("short-goal-run", TaskRunStatus::Paused)
+                    .map_err(|error| error.to_string())?;
+                let user_goal = if inline_middle {
+                    store
+                        .get_run("short-goal-run")
+                        .map_err(|error| error.to_string())?
+                        .ok_or("初始Goal缺失")?
+                } else {
+                    store
+                        .update_run_goal(
+                            "short-goal-run",
+                            1,
+                            "用户当前短Goal",
+                            "用户修改",
+                            super::super::types::RunGoalActorSource::Gui,
+                        )
+                        .map_err(|error| error.to_string())?
+                };
+                if !inline_middle || continuation {
+                    assert!(
+                        store
+                            .canonical_goal_reference("short-goal-run")
+                            .map_err(|error| error.to_string())?
+                            .is_none()
+                    );
+                }
+                let current = if inline_middle {
+                    let prepared = crate::prepared_turn::PreparedUserTurn::build(
+                        crate::prepared_turn::UserTurnInput {
+                            text: &initial,
+                            attachments: &[],
+                            spill_dir: &directory.path().join(".eko/artifacts/user-input"),
+                            conversation_id: Some("short-goal-conversation"),
+                            turn_id: Some("short-goal-turn"),
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                    assert!(
+                        prepared.resources.is_empty(),
+                        "中段文本必须沿真实PreparedUserTurn内联，而非借fixture补源"
+                    );
+                    prepared.to_message().map_err(|error| error.to_string())?
+                } else {
+                    Message::user("继续".to_string())
+                };
+                let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
+                let _registration = registry.register("short-goal-run", store.clone());
+                let model = Arc::new(
+                    echo_agent::testing::MockLlmClient::new().with_response("按当前短Goal继续。"),
+                );
+                let remote = Arc::new(UnreachableSshFiles(std::sync::atomic::AtomicUsize::new(0)));
+                let builder = ReactAgentBuilder::new()
+                    .model("mock-model")
+                    .auto_project_rules(false)
+                    .file_system(remote.clone())
+                    .tool_output_artifacts(crate::infra::tool_output_artifact_config(Some(
+                        directory.path(),
+                    )))
+                    .llm_client(model.clone())
+                    .token_limit(8_000);
+                let agent = if reader_only {
+                    builder.enable_tools().build()
+                } else {
+                    builder.build()
+                }
+                .map_err(|error| error.to_string())?;
+                agent.set_pre_model_context_projector(Some(Arc::new(
+                    TaskRuntimeContextProjector::new(registry),
+                )));
+                let invocation = AgentInvocationContext {
+                    allowed_tools: reader_only
+                        .then(|| ["read_file".to_string()].into_iter().collect()),
+                    runtime: Some(echo_agent::tools::ExternalRunContext {
+                        run_id: Some("short-goal-run".to_string()),
+                        conversation_id: Some("short-goal-conversation".to_string()),
+                        turn_id: Some("short-goal-turn".to_string()),
+                        execution_id: Some("short-goal-turn".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let mut events = agent
+                    .execute_stream_message_with_invocation_context(
+                        current,
+                        CancellationToken::new(),
+                        invocation,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                while let Some(event) = events.next().await {
+                    event.map_err(|error| error.to_string())?;
+                }
+                assert_eq!(
+                    model.call_count(),
+                    1,
+                    "必要源已完整内联，不应因派生历史新增reader门控"
+                );
+                assert!(
+                    model
+                        .all_tool_counts()
+                        .iter()
+                        .all(|count| *count == usize::from(reader_only))
+                );
+                if inline_middle {
+                    assert!(
+                        model.all_calls().iter().all(|messages| messages
+                            .iter()
+                            .any(|message| message.role == echo_agent::llm::types::Role::User
+                                && message.content.as_text_ref() == Some(initial.as_str()))),
+                        "当前实际请求须含完整中段文本及尾部，不能只认capsule预览或本地缓存"
+                    );
+                }
+                assert_eq!(remote.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+                let after = store
+                    .get_run("short-goal-run")
+                    .map_err(|error| error.to_string())?
+                    .ok_or("短Goal缺失")?;
+                assert_eq!(
+                    (after.goal, after.goal_revision, after.goal_sha256),
+                    (
+                        user_goal.goal,
+                        user_goal.goal_revision,
+                        user_goal.goal_sha256
+                    )
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_steer_missing_or_changed_cache_recovers_only_from_journal() -> Result<(), String> {
+        use echo_agent::tools::files::artifact::{ArtifactPageLimit, read_artifact_page};
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let original = format!("{}尾部义务仍在", "缓存缺失恢复 ".repeat(12_000));
+        let store = seed_bounded_steer_run(
+            &temporary.path().join(".eko/tasks"),
+            "cache-recovery",
+            &original,
+        )?;
+        let state = store
+            .get_run_state("cache-recovery")
+            .map_err(|error| error.to_string())?
+            .ok_or("Run 缺失")?;
+        let steer = state.recent_constraints.first().ok_or("原文缺失")?;
+        let first = store
+            .recorded_user_steer_artifact("cache-recovery", steer)
+            .map_err(|error| error.to_string())?;
+        let second = store
+            .recorded_user_steer_artifact("cache-recovery", steer)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(first.path, second.path);
+        assert_eq!(first.sha256, second.sha256);
+        let config = crate::infra::tool_output_artifact_config(Some(temporary.path()));
+        let reference = echo_agent::tools::artifact::ToolOutputArtifactRef {
+            path: first.path.clone(),
+            artifact_bytes: first.bytes,
+            payload_bytes: first.bytes,
+            sha256: first.sha256.clone().ok_or("hash 缺失")?,
+            retention: config.retention.clone(),
+        };
+        std::fs::write(&first.path, "已变更的缓存").map_err(|error| error.to_string())?;
+        assert!(
+            read_artifact_page(&config, &reference, None, ArtifactPageLimit::Tokens(256)).is_err()
+        );
+        let capsule =
+            build_runtime_recovery_capsule(&store, "cache-recovery").ok_or("capsule 缺失")?;
+        assert_eq!(
+            std::fs::read_to_string(&first.path).map_err(|error| error.to_string())?,
+            original
+        );
+        assert!(capsule.contains(&reference.sha256));
+        std::fs::remove_file(&first.path).map_err(|error| error.to_string())?;
+        let missing =
+            build_runtime_recovery_capsule(&store, "cache-recovery").ok_or("capsule 缺失")?;
+        assert!(missing.contains(&reference.sha256));
+        assert_eq!(
+            std::fs::read_to_string(&first.path).map_err(|error| error.to_string())?,
+            original
+        );
+        std::fs::remove_file(&first.path).map_err(|error| error.to_string())?;
+        let directory = first.path.parent().ok_or("原目录缺失")?;
+        std::fs::remove_dir(directory).map_err(|error| error.to_string())?;
+        std::fs::write(directory, "阻断原 artifact 目录").map_err(|error| error.to_string())?;
+        assert!(build_runtime_recovery_capsule_checked(&store, "cache-recovery").is_err());
+        let still_original = store
+            .get_run_state("cache-recovery")
+            .map_err(|error| error.to_string())?
+            .ok_or("journal 丢失")?;
+        assert_eq!(
+            still_original
+                .recent_constraints
+                .first()
+                .map(|steer| steer.text.as_str()),
+            Some(original.as_str())
+        );
+        Ok(())
+    }
+
+    struct ConstraintFailureProbe(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl echo_agent::tools::Tool for ConstraintFailureProbe {
+        fn name(&self) -> &str {
+            "after_missing_constraint_probe"
+        }
+        fn description(&self) -> &str {
+            "确认必要上下文错误后未进入后续工具"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{}})
+        }
+        fn execute<'a>(
+            &'a self,
+            _: echo_agent::tools::ToolParameters,
+        ) -> BoxFuture<'a, echo_agent::error::Result<echo_agent::tools::ToolResult>> {
+            Box::pin(async move {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(echo_agent::tools::ToolResult::success("此工具不应执行"))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_steer_materialization_failure_blocks_actual_model() -> Result<(), String> {
+        use echo_agent::agent::{
+            Agent, AgentEvent, AgentInvocationContext, CancellationToken, ReactAgentBuilder,
+        };
+        use futures::StreamExt;
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let original = format!("{}尾部仍是必须遵守的限制", "物化失败背景 ".repeat(12_000));
+        let store = Arc::new(seed_bounded_steer_run(
+            &temporary.path().join(".eko/tasks"),
+            "blocked-model",
+            &original,
+        )?);
+        std::fs::write(temporary.path().join(".eko/artifacts"), "阻断原文缓存目录")
+            .map_err(|error| error.to_string())?;
+        let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
+        let _registration = registry.register("blocked-model", store.clone());
+        let llm = Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .then_tool_call("after-failure", "after_missing_constraint_probe", "{}")
+                .with_response("此回答不得到达模型。"),
+        );
+        let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent = ReactAgentBuilder::new()
+            .model("mock-model")
+            .llm_client(llm.clone())
+            .tool(Box::new(ConstraintFailureProbe(tool_calls.clone())))
+            .token_limit(8_000)
+            .build()
+            .map_err(|error| error.to_string())?;
+        // 使用生产组合 projector，避免只给直接 TaskRuntime helper 上 strict 而漏实际包装。
+        agent.set_pre_model_context_projector(Some(Arc::new(
+            crate::turn_context::EkoContextProjector::new(
+                registry,
+                Arc::new(crate::turn_context::TurnPromptContextRegistry::new()),
+            ),
+        )));
+        let invocation = AgentInvocationContext {
+            runtime: Some(echo_agent::tools::ExternalRunContext {
+                run_id: Some("blocked-model".to_owned()),
+                turn_id: Some("blocked-turn".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let result = agent
+            .execute_stream_message_with_invocation_context(
+                Message::user("继续原任务".to_owned()),
+                CancellationToken::new(),
+                invocation,
+            )
+            .await;
+        let mut failed = false;
+        match result {
+            Err(error) => {
+                failed = error.to_string().contains("用户约束原文");
+            }
+            Ok(mut stream) => {
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Err(error) => failed |= error.to_string().contains("用户约束原文"),
+                        Ok(AgentEvent::Error { failure, .. }) => {
+                            failed |= is_required_context_unavailable(&failure)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(failed, "必须沿原失败通道报告原文引用错误");
+        assert_eq!(llm.call_count(), 0, "不能在缺约束时仅告警后继续模型");
+        assert_eq!(
+            tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "模型脚本明确安排的真实注册探针工具不得执行"
+        );
+        let state = store
+            .get_run_state("blocked-model")
+            .map_err(|error| error.to_string())?
+            .ok_or("journal 缺失")?;
+        assert_eq!(
+            state
+                .recent_constraints
+                .first()
+                .map(|steer| steer.text.as_str()),
+            Some(original.as_str())
+        );
+        Ok(())
+    }
+
+    type FinalToolObservations = Arc<std::sync::Mutex<Vec<Vec<String>>>>;
+
+    struct ActualRequestAudit {
+        inner: crate::turn_context::EkoContextProjector,
+        tools: FinalToolObservations,
+    }
+
+    impl PreModelContextProjector for ActualRequestAudit {
+        fn is_required(&self) -> bool {
+            self.inner.is_required()
+        }
+        fn project<'a>(
+            &'a self,
+            context: &'a ProjectionContext,
+        ) -> BoxFuture<'a, AgentResult<Vec<ContextProjection>>> {
+            self.inner.project(context)
+        }
+        fn validate_model_request<'a>(
+            &'a self,
+            context: &'a ProjectionContext,
+            request: &'a echo_agent::llm::ChatRequest,
+            artifacts: Option<&'a echo_agent::tools::artifact::ToolOutputArtifactConfig>,
+        ) -> BoxFuture<'a, AgentResult<()>> {
+            Box::pin(async move {
+                let mut names = request
+                    .tools
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|tool| tool.function.name.clone())
+                    .collect::<Vec<_>>();
+                names.sort_unstable();
+                self.tools
+                    .lock()
+                    .map_err(|_| {
+                        echo_agent::error::ReactError::Other("最终工具观察锁不可用".to_owned())
+                    })?
+                    .push(names);
+                self.inner
+                    .validate_model_request(context, request, artifacts)
+                    .await
+            })
+        }
+    }
+
+    fn seed_primary_context_run(
+        root: &std::path::Path,
+        run_id: &str,
+        text: &str,
+        allowed: &[&str],
+    ) -> Result<Arc<TaskRuntimeStore>, String> {
+        let store = Arc::new(seed_bounded_steer_run(root, run_id, text)?);
+        store
+            .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+                plan_id: format!("plan-{run_id}"),
+                run_id: run_id.to_owned(),
+                revision: 1,
+                domain_profile: DomainProfile::General,
+                goal_revision: 1,
+                goal_sha256: super::super::task_goal_sha256("保留原要求并继续当前任务"),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::Sequential,
+                tasks: vec![PlanTask {
+                    id: "primary-verification".to_owned(),
+                    title: "核对真实 primary verification 恢复".to_owned(),
+                    description: "遵守完整用户约束并报告验证结果".to_owned(),
+                    kind: PlanTaskKind::Verification,
+                    agent_role: "primary".to_owned(),
+                    allowed_tools: allowed.iter().map(|name| (*name).to_owned()).collect(),
+                    ..Default::default()
+                }],
+            })
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run(run_id, TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        Ok(store)
+    }
+
+    async fn primary_context_agent(
+        registry: Arc<TaskRuntimeProjectionRegistry>,
+        config: echo_agent::tools::artifact::ToolOutputArtifactConfig,
+        llm: Arc<dyn echo_agent::llm::LlmClient>,
+        remote: Arc<UnreachableSshFiles>,
+        observed: FinalToolObservations,
+        probe_calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Result<crate::agent_handle::AgentHandle, String> {
+        let agent = echo_agent::agent::ReactAgentBuilder::new()
+            .model("mock-model")
+            .enable_tools()
+            .file_system(remote)
+            .auto_project_rules(false)
+            .tool_output_artifacts(config)
+            .llm_client(llm)
+            .token_limit(8_000)
+            .max_iterations(32)
+            .tool(Box::new(ConstraintFailureProbe(probe_calls)))
+            .build()
+            .map_err(|error| error.to_string())?;
+        assert!(
+            agent
+                .tool_names()
+                .iter()
+                .any(|name| name == "read_artifact")
+        );
+        assert!(agent.tool_names().iter().any(|name| name == "read_file"));
+        *agent.context().lock().await = ContextManager::builder(8_000)
+            .compressor(
+                echo_agent::compression::compressor::SlidingWindowCompressor::new(20)
+                    .with_recent_token_budget(400),
+            )
+            .build();
+        agent.set_pre_model_context_projector(Some(Arc::new(ActualRequestAudit {
+            inner: crate::turn_context::EkoContextProjector::new(
+                registry,
+                Arc::new(crate::turn_context::TurnPromptContextRegistry::new()),
+            ),
+            tools: observed,
+        })));
+        Ok(crate::agent_handle::AgentHandle::new(agent))
+    }
+
+    async fn execute_primary_context_run(
+        store: Arc<TaskRuntimeStore>,
+        run_id: &str,
+        agent: crate::agent_handle::AgentHandle,
+    ) -> Result<super::super::executor::RunOutcome, String> {
+        let cancel = echo_agent::agent::CancellationToken::new();
+        let owner = store
+            .register_run_cancellation(run_id, cancel.clone())
+            .map_err(|error| error.to_string())?;
+        let outcome = super::super::executor::execute_run(
+            store.clone(),
+            Some(agent),
+            None,
+            None,
+            None,
+            None,
+            run_id,
+            cancel,
+            super::super::memory_bridge::MemoryPolicy::None,
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string());
+        drop(owner);
+        store.wait_for_run_driver_idle(run_id).await;
+        outcome
+    }
+
+    #[tokio::test]
+    async fn primary_required_context_failure_pauses_then_real_resume_reads_full_source()
+    -> Result<(), String> {
+        use echo_agent::tools::files::artifact::{ArtifactPageLimit, read_artifact_page};
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let original = format!(
+            "{}FULL_REQUIREMENT_TAIL_6509🚀",
+            "持续约束背景 ".repeat(2_000)
+        );
+        let run_id = "primary-context-recovery";
+        let store = seed_primary_context_run(
+            &temporary.path().join(".eko/tasks"),
+            run_id,
+            &original,
+            &["read_artifact", "after_missing_constraint_probe"],
+        )?;
+        let _resources = store.test_resource_scope();
+        let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
+        let _registration = registry.register(run_id, store.clone());
+        let config = crate::infra::tool_output_artifact_config(Some(temporary.path()));
+        let artifact_root = temporary.path().join(".eko/artifacts");
+        std::fs::write(&artifact_root, "阻止本机原文缓存物化")
+            .map_err(|error| error.to_string())?;
+        let first_model = Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .then_tool_call("after-failure", "after_missing_constraint_probe", "{}")
+                .with_response("不应到达模型"),
+        );
+        let remote = Arc::new(UnreachableSshFiles(std::sync::atomic::AtomicUsize::new(0)));
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_agent = primary_context_agent(
+            registry.clone(),
+            config.clone(),
+            first_model.clone(),
+            remote.clone(),
+            observed.clone(),
+            probe_calls.clone(),
+        )
+        .await?;
+        let result = execute_primary_context_run(store.clone(), run_id, first_agent).await?;
+        assert!(matches!(
+            result,
+            super::super::executor::RunOutcome::Paused { .. }
+        ));
+        assert_eq!(first_model.call_count(), 0);
+        assert_eq!(probe_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let paused = store
+            .get_run_state(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("暂停 Run 缺失")?;
+        assert_eq!(paused.run.status, TaskRunStatus::Paused);
+        let paused_plan = store
+            .get_plan(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("暂停计划缺失")?;
+        let task = paused_plan.tasks.first().ok_or("暂停任务缺失")?;
+        assert!(matches!(
+            task.status,
+            echo_agent::tasks::TaskStatus::Paused(_)
+        ));
+        assert_eq!(task.retry_count, 0);
+        let stale = super::super::types::TaskRunResumeIdentity::capture(&paused);
+        store
+            .record_run_steer(run_id, "after-pause", "继续保持原工具范围")
+            .map_err(|error| error.to_string())?;
+        assert!(
+            store.resume_task_run_expected(&stale).is_err(),
+            "原版本重读必须拒绝旧恢复身份"
+        );
+        std::fs::remove_file(&artifact_root).map_err(|error| error.to_string())?;
+        let current = store
+            .get_run_state(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("当前 Run 缺失")?;
+        let steer = current
+            .recent_constraints
+            .iter()
+            .find(|steer| steer.turn_id == "oversized-steer")
+            .ok_or("原约束缺失")?;
+        let artifact = store
+            .recorded_user_steer_artifact(run_id, steer)
+            .map_err(|error| error.to_string())?;
+        let reference = echo_agent::tools::artifact::ToolOutputArtifactRef {
+            path: artifact.path.clone(),
+            artifact_bytes: artifact.bytes,
+            payload_bytes: artifact.bytes,
+            sha256: artifact.sha256.clone().ok_or("原文 hash 缺失")?,
+            retention: config.retention.clone(),
+        };
+        // 用真实 reader 生成同文件快照的 cursor fixture；实际消费仍由原模型/工具 pipeline 完成。
+        let mut script = echo_agent::testing::MockLlmClient::new();
+        let mut cursor = None;
+        for ordinal in 0..32 {
+            let mut parameters = serde_json::json!({
+                "path": artifact.path.clone(),
+                "expected_sha256": reference.sha256.clone(),
+                "max_tokens": 2_000,
+            });
+            if let Some(cursor) = cursor.as_ref() {
+                parameters
+                    .as_object_mut()
+                    .ok_or("原reader参数不是对象")?
+                    .insert("cursor".to_string(), serde_json::json!(cursor));
+            }
+            script = script.then_tool_call(
+                format!("source-page-{ordinal}"),
+                "read_artifact",
+                parameters.to_string(),
+            );
+            let page = read_artifact_page(
+                &config,
+                &reference,
+                cursor.as_deref(),
+                ArtifactPageLimit::Tokens(2_000),
+            )
+            .map_err(|error| error.to_string())?;
+            if page.complete {
+                break;
+            }
+            cursor = Some(page.next_cursor.ok_or("原 reader 未给下一页")?);
+            if ordinal == 31 {
+                return Err("原文分页 fixture 超出本测试预期范围".to_owned());
+            }
+        }
+        let resumed_model = Arc::new(script.with_response("已读取完整约束并完成验证。"));
+        let resumed_agent = primary_context_agent(
+            registry,
+            config,
+            resumed_model.clone(),
+            remote.clone(),
+            observed.clone(),
+            probe_calls,
+        )
+        .await?;
+        let expected = super::super::types::TaskRunResumeIdentity::capture(&current);
+        let launch = super::super::executor::launch_task_run_resume(
+            store.clone(),
+            expected,
+            resumed_agent,
+            None,
+            None,
+            None,
+            echo_agent::agent::CancellationToken::new(),
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let recovered = launch.wait().await.map_err(|error| error.to_string())?;
+        store.wait_for_run_driver_idle(run_id).await;
+        assert!(
+            matches!(&recovered, super::super::executor::RunOutcome::Completed),
+            "原真实恢复未完成：{recovered:?}"
+        );
+        assert_eq!(
+            store
+                .get_run(run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("Run 缺失")?
+                .status,
+            TaskRunStatus::Completed
+        );
+        let final_plan = store
+            .get_plan(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("计划缺失")?;
+        assert_eq!(final_plan.tasks.first().ok_or("任务缺失")?.retry_count, 0);
+        assert!(
+            resumed_model
+                .all_calls()
+                .iter()
+                .any(|messages| messages.iter().any(|message| {
+                    message
+                        .content
+                        .as_text_ref()
+                        .is_some_and(|text| text.contains("FULL_REQUIREMENT_TAIL_6509🚀"))
+                })),
+            "完整尾部必须真正进入原模型 API，不能仅用 helper 回读互证"
+        );
+        assert!(
+            observed
+                .lock()
+                .map_err(|_| "观察锁不可用")?
+                .iter()
+                .all(|names| names == &["read_artifact".to_owned()])
+        );
+        assert_eq!(remote.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn primary_required_source_with_ssh_read_file_only_pauses_without_widening_scope()
+    -> Result<(), String> {
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let original = format!(
+            "{}SSH_PRIVATE_TAIL_8462🚀",
+            "原文不能交给远端读取 ".repeat(2_000)
+        );
+        let run_id = "primary-hard-w";
+        let store = seed_primary_context_run(
+            &temporary.path().join(".eko/tasks"),
+            run_id,
+            &original,
+            &["read_file"],
+        )?;
+        for index in 0..12 {
+            store
+                .record_run_steer(
+                    run_id,
+                    &format!("later-{index}"),
+                    "后继短输入，原工具上界保持read_file",
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        assert!(
+            store
+                .get_run_state(run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("原Run缺失")?
+                .recent_constraints
+                .iter()
+                .all(|steer| steer.turn_id != "oversized-steer")
+        );
+        let _resources = store.test_resource_scope();
+        let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
+        let _registration = registry.register(run_id, store.clone());
+        let llm = Arc::new(
+            echo_agent::testing::MockLlmClient::new().with_response("此调用必须被准入阻止"),
+        );
+        let remote = Arc::new(UnreachableSshFiles(std::sync::atomic::AtomicUsize::new(0)));
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent = primary_context_agent(
+            registry,
+            crate::infra::tool_output_artifact_config(Some(temporary.path())),
+            llm.clone(),
+            remote.clone(),
+            observed.clone(),
+            probes.clone(),
+        )
+        .await?;
+        let outcome = execute_primary_context_run(store.clone(), run_id, agent).await?;
+        assert!(matches!(
+            outcome,
+            super::super::executor::RunOutcome::Paused { .. }
+        ));
+        let actual = observed.lock().map_err(|_| "观察锁不可用")?;
+        assert_eq!(
+            actual.as_slice(),
+            &[vec!["read_file".to_owned()]],
+            "必须检查原 snapshot 最终请求，不能用注册目录冒可读"
+        );
+        assert_eq!(llm.call_count(), 0);
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(remote.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let run = store
+            .get_run(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("Run 缺失")?;
+        assert_eq!(run.status, TaskRunStatus::Paused);
+        let plan = store
+            .get_plan(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("计划缺失")?;
+        let task = plan.tasks.first().ok_or("任务缺失")?;
+        assert_eq!(task.allowed_tools, vec!["read_file".to_owned()]);
+        assert!(matches!(
+            task.status,
+            echo_agent::tasks::TaskStatus::Paused(_)
+        ));
+        assert_eq!(task.retry_count, 0);
         Ok(())
     }
 
@@ -1079,10 +4067,27 @@ mod tests {
         use echo_agent::compression::compressor::SlidingWindowCompressor;
         let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
         let store = seed_projection_store("compression-run", "keep the original goal")?;
-        let constraint = format!("{}必须保留结尾限制🚀", "背景介绍".repeat(80));
+        let constraint = format!("{}必须保留结尾限制🚀", "背景介绍".repeat(600));
         store
             .record_run_steer("compression-run", "first-steer", &constraint)
             .map_err(|error| error.to_string())?;
+        let steer = store
+            .get_run_state("compression-run")
+            .map_err(|error| error.to_string())?
+            .and_then(|state| state.recent_constraints.into_iter().next())
+            .ok_or_else(|| "原 journal 约束缺失".to_string())?;
+        let artifact = store
+            .recorded_user_steer_artifact("compression-run", &steer)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            std::fs::read_to_string(&artifact.path).map_err(|error| error.to_string())?,
+            constraint
+        );
+        let sha256 = artifact
+            .sha256
+            .as_deref()
+            .ok_or("原文 hash 缺失")?
+            .to_string();
         let _registration = registry.register("compression-run", store);
         let projector = TaskRuntimeContextProjector::new(registry);
         let mut context = ContextManager::builder(8_000)
@@ -1111,7 +4116,14 @@ mod tests {
                     .iter()
                     .any(|text| text.contains("keep the original goal"))
             );
-            assert!(texts.iter().any(|text| text.contains(&constraint)));
+            assert!(texts.iter().any(|text| text.contains(&sha256)));
+            assert!(!texts.iter().any(|text| text.contains(&constraint)));
+            assert!(
+                texts
+                    .iter()
+                    .any(|text| text.contains("which Goal obligation this turn advanced")),
+                "轮次收尾要求必须经受真实压缩仍可见"
+            );
             assert_eq!(
                 texts
                     .iter()
@@ -1127,6 +4139,58 @@ mod tests {
                 1
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn recorded_user_steer_retains_full_original_after_cold_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let original = format!("{}禁止推送且保留末尾限制🚀", "完整背景".repeat(600));
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        store.create_run(
+            "full-steer",
+            "default",
+            "original-conversation",
+            "original-message",
+            DomainProfile::General,
+            "original goal",
+            "agent_task_plan",
+            AttendedMode::Attended,
+        )?;
+        store.record_run_steer("full-steer", "original-turn", &original)?;
+        drop(store);
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        let event = reopened
+            .list_events("full-steer", 0)?
+            .into_iter()
+            .find(|event| {
+                event.event_type == super::super::types::RuntimeEventKind::RunSteerRecorded
+            })
+            .ok_or("original steer journal event missing")?;
+        assert_eq!(
+            event
+                .payload
+                .get("text")
+                .and_then(serde_json::Value::as_str),
+            Some(original.as_str())
+        );
+        let state = reopened
+            .get_run_state("full-steer")?
+            .ok_or("original run missing")?;
+        assert_eq!(state.run.conversation_id, "original-conversation");
+        let steer = state
+            .recent_constraints
+            .first()
+            .ok_or("original steer projection missing")?;
+        assert_eq!(steer.turn_id, "original-turn");
+        assert_eq!(steer.text, original);
+        let capsule = build_runtime_recovery_capsule(&reopened, "full-steer")
+            .ok_or("recovery capsule missing")?;
+        assert!(!capsule.contains(&original));
+        let artifact = reopened.recorded_user_steer_artifact("full-steer", steer)?;
+        assert_eq!(std::fs::read_to_string(&artifact.path)?, original);
+        assert!(capsule.contains(artifact.sha256.as_deref().ok_or("原文 hash 缺失")?));
         Ok(())
     }
 
@@ -1170,9 +4234,9 @@ mod tests {
                 .project(&projection_context(Some("long-goal")))
                 .await
                 .map_err(|error| error.to_string())?;
-            if projections.len() != 2 {
+            if projections.len() != 5 {
                 return Err(format!(
-                    "expected two replaceable projections, got {}",
+                    "expected goal, recovery, budget, original-input and domain projections, got {}",
                     projections.len()
                 ));
             }
@@ -1196,6 +4260,11 @@ mod tests {
             }
             if !contract.contains("跨窗口目标") || !contract.contains("bounded here") {
                 return Err("UTF-8 Goal contract was not safely bounded".to_string());
+            }
+            if !contract.contains("which Goal obligation this turn advanced")
+                || !contract.contains("does not modify the Goal")
+            {
+                return Err("round review requirement disappeared on refresh".to_string());
             }
             let capsule = projections
                 .get(1)
@@ -1231,5 +4300,930 @@ mod tests {
         assert_eq!(goal_contracts, 1);
         assert_eq!(recovery_capsules, 1);
         Ok(())
+    }
+
+    /// 两个自然结束的 RunTurn 只推进 A/B，canonical Goal 的原文、revision、
+    /// hash 与共享合同都不变；任务推进只改计划状态，不产生新的 Goal 版本。
+    #[test]
+    fn two_finished_run_turns_keep_one_unchanged_goal_contract() -> Result<(), String> {
+        use super::super::store::{RunTurnClaimOutcome, RunTurnCompletion};
+        use super::super::types::{RunTurnOrigin, RunTurnStatus as TurnStatus, TurnVisibility};
+
+        let store = TaskRuntimeStore::new_in_memory()
+            .map_err(|error| format!("seed store failed: {error}"))?;
+        let goal = "总Goal：A 导出数据；B 补齐回归验收；C 更新发布说明";
+        let goal_sha256 = crate::tasks::task_runtime::task_goal_sha256(goal);
+        store
+            .create_run(
+                "two-turn-run",
+                "default",
+                "two-turn-conversation",
+                "two-turn-root",
+                DomainProfile::General,
+                goal,
+                "agent_task_plan",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+                plan_id: "two-turn-plan".to_string(),
+                run_id: "two-turn-run".to_string(),
+                revision: 1,
+                domain_profile: DomainProfile::General,
+                goal_revision: 1,
+                goal_sha256: goal_sha256.clone(),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::Sequential,
+                tasks: vec![PlanTask {
+                    id: "obligation-a".to_string(),
+                    title: "推进 A".to_string(),
+                    kind: PlanTaskKind::Implementation,
+                    agent_role: "implementer".to_string(),
+                    ..PlanTask::default()
+                }],
+            })
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation("two-turn-run", true, false, None, None)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("two-turn-run", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+
+        let first = build_runtime_goal_contract(&store, "two-turn-run")
+            .ok_or_else(|| "启用续接的Run必须有共享Goal合同".to_string())?;
+
+        for (turn_id, message_id) in [("turn-1", "message-1"), ("turn-2", "message-2")] {
+            let claim = store
+                .claim_run_turn(
+                    "two-turn-run",
+                    turn_id,
+                    RunTurnOrigin::User,
+                    TurnVisibility::Internal,
+                )
+                .map_err(|error| error.to_string())?;
+            assert!(
+                matches!(claim, RunTurnClaimOutcome::Started(_)),
+                "第 {turn_id} 轮必须作为真实 RunTurn 开始"
+            );
+            store
+                .finish_run_turn(
+                    "two-turn-run",
+                    RunTurnCompletion {
+                        turn_id,
+                        status: TurnStatus::Ended,
+                        elapsed_seconds: 1,
+                        final_message_id: Some(message_id),
+                        error_fingerprint: None,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+        }
+
+        let second = build_runtime_goal_contract(&store, "two-turn-run")
+            .ok_or_else(|| "两个自然结束Turn后合同不能消失".to_string())?;
+        // 预算计数会随真实 turn 的耗时前进，但 Goal 身份（Run/状态/目标 hash/
+        // 计划版本）与收尾要求必须逐字不变。
+        let goal_identity = |contract: &str| {
+            contract
+                .split("Continuation contract:")
+                .next()
+                .map(str::to_string)
+        };
+        assert_eq!(
+            goal_identity(&second),
+            goal_identity(&first),
+            "两个自然结束的 RunTurn 不能改写 Goal 身份或计划版本"
+        );
+        assert!(
+            second.contains("which Goal obligation this turn advanced"),
+            "两个自然结束Turn后收尾要求仍须可见"
+        );
+
+        // 推进 A、下一轮改做 B：只允许计划/任务状态变化，Goal 不变。
+        store
+            .set_task_status(
+                "two-turn-run",
+                "obligation-a",
+                echo_agent::tasks::TaskStatus::Completed,
+                Some("implementer"),
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        let third = build_runtime_goal_contract(&store, "two-turn-run")
+            .ok_or_else(|| "任务推进后合同不能消失".to_string())?;
+        assert!(third.contains(goal), "A/B/C 总目标不能因推进 A 而缩小");
+        assert!(third.contains(&goal_sha256));
+        assert!(third.contains("which Goal obligation this turn advanced"));
+
+        let run = store
+            .get_run("two-turn-run")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Run缺失".to_string())?;
+        assert_eq!(run.goal, goal);
+        assert_eq!(run.goal_revision, 1);
+        assert_eq!(run.goal_sha256, goal_sha256);
+        let goal_updates = store
+            .list_events("two-turn-run", 0)
+            .map_err(|error| error.to_string())?
+            .iter()
+            .filter(|event| {
+                event.event_type == super::super::types::RuntimeEventKind::RunGoalUpdated
+            })
+            .count();
+        assert_eq!(goal_updates, 0, "轮次推进不能产生新的 Goal 版本事实");
+        Ok(())
+    }
+
+    /// 跨轮负控：A/B/C 总目标下，本轮只推进 A、下轮改做 B，以及普通 Steer
+    /// 和轮次文字都不能改写 canonical Goal 的原文、revision 或 hash；只有
+    /// 用户显式更新才沿原 CAS 路径产生新版本并保留历史原文。
+    #[test]
+    fn round_focus_and_steer_never_rewrite_canonical_goal_but_user_update_does()
+    -> Result<(), String> {
+        let store = TaskRuntimeStore::new_in_memory()
+            .map_err(|error| format!("seed store failed: {error}"))?;
+        let goal = "总Goal：A 导出数据；B 补齐回归验收；C 更新发布说明";
+        store
+            .create_run(
+                "focus-run",
+                "default",
+                "focus-conversation",
+                "focus-root",
+                DomainProfile::General,
+                goal,
+                "agent_task_plan",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation("focus-run", true, false, None, None)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("focus-run", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+
+        let goal_sha256 = crate::tasks::task_runtime::task_goal_sha256(goal);
+        let first = build_runtime_goal_contract(&store, "focus-run")
+            .ok_or_else(|| "启用续接的Run必须有共享Goal合同".to_string())?;
+        assert_eq!(first.matches(RUNTIME_GOAL_MARKER).count(), 1);
+        assert!(first.contains(goal));
+        assert!(first.contains(&goal_sha256));
+        for required in [
+            "read-only for you",
+            "Only an explicit user change creates a new Goal revision",
+            "which Goal obligation this turn advanced",
+            "the concrete evidence and its verification level",
+            "the obligations still open",
+            "the next step",
+            "no new acceptance evidence",
+            "never present unverified work as done",
+            "does not modify the Goal",
+            "no independent reflection model call, no summary store, and no completion authority",
+        ] {
+            assert!(
+                first.contains(required),
+                "共享Goal合同缺少收尾要求: {required}"
+            );
+        }
+        assert!(
+            first.contains("No fixed five-heading template is required")
+                && first.contains("follow the user's explicitly requested output format"),
+            "收尾不强制五标题，也不能禁止用户明确要求的报告格式"
+        );
+
+        // 本轮只推进 A，下一轮改做 B：steer 与轮次文字都只是执行选择。
+        store
+            .record_run_steer(
+                "focus-run",
+                "turn-1",
+                "本轮执行重点：先只推进 A，另两项保留",
+            )
+            .map_err(|error| error.to_string())?;
+        let second = build_runtime_goal_contract(&store, "focus-run")
+            .ok_or_else(|| "同一Run的合同不能因Steer消失".to_string())?;
+        store
+            .record_run_steer(
+                "focus-run",
+                "turn-2",
+                "下轮执行重点：改为推进 B，A/C 未完成义务不消失",
+            )
+            .map_err(|error| error.to_string())?;
+        let third = build_runtime_goal_contract(&store, "focus-run")
+            .ok_or_else(|| "下一轮合同不能因执行重点变化消失".to_string())?;
+        for contract in [&second, &third] {
+            assert!(
+                contract.contains(goal),
+                "A/B/C 总目标不能在执行重点变化后消失"
+            );
+            assert!(contract.contains(&goal_sha256));
+            assert!(contract.contains("which Goal obligation this turn advanced"));
+        }
+        let steady = store
+            .get_run("focus-run")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Run缺失".to_string())?;
+        assert_eq!(steady.goal, goal);
+        assert_eq!(steady.goal_revision, 1);
+        assert_eq!(steady.goal_sha256, goal_sha256);
+
+        // 用户显式更新：沿用原 revision/CAS 路径产生后继版本。
+        store
+            .transition_run("focus-run", TaskRunStatus::Paused)
+            .map_err(|error| error.to_string())?;
+        let revised = "更新后的总Goal：导出数据与回归验收合并交付；更新发布说明；补充迁移文档";
+        let updated = store
+            .update_run_goal(
+                "focus-run",
+                1,
+                revised,
+                "用户显式追加 D",
+                super::super::types::RunGoalActorSource::Gui,
+            )
+            .map_err(|error| error.to_string())?;
+        assert_eq!(updated.goal_revision, 2);
+        let fourth = build_runtime_goal_contract(&store, "focus-run")
+            .ok_or_else(|| "用户更新后合同必须引用当前Goal".to_string())?;
+        assert!(fourth.contains(revised));
+        assert!(fourth.contains(&updated.goal_sha256));
+        assert!(!fourth.contains(goal), "合同只能引用当前 canonical Goal");
+        assert!(fourth.contains("which Goal obligation this turn advanced"));
+
+        // 历史原文仍保留在 run journal：原创建目标不被覆盖。
+        let events = store
+            .list_events("focus-run", 0)
+            .map_err(|error| error.to_string())?;
+        assert!(
+            events.iter().any(|event| event.event_type
+                == super::super::types::RuntimeEventKind::RunGoalUpdated
+                && event
+                    .payload
+                    .get("new_goal")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(revised)),
+            "用户更新必须留下可审阅的显式变更事实"
+        );
+        assert!(
+            events.iter().any(|event| event.event_type
+                == super::super::types::RuntimeEventKind::RunCreated
+                && event
+                    .payload
+                    .get("goal")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(goal)),
+            "原Goal原文必须保留"
+        );
+        Ok(())
+    }
+    // 旧行为是事后隔离复现：旧 CLI ad0a22b / blob 67bdd20c 两个真实 producer
+    // 原文见 legacy 子模块；当前正式 projector 不注入手写 budget/recovery facts。
+    // 只用本机 axum 合成应答，fake usage 驱动原 store 记账，不代表缓存收益。
+    mod prefix_http_tests {
+        use super::*;
+        use crate::tasks::task_runtime::store;
+        use crate::tasks::task_runtime::types::{RunTurnOrigin, TurnVisibility};
+        use axum::{Json, Router, extract::State, routing::post};
+        use echo_agent::llm::cache::wire::{wire_prompt_fingerprint, wire_prompt_prefix_diff};
+        use echo_agent::llm::cache::{CacheHints, PromptCacheLayout, stable_prefix_hash};
+        use echo_agent::llm::{ChatRequest, LlmApiProtocol, LlmClient};
+        use echo_integration::providers::{
+            AnthropicClient, LlmConfig, OpenAiClient, ResponsesClient,
+        };
+        use serde_json::{Value, json};
+        use std::time::Duration;
+        use tokio::sync::Mutex;
+
+        #[derive(Clone)]
+        struct Capture {
+            protocol: LlmApiProtocol,
+            requests: Arc<Mutex<Vec<Value>>>,
+        }
+
+        async fn respond(State(capture): State<Capture>, Json(body): Json<Value>) -> Json<Value> {
+            let mut requests = capture.requests.lock().await;
+            requests.push(body);
+            let step = requests.len();
+            let output = format!("合成响应 {step}");
+            Json(match capture.protocol {
+                LlmApiProtocol::ChatCompletions => json!({
+                    "id":format!("chat-{step}"),"object":"chat.completion","created":0,
+                    "model":"prefix-fixture","choices":[{"index":0,"finish_reason":"stop",
+                    "message":{"role":"assistant","content":output}}],
+                    "usage":{"prompt_tokens":11,"completion_tokens":1,"total_tokens":12}
+                }),
+                LlmApiProtocol::Responses => json!({
+                    "id":format!("resp-{step}"),"object":"response","status":"completed",
+                    "model":"prefix-fixture","output":[{"type":"message",
+                    "id":format!("msg-{step}"),"role":"assistant","status":"completed",
+                    "content":[{"type":"output_text","text":output,"annotations":[]}]}],
+                    "usage":{"input_tokens":11,"output_tokens":1,"total_tokens":12}
+                }),
+                LlmApiProtocol::Anthropic => json!({
+                    "id":format!("anthropic-{step}"),"type":"message","role":"assistant",
+                    "model":"prefix-fixture","content":[{"type":"text","text":output}],
+                    "stop_reason":"end_turn","stop_sequence":null,
+                    "usage":{"input_tokens":11,"output_tokens":1}
+                }),
+            })
+        }
+
+        fn client(protocol: LlmApiProtocol, base: &str) -> Result<Box<dyn LlmClient>, String> {
+            let endpoint = format!("{base}/v1/{}", protocol.endpoint_path());
+            if protocol == LlmApiProtocol::Anthropic {
+                // Anthropic 公共构造器保留生产HTTP设置；执行者给整个native设置
+                // NO_PROXY=127.0.0.1,localhost，不修改并行测试的进程环境。
+                return Ok(Box::new(AnthropicClient::with_base_url(
+                    endpoint,
+                    "local-fake-key",
+                    "prefix-fixture",
+                )));
+            }
+            let config = LlmConfig::for_provider(
+                "prefix-local-fixture",
+                endpoint,
+                "local-fake-key",
+                "prefix-fixture",
+                protocol,
+            )
+            .map_err(|error| error.to_string())?;
+            let http = Arc::new(
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .map_err(|error| error.to_string())?,
+            );
+            match protocol {
+                LlmApiProtocol::ChatCompletions => OpenAiClient::with_client(http, config)
+                    .map(|client| Box::new(client) as Box<dyn LlmClient>),
+                LlmApiProtocol::Responses => ResponsesClient::with_client(http, config)
+                    .map(|client| Box::new(client) as Box<dyn LlmClient>),
+                LlmApiProtocol::Anthropic => return Err("Anthropic already handled".into()),
+            }
+            .map_err(|error| error.to_string())
+        }
+
+        fn request(context: &ContextManager) -> ChatRequest {
+            let mut request = ChatRequest::new(context.messages().to_vec());
+            let layout = PromptCacheLayout::from_messages(&request.messages, &[]);
+            request.cache_hints = Some(CacheHints {
+                breakpoints: vec![],
+                stable_prefix_hash: Some(stable_prefix_hash(
+                    layout.system,
+                    layout.canonical,
+                    layout.tools,
+                    layout.history,
+                )),
+                segments: layout.segment_ranges(),
+            });
+            request
+        }
+
+        fn contains_text(body: &Value, text: &str) -> bool {
+            match body {
+                Value::String(value) => value.contains(text),
+                Value::Array(values) => values.iter().any(|value| contains_text(value, text)),
+                Value::Object(values) => values.values().any(|value| contains_text(value, text)),
+                _ => false,
+            }
+        }
+
+        async fn exchange(
+            protocol: LlmApiProtocol,
+            old: bool,
+            base: &str,
+            requests: &Arc<Mutex<Vec<Value>>>,
+        ) -> Result<(), String> {
+            let run_id = "prefix-http-run";
+            let turn_id = "prefix-http-turn";
+            let original_goal = "保留准确原始目标 🧭";
+            let store = seed_projection_store(run_id, original_goal)?;
+            store
+                .configure_run_continuation(run_id, true, false, Some(10_000), None)
+                .map_err(|error| error.to_string())?;
+            store
+                .transition_run(run_id, TaskRunStatus::Running)
+                .map_err(|error| error.to_string())?;
+            let claim = store
+                .claim_run_turn(
+                    run_id,
+                    turn_id,
+                    RunTurnOrigin::User,
+                    TurnVisibility::Visible,
+                )
+                .map_err(|error| error.to_string())?;
+            assert!(
+                matches!(claim, store::RunTurnClaimOutcome::Started(_)),
+                "HTTP记账前必须实际启动RunTurn"
+            );
+            let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
+            let _registration = registry.register(run_id, Arc::clone(&store));
+            let projector = TaskRuntimeContextProjector::new(registry);
+            let client = client(protocol, base)?;
+            let mut context = ContextManager::builder(32_000).build();
+            context.push(Message::system(
+                "固定规则：遵守原始目标及真实工具结果。".into(),
+            ));
+            context.push(Message::user(original_goal.into()));
+            let mut goal_before = None;
+            let mut recovery_before = None;
+            for step in 1..=3 {
+                let projections = if old {
+                    // 原 TaskRuntime project 的三 marker 替换路由。旧两字段 literal
+                    // 仅机械适配为 replacing；业务文本未改写、未预置不稳定字段。
+                    vec![
+                        ContextProjection::replacing(
+                            RUNTIME_GOAL_MARKER,
+                            legacy::build_runtime_goal_contract_checked(&store, run_id)
+                                .map_err(|error| error.to_string())?
+                                .map(Message::user),
+                        ),
+                        ContextProjection::replacing(
+                            RUNTIME_RECOVERY_MARKER,
+                            legacy::build_runtime_recovery_capsule_checked(&store, run_id)
+                                .map_err(|error| error.to_string())?
+                                .map(Message::user),
+                        ),
+                        ContextProjection::replacing(DOMAIN_METHOD_MARKER, None),
+                    ]
+                } else {
+                    projector
+                        .project(&projection_context(Some(run_id)))
+                        .await
+                        .map_err(|error| error.to_string())?
+                };
+                let text = |marker: &str| {
+                    projections
+                        .iter()
+                        .find(|projection| projection.marker == marker)
+                        .and_then(|projection| projection.message.as_ref())
+                        .and_then(|message| message.content.as_text())
+                };
+                let goal = text(RUNTIME_GOAL_MARKER).ok_or("missing current Goal")?;
+                let recovery = text(RUNTIME_RECOVERY_MARKER).ok_or("missing recovery")?;
+                if step > 1 {
+                    assert_eq!(
+                        goal_before.as_ref() == Some(&goal),
+                        !old,
+                        "Goal body must be stable only after removing per-call budget"
+                    );
+                    assert_ne!(
+                        recovery_before.as_ref(),
+                        Some(&recovery),
+                        "real store steer must update current recovery in both arms"
+                    );
+                }
+                goal_before = Some(goal);
+                recovery_before = Some(recovery);
+                context.apply_projection_scope("pre-model", &projections);
+                assert!(
+                    context
+                        .messages()
+                        .iter()
+                        .any(|message| message.content.as_text_ref() == Some(original_goal))
+                );
+                let response = client
+                    .chat(request(&context))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                assert_eq!(response.content(), Some(format!("合成响应 {step}")));
+                {
+                    let captured = requests.lock().await;
+                    let body = captured.last().ok_or("actual HTTP request missing")?;
+                    // 前缀稳定本身不能证明最新事实抵达模型；逐一核对真实投影正文。
+                    for projection in &projections {
+                        if let Some(message) = &projection.message {
+                            let text =
+                                message.content.as_text().ok_or("projection text missing")?;
+                            assert!(
+                                contains_text(body, &text),
+                                "actual HTTP body lost current projection: {}",
+                                projection.marker
+                            );
+                        }
+                    }
+                }
+                let usage = response
+                    .usage
+                    .ok_or("fake HTTP response usage not parsed")?;
+                assert_eq!(usage.effective_prompt_tokens(), 11);
+                store
+                    .account_run_turn_usage(
+                        run_id,
+                        turn_id,
+                        &format!("http-{step}"),
+                        u64::from(usage.effective_prompt_tokens()),
+                        u64::from(usage.completion_tokens.unwrap_or(0)),
+                    )
+                    .map_err(|error| error.to_string())?;
+                context.push(response.message);
+                if step < 3 {
+                    let steer = format!("补充约束 {step}：保留已完成工作的证据。");
+                    store
+                        .record_run_steer(run_id, turn_id, &steer)
+                        .map_err(|error| error.to_string())?;
+                    context.push(Message::user(steer));
+                }
+            }
+            assert_eq!(
+                store
+                    .get_run(run_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or("run missing")?
+                    .goal,
+                original_goal
+            );
+            Ok(())
+        }
+
+        async fn capture(protocol: LlmApiProtocol, old: bool) -> Result<Vec<Value>, String> {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let state = Capture {
+                protocol,
+                requests: Arc::clone(&requests),
+            };
+            let router = Router::new()
+                .route("/v1/*endpoint", post(respond))
+                .with_state(state);
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .map_err(|error| error.to_string())?;
+            let base = format!(
+                "http://{}",
+                listener.local_addr().map_err(|error| error.to_string())?
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, router).await });
+            let result = tokio::time::timeout(
+                Duration::from_secs(20),
+                exchange(protocol, old, &base, &requests),
+            )
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            server.abort();
+            let _ = server.await;
+            result?;
+            let captured = requests.lock().await.clone();
+            assert_eq!(
+                captured.len(),
+                3,
+                "exactly three actual HTTP requests per arm"
+            );
+            Ok(captured)
+        }
+
+        async fn verify(protocol: LlmApiProtocol) -> Result<(), String> {
+            let before = capture(protocol, true).await?;
+            let after = capture(protocol, false).await?;
+            for (label, bodies, expected_append) in [
+                ("旧producer隔离复现", before, false),
+                ("正式projector", after, true),
+            ] {
+                let mut previous = None;
+                for (index, body) in bodies.iter().enumerate() {
+                    let fingerprint =
+                        wire_prompt_fingerprint(body).map_err(|error| error.to_string())?;
+                    if let Some(previous) = previous {
+                        let diff = wire_prompt_prefix_diff(previous, body)
+                            .map_err(|error| error.to_string())?;
+                        assert_eq!(
+                            diff.is_append_only, expected_append,
+                            "{protocol:?} {label}: {diff:?}"
+                        );
+                        if !expected_append {
+                            assert!(
+                                diff.first_difference
+                                    .as_deref()
+                                    .is_some_and(|path| path.starts_with("messages[")),
+                                "{diff:?}"
+                            );
+                        }
+                        println!(
+                            "{}",
+                            json!({"protocol":format!("{protocol:?}"),"arm":label,
+                            "request":index.saturating_add(1),"fingerprint":fingerprint,"diff":diff})
+                        );
+                    }
+                    previous = Some(body);
+                }
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn app_projector_chat_http_before_after_three_requests() -> Result<(), String> {
+            verify(LlmApiProtocol::ChatCompletions).await
+        }
+
+        #[tokio::test]
+        async fn app_projector_responses_http_before_after_three_requests() -> Result<(), String> {
+            verify(LlmApiProtocol::Responses).await
+        }
+
+        #[tokio::test]
+        async fn app_projector_anthropic_http_before_after_three_requests() -> Result<(), String> {
+            verify(LlmApiProtocol::Anthropic).await
+        }
+
+        mod legacy {
+            use super::*;
+            // ad0a22b87bc115a6fd157c7ee49e63cf3e58017f:compact_context.rs
+            // blob 67bdd20cfdfb51bc8767361dea7c1abeb4701a49。
+            // 两函数只加pub(super)并经等价rustfmt缩进/换行；字符串与计算不变。
+            pub(super) fn build_runtime_goal_contract_checked(
+                store: &TaskRuntimeStore,
+                run_id: &str,
+            ) -> Result<Option<String>, super::store::StoreError> {
+                let Some(state) = store.get_run_state(run_id)? else {
+                    return Ok(None);
+                };
+                let Some(continuation) = state.continuation.as_ref() else {
+                    return Ok(None);
+                };
+                if !continuation.enabled {
+                    return Ok(None);
+                }
+                let goal_reference = store.canonical_goal_reference(run_id)?;
+                let run = state.run;
+                let mut hasher = Sha256::new();
+                hasher.update(run.goal.as_bytes());
+                let goal_hash = format!("{:x}", hasher.finalize());
+                let objective = run
+                    .goal
+                    .chars()
+                    .take(MAX_GOAL_CONTRACT_CHARS)
+                    .collect::<String>();
+                let objective_truncated = run.goal.chars().count() > MAX_GOAL_CONTRACT_CHARS;
+                let plan_revision = store
+                    .get_plan(run_id)
+                    .ok()
+                    .flatten()
+                    .map(|plan| plan.revision);
+                let remaining_tokens = continuation
+                    .token_budget
+                    .map(|budget| budget.saturating_sub(continuation.tokens_used));
+                let remaining_time_seconds = continuation
+                    .time_budget_seconds
+                    .map(|budget| budget.saturating_sub(continuation.time_used_seconds));
+
+                let mut contract = format!(
+                    "{RUNTIME_GOAL_MARKER}\n\
+                     Run: id={}, status={}, objective_sha256={}, plan_revision={}\n\
+                     Objective{}:\n{}\n\
+                     Continuation contract:\n\
+                     - This finite Turn ending is not evidence that the TaskRun Goal is complete.\n\
+                     - Do not narrow or replace the objective with what fits in one Turn.\n\
+                     - Before completion, audit the original objective, current plan, artifacts, and verification evidence.\n\
+                     - TaskRuntime completion blockers are authoritative; final wording never overrides them.\n\
+                     - On a recoverable blocker, record the concrete blocker and preserve resumable state.\n\
+                     {round_review}\
+                     Budget: tokens_used={}, token_budget={}, tokens_remaining={}; time_used_seconds={}, time_budget_seconds={}, time_remaining_seconds={}\n",
+                    run.run_id,
+                    run.status.as_str(),
+                    goal_hash,
+                    plan_revision
+                        .map(|revision| revision.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    if objective_truncated {
+                        let artifact = goal_reference.as_ref().ok_or_else(|| {
+                            super::store::StoreError::InvalidPlan(
+                                "长Goal缺本机可读引用".to_string(),
+                            )
+                        })?;
+                        format!(
+                            " (bounded here; recover the full current Goal with host read_artifact: {}; sha256={})",
+                            artifact.artifact.path.display(),
+                            artifact.goal_sha256
+                        )
+                    } else {
+                        String::new()
+                    },
+                    objective,
+                    continuation.tokens_used,
+                    continuation
+                        .token_budget
+                        .map(|budget| budget.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    remaining_tokens
+                        .map(|tokens| tokens.to_string())
+                        .unwrap_or_else(|| "unbounded".to_string()),
+                    continuation.time_used_seconds,
+                    continuation
+                        .time_budget_seconds
+                        .map(|budget| budget.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    remaining_time_seconds
+                        .map(|seconds| seconds.to_string())
+                        .unwrap_or_else(|| "unbounded".to_string()),
+                    round_review = GOAL_ROUND_REVIEW_RULES,
+                );
+                if let Some(reference) = goal_reference {
+                    contract.push_str(&format_goal_reference(&reference)?);
+                }
+                Ok(Some(contract))
+            }
+
+            pub(super) fn build_runtime_recovery_capsule_checked(
+                store: &TaskRuntimeStore,
+                run_id: &str,
+            ) -> Result<Option<String>, super::store::StoreError> {
+                let state = store
+                    .get_run_state(run_id)?
+                    .ok_or_else(|| super::store::StoreError::RunNotFound(run_id.to_string()))?;
+                let run = state.run;
+                let continuation = state.continuation;
+                let recent_constraints = state.recent_constraints;
+                let raw_history = store.raw_input_history_reference(run_id, None)?;
+                let goal_reference = store.canonical_goal_reference(run_id)?;
+                let plan = store.get_plan(run_id).unwrap_or_default();
+                let todos = store.list_todos(run_id).unwrap_or_default();
+                let cells = store.list_background_cells(run_id).unwrap_or_default();
+
+                let has_plan_tasks = plan
+                    .as_ref()
+                    .map(|plan| !plan.tasks.is_empty())
+                    .unwrap_or(false);
+                let has_runtime_todos = todos.iter().any(|todo| !todo.task_id.trim().is_empty());
+                if !has_plan_tasks
+                    && !has_runtime_todos
+                    && recent_constraints.is_empty()
+                    && raw_history.source_records == 0
+                    && goal_reference.is_none()
+                    && cells.is_empty()
+                    && continuation.as_ref().is_none_or(|state| !state.enabled)
+                {
+                    return Ok(None);
+                }
+
+                let mut out = String::new();
+                out.push_str(RUNTIME_RECOVERY_MARKER);
+                out.push('\n');
+                out.push_str(
+                    "Purpose: recover active TaskRuntime state after context compression. \
+                     Continue unfinished work from this capsule; do not treat it as a new user request. \
+                     The file-backed TaskRuntimeStore remains authoritative.\n",
+                );
+                out.push_str(&format!(
+                    "Run: id={}, status={}, route={}, domain={}\nGoal: {}\n",
+                    run.run_id,
+                    run.status.as_str(),
+                    run.route,
+                    run.domain_profile.as_str(),
+                    truncate_chars(&run.goal, MAX_GOAL_CHARS),
+                ));
+                if run.goal.chars().count() > MAX_GOAL_CHARS
+                    && let Some(artifact) = store.objective_artifact_path(run_id)
+                {
+                    out.push_str(&format!(
+                        "Full objective artifact: {}\n",
+                        artifact.display()
+                    ));
+                }
+                if let Some(continuation) = continuation {
+                    out.push_str(&format!(
+                        "Continuation: active_turn={}, last_turn={}, turns_next={}, tokens_used={}, token_budget={}, tokens_remaining={}, time_used_seconds={}, time_budget_seconds={}, time_remaining_seconds={}, compactions={}, deferred={}, pause={}\n",
+                        continuation
+                            .active_turn
+                            .as_ref()
+                            .map(|turn| format!("{}#{}", turn.turn_id, turn.ordinal))
+                            .unwrap_or_else(|| "none".to_string()),
+                        continuation
+                            .last_turn
+                            .as_ref()
+                            .map(|turn| format!("{}:{}", turn.turn_id, turn.status.as_str()))
+                            .unwrap_or_else(|| "none".to_string()),
+                        continuation.next_turn_ordinal,
+                        continuation.tokens_used,
+                        continuation
+                            .token_budget
+                            .map(|budget| budget.to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        continuation
+                            .token_budget
+                            .map(|budget| budget.saturating_sub(continuation.tokens_used).to_string())
+                            .unwrap_or_else(|| "unbounded".to_string()),
+                        continuation.time_used_seconds,
+                        continuation
+                            .time_budget_seconds
+                            .map(|budget| budget.to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        continuation
+                            .time_budget_seconds
+                            .map(|budget| {
+                                budget
+                                    .saturating_sub(continuation.time_used_seconds)
+                                    .to_string()
+                            })
+                            .unwrap_or_else(|| "unbounded".to_string()),
+                        continuation.compaction_count,
+                        continuation.deferred,
+                        continuation
+                            .pause
+                            .as_ref()
+                            .map(|pause| pause.reason.as_str())
+                            .unwrap_or("none"),
+                    ));
+                }
+
+                if let Some(plan) = &plan {
+                    out.push_str(&format!(
+                        "Plan: id={}, execution_mode={}, tasks={}\n",
+                        plan.plan_id,
+                        plan.execution_mode.as_str(),
+                        plan.tasks.len()
+                    ));
+                    push_short_list(&mut out, "Assumptions", &plan.assumptions, 3, 120);
+                    push_short_list(&mut out, "Risks", &plan.risks, 3, 120);
+                }
+
+                // ADR 0037: incremental user constraints recorded via run steers are as
+                // binding as the Goal — surface them in the compression-safe capsule so
+                // narrowed context cannot silently drop them.
+                if !recent_constraints.is_empty() {
+                    out.push_str("Recent user constraints:\n");
+                    // journal 保留全文；受保护 capsule 只放有界预览和可恢复原文引用。
+                    // 最近四条仍仅是本切片展示，不代表全部有效要求已得到覆盖。
+                    for steer in recent_constraints
+                        .iter()
+                        .rev()
+                        .take(4)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                    {
+                        let turn_preview = truncate_chars(&steer.turn_id, MAX_TASK_TITLE_CHARS);
+                        if steer.text.chars().count() <= crate::prepared_turn::PREVIEW_CHARS {
+                            out.push_str(&format!("- (turn {turn_preview}) {}\n", steer.text));
+                            continue;
+                        }
+                        let artifact = store.recorded_user_steer_artifact(run_id, steer)?;
+                        out.push_str(&format!(
+                            "- (turn {turn_preview}) {}\n",
+                            crate::prepared_turn::build_original_message_reference(
+                                &steer.text,
+                                &artifact
+                            ),
+                        ));
+                    }
+                    out.push('\n');
+                }
+
+                out.push_str(&format_raw_history_reference(&raw_history)?);
+                if let Some(reference) = goal_reference {
+                    out.push_str(&format_goal_reference(&reference)?);
+                }
+
+                push_task_group(
+                    &mut out,
+                    "Running tasks",
+                    &todos,
+                    plan.as_ref().map(|p| p.tasks.as_slice()).unwrap_or(&[]),
+                    store,
+                    run_id,
+                    &[TodoStatus::Running],
+                    4,
+                );
+                push_task_group(
+                    &mut out,
+                    "Blocked/failed tasks",
+                    &todos,
+                    plan.as_ref().map(|p| p.tasks.as_slice()).unwrap_or(&[]),
+                    store,
+                    run_id,
+                    &[
+                        TodoStatus::Blocked,
+                        TodoStatus::Failed,
+                        TodoStatus::Cancelled,
+                        TodoStatus::TimedOut,
+                    ],
+                    4,
+                );
+                push_task_group(
+                    &mut out,
+                    "Pending next tasks",
+                    &todos,
+                    plan.as_ref().map(|p| p.tasks.as_slice()).unwrap_or(&[]),
+                    store,
+                    run_id,
+                    &[TodoStatus::Pending],
+                    6,
+                );
+                push_task_group(
+                    &mut out,
+                    "Recently completed tasks",
+                    &todos,
+                    plan.as_ref().map(|p| p.tasks.as_slice()).unwrap_or(&[]),
+                    store,
+                    run_id,
+                    &[TodoStatus::Completed],
+                    5,
+                );
+                push_background_cells(&mut out, &cells);
+
+                Ok(Some(out))
+            }
+        }
     }
 }

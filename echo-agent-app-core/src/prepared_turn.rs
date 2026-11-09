@@ -42,6 +42,9 @@ use echo_agent::llm::types::{ContentPart, ImageUrl, Message};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod provenance;
+pub use provenance::resource_history_display_text;
+
 use crate::attachments::{AttachmentRef, is_image_mime};
 use crate::types::AttachmentSource;
 
@@ -60,7 +63,7 @@ const BYTES_PER_TOKEN: usize = 4;
 
 /// Number of Unicode scalar values retained as a preview when a paste is
 /// spilled. The preview is UTF-8 safe (collected via `chars().take`).
-const PREVIEW_CHARS: usize = 400;
+pub(crate) const PREVIEW_CHARS: usize = 400;
 const USER_INPUT_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Errors raised while preparing a user turn.
@@ -236,6 +239,8 @@ pub struct PreparedUserTurn {
     /// runtime. This is independent of RunTurnOrigin: a user-authored message
     /// can resume an existing run.
     pub authorship: InstructionAuthorship,
+    /// Original AgentRouter input and its real artifact. View provenance never changes authorship.
+    pub agent_input: Option<(PathBuf, crate::agent_router::AgentMessage)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,6 +367,7 @@ impl PreparedUserTurn {
             instruction,
             resources,
             authorship: InstructionAuthorship::User,
+            agent_input: None,
         })
     }
 
@@ -370,7 +376,37 @@ impl PreparedUserTurn {
             instruction: instruction.into(),
             resources: Vec::new(),
             authorship: InstructionAuthorship::Runtime,
+            agent_input: None,
         }
+    }
+
+    /// Freeze the already accepted AgentRouter payload in the existing input-artifact/ResourceLink path.
+    /// The canonical message carries typed origin across FileStore reload and Fork; no wrapper parsing.
+    pub fn bind_agent_input(
+        &mut self,
+        message: &crate::agent_router::AgentMessage,
+        spill_dir: &Path,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> std::io::Result<()> {
+        if message.origin != crate::agent_router::AgentMessageOrigin::Agent {
+            return Ok(());
+        }
+        let raw = serde_json::to_string(message).map_err(std::io::Error::other)?;
+        let resource = spill_to_artifact(
+            &raw,
+            spill_dir,
+            Some(conversation_id),
+            Some(turn_id),
+            "agent-message.json",
+            AttachmentSource::Upload,
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+        self.agent_input = Some((resource.path.clone(), message.clone()));
+        self.resources.push(resource);
+        // Model/runtime guidance is never a direct-user approval or Goal mutation.
+        self.authorship = InstructionAuthorship::Runtime;
+        Ok(())
     }
 
     pub fn runtime_authored(mut self) -> Self {
@@ -454,6 +490,9 @@ impl PreparedUserTurn {
                 }
             }
         }
+
+        // ResourceLink是原生typed载体，初始输入和live Steer都随同一个Message流转。
+        parts.extend(provenance::input_resource_parts(self)?);
 
         // Single text part with no resources → plain text message (matches
         // the old `Message::user(text)` fast path).
@@ -712,11 +751,57 @@ fn spill_to_artifact(
     display_name: &str,
     source: AttachmentSource,
 ) -> Result<InputResourceRef> {
+    spill_to_artifact_at(
+        text,
+        spill_dir,
+        conversation_id,
+        turn_id,
+        display_name,
+        source,
+        None,
+    )
+}
+
+/// 从原 Run journal 全文再物化只读输入缓存；不是第二份可编辑要求状态。
+/// 内容寻址保持重复投影/冷重开的引用稳定，丢失缓存仍可由 journal 重建。
+pub(crate) fn materialize_recorded_user_text(
+    text: &str,
+    spill_dir: &Path,
+    conversation_id: &str,
+    turn_id: &str,
+) -> Result<InputResourceRef> {
+    let name = format!(
+        "recorded-{}.txt",
+        hex::encode(Sha256::digest(text.as_bytes()))
+    );
+    spill_to_artifact_at(
+        text,
+        spill_dir,
+        Some(conversation_id),
+        Some(turn_id),
+        "recorded-user-instruction.txt",
+        AttachmentSource::Message,
+        Some(&name),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spill_to_artifact_at(
+    text: &str,
+    spill_dir: &Path,
+    conversation_id: Option<&str>,
+    turn_id: Option<&str>,
+    display_name: &str,
+    source: AttachmentSource,
+    stable_name: Option<&str>,
+) -> Result<InputResourceRef> {
     let conv = path_component(conversation_id.unwrap_or("unscoped"));
     let turn = path_component(turn_id.unwrap_or(&uuid::Uuid::new_v4().to_string()));
-    let nonce = uuid::Uuid::new_v4();
+    let file_name = stable_name
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}-paste.txt", uuid::Uuid::new_v4()));
     let directory = spill_dir.join(&conv).join(&turn);
-    let final_path = directory.join(format!("{nonce}-paste.txt"));
+    let final_path = directory.join(file_name);
 
     if let Err(error) = cleanup_user_input_older_than(spill_dir, USER_INPUT_MAX_AGE) {
         tracing::warn!(path = %spill_dir.display(), %error, "failed to clean expired user-input artifacts");
@@ -727,12 +812,18 @@ fn spill_to_artifact(
     })?;
 
     let bytes = text.as_bytes();
-    echo_agent::utils::fs::atomic_write(&final_path, bytes).map_err(|source| {
-        PreparedTurnError::Write {
-            path: final_path.clone(),
-            source,
-        }
-    })?;
+    // 稳定引用命中时不改 inode/mtime，原 read_artifact cursor 可继续读同一快照。
+    // 缺失或损坏仅从已读取的 journal 原文再物化；原文权威不写回此缓存。
+    let unchanged = stable_name.is_some()
+        && std::fs::read(&final_path).is_ok_and(|existing| existing.as_slice() == bytes);
+    if !unchanged {
+        echo_agent::utils::fs::atomic_write(&final_path, bytes).map_err(|source| {
+            PreparedTurnError::Write {
+                path: final_path.clone(),
+                source,
+            }
+        })?;
+    }
 
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -795,7 +886,10 @@ fn build_data_reference(artifact: &InputResourceRef) -> String {
 
 /// Preserve the semantics of an oversized original message. Unlike an
 /// attached paste, this artifact may itself contain the user's instructions.
-fn build_original_message_reference(original_text: &str, artifact: &InputResourceRef) -> String {
+pub(crate) fn build_original_message_reference(
+    original_text: &str,
+    artifact: &InputResourceRef,
+) -> String {
     let sha = artifact.sha256.as_deref().unwrap_or("(unknown)");
     let lines = artifact.lines.unwrap_or(0);
     let bytes = artifact.bytes;
@@ -834,10 +928,281 @@ fn path_component(raw: &str) -> String {
     }
 }
 
+/// 已验证的历史资源副本；它是原物化文件的回执，不拥有运行控制状态。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplyForkResourceReceipt {
+    pub source_path: PathBuf,
+    pub target_path: PathBuf,
+    pub bytes: u64,
+    pub sha256: String,
+    /// 文件写入后实际 reader 完整回读成功才置 true。
+    pub reader_verified: bool,
+}
+
+/// 原物化 owner 的部分回执；失败仍保留此前已写文件，不伪造回滚。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplyForkHistoryCopy {
+    pub resources: Vec<ReplyForkResourceReceipt>,
+    pub error: Option<String>,
+    /// 旧不明引用仅历史说明，不因用户文本中的类路径推断资源。
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// 只转换原生Parts中的真实typed资源关联。无关联历史不要求配置artifact reader。
+/// 任一失败都不发布半份历史，但回传所有已验证副本供原入口恢复。
+pub fn copy_reply_fork_history_resources_with_receipts(
+    messages: &mut [echo_agent::memory::StoredMessage],
+    source_artifact_root: Option<&Path>,
+    target_artifact_root: Option<&Path>,
+    target_conversation_id: &str,
+) -> ReplyForkHistoryCopy {
+    let mut resources = Vec::new();
+    let mut warnings = Vec::new();
+    let mut copied = messages.to_vec();
+    let outcome = copy_reply_fork_history_resources_inner(
+        &mut copied,
+        source_artifact_root,
+        target_artifact_root,
+        target_conversation_id,
+        &mut resources,
+        &mut warnings,
+    );
+    resources.sort_by(|left, right| left.target_path.cmp(&right.target_path));
+    resources.dedup_by(|left, right| left.target_path == right.target_path);
+    match outcome {
+        Ok(()) => {
+            messages.clone_from_slice(&copied);
+            ReplyForkHistoryCopy {
+                resources,
+                error: None,
+                warnings,
+            }
+        }
+        Err(error) => ReplyForkHistoryCopy {
+            resources,
+            error: Some(error.to_string()),
+            warnings,
+        },
+    }
+}
+
+/// 调用者必须持有原 product-data owner 及两端 runtime lease。
+pub fn copy_reply_fork_history_resources(
+    messages: &mut [echo_agent::memory::StoredMessage],
+    source_artifact_root: &Path,
+    target_artifact_root: &Path,
+    target_conversation_id: &str,
+) -> anyhow::Result<Vec<ReplyForkResourceReceipt>> {
+    let result = copy_reply_fork_history_resources_with_receipts(
+        messages,
+        Some(source_artifact_root),
+        Some(target_artifact_root),
+        target_conversation_id,
+    );
+    match result.error {
+        Some(error) => Err(anyhow::anyhow!(error)),
+        None => Ok(result.resources),
+    }
+}
+
+fn copy_reply_fork_history_resources_inner(
+    messages: &mut [echo_agent::memory::StoredMessage],
+    source_root: Option<&Path>,
+    target_root: Option<&Path>,
+    target_conversation_id: &str,
+    receipts: &mut Vec<ReplyForkResourceReceipt>,
+    warnings: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    for message in messages {
+        let proven = provenance::migrate_row(
+            message,
+            source_root,
+            target_root,
+            target_conversation_id,
+            receipts,
+        )?;
+        if !proven
+            && message.content.as_deref().is_some_and(|text| {
+                text.contains("用户提交了一条超长原始消息,已落盘且未内联:")
+                    || text.contains("用户附带了一份长文本 artifact(已落盘,未内联):")
+                    || text.contains("[Tool output preview only:")
+            })
+        {
+            warnings.push("历史文字按原样保留，其中的文件引用未作确认。".into());
+        }
+        // 内联内容保持原bytes；UI旧链接无来源时仅说明，不按类路径读取或拒绝整段历史。
+        if let Some(raw) = message.attachments_json.as_deref() {
+            let payload: serde_json::Value = serde_json::from_str(raw)?;
+            if let Some(attachments) = payload
+                .get("attachments")
+                .and_then(serde_json::Value::as_array)
+            {
+                for attachment in attachments {
+                    let Some(url) = attachment.get("url").and_then(serde_json::Value::as_str)
+                    else {
+                        continue;
+                    };
+                    if url.is_empty() {
+                        continue;
+                    }
+                    if let Some((_, encoded)) = url.split_once(',').filter(|(header, _)| {
+                        header.starts_with("data:") && header.ends_with(";base64")
+                    }) {
+                        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+                        if attachment
+                            .get("size")
+                            .and_then(serde_json::Value::as_u64)
+                            .is_some_and(|expected| {
+                                u64::try_from(bytes.len()).ok() != Some(expected)
+                            })
+                        {
+                            anyhow::bail!("历史内联附件大小不匹配");
+                        }
+                    } else {
+                        warnings.push("历史附件链接的关联未确认，原显示内容已保留。".into());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn copy_reply_fork_resource(
+    source: &Path,
+    source_root: &Path,
+    target_root: &Path,
+    conversation_id: &str,
+    expected_bytes: Option<u64>,
+    expected_sha: &str,
+    receipts: &mut Vec<ReplyForkResourceReceipt>,
+) -> anyhow::Result<ReplyForkResourceReceipt> {
+    use anyhow::Context as _;
+    if expected_sha.len() != 64 || !expected_sha.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        anyhow::bail!("历史资源 SHA256 无效: {}", source.display());
+    }
+    let owned_root = source_root
+        .canonicalize()
+        .context("来源 artifact 根无法读取")?;
+    let path = source
+        .canonicalize()
+        .with_context(|| format!("历史资源缺失: {}", source.display()))?;
+    if !path.starts_with(&owned_root) || !std::fs::symlink_metadata(source)?.file_type().is_file() {
+        anyhow::bail!("历史资源不属于来源产品文件: {}", source.display());
+    }
+    let bytes = std::fs::read(&path)?;
+    let length = u64::try_from(bytes.len())?;
+    let sha = hex::encode(Sha256::digest(&bytes));
+    if expected_bytes.is_some_and(|expected| expected != length)
+        || !sha.eq_ignore_ascii_case(expected_sha)
+    {
+        anyhow::bail!("历史资源内容身份不匹配: {}", source.display());
+    }
+    // 这条迁移路径只接原文/工具文本；二进制附件沿原持久内联合同。
+    std::str::from_utf8(&bytes).context("历史原文/工具输出不是有效 UTF-8")?;
+    let user_input_root = owned_root.join("user-input");
+    let directory = if path.starts_with(&user_input_root) {
+        target_root
+            .join("user-input")
+            .join(path_component(conversation_id))
+            .join("reply-fork")
+    } else {
+        target_root
+            .join(path_component(conversation_id))
+            .join("reply-fork")
+    };
+    std::fs::create_dir_all(&directory)?;
+    let canonical_target_root = target_root.canonicalize()?;
+    if !directory
+        .canonicalize()?
+        .starts_with(&canonical_target_root)
+    {
+        anyhow::bail!("目标历史资源目录已变更");
+    }
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| value.chars().all(|ch| ch.is_ascii_alphanumeric()))
+        .unwrap_or("bin");
+    let target = directory.join(format!("{sha}.{extension}"));
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            if std::fs::read(&target)? != bytes {
+                anyhow::bail!("目标资源存在但内容不匹配: {}", target.display());
+            }
+        }
+        Ok(_) => anyhow::bail!("目标资源不是普通文件: {}", target.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            echo_agent::utils::fs::atomic_write(&target, &bytes)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let reread = std::fs::read(&target)?;
+    if reread != bytes
+        || u64::try_from(reread.len())? != length
+        || hex::encode(Sha256::digest(&reread)) != sha
+    {
+        anyhow::bail!("目标资源逐 bytes/SHA 回读失败: {}", target.display());
+    }
+    // 先记录真实已写文件；后续 reader 失败仍返回路径/bytes/SHA 与未验证状态。
+    let receipt_index = receipts.len();
+    let mut receipt = ReplyForkResourceReceipt {
+        source_path: source.to_path_buf(),
+        target_path: target.clone(),
+        bytes: length,
+        sha256: sha.clone(),
+        reader_verified: false,
+    };
+    receipts.push(receipt.clone());
+    // Qualify exactly the same configured reader root used by target Agents.
+    if std::str::from_utf8(&bytes).is_ok() {
+        use echo_agent::tools::files::artifact::{ArtifactPageLimit, read_artifact_page};
+        let config = echo_agent::tools::artifact::ToolOutputArtifactConfig::new(
+            target_root,
+            "conversation_or_30d",
+        );
+        let reference = echo_agent::tools::artifact::ToolOutputArtifactRef {
+            path: target.clone(),
+            artifact_bytes: length,
+            payload_bytes: length,
+            sha256: sha.clone(),
+            retention: "conversation_or_30d".into(),
+        };
+        let mut cursor = None;
+        let mut recovered = String::new();
+        loop {
+            let page = read_artifact_page(
+                &config,
+                &reference,
+                cursor.as_deref(),
+                ArtifactPageLimit::Bytes(32 * 1024),
+            )?;
+            recovered.push_str(&page.content);
+            if page.complete {
+                break;
+            }
+            cursor = Some(
+                page.next_cursor
+                    .ok_or_else(|| anyhow::anyhow!("目标资源分页缺少后续 cursor"))?,
+            );
+        }
+        if recovered.as_bytes() != bytes {
+            anyhow::bail!("目标实际 reader 未恢复完整原文");
+        }
+    }
+    receipt.reader_verified = true;
+    if let Some(recorded) = receipts.get_mut(receipt_index) {
+        *recorded = receipt.clone();
+    }
+    Ok(receipt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::attachments::AttachmentRef;
+    use anyhow::Context as _;
     use echo_agent::llm::types::MessageContent;
 
     fn make_turn_input<'a>(text: &'a str, spill_dir: &'a Path) -> UserTurnInput<'a> {
@@ -1125,6 +1490,908 @@ mod tests {
         assert_eq!(turn.resources.len(), 1, "should spill");
         // No panic = preview collection is char-based. Verify preview marker.
         assert!(turn.instruction.contains("preview:"));
+        Ok(())
+    }
+    fn prepared_resource_message(
+        text: &str,
+        resource: &InputResourceRef,
+    ) -> anyhow::Result<Message> {
+        Ok(PreparedUserTurn {
+            instruction: build_original_message_reference(text, resource),
+            resources: vec![resource.clone()],
+            authorship: InstructionAuthorship::User,
+            agent_input: None,
+        }
+        .to_message()?)
+    }
+
+    // F提案的typed wire夹具；真实producer同形输出由F的直接回归覆盖。
+    fn tool_artifact_message(
+        output: String,
+        reference: &echo_agent::tools::artifact::ToolOutputArtifactRef,
+    ) -> anyhow::Result<Message> {
+        use echo_agent::llm::types::LinkedResource;
+        const PREFIX: &str = "\n\n[Tool output preview only: the text above is not a summary and is not the complete result. Full output artifact: ";
+        let suffix = format!(
+            "{PREFIX}{} ({:.1} MiB, sha256 {}). Use read_artifact with this exact path and expected_sha256 to retrieve bounded pages until complete.]",
+            reference.path.display(),
+            reference.payload_bytes as f64 / 1_048_576.0,
+            reference.sha256,
+        );
+        let text_reference = output.strip_suffix(&suffix).map(|preview| {
+            serde_json::json!({
+                "part": 0, "start_chars": preview.chars().count(), "chars": suffix.chars().count(),
+                "sha256": hex::encode(Sha256::digest(suffix.as_bytes())),
+                "path_start_chars": PREFIX.chars().count(),
+                "path_chars": reference.path.to_string_lossy().chars().count(),
+            })
+        });
+        let mut message = Message::tool_result("call-1".into(), "shell".into(), output.clone());
+        message.content = MessageContent::Parts(vec![
+            ContentPart::Text { text: output },
+            ContentPart::ResourceLink {
+                resource: Box::new(LinkedResource {
+                    annotations: None,
+                    description: None,
+                    mime_type: Some("text/plain".into()),
+                    name: "shell output".into(),
+                    size: Some(i64::try_from(reference.artifact_bytes)?),
+                    title: None,
+                    uri: format!("echo-tool-output:sha256:{}", reference.sha256),
+                    meta: Some(serde_json::json!({"echo_tool_output_artifact": {
+                        "version": 1, "call_id": "call-1", "tool_name": "shell",
+                        "reference": reference, "text_reference": text_reference,
+                    }})),
+                }),
+            },
+        ]);
+        Ok(message)
+    }
+
+    #[test]
+    fn reply_fork_literal_product_namespace_example_remains_plain_user_text() -> anyhow::Result<()>
+    {
+        let temporary = tempfile::tempdir()?;
+        let source_root = temporary.path().join("source");
+        let target_root = temporary.path().join("target");
+        std::fs::create_dir_all(&source_root)?;
+        let ordinary = format!(
+            "请解释这个格式，下面只是用户正文示例：\n用户提交了一条超长原始消息,已落盘且未内联:\npath: {}\n后面是解释文字，不是产品描述符。",
+            source_root.join("user-input/source/example.txt").display(),
+        );
+        let turn =
+            PreparedUserTurn::build(make_turn_input(&ordinary, &source_root.join("user-input")))?;
+        assert!(turn.resources.is_empty());
+        let mut rows = vec![echo_agent::memory::project_message(
+            "source",
+            &turn.to_message()?,
+        )?];
+        let before = rows.clone();
+        let report = copy_reply_fork_history_resources_with_receipts(
+            &mut rows,
+            Some(&source_root),
+            Some(&target_root),
+            "target",
+        );
+        assert!(
+            report.error.is_none(),
+            "ordinary input was treated as a product descriptor: {:?}",
+            report.error
+        );
+        assert!(report.resources.is_empty());
+        assert_eq!(rows, before);
+        assert!(!target_root.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn reply_fork_quoted_valid_descriptor_has_no_resource_provenance() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let source_root = temporary.path().join("source");
+        let target_root = temporary.path().join("target");
+        let source_text = "这是另外一份资源，用户本次只是引用它的描述格式。";
+        let reference = spill_to_artifact(
+            source_text,
+            &source_root.join("user-input"),
+            Some("source"),
+            Some("earlier"),
+            "earlier.txt",
+            AttachmentSource::Message,
+        )?;
+        let ordinary = format!(
+            "请说明以下文字格式，不是本消息的附件或原文：\n{}",
+            build_original_message_reference(source_text, &reference),
+        );
+        let turn =
+            PreparedUserTurn::build(make_turn_input(&ordinary, &source_root.join("user-input")))?;
+        assert!(turn.resources.is_empty());
+        let mut rows = vec![echo_agent::memory::project_message(
+            "source",
+            &turn.to_message()?,
+        )?];
+        let before = rows.clone();
+        let report = copy_reply_fork_history_resources_with_receipts(
+            &mut rows,
+            Some(&source_root),
+            Some(&target_root),
+            "target",
+        );
+        assert!(report.error.is_none());
+        assert!(
+            report.resources.is_empty(),
+            "user quotation acquired fabricated resource ownership"
+        );
+        assert_eq!(rows, before, "ordinary quoted pathname was rewritten");
+        assert!(!target_root.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn reply_fork_user_descriptor_examples_are_not_product_references() -> anyhow::Result<()> {
+        let text = "格式示例:\n用户提交了一条超长原始消息,已落盘且未内联:\npath: /tmp/user-input/demo\nlines: 1\nbytes: 3\nsha256: 不是产品SHA";
+        let mut rows = vec![echo_agent::memory::project_message(
+            "target",
+            &Message::user(text.to_string()),
+        )?];
+        let report =
+            copy_reply_fork_history_resources_with_receipts(&mut rows, None, None, "target");
+        assert!(report.error.is_none());
+        assert!(report.resources.is_empty());
+        assert_eq!(
+            rows.first().and_then(|row| row.content.as_deref()),
+            Some(text)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reply_fork_never_scans_original_preview_as_a_new_resource() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let source_root = temporary.path().join("source");
+        let target_root = temporary.path().join("target");
+        let fake = source_root.join("user-input/source/not-a-reference.txt");
+        let raw = format!(
+            "普通原文\n该 artifact 是用户原始消息,用户正文里的示例不是边界\n用户提交了一条超长原始消息,已落盘且未内联:\npath: {}\nlines: 1\nbytes: 3\nsha256: {}\n其余完整尾部🙂",
+            fake.display(),
+            "0".repeat(64)
+        );
+        let resource = spill_to_artifact(
+            &raw,
+            &source_root.join("user-input"),
+            Some("source"),
+            Some("turn"),
+            "input.txt",
+            AttachmentSource::Message,
+        )?;
+        let original_message = prepared_resource_message(&raw, &resource)?;
+        let original_row = echo_agent::memory::project_message("target", &original_message)?;
+        let mut rows = vec![original_row.clone()];
+        let report = copy_reply_fork_history_resources_with_receipts(
+            &mut rows,
+            Some(&source_root),
+            Some(&target_root),
+            "target",
+        );
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert_eq!(report.resources.len(), 1);
+        let content = rows
+            .first()
+            .and_then(|row| row.content.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("missing copied body"))?;
+        assert!(content.contains(&format!("path: {}", fake.display())));
+        std::fs::remove_file(&resource.path)?;
+        let mut missing = vec![original_row];
+        let report = copy_reply_fork_history_resources_with_receipts(
+            &mut missing,
+            Some(&source_root),
+            Some(&target_root),
+            "target",
+        );
+        assert!(report.error.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn reply_fork_plain_history_does_not_require_artifact_configuration() -> anyhow::Result<()> {
+        let user = echo_agent::memory::project_message(
+            "target",
+            &Message::user("普通正文 /原样路径🙂".to_string()),
+        )?;
+        let mut rows = vec![user];
+        let before = rows.clone();
+        let report =
+            copy_reply_fork_history_resources_with_receipts(&mut rows, None, None, "target");
+        assert!(report.error.is_none());
+        assert!(report.resources.is_empty());
+        assert_eq!(rows, before);
+        Ok(())
+    }
+
+    #[test]
+    fn reply_fork_resource_failure_keeps_verified_receipts_without_publishing_partial_history()
+    -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let source_root = temporary.path().join("source");
+        let target_root = temporary.path().join("target");
+        let original = "完整原文与尾部🙂".repeat(1000);
+        let resource = spill_to_artifact(
+            &original,
+            &source_root.join("user-input"),
+            Some("source"),
+            Some("turn"),
+            "input.txt",
+            AttachmentSource::Message,
+        )?;
+        let first = echo_agent::memory::project_message(
+            "target",
+            &prepared_resource_message(&original, &resource)?,
+        )?;
+        let missing = spill_to_artifact(
+            &original,
+            &source_root.join("user-input"),
+            Some("source"),
+            Some("missing-turn"),
+            "missing.txt",
+            AttachmentSource::Message,
+        )?;
+        let second = echo_agent::memory::project_message(
+            "target",
+            &prepared_resource_message(&original, &missing)?,
+        )?;
+        std::fs::remove_file(&missing.path)?;
+        let mut rows = vec![first, second];
+        let before = rows.clone();
+        let report = copy_reply_fork_history_resources_with_receipts(
+            &mut rows,
+            Some(&source_root),
+            Some(&target_root),
+            "target",
+        );
+        assert!(report.error.is_some());
+        assert_eq!(rows, before);
+        assert_eq!(report.resources.len(), 1);
+        let copied = report
+            .resources
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("missing real partial receipt"))?;
+        assert!(copied.reader_verified);
+        assert_eq!(std::fs::read(&copied.target_path)?, original.as_bytes());
+        assert_eq!(
+            hex::encode(Sha256::digest(std::fs::read(&copied.target_path)?)),
+            copied.sha256
+        );
+        let partial_path = copied.target_path.clone();
+        let partial_sha = copied.sha256.clone();
+        let partial_bytes = copied.bytes;
+        // 部分成功后的重入不能覆盖已冲突的目标文件，也不能先发布半份 canonical 历史。
+        std::fs::write(&missing.path, original.as_bytes())?;
+        let conflicting = "目标中已有另一份内容🙂";
+        std::fs::write(&partial_path, conflicting.as_bytes())?;
+        let rejected_retry = copy_reply_fork_history_resources_with_receipts(
+            &mut rows,
+            Some(&source_root),
+            Some(&target_root),
+            "target",
+        );
+        assert!(rejected_retry.error.is_some());
+        assert_eq!(rows, before);
+        assert_eq!(std::fs::read(&partial_path)?, conflicting.as_bytes());
+        // 仅测试自己修复已知 fixture，再以原 rows/目标身份重入同一 copier。
+        std::fs::write(&partial_path, original.as_bytes())?;
+        let retried = copy_reply_fork_history_resources_with_receipts(
+            &mut rows,
+            Some(&source_root),
+            Some(&target_root),
+            "target",
+        );
+        assert!(retried.error.is_none(), "{:?}", retried.error);
+        assert_eq!(retried.resources.len(), 1, "相同内容复用原已验证副本");
+        let recovered = retried.resources.first().context("retry receipt missing")?;
+        assert_eq!(recovered.target_path, partial_path);
+        assert_eq!(recovered.sha256, partial_sha);
+        assert_eq!(recovered.bytes, partial_bytes);
+        assert!(recovered.reader_verified);
+        assert_ne!(rows, before);
+        std::fs::remove_file(&resource.path)?;
+        std::fs::remove_file(&missing.path)?;
+        let config = echo_agent::tools::artifact::ToolOutputArtifactConfig::new(
+            &target_root,
+            "conversation_or_30d",
+        );
+        let reference = echo_agent::tools::artifact::ToolOutputArtifactRef {
+            path: partial_path,
+            artifact_bytes: partial_bytes,
+            payload_bytes: partial_bytes,
+            sha256: partial_sha,
+            retention: "conversation_or_30d".into(),
+        };
+        let mut cursor = None;
+        let mut read_back = String::new();
+        loop {
+            let page = echo_agent::tools::files::artifact::read_artifact_page(
+                &config,
+                &reference,
+                cursor.as_deref(),
+                echo_agent::tools::files::artifact::ArtifactPageLimit::Bytes(257),
+            )?;
+            read_back.push_str(&page.content);
+            if page.complete {
+                break;
+            }
+            cursor = Some(page.next_cursor.context("retry reader cursor missing")?);
+        }
+        assert_eq!(read_back.as_bytes(), original.as_bytes());
+        assert_eq!(u64::try_from(read_back.len())?, reference.artifact_bytes);
+        assert_eq!(
+            hex::encode(Sha256::digest(read_back.as_bytes())),
+            reference.sha256
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reply_fork_resources_remain_readable_after_source_cleanup() -> anyhow::Result<()> {
+        use echo_agent::memory::project_message;
+        let temporary = tempfile::tempdir()?;
+        let source_root = temporary.path().join("source/.eko/artifacts");
+        let target_root = temporary.path().join("target/.eko/artifacts");
+        let raw = format!("{}\n完整尾部🙂", "原始输入中文🙂\n".repeat(5000));
+        let original = spill_to_artifact(
+            &raw,
+            &source_root.join("user-input"),
+            Some("source"),
+            Some("turn"),
+            "user-message.txt",
+            AttachmentSource::Message,
+        )?;
+        let plain_path = format!("用户正文路径保持原样 {}", original.path.display());
+        let instruction = format!(
+            "{}\n\n{plain_path}",
+            build_original_message_reference(&raw, &original)
+        );
+        let user_message = PreparedUserTurn {
+            instruction,
+            resources: vec![original.clone()],
+            authorship: InstructionAuthorship::User,
+            agent_input: None,
+        }
+        .to_message()?;
+        let mut user = project_message("branch", &user_message)?;
+        let mut payload: serde_json::Value = serde_json::from_str(
+            user.attachments_json
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("projection missing"))?,
+        )?;
+        payload["display_content"] = raw.clone().into();
+        payload["attachments"] = serde_json::json!([{"name":"附件🙂.bin","mime_type":"application/octet-stream","url":"data:application/octet-stream;base64,AP8B","size":3}]);
+        user.attachments_json = Some(serde_json::to_string(&payload)?);
+        let output = format!("{}\n工具末尾🙂", "输出🙂\n".repeat(6000));
+        let config = echo_agent::tools::artifact::ToolOutputArtifactConfig::new(
+            &source_root,
+            "conversation_or_30d",
+        )
+        .threshold_bytes(1);
+        let artifact = echo_agent::tools::artifact::persist_tool_output(
+            config,
+            echo_agent::tools::artifact::ToolOutputArtifactIdentity {
+                conversation_id: Some("source".into()),
+                run_id: Some("run".into()),
+                call_id: "call-1".into(),
+                tool_name: "shell".into(),
+            },
+            &output,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("fixture did not spill"))?;
+        let tool_text = format!(
+            "输出预览\n\n[Tool output preview only: the text above is not a summary and is not the complete result. Full output artifact: {} ({:.1} MiB, sha256 {}). Use read_artifact with this exact path and expected_sha256 to retrieve bounded pages until complete.]",
+            artifact.path.display(),
+            artifact.payload_bytes as f64 / 1_048_576.0,
+            artifact.sha256
+        );
+        let calls = r#"[{"id":"call-1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"pwd\"}"}}]"#.to_string();
+        let tool_row = project_message("branch", &tool_artifact_message(tool_text, &artifact)?)?;
+        let result = tool_row
+            .tool_result_json
+            .clone()
+            .context("tool identity missing")?;
+        let mut rows = vec![
+            user,
+            project_message(
+                "branch",
+                &Message::assistant_with_tools(serde_json::from_str(&calls)?),
+            )?,
+            tool_row,
+        ];
+        let receipts =
+            copy_reply_fork_history_resources(&mut rows, &source_root, &target_root, "branch")?;
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(
+            rows.get(1).and_then(|row| row.tool_calls_json.as_ref()),
+            Some(&calls)
+        );
+        assert_eq!(
+            rows.get(2).and_then(|row| row.tool_result_json.as_ref()),
+            Some(&result)
+        );
+        assert!(
+            rows.first()
+                .and_then(|row| row.content.as_ref())
+                .is_some_and(|text| text.contains(&plain_path))
+        );
+        let payload: serde_json::Value = serde_json::from_str(
+            rows.first()
+                .and_then(|row| row.attachments_json.as_deref())
+                .ok_or_else(|| anyhow::anyhow!("copied projection missing"))?,
+        )?;
+        assert_eq!(
+            payload
+                .get("display_content")
+                .and_then(serde_json::Value::as_str),
+            Some(raw.as_str())
+        );
+        assert_eq!(
+            payload
+                .get("attachments")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("url"))
+                .and_then(serde_json::Value::as_str),
+            Some("data:application/octet-stream;base64,AP8B")
+        );
+        // Only this fixture's source root is removed. Target copies continue
+        // through the real bounded reader after their original owner is gone.
+        std::fs::remove_dir_all(&source_root)?;
+        let tool_display = resource_history_display_text(rows.get(2).context("tool row missing")?)?
+            .context("tool text missing")?;
+        assert!(!tool_display.contains(&artifact.path.to_string_lossy().to_string()));
+        let later_root = temporary.path().join("later/artifacts");
+        let mut refork = rows.clone();
+        let later =
+            copy_reply_fork_history_resources(&mut refork, &target_root, &later_root, "later")?;
+        assert_eq!(later.len(), 2);
+        assert!(
+            !resource_history_display_text(refork.get(2).context("tool row missing")?)?
+                .context("tool text missing")?
+                .contains(&target_root.to_string_lossy().to_string())
+        );
+        for receipt in &receipts {
+            let bytes = std::fs::read(&receipt.target_path)?;
+            assert_eq!(u64::try_from(bytes.len())?, receipt.bytes);
+            assert_eq!(hex::encode(Sha256::digest(&bytes)), receipt.sha256);
+            let expected = if receipt.source_path == original.path {
+                raw.as_bytes()
+            } else {
+                output.as_bytes()
+            };
+            assert_eq!(bytes, expected);
+            let reference = echo_agent::tools::artifact::ToolOutputArtifactRef {
+                path: receipt.target_path.clone(),
+                artifact_bytes: receipt.bytes,
+                payload_bytes: receipt.bytes,
+                sha256: receipt.sha256.clone(),
+                retention: "conversation_or_30d".into(),
+            };
+            let config = echo_agent::tools::artifact::ToolOutputArtifactConfig::new(
+                &target_root,
+                "conversation_or_30d",
+            );
+            let mut cursor = None;
+            let mut recovered = String::new();
+            loop {
+                let page = echo_agent::tools::files::artifact::read_artifact_page(
+                    &config,
+                    &reference,
+                    cursor.as_deref(),
+                    echo_agent::tools::files::artifact::ArtifactPageLimit::Bytes(99),
+                )?;
+                recovered.push_str(&page.content);
+                if page.complete {
+                    break;
+                }
+                cursor = Some(
+                    page.next_cursor
+                        .ok_or_else(|| anyhow::anyhow!("missing continuation"))?,
+                );
+            }
+            assert_eq!(recovered.as_bytes(), expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reply_fork_resource_identity_failure_is_explicit_and_user_paths_are_untouched()
+    -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let source_root = temporary.path().join("source");
+        let target_root = temporary.path().join("target");
+        std::fs::create_dir_all(&source_root)?;
+        let source = source_root.join("original.txt");
+        std::fs::write(&source, "真实原文🙂")?;
+        let wrong_sha = "0".repeat(64);
+        let mut receipts = Vec::new();
+        assert!(
+            copy_reply_fork_resource(
+                &source,
+                &source_root,
+                &target_root,
+                "branch",
+                None,
+                &wrong_sha,
+                &mut receipts,
+            )
+            .is_err()
+        );
+        assert!(!target_root.exists());
+        let ordinary = format!("请分析普通用户路径 {} 和 /tmp/用户🙂", source.display());
+        let mut rows = vec![echo_agent::memory::project_message(
+            "branch",
+            &Message::user(ordinary.clone()),
+        )?];
+        let report = copy_reply_fork_history_resources_with_receipts(
+            &mut rows,
+            Some(&source_root),
+            Some(&target_root),
+            "branch",
+        );
+        assert!(report.error.is_none());
+        assert_eq!(
+            rows.first().and_then(|row| row.content.as_deref()),
+            Some(ordinary.as_str())
+        );
+        assert!(receipts.is_empty());
+        let missing = source_root.join("missing.txt");
+        assert!(
+            copy_reply_fork_resource(
+                &missing,
+                &source_root,
+                &target_root,
+                "branch",
+                None,
+                &wrong_sha,
+                &mut receipts,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+    #[test]
+    fn reply_fork_same_text_and_image_do_not_borrow_resource_identity() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("source");
+        let target = temporary.path().join("target");
+        let raw = "完整输入🙂".repeat(6000);
+        let turn = PreparedUserTurn::build(make_turn_input(&raw, &source.join("user-input")))?;
+        let mut owned = turn.to_message()?;
+        let MessageContent::Parts(parts) = &mut owned.content else {
+            anyhow::bail!("typed input missing");
+        };
+        parts.push(ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "data:image/png;base64,AP8B".into(),
+                detail: None,
+            },
+        });
+        let mut quotation = owned.clone();
+        let MessageContent::Parts(plain_parts) = &mut quotation.content else {
+            anyhow::bail!("parts missing");
+        };
+        plain_parts.retain(|part| !matches!(part, ContentPart::ResourceLink { .. }));
+        let quoted = echo_agent::memory::project_message("branch", &quotation)?;
+        let mut rows = vec![
+            quoted.clone(),
+            echo_agent::memory::project_message("branch", &owned)?,
+        ];
+        let report = copy_reply_fork_history_resources_with_receipts(
+            &mut rows,
+            Some(&source),
+            Some(&target),
+            "branch",
+        );
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert_eq!(report.resources.len(), 1);
+        assert_eq!(rows.first(), Some(&quoted));
+        let restored = echo_agent::memory::restore_message(rows.get(1).context("owned missing")?)?;
+        let MessageContent::Parts(parts) = restored.content else {
+            anyhow::bail!("owned parts lost");
+        };
+        assert!(
+            parts
+                .iter()
+                .any(|part| matches!(part, ContentPart::ImageUrl { image_url }
+            if image_url.url == "data:image/png;base64,AP8B"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reply_fork_managed_file_import_restores_resource_parts_for_later_fork()
+    -> anyhow::Result<()> {
+        use echo_agent::agent::ReactAgentBuilder;
+        use echo_agent::memory::{
+            ConversationStore, EnsureConversationProjectionRequest, FileConversationStore,
+            NewConversation,
+        };
+        use echo_agent::state::FileRuntimeStateStore;
+        use std::sync::Arc;
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("source/artifacts");
+        let target = temporary.path().join("target/artifacts");
+        let later = temporary.path().join("later/artifacts");
+        let raw = "真正的Steer和初始输入共用此producer🙂".repeat(6000);
+        let turn = PreparedUserTurn::build(make_turn_input(&raw, &source.join("user-input")))?;
+        let mut rows = vec![echo_agent::memory::project_message(
+            "branch",
+            &turn.to_message()?,
+        )?];
+        copy_reply_fork_history_resources(&mut rows, &source, &target, "branch")?;
+        let store_path = temporary.path().join("transcript");
+        let store = Arc::new(FileConversationStore::new(&store_path)?);
+        store
+            .ensure_projection_epoch(EnsureConversationProjectionRequest {
+                conversation: NewConversation {
+                    conversation_id: "branch".into(),
+                    user_id: "test".into(),
+                    agent_type: None,
+                    title: None,
+                },
+                expected_tombstone_epoch: None,
+            })
+            .await?;
+        let runtime = Arc::new(FileRuntimeStateStore::new(
+            temporary.path().join("runtime"),
+        )?);
+        let agent = crate::agent_handle::AgentHandle::new(
+            ReactAgentBuilder::new()
+                .llm_client(Arc::new(echo_agent::testing::MockLlmClient::new()))
+                .system_prompt("current system")
+                .conversation_id("branch")
+                .conversation_store(store.clone())
+                .state_store(runtime.clone())
+                .build()?,
+        );
+        crate::managed_conversation::replace_and_resume(
+            store.as_ref(),
+            runtime.as_ref(),
+            &agent,
+            "branch",
+            &rows,
+        )
+        .await?;
+        drop(store);
+        let reopened = FileConversationStore::new(&store_path)?;
+        let mut restored = reopened.get_messages("branch").await?;
+        assert_eq!(restored.len(), 1);
+        let display =
+            resource_history_display_text(restored.first().context("reopened row missing")?)?
+                .context("display missing")?;
+        assert!(!display.contains("[Linked resource]"));
+        let agent_messages = agent
+            .read_async(|agent| Box::pin(async move { agent.get_messages().await }))
+            .await;
+        assert!(agent_messages.iter().any(
+            |message| matches!(&message.content, MessageContent::Parts(parts)
+            if parts.iter().any(|part| matches!(part, ContentPart::ResourceLink { .. })))
+        ));
+        std::fs::remove_dir_all(&source)?;
+        let report = copy_reply_fork_history_resources_with_receipts(
+            &mut restored,
+            Some(&target),
+            Some(&later),
+            "later",
+        );
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert_eq!(report.resources.len(), 1);
+        let receipt = report.resources.first().context("later receipt missing")?;
+        assert_eq!(std::fs::read(&receipt.target_path)?, raw.as_bytes());
+        Ok(())
+    }
+
+    #[test]
+    fn reply_fork_typed_tool_identity_mismatch_does_not_publish_history() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("source");
+        let target = temporary.path().join("target");
+        let reference = echo_agent::tools::artifact::persist_tool_output(
+            echo_agent::tools::artifact::ToolOutputArtifactConfig::new(
+                &source,
+                "conversation_or_30d",
+            )
+            .threshold_bytes(1),
+            echo_agent::tools::artifact::ToolOutputArtifactIdentity {
+                conversation_id: Some("source".into()),
+                run_id: Some("run".into()),
+                call_id: "call-1".into(),
+                tool_name: "shell".into(),
+            },
+            "完整输出🙂",
+        )?
+        .context("artifact missing")?;
+        let mut message = tool_artifact_message("普通工具文字保持原样".into(), &reference)?;
+        message.tool_call_id = Some("different-physical-result".into());
+        let mut rows = vec![echo_agent::memory::project_message("branch", &message)?];
+        let before = rows.clone();
+        let report = copy_reply_fork_history_resources_with_receipts(
+            &mut rows,
+            Some(&source),
+            Some(&target),
+            "branch",
+        );
+        assert!(report.error.is_some());
+        assert!(report.resources.is_empty());
+        assert_eq!(rows, before);
+        assert!(!target.exists());
+        Ok(())
+    }
+}
+
+/// Only the original typed ResourceLink may classify a canonical Agent input.
+pub fn persisted_agent_input(
+    message: &Message,
+) -> anyhow::Result<Option<crate::agent_router::AgentMessage>> {
+    provenance::persisted_agent_input(message)
+}
+
+#[cfg(test)]
+mod agent_communication_source_tests {
+    use super::*;
+    use echo_agent::memory::{ConversationStore, FileConversationStore, NewConversation};
+
+    fn root() -> anyhow::Result<tempfile::TempDir> {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".echo-semantic/local/agent-communication-tests");
+        std::fs::create_dir_all(&base)?;
+        Ok(tempfile::tempdir_in(base)?)
+    }
+    fn input() -> crate::agent_router::AgentMessage {
+        crate::agent_router::AgentMessage::agent_text(
+            Some(crate::agent_router::AgentAddress::new(
+                crate::workspace::WorkspaceId::from_raw("source".into()),
+                "sender",
+            )),
+            crate::agent_router::AgentAddress::new(
+                crate::workspace::WorkspaceId::from_raw("target".into()),
+                "conversation",
+            ),
+            "原始Agent输入\n中文🧪及完整尾部约束",
+        )
+    }
+    fn prepare(
+        root: &Path,
+    ) -> anyhow::Result<(PreparedUserTurn, crate::agent_router::AgentMessage)> {
+        let input = input();
+        let mut turn = PreparedUserTurn::runtime_instruction("模型侧指令原样保持");
+        turn.bind_agent_input(&input, root, "conversation", "original-turn")?;
+        Ok((turn, input))
+    }
+    #[test]
+    fn typed_agent_input_roundtrip_keeps_origin_fulltext_and_original_instruction()
+    -> anyhow::Result<()> {
+        let root = root()?;
+        let (turn, input) = prepare(root.path())?;
+        assert_eq!(turn.authorship, InstructionAuthorship::Runtime);
+        assert_eq!(turn.instruction, "模型侧指令原样保持");
+        let stored = echo_agent::memory::project_message("conversation", &turn.to_message()?)?;
+        let restored = echo_agent::memory::restore_message(&stored)?;
+        assert_eq!(persisted_agent_input(&restored)?, Some(input));
+        assert!(
+            persisted_agent_input(&Message::user(
+                "[eko_agent_message] fake source".to_string()
+            ))?
+            .is_none()
+        );
+        Ok(())
+    }
+    #[test]
+    fn typed_agent_input_fork_copies_real_artifact_and_keeps_original_source() -> anyhow::Result<()>
+    {
+        let root = root()?;
+        let source_root = root.path().join("source");
+        let target_root = root.path().join("target");
+        let (turn, input) = prepare(&source_root)?;
+        let mut rows = vec![echo_agent::memory::project_message(
+            "conversation",
+            &turn.to_message()?,
+        )?];
+        let report = copy_reply_fork_history_resources_with_receipts(
+            &mut rows,
+            Some(&source_root),
+            Some(&target_root),
+            "fork",
+        );
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert_eq!(report.resources.len(), 1);
+        assert!(report.resources.iter().all(
+            |receipt| receipt.reader_verified && receipt.target_path.starts_with(&target_root)
+        ));
+        let copied = rows
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("copied row missing"))?;
+        assert_eq!(
+            persisted_agent_input(&echo_agent::memory::restore_message(copied)?)?,
+            Some(input)
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn typed_agent_input_new_filestore_reopen_preserves_canonical_source()
+    -> anyhow::Result<()> {
+        let root = root()?;
+        let (turn, input) = prepare(&root.path().join("artifacts"))?;
+        let directory = root.path().join("store");
+        let store = FileConversationStore::new(&directory)?;
+        let authority = store
+            .ensure_projection_epoch(echo_agent::memory::EnsureConversationProjectionRequest {
+                conversation: NewConversation {
+                    conversation_id: "conversation".into(),
+                    user_id: "default".into(),
+                    agent_type: None,
+                    title: None,
+                },
+                expected_tombstone_epoch: None,
+            })
+            .await?
+            .authority;
+        let rows = vec![echo_agent::memory::project_message(
+            "conversation",
+            &turn.to_message()?,
+        )?];
+        let import = echo_agent::memory::ManagedConversationImport::prepare_for_generation(
+            "conversation",
+            authority.epoch,
+            authority.revision,
+            "original-input-generation",
+            rows,
+        )?;
+        store.import_managed_messages(import).await?;
+        drop(store);
+        let reopened = FileConversationStore::new(directory)?;
+        let rows = reopened.get_messages("conversation").await?;
+        let row = rows
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("cold row missing"))?;
+        assert_eq!(
+            persisted_agent_input(&echo_agent::memory::restore_message(row)?)?,
+            Some(input)
+        );
+        Ok(())
+    }
+    #[test]
+    fn typed_agent_input_bad_metadata_rejects_before_resource_copy() -> anyhow::Result<()> {
+        let root = root()?;
+        let (turn, _) = prepare(&root.path().join("source"))?;
+        let mut message = turn.to_message()?;
+        if let echo_agent::llm::types::MessageContent::Parts(parts) = &mut message.content {
+            for part in parts {
+                if let ContentPart::ResourceLink { resource } = part
+                    && let Some(value) = resource
+                        .meta
+                        .as_mut()
+                        .and_then(|meta| meta.get_mut("eko_agent_communication"))
+                {
+                    let text = value
+                        .get_mut("message")
+                        .and_then(|message| message.get_mut("payload"))
+                        .and_then(|payload| payload.get_mut("text"))
+                        .ok_or_else(|| anyhow::anyhow!("typed source text missing"))?;
+                    *text = serde_json::json!("tampered body");
+                }
+            }
+        }
+        assert!(persisted_agent_input(&message).is_err());
+        let mut rows = vec![echo_agent::memory::project_message(
+            "conversation",
+            &message,
+        )?];
+        let before = rows.clone();
+        let report = copy_reply_fork_history_resources_with_receipts(
+            &mut rows,
+            Some(&root.path().join("source")),
+            Some(&root.path().join("target")),
+            "fork",
+        );
+        assert!(report.error.is_some());
+        assert!(report.resources.is_empty());
+        assert_eq!(rows, before);
         Ok(())
     }
 }

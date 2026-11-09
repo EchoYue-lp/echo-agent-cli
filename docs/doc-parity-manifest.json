@@ -1,6 +1,6 @@
 {
-  "schemaVersion": 1,
-  "authority": "zh is the editorial source; en is a reviewed semantic translation. Every migrated entry removes its legacy root source after parity passes.",
+  "schemaVersion": 2,
+  "authority": "中文是当前正式产品文档的主维护来源；不要求为新增或修改的中文页面创建英语副本。既有reviewed英语页按登记检查，工程计划独立登记且不作为产品页面。",
   "entries": [
     {
       "legacyPath": "MASTER-PLAN.md",
@@ -481,6 +481,174 @@
       "sourceLanguage": "zh-mixed",
       "translationStatus": "reviewed",
       "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0050-gui-product-convergence.md",
+      "targetPath": "adr/0050-gui-product-convergence.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0051-ssh-terminal-sessions.md",
+      "targetPath": "adr/0051-ssh-terminal-sessions.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0053-im-cron-gui-control.md",
+      "targetPath": "adr/0053-im-cron-gui-control.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0052-gui-subagent-depth-policy.md",
+      "targetPath": "adr/0052-gui-subagent-depth-policy.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "guides/gui-hitl-dialog.md",
+      "targetPath": "guides/gui-hitl-dialog.md",
+      "kind": "guide",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "guides/gui-task-runtime-panel.md",
+      "targetPath": "guides/gui-task-runtime-panel.md",
+      "kind": "guide",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0054-task-bound-domain-plugins.md",
+      "targetPath": "adr/0054-task-bound-domain-plugins.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0055-project-workspaces.md",
+      "targetPath": "adr/0055-project-workspaces.md",
+      "kind": "adr",
+      "sourceLanguage": "zh-mixed",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "legacyPath": "adr/0056-personal-weixin-channel.md",
+      "targetPath": "adr/0056-personal-weixin-channel.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "reviewed",
+      "legacyRemoved": true
+    },
+    {
+      "targetPath": "adr/0057-native-messages-and-progress-policy.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "adr/0058-im-native-output-projection.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "adr/0060-subagent-native-observations.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "adr/0061-tool-categories-and-required-tools.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "architecture/performance-baseline.md",
+      "kind": "architecture",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "guides/extension-panel-scope-settlement.md",
+      "kind": "guide",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "guides/hitl-replay-identity.md",
+      "kind": "guide",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "guides/plugin-panel-scope-settlement.md",
+      "kind": "guide",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "guides/task-run-history.md",
+      "kind": "guide",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "adr/0062-current-five-risk-binding.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "adr/0063-project-context-startup.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "adr/0064-background-cell-receipt-ownership.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "adr/0065-cache-prefix-facts.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "adr/0066-turn-presentation-and-usage-projection.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    },
+    {
+      "targetPath": "adr/0067-local-chart-rendering.md",
+      "kind": "adr",
+      "sourceLanguage": "zh",
+      "translationStatus": "not_required"
+    }
+  ],
+  "engineeringEntries": [
+    {
+      "path": "MASTER-PLAN.md",
+      "kind": "project-plan"
     }
   ]
 }

@@ -1,5 +1,7 @@
 # ADR 0034: Full-Direction Agent Communication Matrix and Conversation Collaboration Tools
 
+> Delegation policy update: ADR [0052](0052-gui-subagent-depth-policy.md) supersedes only the unconditional nesting/default-three and fixed-single-layer clauses below. Communication, lifecycle and GUI decisions remain in force.
+
 - Status: Accepted
 - Date: 2026-09-02
 - Owners: `agent_control`, `tasks/task_runtime`, `state/app_state`

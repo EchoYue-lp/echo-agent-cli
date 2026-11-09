@@ -1,12 +1,15 @@
+import type { HitlRequestIdentity } from '../types/api';
 // @vitest-environment jsdom
-import { act, renderHook, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useConversationStore } from '../stores/conversationStore';
 import { useChatStore } from '../stores/chatStore';
 import { useToastStore } from '../stores/toastStore';
 import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
 import { subagentRunStoreKey, useSubagentRunStore } from '../stores/subagentRunStore';
-import type { ExecEvent } from '../generated';
+import type { ExecEvent, TaskRun, TaskRunResumeReceipt } from '../generated';
+import type { Workspace } from '../api/endpoints';
+import { useWorkspaceStore } from '../stores/workspaceStore';
 import type {
   AgentEvent,
   ChatEventEnvelope,
@@ -14,9 +17,11 @@ import type {
   ConversationInputFact,
   ConversationInputFrontier,
   ConversationInputProjection,
+  ConversationInputReceipt,
+  Attachment,
 } from '../types/api';
 import { resetChatEventCursorsForTest } from './chatEventSequencer';
-import { useTauriChat } from './useTauriChat';
+import { useTauriChat, type ChatSendSubmission } from './useTauriChat';
 
 const mocks = vi.hoisted(() => ({
   apiInvoke: vi.fn(),
@@ -31,6 +36,35 @@ const emptyReplay = (): ChatEventReplay => ({
   latest_cursor: 0,
   truncated: false,
 });
+
+function deferred<T>() {
+  let resolve: (value: T) => void = () => undefined;
+  let reject: (reason: Error) => void = () => undefined;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function draftSubmission(
+  text: string,
+  onPersisted?: ChatSendSubmission['onPersisted'],
+  attachments?: Attachment[],
+  domainPlugin?: string
+): ChatSendSubmission {
+  const workspace = useWorkspaceStore.getState().current;
+  const conversation = useConversationStore.getState();
+  return {
+    externalId: 'fixed-draft-submission',
+    workspaceId: workspace?.id ?? 'global',
+    workspaceGeneration: workspace?.product_data_generation ?? 'global',
+    conversationId: conversation.activeId,
+    newConversationEpoch: conversation.newConversationEpoch,
+    payload: { text, attachments, domainPlugin },
+    onPersisted,
+  };
+}
 
 const inputProjection = (
   inputId: string,
@@ -65,6 +99,22 @@ const inputProjection = (
 
 let queuedFrontier: ConversationInputFrontier = { queue_revision: 0, items: [] };
 
+const nativeCommentary = (text: string, sequence = 1): AgentEvent => ({
+  type: 'assistant_message',
+  data: {
+    block: {
+      block_id: 'native-body',
+      request_id: 'native-request',
+      sequence,
+      phase: 'commentary',
+      delta: text,
+      complete: false,
+      provider: null,
+      reasoning: null,
+    },
+  },
+});
+
 const agentEnvelope = (
   turnId: string,
   sequence: number,
@@ -86,7 +136,7 @@ const agentEnvelope = (
   payload: {
     source: 'agent',
     event: {
-      schema_version: 4,
+      schema_version: 5,
       event_id: `agent-event-${sequence}`,
       content_hash: `agent-hash-${sequence}`,
       sequence,
@@ -204,7 +254,21 @@ vi.mock('@tauri-apps/api/event', () => ({
   listen: mocks.listen,
 }));
 
+const hitlIdentity = (request_id: string): HitlRequestIdentity => ({
+  request_id,
+  response_target: `target-${request_id}`,
+  kind: 'approval',
+  scope: {
+    workspace_id: 'original-workspace',
+    host_generation: 'original-generation',
+    conversation_id: 'original-conversation',
+    root_turn_id: 'original-root',
+    turn_id: 'original-turn',
+  },
+});
+
 describe('useTauriChat foreground turn recovery', () => {
+  afterEach(cleanup);
   const activeSnapshot = {
     workspace_id: 'global',
     surface: 'gui',
@@ -226,6 +290,7 @@ describe('useTauriChat foreground turn recovery', () => {
         return () => mocks.listeners.delete(eventName);
       }
     );
+    useWorkspaceStore.setState({ current: null, isLoading: false });
     useConversationStore.setState({ activeId: null, newConversationEpoch: 0 });
     useChatStore.getState().clearMessages();
     useChatStore.setState({ pendingHitlRequests: [] });
@@ -370,6 +435,226 @@ describe('useTauriChat foreground turn recovery', () => {
     hook.unmount();
   });
 
+  function conflictRun(
+    id: string,
+    status: TaskRun['status'] = 'paused',
+    workspaceId = 'global'
+  ): TaskRun {
+    return {
+      run_id: id,
+      workspace_id: workspaceId,
+      conversation_id: 'conversation-conflict',
+      root_message_id: 'conflict-message',
+      domain_profile: 'general',
+      domain_binding: null,
+      status,
+      goal: id,
+      goal_revision: 1,
+      goal_sha256: 'goal',
+      plan_id: null,
+      route: 'diagnostic-only',
+      attended_mode: 'attended',
+      created_at: '2026-10-25T00:00:00Z',
+      updated_at: '2026-10-25T00:00:00Z',
+    };
+  }
+
+  function conflictBackend(
+    resume: () => Promise<TaskRunResumeReceipt>,
+    workspace: Workspace | null = null
+  ) {
+    const workspaceId = workspace?.id ?? 'global';
+    useWorkspaceStore.setState({ current: workspace });
+    mocks.apiInvoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === 'get_active_chat_turn') return null;
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs') return queuedFrontier;
+      if (command === 'send_chat_message')
+        return {
+          kind: 'task_run_conflict',
+          run_id: 'run-live',
+          goal: 'current live goal',
+          input_id: 'conflict-input',
+        };
+      if (command === 'resume_task_run') return resume();
+      if (command === 'get_task_run')
+        return conflictRun(
+          String(args?.runId),
+          args?.runId === 'run-old' ? 'failed' : 'paused',
+          workspaceId
+        );
+      if (command === 'list_task_events')
+        return { events: [], next_after_sequence: args?.sinceSeq ?? '0', has_more: false };
+      if (command === 'get_task_plan' || command === 'get_task_continuation') return null;
+      if (
+        command === 'list_task_todos' ||
+        command === 'list_task_artifacts' ||
+        command === 'list_recovery_blockers' ||
+        command === 'list_task_background_cells'
+      )
+        return [];
+      if (command === 'get_task_completion_gate')
+        return {
+          run_id: args?.runId,
+          goal_revision: 1,
+          plan_revision: 0,
+          ready: false,
+          requirements: [],
+          blockers: [],
+        };
+      return { success: true };
+    });
+    useConversationStore.setState({ activeId: 'conversation-conflict' });
+    useTaskRuntimeStore.setState({
+      activeRun: conflictRun('run-live', 'paused', workspaceId),
+      taskScope: {
+        workspaceId,
+        workspaceGeneration: workspace?.product_data_generation ?? 'global',
+      },
+    });
+  }
+
+  it('continues the conflict run while the real task inspector selects a different historical run', async () => {
+    conflictBackend(async () => ({ kind: 'resumed', run_id: 'run-live', turn_id: null }));
+    const hook = renderHook(() => useTauriChat());
+    await act(async () => {
+      await hook.result.current.sendMessage('continue the live task');
+    });
+    const prompt = useTaskRuntimeStore.getState().interruptPrompt;
+    expect(prompt?.runId).toBe('run-live');
+    await act(async () => {
+      await useTaskRuntimeStore
+        .getState()
+        .loadByRun({ workspaceId: 'global', workspaceGeneration: 'global' }, 'run-old');
+    });
+    await act(async () => {
+      await prompt?.resolve('continue');
+    });
+    expect(mocks.apiInvoke).toHaveBeenCalledWith('resume_task_run', {
+      workspaceGeneration: 'global',
+      workspaceId: 'global',
+      runId: 'run-live',
+    });
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('resume_task_run', {
+      workspaceGeneration: 'global',
+      workspaceId: 'global',
+      runId: 'run-old',
+    });
+    expect(useTaskRuntimeStore.getState().activeRun?.run_id).toBe('run-live');
+    expect(useTaskRuntimeStore.getState().historySnapshot?.activeRun?.run_id).toBe('run-old');
+    hook.unmount();
+  });
+
+  it('does not dismiss a successor prompt when the previous Continue receipt arrives late', async () => {
+    const resumed = deferred<TaskRunResumeReceipt>();
+    conflictBackend(() => resumed.promise);
+    const hook = renderHook(() => useTauriChat());
+    await act(async () => {
+      await hook.result.current.sendMessage('continue the live task');
+    });
+    const original = useTaskRuntimeStore.getState().interruptPrompt;
+    let continuing: Promise<void> | undefined;
+    act(() => {
+      continuing = original?.resolve('continue');
+    });
+    await waitFor(() =>
+      expect(mocks.apiInvoke).toHaveBeenCalledWith('resume_task_run', {
+        workspaceGeneration: 'global',
+        workspaceId: 'global',
+        runId: 'run-live',
+      })
+    );
+    const successor = {
+      runId: 'run-next',
+      goal: 'new prompt',
+      newMessage: 'new input',
+      resolve: vi.fn(async () => {}),
+    };
+    act(() => useTaskRuntimeStore.getState().openInterruptPrompt(successor));
+    await act(async () => {
+      resumed.resolve({ kind: 'resumed', run_id: 'run-live', turn_id: null });
+      await continuing;
+    });
+    expect(useTaskRuntimeStore.getState().interruptPrompt).toBe(successor);
+    hook.unmount();
+  });
+
+  it.each(['conversation', 'workspace', 'generation'] as const)(
+    'does not project a late Continue into a changed %s',
+    async (change) => {
+      const resumed = deferred<TaskRunResumeReceipt>();
+      const workspace: Workspace = {
+        id: 'workspace-1',
+        name: 'original',
+        root: '/original',
+        kind: { type: 'coding' },
+        metadata: { tags: [], project_location: { kind: 'local' as const, path: '/original' } },
+        product_data_generation: 'generation-a',
+        created_at: '2026-10-25T00:00:00Z',
+        last_active: '2026-10-25T00:00:00Z',
+      };
+      conflictBackend(() => resumed.promise, workspace);
+      const hook = renderHook(() => useTauriChat());
+      await act(async () => {
+        await hook.result.current.sendMessage('continue the live task');
+      });
+      const original = useTaskRuntimeStore.getState().interruptPrompt;
+      let continuing: Promise<void> | undefined;
+      act(() => {
+        continuing = original?.resolve('continue');
+      });
+      await waitFor(() =>
+        expect(mocks.apiInvoke).toHaveBeenCalledWith('resume_task_run', {
+          workspaceGeneration: 'generation-a',
+          workspaceId: 'workspace-1',
+          runId: 'run-live',
+        })
+      );
+      const successor = {
+        runId: 'new-target',
+        goal: 'new target',
+        newMessage: 'new input',
+        resolve: vi.fn(async () => {}),
+      };
+      act(() => {
+        if (change === 'conversation')
+          useConversationStore.setState({ activeId: 'new-conversation' });
+        else
+          useWorkspaceStore.setState({
+            current: {
+              id: change === 'workspace' ? 'new-workspace' : 'workspace-1',
+              name: 'new',
+              root: '/new',
+              kind: { type: 'coding' },
+              metadata: { tags: [], project_location: { kind: 'local' as const, path: '/new' } },
+              product_data_generation: 'new-generation',
+              created_at: '2026-10-25T00:00:00Z',
+              last_active: '2026-10-25T00:00:00Z',
+            },
+          });
+        useTaskRuntimeStore.getState().reset();
+        useTaskRuntimeStore.setState({
+          activeRun: {
+            ...conflictRun(
+              'new-target',
+              'paused',
+              change === 'workspace' ? 'new-workspace' : 'workspace-1'
+            ),
+            conversation_id: 'new-conversation',
+          },
+        });
+        useTaskRuntimeStore.getState().openInterruptPrompt(successor);
+      });
+      await act(async () => {
+        resumed.resolve({ kind: 'resumed', run_id: 'run-live', turn_id: null });
+        await continuing;
+      });
+      expect(useTaskRuntimeStore.getState().interruptPrompt).toBe(successor);
+      expect(useTaskRuntimeStore.getState().activeRun?.run_id).toBe('new-target');
+      hook.unmount();
+    }
+  );
+
   it('cancels the exact conflicting run before starting the new input once', async () => {
     const conversationId = 'conversation-conflict';
     useConversationStore.setState({ activeId: conversationId });
@@ -415,6 +700,7 @@ describe('useTauriChat foreground turn recovery', () => {
     });
 
     expect(mocks.apiInvoke).toHaveBeenCalledWith('cancel_task_run', {
+      workspaceGeneration: 'global',
       workspaceId: 'global',
       runId: 'run-existing',
     });
@@ -509,6 +795,1526 @@ describe('useTauriChat foreground turn recovery', () => {
     hook.unmount();
   });
 
+  it('abandons only an exact recovery-required channel input', async () => {
+    const conversationId = 'conversation-channel-recovery';
+    useConversationStore.setState({ activeId: conversationId });
+    const binding = {
+      version: 1,
+      channel_id: 'weixin',
+      account_id: 'account-a',
+      credential_generation: 'generation-a',
+      peer_id: 'peer-a',
+      provider_message_id: 'provider-a',
+      workspace_generation: 'global',
+      context: { kind: 'absent' as const },
+      execution: { kind: 'chat' as const },
+    };
+    const base = inputProjection('channel-recovery', conversationId, '旧的待恢复消息');
+    const recovery: ConversationInputProjection = {
+      ...base,
+      receipt: {
+        ...base.receipt,
+        phase: 'recovery_required',
+        reason: '原驱动中断，副作用未知',
+        attempt: 1,
+      },
+      payload: { ...base.payload, channel_binding: binding },
+    };
+    const ordinaryBase = inputProjection('channel-ordinary', conversationId, '普通渠道消息');
+    const ordinary: ConversationInputProjection = {
+      ...ordinaryBase,
+      payload: { ...ordinaryBase.payload, channel_binding: binding },
+    };
+    mocks.apiInvoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === 'get_active_chat_turn')
+        return { ...activeSnapshot, conversation_id: conversationId };
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs')
+        return { queue_revision: 9, items: [recovery, ordinary] };
+      if (command === 'abandon_channel_recovery_input') {
+        // 原生命令使用 rename_all = "snake_case"，缺少该键时尚未进入恢复逻辑。
+        if (typeof args?.expected_queue_revision !== 'number') {
+          throw new Error('missing required key expected_queue_revision');
+        }
+        return { receipt: { ...recovery.receipt, phase: 'cancelled' }, queue_revision: 10 };
+      }
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => expect(hook.result.current.queuedInputs).toHaveLength(2));
+    // 非恢复中的渠道项不提供该动作，也不发出 IPC。
+    await act(async () => {
+      hook.result.current.abandonChannelRecoveryInput('channel-ordinary');
+    });
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith(
+      'abandon_channel_recovery_input',
+      expect.anything()
+    );
+    await act(async () => {
+      hook.result.current.abandonChannelRecoveryInput('channel-recovery');
+    });
+    expect(mocks.apiInvoke).toHaveBeenCalledWith('abandon_channel_recovery_input', {
+      identity: recovery.receipt.identity,
+      expected_queue_revision: 9,
+    });
+    hook.unmount();
+  });
+
+  it.each(['another conversation', 'another new draft'] as const)(
+    'keeps a deferred first input on its original saved conversation after %s is selected',
+    async (selection) => {
+      useConversationStore.setState({ activeId: null, workspaceId: 'global' });
+      const create = deferred<{ kind: string; id: string }>();
+      const admit = deferred<{ kind: string; root_turn_id: string; active_turn_id: string }>();
+      let requestedId = '';
+      let requestedRoot = '';
+      const onDirectAccepted = vi.fn();
+      const onPersisted = vi.fn();
+      mocks.apiInvoke.mockImplementation(
+        async (command: string, args?: Record<string, unknown>) => {
+          if (command === 'get_active_chat_turn') return null;
+          if (command === 'replay_chat_events') return emptyReplay();
+          if (command === 'create_conversation') {
+            requestedId = String((args?.request as { id: string }).id);
+            return create.promise;
+          }
+          if (command === 'list_conversations' || command === 'list_tool_executions') return [];
+          if (command === 'get_conversation')
+            return {
+              messages: [
+                {
+                  role: 'user',
+                  content: 'other conversation contents',
+                  created_at: '2026-10-28T00:00:00Z',
+                },
+              ],
+            };
+          if (command === 'list_queued_chat_inputs') return { queue_revision: 0, items: [] };
+          if (command === 'send_chat_message') {
+            requestedRoot = String((args?.request as { messageKey: string }).messageKey);
+            return admit.promise;
+          }
+          return { success: true };
+        }
+      );
+      const hook = renderHook(() => useTauriChat());
+      await waitFor(() => expect(mocks.listeners.has('chat://event')).toBe(true));
+      const submission = {
+        ...draftSubmission('original first input', onPersisted),
+        onDirectAccepted,
+      };
+      let sending: Promise<boolean> | undefined;
+      act(() => {
+        sending = hook.result.current.sendMessage(
+          'original first input',
+          undefined,
+          undefined,
+          submission
+        );
+      });
+      await waitFor(() => expect(requestedId).not.toBe(''));
+      await act(async () => {
+        if (selection === 'another conversation')
+          await useConversationStore.getState().loadConversation('other-conversation');
+        else await useConversationStore.getState().startNew();
+      });
+      const expectedActive = selection === 'another conversation' ? 'other-conversation' : null;
+      const messages = useChatStore.getState().messages;
+      await act(async () => {
+        create.resolve({ kind: 'primary', id: requestedId });
+      });
+      await waitFor(() =>
+        expect(
+          mocks.apiInvoke.mock.calls.some(([command]) => command === 'send_chat_message')
+        ).toBe(true)
+      );
+      expect(
+        mocks.apiInvoke.mock.calls.find(([command]) => command === 'send_chat_message')?.[1]
+      ).toMatchObject({
+        request: {
+          workspaceId: 'global',
+          conversationId: requestedId,
+          message: 'original first input',
+        },
+      });
+      expect(useConversationStore.getState().activeId).toBe(expectedActive);
+      expect(useChatStore.getState().messages).toEqual(messages);
+      await act(async () => {
+        admit.resolve({
+          kind: 'started',
+          root_turn_id: requestedRoot,
+          active_turn_id: requestedRoot,
+        });
+        expect(await sending).toBe(true);
+      });
+      expect(useConversationStore.getState().activeId).toBe(expectedActive);
+      expect(useChatStore.getState().messages).toEqual(messages);
+      expect(onDirectAccepted).toHaveBeenCalledExactlyOnceWith(expect.any(Function));
+      expect(onDirectAccepted.mock.calls[0]?.[0]()).toBe(false);
+      expect(onPersisted).not.toHaveBeenCalled();
+    }
+  );
+
+  it('publishes direct acceptance for its own ordinary first conversation without inventing persistence', async () => {
+    useConversationStore.setState({ activeId: null, workspaceId: 'global' });
+    let requestedId = '';
+    let directWasCurrent = false;
+    const onDirectAccepted = vi.fn((canProject: () => boolean) => {
+      directWasCurrent = canProject();
+    });
+    const onPersisted = vi.fn();
+    mocks.apiInvoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === 'get_active_chat_turn') return null;
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'create_conversation') {
+        requestedId = String((args?.request as { id: string }).id);
+        return { kind: 'primary', id: requestedId };
+      }
+      if (command === 'list_conversations' || command === 'list_tool_executions') return [];
+      if (command === 'list_queued_chat_inputs') return { queue_revision: 0, items: [] };
+      if (command === 'send_chat_message') {
+        const request = args?.request as { messageKey: string };
+        return {
+          kind: 'started',
+          root_turn_id: request.messageKey,
+          active_turn_id: request.messageKey,
+        };
+      }
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => expect(mocks.listeners.has('chat://event')).toBe(true));
+    await act(async () => {
+      expect(
+        await hook.result.current.sendMessage('normal first input', undefined, undefined, {
+          ...draftSubmission('normal first input', onPersisted),
+          onDirectAccepted,
+        })
+      ).toBe(true);
+    });
+    expect(useConversationStore.getState().activeId).toBe(requestedId);
+    expect(
+      useChatStore
+        .getState()
+        .messages.filter((message) => message.role === 'user')
+        .map((message) => message.content)
+    ).toEqual(['normal first input']);
+    expect(onDirectAccepted).toHaveBeenCalledTimes(1);
+    expect(directWasCurrent).toBe(true);
+    expect(onPersisted).not.toHaveBeenCalled();
+  });
+
+  it('keeps a late ordinary admission from resetting the view after Stop', async () => {
+    const conversationId = 'ordinary-admission-after-stop';
+    useConversationStore.setState({ activeId: conversationId, workspaceId: 'global' });
+    const admission = deferred<{ kind: string; root_turn_id: string; active_turn_id: string }>();
+    const onDirectAccepted = vi.fn();
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn') return null;
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs') return { queue_revision: 0, items: [] };
+      if (command === 'send_chat_message') return admission.promise;
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() =>
+      expect(mocks.apiInvoke).toHaveBeenCalledWith('list_queued_chat_inputs', expect.anything())
+    );
+    let sending: Promise<boolean> | undefined;
+    act(() => {
+      sending = hook.result.current.sendMessage('ordinary input', undefined, undefined, {
+        ...draftSubmission('ordinary input'),
+        onDirectAccepted,
+      });
+    });
+    await waitFor(() =>
+      expect(mocks.apiInvoke.mock.calls.some(([command]) => command === 'send_chat_message')).toBe(
+        true
+      )
+    );
+    await act(async () => {
+      await hook.result.current.cancel();
+    });
+    const messages = useChatStore.getState().messages;
+    await act(async () => {
+      admission.resolve({
+        kind: 'started',
+        root_turn_id: 'late-root',
+        active_turn_id: 'late-root',
+      });
+      expect(await sending).toBe(true);
+    });
+    expect(onDirectAccepted).toHaveBeenCalledExactlyOnceWith(expect.any(Function));
+    expect(onDirectAccepted.mock.calls[0]?.[0]()).toBe(false);
+    expect(useChatStore.getState().messages).toEqual(messages);
+  });
+
+  it('reports only its exact created address before list refresh without treating it as message acceptance', async () => {
+    useConversationStore.setState({ activeId: null, workspaceId: 'global' });
+    const list = deferred<never[]>();
+    const admission = deferred<{ kind: string }>();
+    const bound: unknown[] = [];
+    const accepted = vi.fn();
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn') return null;
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'create_conversation') return { kind: 'primary', id: 'own-created' };
+      if (command === 'list_conversations') return list.promise;
+      if (command === 'list_queued_chat_inputs') return { queue_revision: 0, items: [] };
+      if (command === 'send_chat_message') return admission.promise;
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => expect(mocks.listeners.has('chat://event')).toBe(true));
+    let sending: Promise<boolean> | undefined;
+    act(() => {
+      sending = hook.result.current.sendMessage('new Goal', undefined, undefined, {
+        ...draftSubmission('new Goal'),
+        onDirectAccepted: accepted,
+        onConversationCreated: (address) =>
+          bound.push({ address, activeId: useConversationStore.getState().activeId }),
+      });
+    });
+    await waitFor(() => expect(bound).toHaveLength(1));
+    expect(bound).toEqual([
+      { address: { workspace_id: 'global', conversation_id: 'own-created' }, activeId: null },
+    ]);
+    expect(accepted).not.toHaveBeenCalled();
+    await act(async () => {
+      list.resolve([]);
+    });
+    await waitFor(() =>
+      expect(mocks.apiInvoke.mock.calls.some(([name]) => name === 'send_chat_message')).toBe(true)
+    );
+    await act(async () => {
+      admission.reject(new Error('admission failed'));
+      expect(await sending).toBe(false);
+    });
+    expect(accepted).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['create', 'Stop'],
+    ['create', 'unmount'],
+    ['list', 'Stop'],
+    ['list', 'unmount'],
+  ] as const)(
+    'does not reacquire a first-input projection when %s finishes after %s',
+    async (stage, interruption) => {
+      useConversationStore.setState({ activeId: null, workspaceId: 'global' });
+      const create = deferred<{ kind: string; id: string }>();
+      const list = deferred<never[]>();
+      let requestedId = '';
+      let listRequested = false;
+      const onDirectAccepted = vi.fn();
+      const onPersisted = vi.fn();
+      mocks.apiInvoke.mockImplementation(
+        async (command: string, args?: Record<string, unknown>) => {
+          if (command === 'get_active_chat_turn') return null;
+          if (command === 'replay_chat_events') return emptyReplay();
+          if (command === 'create_conversation') {
+            requestedId = String((args?.request as { id: string }).id);
+            return stage === 'create' ? create.promise : { kind: 'primary', id: requestedId };
+          }
+          if (command === 'list_conversations') {
+            listRequested = true;
+            return stage === 'list' ? list.promise : [];
+          }
+          if (command === 'list_queued_chat_inputs') return { queue_revision: 0, items: [] };
+          if (command === 'send_chat_message') {
+            const request = args?.request as { messageKey: string };
+            return {
+              kind: 'started',
+              root_turn_id: request.messageKey,
+              active_turn_id: request.messageKey,
+            };
+          }
+          return { success: true };
+        }
+      );
+      const hook = renderHook(() => useTauriChat());
+      await waitFor(() => expect(mocks.listeners.has('chat://event')).toBe(true));
+      let sending: Promise<boolean> | undefined;
+      act(() => {
+        sending = hook.result.current.sendMessage('bootstrap input', undefined, undefined, {
+          ...draftSubmission('bootstrap input', onPersisted),
+          onDirectAccepted,
+        });
+      });
+      await waitFor(() =>
+        expect(stage === 'create' ? requestedId !== '' : listRequested).toBe(true)
+      );
+      if (interruption === 'Stop')
+        await act(async () => {
+          await hook.result.current.cancel();
+        });
+      else hook.unmount();
+      const messages = useChatStore.getState().messages;
+      const toasts = useToastStore.getState().toasts;
+
+      await act(async () => {
+        if (stage === 'create') create.resolve({ kind: 'primary', id: requestedId });
+        else list.resolve([]);
+        expect(await sending).toBe(true);
+      });
+
+      expect(
+        mocks.apiInvoke.mock.calls.find(([command]) => command === 'send_chat_message')?.[1]
+      ).toMatchObject({
+        request: { conversationId: requestedId, message: 'bootstrap input' },
+      });
+      expect(useChatStore.getState().messages).toBe(messages);
+      expect(useToastStore.getState().toasts).toBe(toasts);
+      expect(onDirectAccepted).toHaveBeenCalledExactlyOnceWith(expect.any(Function));
+      expect(onDirectAccepted.mock.calls[0]?.[0]()).toBe(false);
+      expect(onPersisted).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(
+    (['before', 'after'] as const).flatMap((failureTiming) =>
+      (['idle', 'already-starting'] as const).map(
+        (snapshotKind) => [failureTiming, snapshotKind] as const
+      )
+    )
+  )(
+    '新会话首条启动回执未返回时，恢复队列不会抢占原提交或隐藏失败（错误在回执%s，快照%s）',
+    async (failureTiming, snapshotKind) => {
+      useConversationStore.setState({ activeId: null, workspaceId: 'global' });
+      useChatStore.getState().clearMessages();
+      const startup = deferred<{
+        kind: string;
+        root_turn_id: string;
+        active_turn_id: string;
+        input_id: string;
+      }>();
+      const recoverySnapshot = deferred<typeof activeSnapshot | null>();
+      let conversationId = '';
+      let rootTurnId = '';
+      let sendCalls = 0;
+      let recoveryReadPendingInput = false;
+      const onDirectAccepted = vi.fn((canProject: () => boolean) =>
+        expect(canProject()).toBe(true)
+      );
+      mocks.apiInvoke.mockImplementation(
+        async (command: string, args?: Record<string, unknown>) => {
+          if (command === 'create_conversation') {
+            conversationId = String((args?.request as { id: string }).id);
+            return { kind: 'primary', id: conversationId };
+          }
+          if (command === 'list_conversations') return [];
+          if (command === 'get_active_chat_turn') return recoverySnapshot.promise;
+          if (command === 'replay_chat_events') return emptyReplay();
+          if (command === 'list_queued_chat_inputs') {
+            if (rootTurnId) recoveryReadPendingInput = true;
+            return queuedFrontier;
+          }
+          if (command === 'send_chat_message') {
+            sendCalls += 1;
+            const request = args?.request as { messageKey: string };
+            if (sendCalls > 1) return { kind: 'queued', input_id: 'original-first-input' };
+            rootTurnId = request.messageKey;
+            queuedFrontier = {
+              queue_revision: 1,
+              items: [inputProjection('original-first-input', conversationId, '首条输入')],
+            };
+            return startup.promise;
+          }
+          return { success: true };
+        }
+      );
+      const hook = renderHook(() => useTauriChat());
+      await waitFor(() => expect(mocks.listeners.has('chat://event')).toBe(true));
+      let sending: Promise<boolean> | undefined;
+      act(() => {
+        sending = hook.result.current.sendMessage('首条输入', undefined, undefined, {
+          ...draftSubmission('首条输入'),
+          onDirectAccepted,
+        });
+      });
+      await waitFor(() => expect(rootTurnId).not.toBe(''));
+      await act(async () =>
+        recoverySnapshot.resolve(
+          snapshotKind === 'idle'
+            ? null
+            : {
+                ...activeSnapshot,
+                conversation_id: conversationId,
+                root_turn_id: rootTurnId,
+                active_turn_id: rootTurnId,
+              }
+        )
+      );
+      await waitFor(() => expect(recoveryReadPendingInput).toBe(true));
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(sendCalls).toBe(1);
+      expect(hook.result.current.isSubmitting).toBe(true);
+      expect(hook.result.current.queuedInputs).toEqual([]);
+      const fail = () => {
+        mocks.listeners.get('chat://event')?.({
+          payload: agentEnvelope(
+            rootTurnId,
+            1,
+            {
+              type: 'error',
+              data: {
+                source: 'react_loop',
+                message: '实际模型错误',
+                failure: {
+                  category: 'llm',
+                  terminal_kind: 'failed',
+                  retryable: false,
+                  code: 'llm_invalid_response',
+                  http_status: null,
+                  message: '实际模型错误',
+                },
+              },
+            },
+            conversationId,
+            rootTurnId
+          ),
+        });
+        queuedFrontier = { queue_revision: 2, items: [] };
+        mocks.listeners.get('chat://event')?.({
+          payload: turnStatusEnvelope(rootTurnId, rootTurnId, 2, 'failed', conversationId),
+        });
+      };
+      if (failureTiming === 'before') await act(async () => fail());
+      await act(async () => {
+        startup.resolve({
+          kind: 'started',
+          root_turn_id: rootTurnId,
+          active_turn_id: rootTurnId,
+          input_id: 'original-first-input',
+        });
+        expect(await sending).toBe(true);
+      });
+      expect(onDirectAccepted).toHaveBeenCalledTimes(1);
+      expect(useChatStore.getState().messages.filter((m) => m.role === 'assistant')).toHaveLength(
+        1
+      );
+      expect(hook.result.current.isSubmitting).toBe(false);
+      expect(hook.result.current.queuedInputs).toEqual([]);
+      if (failureTiming === 'after') await act(async () => fail());
+      expect(useChatStore.getState().messages.filter((m) => m.role === 'user')).toHaveLength(1);
+      expect(useChatStore.getState().messages.at(-1)?.content).toContain('实际模型错误');
+      expect(useChatStore.getState().runStatus).toBe('failed');
+      hook.unmount();
+    }
+  );
+
+  it('keeps its original first-input owner across a delayed metadata list normally', async () => {
+    useConversationStore.setState({ activeId: null, workspaceId: 'global' });
+    const list = deferred<never[]>();
+    let requestedId = '';
+    let listRequested = false;
+    let directWasCurrent = false;
+    const onDirectAccepted = vi.fn((canProject: () => boolean) => {
+      directWasCurrent = canProject();
+    });
+    mocks.apiInvoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === 'get_active_chat_turn') return null;
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'create_conversation') {
+        requestedId = String((args?.request as { id: string }).id);
+        return { kind: 'primary', id: requestedId };
+      }
+      if (command === 'list_conversations') {
+        listRequested = true;
+        return list.promise;
+      }
+      if (command === 'list_queued_chat_inputs') return { queue_revision: 0, items: [] };
+      if (command === 'send_chat_message') {
+        const request = args?.request as { messageKey: string };
+        return {
+          kind: 'started',
+          root_turn_id: request.messageKey,
+          active_turn_id: request.messageKey,
+        };
+      }
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => expect(mocks.listeners.has('chat://event')).toBe(true));
+    let sending: Promise<boolean> | undefined;
+    act(() => {
+      sending = hook.result.current.sendMessage('original delayed list', undefined, undefined, {
+        ...draftSubmission('original delayed list'),
+        onDirectAccepted,
+      });
+    });
+    await waitFor(() => expect(listRequested).toBe(true));
+    expect(useConversationStore.getState().activeId).toBe(requestedId);
+    await act(async () => {
+      list.resolve([]);
+      expect(await sending).toBe(true);
+    });
+    expect(directWasCurrent).toBe(true);
+    expect(onDirectAccepted).toHaveBeenCalledTimes(1);
+    expect(
+      useChatStore
+        .getState()
+        .messages.filter((message) => message.role === 'user')
+        .map((message) => message.content)
+    ).toEqual(['original delayed list']);
+  });
+
+  it('acknowledges the real durable input before Frontier and Steer can finish', async () => {
+    const conversationId = 'durable-before-observation';
+    useConversationStore.setState({ activeId: conversationId });
+    const persisted = inputProjection('opaque-backend-input', conversationId, '追加约束');
+    const queue = deferred<ConversationInputReceipt>();
+    const frontier = deferred<ConversationInputFrontier>();
+    const steer = deferred<ConversationInputReceipt>();
+    const onPersisted = vi.fn();
+    let queueStarted = false;
+    let frontierReleased = false;
+    let current: ConversationInputFrontier = { queue_revision: 0, items: [] };
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn')
+        return { ...activeSnapshot, conversation_id: conversationId };
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'queue_chat_input') {
+        queueStarted = true;
+        return queue.promise;
+      }
+      if (command === 'list_queued_chat_inputs') {
+        return queueStarted && !frontierReleased ? frontier.promise : current;
+      }
+      if (command === 'steer_chat_message') return steer.promise;
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() =>
+      expect(mocks.apiInvoke).toHaveBeenCalledWith('list_queued_chat_inputs', {
+        workspaceId: 'global',
+        conversationId,
+      })
+    );
+    const submission = draftSubmission('追加约束', onPersisted);
+    let sending: Promise<boolean> | undefined;
+    let resolved = false;
+    act(() => {
+      sending = hook.result.current
+        .sendMessage('追加约束', undefined, undefined, submission)
+        .then((accepted) => {
+          resolved = true;
+          return accepted;
+        });
+    });
+    expect(onPersisted).not.toHaveBeenCalled();
+    await act(async () => {
+      queue.resolve(persisted.receipt);
+      await Promise.resolve();
+    });
+    expect(resolved).toBe(true);
+    expect(onPersisted).toHaveBeenCalledExactlyOnceWith(persisted.receipt, expect.any(Function));
+    expect(onPersisted.mock.calls[0]?.[1]()).toBe(true);
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('steer_chat_message', expect.anything());
+    expect(await sending).toBe(true);
+    await act(async () => {
+      frontierReleased = true;
+      current = { queue_revision: 3, items: [persisted] };
+      frontier.resolve(current);
+    });
+    await waitFor(() =>
+      expect(mocks.apiInvoke).toHaveBeenCalledWith(
+        'steer_chat_message',
+        expect.objectContaining({ identity: persisted.receipt.identity })
+      )
+    );
+    expect(useChatStore.getState().messages.filter((message) => message.role === 'user')).toEqual(
+      []
+    );
+    await act(async () => {
+      current = { queue_revision: 5, items: [] };
+      steer.resolve({ ...persisted.receipt, phase: 'drained', drained: true, queue_revision: 5 });
+    });
+    await waitFor(() =>
+      expect(
+        useChatStore
+          .getState()
+          .messages.filter((message) => message.role === 'user')
+          .map((message) => message.content)
+      ).toEqual(['追加约束'])
+    );
+    expect(onPersisted).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries a lost durable acknowledgement with the same identity and frozen domain payload', async () => {
+    const conversationId = 'durable-lost-ack';
+    useConversationStore.setState({ activeId: conversationId });
+    const receipt = {
+      ...inputProjection('original-opaque-input', conversationId, '原始内容').receipt,
+      duplicate: true,
+    };
+    const onPersisted = vi.fn();
+    const attachment: Attachment = {
+      name: '中文.txt',
+      mime_type: 'text/plain',
+      data: 'YWJj',
+      size: 3,
+      source: 'upload',
+    };
+    let calls = 0;
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn')
+        return { ...activeSnapshot, conversation_id: conversationId };
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs') return { queue_revision: 0, items: [] };
+      if (command === 'queue_chat_input') {
+        calls += 1;
+        if (calls === 1) throw new Error('response lost after admission');
+        return receipt;
+      }
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() =>
+      expect(mocks.apiInvoke).toHaveBeenCalledWith('list_queued_chat_inputs', {
+        workspaceId: 'global',
+        conversationId,
+      })
+    );
+    const submission = draftSubmission('原始内容', onPersisted, [attachment], 'evidence-method');
+    await act(async () => {
+      expect(
+        await hook.result.current.sendMessage(
+          '原始内容',
+          [attachment],
+          'evidence-method',
+          submission
+        )
+      ).toBe(false);
+    });
+    expect(onPersisted).not.toHaveBeenCalled();
+    await act(async () => {
+      expect(
+        await hook.result.current.sendMessage(
+          '原始内容',
+          [attachment],
+          'evidence-method',
+          submission
+        )
+      ).toBe(true);
+    });
+    const attempts = mocks.apiInvoke.mock.calls.filter(
+      ([command]) => command === 'queue_chat_input'
+    );
+    expect(attempts).toHaveLength(2);
+    expect(attempts[0]?.[1]).toEqual(attempts[1]?.[1]);
+    expect(attempts[1]?.[1]).toMatchObject({
+      externalId: submission.externalId,
+      text: '原始内容',
+      domainPlugin: 'evidence-method',
+      attachments: [attachment],
+    });
+    expect(onPersisted).toHaveBeenCalledExactlyOnceWith(receipt, expect.any(Function));
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('steer_chat_message', expect.anything());
+  });
+
+  it.each(['text', 'attachment', 'domain'] as const)(
+    'rejects reuse of a draft identity with changed %s before transport',
+    async (changed) => {
+      useConversationStore.setState({ activeId: activeSnapshot.conversation_id });
+      const hook = renderHook(() => useTauriChat());
+      await waitFor(() =>
+        expect(mocks.apiInvoke).toHaveBeenCalledWith('list_queued_chat_inputs', expect.anything())
+      );
+      const original: Attachment = {
+        name: 'original.txt',
+        mime_type: 'text/plain',
+        data: 'YWJj',
+        size: 3,
+      };
+      const onPersisted = vi.fn();
+      const submission = draftSubmission('original', onPersisted, [original], 'original-domain');
+      await act(async () => {
+        expect(
+          await hook.result.current.sendMessage(
+            changed === 'text' ? 'replacement' : 'original',
+            [changed === 'attachment' ? { ...original, data: 'eHl6' } : original],
+            changed === 'domain' ? 'replacement-domain' : 'original-domain',
+            submission
+          )
+        ).toBe(false);
+      });
+      expect(mocks.apiInvoke).not.toHaveBeenCalledWith('queue_chat_input', expect.anything());
+      expect(onPersisted).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([
+    'conversation',
+    'workspace',
+    'generation',
+    'new conversation epoch',
+    'workspace transition',
+  ] as const)('does not retarget a prepared draft after a %s change', async (changed) => {
+    useConversationStore.setState({ activeId: activeSnapshot.conversation_id });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() =>
+      expect(mocks.apiInvoke).toHaveBeenCalledWith('list_queued_chat_inputs', expect.anything())
+    );
+    const submission = draftSubmission('original', vi.fn());
+    await act(async () => {
+      if (changed === 'conversation')
+        useConversationStore.setState({ activeId: 'another-conversation' });
+      if (changed === 'new conversation epoch')
+        useConversationStore.setState({ newConversationEpoch: 1 });
+      if (changed === 'workspace transition') useWorkspaceStore.setState({ isLoading: true });
+      if (changed === 'workspace' || changed === 'generation')
+        useWorkspaceStore.setState({
+          current: {
+            id: changed === 'workspace' ? 'another-workspace' : 'global',
+            name: 'replacement',
+            root: '/replacement',
+            kind: { type: 'coding' },
+            metadata: {
+              tags: [],
+              project_location: { kind: 'local' as const, path: '/replacement' },
+            },
+            product_data_generation: 'reopened',
+            created_at: '',
+            last_active: '',
+          },
+        });
+      expect(
+        await hook.result.current.sendMessage('original', undefined, undefined, submission)
+      ).toBe(false);
+    });
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('queue_chat_input', expect.anything());
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('send_chat_message', expect.anything());
+  });
+
+  it.each([
+    'throwing callback',
+    'rejected callback',
+    'Frontier failure',
+    'Steer rejection',
+  ] as const)('keeps durable acceptance when the %s cannot finish', async (failure) => {
+    const conversationId = 'durable-observation-failure';
+    useConversationStore.setState({ activeId: conversationId });
+    const receipt = inputProjection('persisted-input', conversationId, 'saved').receipt;
+    let submitted = false;
+    const onPersisted = vi.fn(() => {
+      if (failure === 'throwing callback') throw new Error('view update failed');
+      if (failure === 'rejected callback')
+        return Promise.reject(new Error('async view update failed'));
+    });
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn')
+        return { ...activeSnapshot, conversation_id: conversationId };
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'queue_chat_input') {
+        submitted = true;
+        return receipt;
+      }
+      if (command === 'list_queued_chat_inputs') {
+        if (submitted && failure === 'Frontier failure') throw new Error('observation unavailable');
+        if (submitted && failure === 'Steer rejection')
+          return {
+            queue_revision: 1,
+            items: [inputProjection('persisted-input', conversationId, 'saved')],
+          };
+        return { queue_revision: 0, items: [] };
+      }
+      if (command === 'steer_chat_message')
+        throw new Error('original turn no longer accepts Steer');
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() =>
+      expect(mocks.apiInvoke).toHaveBeenCalledWith('list_queued_chat_inputs', expect.anything())
+    );
+    await act(async () => {
+      expect(
+        await hook.result.current.sendMessage(
+          'saved',
+          undefined,
+          undefined,
+          draftSubmission('saved', onPersisted)
+        )
+      ).toBe(true);
+    });
+    await waitFor(() =>
+      expect(useToastStore.getState().toasts).toEqual([
+        expect.objectContaining({
+          type: failure === 'Steer rejection' ? 'error' : 'warning',
+          message: expect.stringContaining(
+            failure === 'Steer rejection' ? '补充当前任务失败' : '输入已保存'
+          ),
+        }),
+      ])
+    );
+    if (failure === 'Steer rejection') {
+      await waitFor(() =>
+        expect(hook.result.current.queuedInputs.at(0)?.steerOutcome).toBe('rejected')
+      );
+    }
+    expect(onPersisted).toHaveBeenCalledExactlyOnceWith(receipt, expect.any(Function));
+    expect(
+      mocks.apiInvoke.mock.calls.filter(([command]) => command === 'queue_chat_input')
+    ).toHaveLength(1);
+  });
+
+  it('reports the original late durable fact while fencing a different conversation', async () => {
+    const conversationId = 'late-persisted-original';
+    useConversationStore.setState({ activeId: conversationId });
+    const queue = deferred<ConversationInputReceipt>();
+    const receipt = inputProjection(
+      'late-original-input',
+      conversationId,
+      'saved original'
+    ).receipt;
+    const onPersisted = vi.fn();
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn')
+        return { ...activeSnapshot, conversation_id: useConversationStore.getState().activeId };
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs') return { queue_revision: 0, items: [] };
+      if (command === 'queue_chat_input') return queue.promise;
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() =>
+      expect(mocks.apiInvoke).toHaveBeenCalledWith('list_queued_chat_inputs', expect.anything())
+    );
+    const submission = draftSubmission('saved original', onPersisted);
+    let sending: Promise<boolean> | undefined;
+    act(() => {
+      sending = hook.result.current.sendMessage('saved original', undefined, undefined, submission);
+    });
+    await act(async () => {
+      useConversationStore.setState({ activeId: 'new-visible-conversation' });
+      useChatStore.getState().clearMessages();
+      useChatStore.getState().addUserMessage('new draft belongs here');
+    });
+    const visible = useChatStore.getState().messages;
+    await act(async () => {
+      queue.resolve(receipt);
+      expect(await sending).toBe(true);
+    });
+    expect(onPersisted).toHaveBeenCalledExactlyOnceWith(receipt, expect.any(Function));
+    expect(onPersisted.mock.calls[0]?.[1]()).toBe(false);
+    expect(useChatStore.getState().messages).toEqual(visible);
+    expect(useToastStore.getState().toasts).toEqual([]);
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('steer_chat_message', expect.anything());
+  });
+
+  it('rechecks the live turn fence after early acknowledgement and a delayed Frontier', async () => {
+    const conversationId = 'persisted-before-turn-settlement';
+    useConversationStore.setState({ activeId: conversationId });
+    const projection = inputProjection('settled-before-observation', conversationId, 'saved');
+    const frontier = deferred<ConversationInputFrontier>();
+    const onPersisted = vi.fn();
+    let submitted = false;
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn')
+        return { ...activeSnapshot, conversation_id: conversationId };
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'queue_chat_input') {
+        submitted = true;
+        return projection.receipt;
+      }
+      if (command === 'list_queued_chat_inputs')
+        return submitted ? frontier.promise : { queue_revision: 0, items: [] };
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => expect(mocks.listeners.has('chat://event')).toBe(true));
+    await waitFor(() =>
+      expect(mocks.apiInvoke).toHaveBeenCalledWith('list_queued_chat_inputs', expect.anything())
+    );
+    await act(async () => {
+      expect(
+        await hook.result.current.sendMessage(
+          'saved',
+          undefined,
+          undefined,
+          draftSubmission('saved', onPersisted)
+        )
+      ).toBe(true);
+    });
+    const canProject = onPersisted.mock.calls[0]?.[1] as (() => boolean) | undefined;
+    expect(canProject?.()).toBe(true);
+    act(() => {
+      mocks.listeners.get('chat://event')?.({
+        payload: turnStatusEnvelope(
+          activeSnapshot.active_turn_id,
+          activeSnapshot.root_turn_id,
+          1,
+          'completed',
+          conversationId
+        ),
+      });
+    });
+    expect(canProject?.()).toBe(false);
+    await act(async () => {
+      frontier.resolve({ queue_revision: 4, items: [] });
+    });
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('steer_chat_message', expect.anything());
+  });
+
+  it('does not fabricate a persisted notification from a malformed admission response', async () => {
+    useConversationStore.setState({ activeId: activeSnapshot.conversation_id });
+    const previous = mocks.apiInvoke.getMockImplementation();
+    mocks.apiInvoke.mockImplementation(async (command, args) =>
+      command === 'queue_chat_input' ? { success: true } : previous?.(command, args)
+    );
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() =>
+      expect(mocks.apiInvoke).toHaveBeenCalledWith('list_queued_chat_inputs', expect.anything())
+    );
+    const onPersisted = vi.fn();
+    await act(async () => {
+      expect(
+        await hook.result.current.sendMessage(
+          'saved',
+          undefined,
+          undefined,
+          draftSubmission('saved', onPersisted)
+        )
+      ).toBe(false);
+    });
+    expect(onPersisted).not.toHaveBeenCalled();
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('steer_chat_message', expect.anything());
+  });
+
+  it('forwards an explicit domain on the unchanged ordinary send without fabricating persistence', async () => {
+    const conversationId = 'ordinary-explicit-domain';
+    useConversationStore.setState({ activeId: conversationId, workspaceId: 'global' });
+    const onPersisted = vi.fn();
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn') return null;
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs') return { queue_revision: 0, items: [] };
+      if (command === 'send_chat_message')
+        return { kind: 'started', root_turn_id: 'ordinary-root', active_turn_id: 'ordinary-root' };
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() =>
+      expect(mocks.apiInvoke).toHaveBeenCalledWith('list_queued_chat_inputs', expect.anything())
+    );
+    await act(async () => {
+      expect(
+        await hook.result.current.sendMessage(
+          'inspect evidence',
+          undefined,
+          'evidence-method',
+          draftSubmission('inspect evidence', onPersisted, undefined, 'evidence-method')
+        )
+      ).toBe(true);
+    });
+    expect(mocks.apiInvoke).toHaveBeenCalledWith('send_chat_message', {
+      request: expect.objectContaining({ domainPlugin: 'evidence-method' }),
+    });
+    expect(onPersisted).not.toHaveBeenCalled();
+  });
+
+  it('replaces a queued input with its stable identity and queue revision', async () => {
+    const conversationId = 'conversation-edit';
+    useConversationStore.setState({ activeId: conversationId });
+    const pending = inputProjection('edited-input', conversationId, 'original');
+    queuedFrontier = { queue_revision: 11, items: [pending] };
+    const previous = mocks.apiInvoke.getMockImplementation();
+    mocks.apiInvoke.mockImplementation(async (command, args) => {
+      if (command === 'get_active_chat_turn') return null;
+      if (command === 'replace_queued_chat_input') {
+        const edited = {
+          ...pending,
+          receipt: {
+            ...pending.receipt,
+            identity: { ...pending.receipt.identity, revision: 2, payload_sha256: 'edited-sha' },
+          },
+          payload: { ...pending.payload, text: 'edited 中文🙂', payload_sha256: 'edited-sha' },
+        };
+        queuedFrontier = { queue_revision: 12, items: [edited] };
+        return edited.receipt;
+      }
+      return previous?.(command, args);
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => expect(hook.result.current.queuedInputs).toHaveLength(1));
+    await act(async () => {
+      expect(await hook.result.current.replaceQueuedMessage('edited-input', 'edited 中文🙂')).toBe(
+        true
+      );
+    });
+    expect(mocks.apiInvoke).toHaveBeenCalledWith('replace_queued_chat_input', {
+      identity: pending.receipt.identity,
+      expectedQueueRevision: 11,
+      text: 'edited 中文🙂',
+      attachments: [],
+      domainPlugin: null,
+    });
+    expect(hook.result.current.queuedInputs.at(0)?.identity.revision).toBe(2);
+    expect(hook.result.current.queuedInputs.at(0)?.text).toBe('edited 中文🙂');
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('remove_queued_chat_input', expect.anything());
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('queue_chat_input', expect.anything());
+    hook.unmount();
+  });
+
+  it('retains the original queued projection when replacement CAS is rejected', async () => {
+    const conversationId = 'conversation-stale-edit';
+    useConversationStore.setState({ activeId: conversationId });
+    const pending = inputProjection('stale-input', conversationId, 'original');
+    queuedFrontier = { queue_revision: 11, items: [pending] };
+    const previous = mocks.apiInvoke.getMockImplementation();
+    mocks.apiInvoke.mockImplementation(async (command, args) => {
+      if (command === 'get_active_chat_turn') return null;
+      if (command === 'replace_queued_chat_input') throw new Error('queue revision changed');
+      return previous?.(command, args);
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => expect(hook.result.current.queuedInputs).toHaveLength(1));
+    await act(async () => {
+      expect(await hook.result.current.replaceQueuedMessage('stale-input', 'late edit')).toBe(
+        false
+      );
+    });
+    expect(hook.result.current.queuedInputs.at(0)?.text).toBe('original');
+    expect(
+      useToastStore
+        .getState()
+        .toasts.some((toast) => toast.message.includes('queue revision changed'))
+    ).toBe(true);
+    hook.unmount();
+  });
+
+  it('does not project a queued edit receipt into a successor conversation', async () => {
+    const conversationId = 'conversation-late-edit';
+    useConversationStore.setState({ activeId: conversationId });
+    const pending = inputProjection('late-edit', conversationId, 'original');
+    queuedFrontier = { queue_revision: 11, items: [pending] };
+    const replacement = deferred<ConversationInputReceipt>();
+    const previous = mocks.apiInvoke.getMockImplementation();
+    mocks.apiInvoke.mockImplementation(async (command, args) => {
+      if (command === 'get_active_chat_turn') return null;
+      if (command === 'replace_queued_chat_input') return replacement.promise;
+      return previous?.(command, args);
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => expect(hook.result.current.queuedInputs).toHaveLength(1));
+    let result: Promise<boolean> | undefined;
+    act(() => {
+      result = hook.result.current.replaceQueuedMessage('late-edit', 'edited');
+    });
+    await act(async () => {
+      queuedFrontier = { queue_revision: 0, items: [] };
+      useConversationStore.setState({ activeId: 'successor-conversation' });
+    });
+    await act(async () => {
+      replacement.resolve({
+        ...pending.receipt,
+        identity: { ...pending.receipt.identity, revision: 2 },
+      });
+      expect(await result).toBe(false);
+    });
+    expect(hook.result.current.queuedInputs).toEqual([]);
+    hook.unmount();
+  });
+
+  it('keeps channel-owned queue inputs with their original runtime', async () => {
+    const conversationId = 'channel-original';
+    useConversationStore.setState({ activeId: conversationId });
+    const pending = inputProjection('channel-owned', conversationId, 'provider message');
+    Object.assign(pending.payload, { channel_binding: { channel_id: 'weixin' } });
+    queuedFrontier = { queue_revision: 11, items: [pending] };
+    const previous = mocks.apiInvoke.getMockImplementation();
+    mocks.apiInvoke.mockImplementation(async (command, args) =>
+      command === 'get_active_chat_turn' ? null : previous?.(command, args)
+    );
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => expect(hook.result.current.queuedInputs.at(0)?.channelOwned).toBe(true));
+    await act(async () => {
+      expect(await hook.result.current.replaceQueuedMessage('channel-owned', 'edited')).toBe(false);
+      expect(await hook.result.current.steerQueuedMessage('channel-owned')).toBe(false);
+      hook.result.current.removeQueuedMessage('channel-owned');
+      hook.result.current.clearQueuedMessages();
+    });
+    for (const command of [
+      'replace_queued_chat_input',
+      'steer_chat_message',
+      'remove_queued_chat_input',
+    ]) {
+      expect(mocks.apiInvoke).not.toHaveBeenCalledWith(command, expect.anything());
+    }
+    hook.unmount();
+  });
+
+  it.each(['automatic admission', 'manual admission'] as const)(
+    'shares the original pending Steer receipt after %s instead of rejecting the same input',
+    async (origin) => {
+      const conversationId = 'native-wait-steer-concurrent';
+      useConversationStore.setState({ activeId: conversationId });
+      const pending = inputProjection(
+        'native-original-input',
+        conversationId,
+        'STEER_NATIVE_CONTROL'
+      );
+      const first = deferred<ConversationInputReceipt>();
+      let invocations = 0;
+      queuedFrontier = {
+        queue_revision: origin === 'automatic admission' ? 0 : 1,
+        items: origin === 'automatic admission' ? [] : [pending],
+      };
+      mocks.apiInvoke.mockImplementation(async (command: string) => {
+        if (command === 'get_active_chat_turn')
+          return { ...activeSnapshot, conversation_id: conversationId };
+        if (command === 'replay_chat_events') return emptyReplay();
+        if (command === 'list_queued_chat_inputs') return queuedFrontier;
+        if (command === 'queue_chat_input') {
+          queuedFrontier = { queue_revision: 1, items: [pending] };
+          return pending.receipt;
+        }
+        if (command === 'steer_chat_message') {
+          invocations += 1;
+          if (invocations > 1) throw new Error('queued input is no longer pending');
+          queuedFrontier = {
+            queue_revision: 3,
+            items: [{ ...pending, receipt: { ...pending.receipt, phase: 'mailbox_accepted' } }],
+          };
+          return first.promise;
+        }
+        return { success: true };
+      });
+      const hook = renderHook(() => useTauriChat());
+      await waitFor(() =>
+        expect(mocks.apiInvoke).toHaveBeenCalledWith('list_queued_chat_inputs', {
+          workspaceId: 'global',
+          conversationId,
+        })
+      );
+      let original: Promise<boolean> | undefined;
+      if (origin === 'automatic admission') {
+        await act(async () => {
+          expect(await hook.result.current.sendMessage('STEER_NATIVE_CONTROL')).toBe(true);
+        });
+      } else {
+        act(() => {
+          original = hook.result.current.steerQueuedMessage(pending.receipt.identity.input_id);
+        });
+      }
+      await waitFor(() => expect(invocations).toBe(1));
+      let immediate: Promise<boolean> | undefined;
+      await act(async () => {
+        immediate = hook.result.current.steerQueuedMessage(pending.receipt.identity.input_id);
+        await Promise.resolve();
+      });
+      const callsBeforeDrain = invocations;
+      const outcomeBeforeDrain = hook.result.current.queuedInputs.at(0)?.steerOutcome;
+      let immediateResult = false;
+      await act(async () => {
+        queuedFrontier = { queue_revision: 5, items: [] };
+        first.resolve({ ...pending.receipt, phase: 'drained', drained: true, queue_revision: 5 });
+        immediateResult = (await immediate) ?? false;
+        if (original) expect(await original).toBe(true);
+      });
+      await waitFor(() => expect(hook.result.current.queuedInputs).toEqual([]));
+      expect(callsBeforeDrain).toBe(1);
+      expect(outcomeBeforeDrain).toBeUndefined();
+      expect(immediateResult).toBe(true);
+      expect(useToastStore.getState().toasts.some((toast) => toast.type === 'error')).toBe(false);
+      expect(
+        useChatStore.getState().messages.filter((message) => message.role === 'user')
+      ).toHaveLength(1);
+      expect(mocks.apiInvoke).not.toHaveBeenCalledWith(
+        'remove_queued_chat_input',
+        expect.anything()
+      );
+      hook.unmount();
+    }
+  );
+
+  it('keeps a real rejection retryable under the original identity after shared observation ends', async () => {
+    const conversationId = 'native-steer-real-rejection';
+    useConversationStore.setState({ activeId: conversationId });
+    const pending = inputProjection('native-retained-input', conversationId, 'original input');
+    const rejected = deferred<ConversationInputReceipt>();
+    const retried = deferred<ConversationInputReceipt>();
+    let invocations = 0;
+    queuedFrontier = { queue_revision: 1, items: [pending] };
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn')
+        return { ...activeSnapshot, conversation_id: conversationId };
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs') return queuedFrontier;
+      if (command === 'steer_chat_message') {
+        invocations += 1;
+        return invocations === 1 ? rejected.promise : retried.promise;
+      }
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() =>
+      expect(hook.result.current.queuedInputs.at(0)?.id).toBe('native-retained-input')
+    );
+    let first: Promise<boolean> | undefined;
+    let joined: Promise<boolean> | undefined;
+    act(() => {
+      first = hook.result.current.steerQueuedMessage('native-retained-input');
+      joined = hook.result.current.steerQueuedMessage('native-retained-input');
+    });
+    await act(async () => {
+      rejected.reject(new Error('queued input frontier changed; refresh and retry'));
+      expect(await first).toBe(false);
+      expect(await joined).toBe(false);
+    });
+    expect(invocations).toBe(1);
+    expect(hook.result.current.queuedInputs.at(0)?.steerOutcome).toBe('rejected');
+    expect(useToastStore.getState().toasts.filter((toast) => toast.type === 'error')).toHaveLength(
+      1
+    );
+    let retry: Promise<boolean> | undefined;
+    act(() => {
+      retry = hook.result.current.steerQueuedMessage('native-retained-input');
+    });
+    expect(invocations).toBe(2);
+    expect(hook.result.current.queuedInputs.at(0)?.steerOutcome).toBeUndefined();
+    await act(async () => {
+      queuedFrontier = { queue_revision: 5, items: [] };
+      retried.resolve({ ...pending.receipt, phase: 'drained', drained: true, queue_revision: 5 });
+      expect(await retry).toBe(true);
+    });
+    for (const [, args] of mocks.apiInvoke.mock.calls.filter(
+      ([command]) => command === 'steer_chat_message'
+    ))
+      expect(args.identity).toEqual(pending.receipt.identity);
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('queue_chat_input', expect.anything());
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('remove_queued_chat_input', expect.anything());
+    expect(
+      useChatStore.getState().messages.filter((message) => message.role === 'user')
+    ).toHaveLength(1);
+    hook.unmount();
+  });
+
+  it.each(
+    (['revision', 'payload hash'] as const).flatMap((change) =>
+      (['rejected', 'drained', 'retained'] as const).map((outcome) => [change, outcome] as const)
+    )
+  )('isolates a changed %s while the earlier source receipt is %s', async (change, outcome) => {
+    const conversationId = 'native-steer-source-version';
+    useConversationStore.setState({ activeId: conversationId });
+    const pending = inputProjection('same-input-version', conversationId, 'original input');
+    const changed: ConversationInputProjection = {
+      ...pending,
+      receipt: {
+        ...pending.receipt,
+        identity: {
+          ...pending.receipt.identity,
+          revision: change === 'revision' ? 2 : 1,
+          payload_sha256:
+            change === 'payload hash' ? 'new-payload-sha' : pending.receipt.identity.payload_sha256,
+        },
+      },
+    };
+    const oldReceipt = deferred<ConversationInputReceipt>();
+    const newReceipt = deferred<ConversationInputReceipt>();
+    let invocations = 0;
+    queuedFrontier = { queue_revision: 1, items: [pending] };
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn')
+        return { ...activeSnapshot, conversation_id: conversationId };
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs') return queuedFrontier;
+      if (command === 'steer_chat_message') {
+        invocations += 1;
+        return invocations === 1 ? oldReceipt.promise : newReceipt.promise;
+      }
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() =>
+      expect(hook.result.current.queuedInputs.at(0)?.id).toBe('same-input-version')
+    );
+    let first: Promise<boolean> | undefined;
+    act(() => {
+      first = hook.result.current.steerQueuedMessage('same-input-version');
+    });
+    await act(async () => {
+      queuedFrontier = { queue_revision: 2, items: [changed] };
+      mocks.listeners.get('chat://event')?.({
+        payload: inputLifecycleEnvelope(1, 'persisted', conversationId, 'same-input-version'),
+      });
+    });
+    await waitFor(() =>
+      expect(hook.result.current.queuedInputs.at(0)?.identity).toEqual(changed.receipt.identity)
+    );
+    let second: Promise<boolean> | undefined;
+    act(() => {
+      second = hook.result.current.steerQueuedMessage('same-input-version');
+    });
+    const callsBeforeSettlement = invocations;
+    const visibleMessages = useChatStore.getState().messages;
+    await act(async () => {
+      if (outcome === 'rejected')
+        oldReceipt.reject(new Error('original source version was superseded'));
+      else
+        oldReceipt.resolve({
+          ...pending.receipt,
+          phase: outcome === 'drained' ? 'drained' : 'deferred',
+          drained: outcome === 'drained',
+          queue_revision: 2,
+        });
+      expect(await first).toBe(outcome === 'drained');
+    });
+    // 此时新版本还在等待自己的回执；不在同一act里结算而掩盖旧结果覆盖窗口。
+    expect(hook.result.current.queuedInputs.at(0)?.identity).toEqual(changed.receipt.identity);
+    expect(hook.result.current.queuedInputs.at(0)?.steerOutcome).toBeUndefined();
+    expect(useChatStore.getState().messages).toEqual(visibleMessages);
+    expect(useToastStore.getState().toasts).toEqual([]);
+    await act(async () => {
+      queuedFrontier = { queue_revision: 5, items: [] };
+      newReceipt.resolve({
+        ...changed.receipt,
+        phase: 'drained',
+        drained: true,
+        queue_revision: 5,
+      });
+      expect(await second).toBe(true);
+    });
+    expect(callsBeforeSettlement).toBe(2);
+    const args = mocks.apiInvoke.mock.calls
+      .filter(([command]) => command === 'steer_chat_message')
+      .map(([, args]) => args);
+    expect(args.at(0)?.identity).toEqual(pending.receipt.identity);
+    expect(args.at(1)?.identity).toEqual(changed.receipt.identity);
+    expect(args.at(1)?.expectedQueueRevision).toBe(2);
+    hook.unmount();
+  });
+
+  it.each(['turn', 'workspace generation'] as const)(
+    'keeps an old shared promise from projecting into a new %s with the same input identity',
+    async (change) => {
+      const conversationId = 'native-steer-owner-change';
+      const workspace: Workspace = {
+        id: 'global',
+        name: 'Controlled local workspace',
+        root: '/controlled-local',
+        kind: { type: 'coding' },
+        metadata: {
+          tags: [],
+          project_location: { kind: 'local' as const, path: '/controlled-local' },
+        },
+        product_data_generation: 'generation-a',
+        created_at: '2026-10-25T00:00:00Z',
+        last_active: '2026-10-25T00:00:00Z',
+      };
+      useWorkspaceStore.setState({ current: workspace });
+      useConversationStore.setState({ activeId: conversationId });
+      let snapshot = { ...activeSnapshot, conversation_id: conversationId };
+      const pending = inputProjection('same-original-input', conversationId, 'current guidance');
+      const oldReceipt = deferred<ConversationInputReceipt>();
+      const newReceipt = deferred<ConversationInputReceipt>();
+      let invocations = 0;
+      queuedFrontier = { queue_revision: 1, items: [pending] };
+      mocks.apiInvoke.mockImplementation(async (command: string) => {
+        if (command === 'get_active_chat_turn') return snapshot;
+        if (command === 'replay_chat_events') return emptyReplay();
+        if (command === 'list_queued_chat_inputs') return queuedFrontier;
+        if (command === 'steer_chat_message') {
+          invocations += 1;
+          return invocations === 1 ? oldReceipt.promise : newReceipt.promise;
+        }
+        return { success: true };
+      });
+      const hook = renderHook(() => useTauriChat());
+      await waitFor(() =>
+        expect(hook.result.current.queuedInputs.at(0)?.id).toBe('same-original-input')
+      );
+      let oldResult: Promise<boolean> | undefined;
+      let oldJoined: Promise<boolean> | undefined;
+      act(() => {
+        oldResult = hook.result.current.steerQueuedMessage('same-original-input');
+        oldJoined = hook.result.current.steerQueuedMessage('same-original-input');
+      });
+      expect(invocations).toBe(1);
+      await act(async () => {
+        if (change === 'turn') {
+          snapshot = { ...snapshot, active_turn_id: 'continued-original-run-turn' };
+          mocks.listeners.get('chat://event')?.({
+            payload: turnStatusEnvelope(
+              snapshot.active_turn_id,
+              snapshot.root_turn_id,
+              1,
+              'running',
+              conversationId
+            ),
+          });
+        } else {
+          useWorkspaceStore.setState({
+            current: { ...workspace, product_data_generation: 'generation-b' },
+          });
+        }
+      });
+      await waitFor(() =>
+        expect(hook.result.current.queuedInputs.at(0)?.id).toBe('same-original-input')
+      );
+      let currentResult: Promise<boolean> | undefined;
+      act(() => {
+        currentResult = hook.result.current.steerQueuedMessage('same-original-input');
+      });
+      const callsBeforeSettlement = invocations;
+      const visibleMessages = useChatStore.getState().messages;
+      await act(async () => {
+        oldReceipt.resolve({
+          ...pending.receipt,
+          phase: 'drained',
+          drained: true,
+          queue_revision: 3,
+        });
+        expect(await oldResult).toBe(true);
+        expect(await oldJoined).toBe(true);
+      });
+      expect(useChatStore.getState().messages).toEqual(visibleMessages);
+      expect(useToastStore.getState().toasts).toEqual([]);
+      await act(async () => {
+        queuedFrontier = { queue_revision: 5, items: [] };
+        newReceipt.resolve({
+          ...pending.receipt,
+          phase: 'drained',
+          drained: true,
+          queue_revision: 5,
+        });
+        expect(await currentResult).toBe(true);
+      });
+      expect(callsBeforeSettlement).toBe(2);
+      expect(
+        useChatStore.getState().messages.filter((message) => message.role === 'user')
+      ).toHaveLength(1);
+      hook.unmount();
+    }
+  );
+
+  it('没有活跃turn时保留排队输入，不向Steer接口传null', async () => {
+    const conversationId = 'conversation-without-active-turn';
+    useConversationStore.setState({ activeId: conversationId });
+    const pending = inputProjection('retained-input', conversationId, '尚未发送的输入');
+    queuedFrontier = { queue_revision: 11, items: [pending] };
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn') return null;
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs') return queuedFrontier;
+      if (command === 'send_chat_message') throw new Error('对话尚未获准启动');
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => expect(hook.result.current.queuedInputs.at(0)?.id).toBe('retained-input'));
+    await waitFor(() => expect(useChatStore.getState().isStreaming).toBe(false));
+    await act(async () => {
+      expect(await hook.result.current.steerQueuedMessage('retained-input')).toBe(false);
+    });
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('steer_chat_message', expect.anything());
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('remove_queued_chat_input', expect.anything());
+    expect(hook.result.current.queuedInputs.at(0)?.identity).toEqual(pending.receipt.identity);
+    expect(useToastStore.getState().toasts.at(-1)?.message).toContain('当前没有正在执行的对话');
+    hook.unmount();
+  });
+
   it('steers an exact selected identity and refreshes instead of removing locally', async () => {
     const conversationId = 'conversation-steer-accepted';
     useConversationStore.setState({ activeId: conversationId });
@@ -555,6 +2361,224 @@ describe('useTauriChat foreground turn recovery', () => {
       mocks.apiInvoke.mock.calls.filter(([command]) => command === 'remove_queued_chat_input')
     ).toHaveLength(0);
     expect(useChatStore.getState().runStatus).toBe('running');
+    hook.unmount();
+  });
+
+  it.each(
+    (
+      [
+        'conversation',
+        'workspace',
+        'workspace generation',
+        'conversation reopen',
+        'hook remount',
+      ] as const
+    ).flatMap((change) =>
+      (['Steer IPC', 'Frontier IPC'] as const).map((boundary) => [change, boundary] as const)
+    )
+  )('drops late Steer success after %s while awaiting %s', async (change, boundary) => {
+    const workspace: Workspace = {
+      id: 'steer-workspace-a',
+      name: 'Steer workspace',
+      root: '/steer-workspace',
+      kind: { type: 'coding' },
+      metadata: {
+        tags: [],
+        project_location: { kind: 'local' as const, path: '/steer-workspace' },
+      },
+      product_data_generation: 'generation-a',
+      created_at: '2026-10-25T00:00:00Z',
+      last_active: '2026-10-25T00:00:00Z',
+    };
+    let visibleSnapshot = {
+      ...activeSnapshot,
+      workspace_id: workspace.id,
+      conversation_id: 'steer-conversation-a',
+      root_turn_id: 'steer-root-a',
+      active_turn_id: 'steer-turn-a',
+    };
+    const pending = inputProjection(
+      'late-steer-a',
+      visibleSnapshot.conversation_id,
+      'original input'
+    );
+    pending.receipt.identity.address.workspace_id = workspace.id;
+    const current = inputProjection(
+      'current-steer-b',
+      visibleSnapshot.conversation_id,
+      'current input'
+    );
+    current.receipt.identity.address.workspace_id = workspace.id;
+    let visibleFrontier: ConversationInputFrontier = { queue_revision: 11, items: [pending] };
+    let resolveSteer: ((receipt: ConversationInputReceipt) => void) | undefined;
+    let resolveFrontier: ((frontier: ConversationInputFrontier) => void) | undefined;
+    let waitForFrontier = false;
+    useWorkspaceStore.setState({ current: workspace });
+    useConversationStore.setState({ activeId: visibleSnapshot.conversation_id });
+    mocks.apiInvoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === 'get_active_chat_turn') return visibleSnapshot;
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs') {
+        if (waitForFrontier) {
+          waitForFrontier = false;
+          return new Promise<ConversationInputFrontier>((resolve) => {
+            resolveFrontier = resolve;
+          });
+        }
+        return visibleFrontier;
+      }
+      if (command === 'steer_chat_message') {
+        if (
+          (args?.identity as ConversationInputReceipt['identity']).input_id ===
+          pending.receipt.identity.input_id
+        ) {
+          if (boundary === 'Steer IPC') {
+            return new Promise<ConversationInputReceipt>((resolve) => {
+              resolveSteer = resolve;
+            });
+          }
+          waitForFrontier = true;
+          return { ...pending.receipt, phase: 'drained', drained: true, queue_revision: 12 };
+        }
+        visibleFrontier = { queue_revision: 22, items: [] };
+        return { ...current.receipt, phase: 'drained', drained: true, queue_revision: 22 };
+      }
+      return { success: true };
+    });
+    let hook = renderHook(() => useTauriChat());
+    await waitFor(() => expect(hook.result.current.queuedInputs.at(0)?.id).toBe('late-steer-a'));
+    let result: Promise<boolean> | undefined;
+    act(() => {
+      result = hook.result.current.steerQueuedMessage('late-steer-a');
+    });
+    await waitFor(() =>
+      expect(boundary === 'Steer IPC' ? resolveSteer : resolveFrontier).toBeDefined()
+    );
+
+    visibleSnapshot = {
+      ...visibleSnapshot,
+      root_turn_id: 'steer-root-b',
+      active_turn_id: 'steer-turn-b',
+    };
+    if (change === 'conversation') {
+      visibleSnapshot = { ...visibleSnapshot, conversation_id: 'steer-conversation-b' };
+      current.receipt.identity.address.conversation_id = visibleSnapshot.conversation_id;
+    }
+    if (change === 'workspace') {
+      visibleSnapshot = { ...visibleSnapshot, workspace_id: 'steer-workspace-b' };
+      current.receipt.identity.address.workspace_id = visibleSnapshot.workspace_id;
+    }
+    visibleFrontier = { queue_revision: 21, items: [current] };
+    await act(async () => {
+      useChatStore.getState().clearMessages();
+      useChatStore.getState().startAssistantMessage('steer-root-b');
+      useChatStore.getState().appendToken('steer-root-b', 'current reply');
+      if (change === 'workspace' || change === 'workspace generation') {
+        useWorkspaceStore.setState({
+          current: {
+            ...workspace,
+            id: visibleSnapshot.workspace_id,
+            product_data_generation: 'generation-b',
+          },
+        });
+      }
+      if (change === 'conversation')
+        useConversationStore.setState({ activeId: visibleSnapshot.conversation_id });
+      if (change === 'conversation reopen')
+        useConversationStore.setState({ newConversationEpoch: 1 });
+      if (change === 'hook remount') {
+        hook.unmount();
+        hook = renderHook(() => useTauriChat());
+      }
+    });
+    const visibleMessages = useChatStore.getState().messages;
+    await act(async () => {
+      resolveSteer?.({ ...pending.receipt, phase: 'drained', drained: true, queue_revision: 12 });
+      resolveFrontier?.({ queue_revision: 12, items: [] });
+      expect(await result).toBe(true);
+    });
+
+    expect(useChatStore.getState().messages).toEqual(visibleMessages);
+    expect(useToastStore.getState().toasts).toEqual([]);
+    expect(
+      mocks.apiInvoke.mock.calls.filter(([command]) => command === 'steer_chat_message')
+    ).toHaveLength(1);
+    expect(
+      mocks.apiInvoke.mock.calls.filter(([command]) =>
+        ['queue_chat_input', 'send_chat_message', 'remove_queued_chat_input'].includes(command)
+      )
+    ).toHaveLength(0);
+    await waitFor(() => expect(hook.result.current.queuedInputs.at(0)?.id).toBe('current-steer-b'));
+    await act(async () => {
+      expect(await hook.result.current.steerQueuedMessage('current-steer-b')).toBe(true);
+    });
+    expect(
+      useChatStore.getState().messages.find((message) => message.id === 'steer-root-b')
+    ).toMatchObject({ content: 'current reply', isStreaming: false });
+    expect(
+      useChatStore
+        .getState()
+        .messages.filter((message) => message.role === 'user')
+        .map((message) => message.content)
+    ).toEqual(['current input']);
+    hook.unmount();
+  });
+
+  it('does not show a late Steer rejection in another conversation', async () => {
+    const conversationId = 'late-rejected-steer-a';
+    useConversationStore.setState({ activeId: conversationId });
+    const pending = inputProjection('late-rejection', conversationId, 'original input');
+    let rejectSteer: ((reason: Error) => void) | undefined;
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn')
+        return { ...activeSnapshot, conversation_id: useConversationStore.getState().activeId };
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs') return { queue_revision: 1, items: [pending] };
+      if (command === 'steer_chat_message')
+        return new Promise<ConversationInputReceipt>((_resolve, reject) => {
+          rejectSteer = reject;
+        });
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => expect(hook.result.current.queuedInputs.at(0)?.id).toBe('late-rejection'));
+    let result: Promise<boolean> | undefined;
+    act(() => {
+      result = hook.result.current.steerQueuedMessage('late-rejection');
+    });
+    await waitFor(() => expect(rejectSteer).toBeDefined());
+    act(() => {
+      useConversationStore.setState({ activeId: 'late-rejected-steer-b' });
+    });
+    await act(async () => {
+      rejectSteer?.(new Error('old turn settled'));
+      expect(await result).toBe(false);
+    });
+    expect(useToastStore.getState().toasts).toEqual([]);
+    hook.unmount();
+  });
+
+  it('shows a retained outcome when the safe point keeps Steer queued', async () => {
+    const conversationId = 'retained-steer';
+    const pending = inputProjection('retained-input', conversationId, 'keep queued');
+    useConversationStore.setState({ activeId: conversationId });
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn') return null;
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs') return { queue_revision: 1, items: [pending] };
+      if (command === 'steer_chat_message') {
+        return { ...pending.receipt, phase: 'persisted', drained: false, queue_revision: 2 };
+      }
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => expect(hook.result.current.queuedInputs.at(0)?.id).toBe('retained-input'));
+    await act(async () => {
+      expect(await hook.result.current.steerQueuedMessage('retained-input')).toBe(false);
+    });
+    await waitFor(() =>
+      expect(hook.result.current.queuedInputs.at(0)?.steerOutcome).toBe('retained')
+    );
     hook.unmount();
   });
 
@@ -682,7 +2706,7 @@ describe('useTauriChat foreground turn recovery', () => {
         payload: agentEnvelope(
           snapshot.active_turn_id,
           4,
-          { type: 'token', data: 'ordered token' },
+          nativeCommentary('ordered token', 4),
           conversationId,
           snapshot.root_turn_id
         ),
@@ -700,9 +2724,107 @@ describe('useTauriChat foreground turn recovery', () => {
 
     await waitFor(() => expect(useChatStore.getState().runStatus).toBe('completed'));
     expect(
-      useChatStore.getState().messages.find((message) => message.id === snapshot.root_turn_id)
-        ?.content
+      useChatStore
+        .getState()
+        .messages.find((message) => message.id === snapshot.root_turn_id)
+        ?.assistantBlocks?.map((block) => block.content)
+        .join('')
     ).toContain('ordered token');
+    hook.unmount();
+  });
+
+  it('原生 schema5 保存检查点不阻塞 completed，下一条输入正常启动新回合', async () => {
+    const conversationId = 'native-schema5-conversation';
+    const snapshot = {
+      ...activeSnapshot,
+      conversation_id: conversationId,
+      root_turn_id: 'native-schema5-root',
+      active_turn_id: 'native-schema5-turn',
+    };
+    useConversationStore.setState({ activeId: conversationId });
+    let completed = false;
+    mocks.apiInvoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === 'get_active_chat_turn') return completed ? null : snapshot;
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs') return { queue_revision: 0, items: [] };
+      if (command === 'send_chat_message') {
+        const request = args?.request as { messageKey: string };
+        return {
+          kind: 'started',
+          root_turn_id: request.messageKey,
+          active_turn_id: request.messageKey,
+        };
+      }
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() =>
+      expect(mocks.apiInvoke).toHaveBeenCalledWith('list_queued_chat_inputs', {
+        workspaceId: 'global',
+        conversationId,
+      })
+    );
+    act(() => {
+      const listener = mocks.listeners.get('chat://event');
+      const agent = (sequence: number, event: AgentEvent) =>
+        agentEnvelope(
+          snapshot.active_turn_id,
+          sequence,
+          event,
+          conversationId,
+          snapshot.root_turn_id
+        );
+      listener?.({
+        payload: turnStatusEnvelope(
+          snapshot.active_turn_id,
+          snapshot.root_turn_id,
+          1,
+          'running',
+          conversationId
+        ),
+      });
+      listener?.({
+        payload: agent(2, {
+          type: 'transcript_projection_settlement',
+          data: {
+            status: 'settled',
+            operation_id: 'transcript-projection-v1:original',
+            conversation_id: conversationId,
+            generation_id: conversationId,
+            attempt: 1,
+            error_class: null,
+            detail: null,
+          },
+        }),
+      });
+      listener?.({ payload: agent(3, nativeCommentary('本机原回复', 3)) });
+      listener?.({ payload: agent(4, { type: 'final_answer', data: '本机原回复' }) });
+      completed = true;
+      listener?.({
+        payload: turnStatusEnvelope(
+          snapshot.active_turn_id,
+          snapshot.root_turn_id,
+          5,
+          'completed',
+          conversationId
+        ),
+      });
+    });
+    await waitFor(() => expect(useChatStore.getState().isStreaming).toBe(false));
+    expect(useChatStore.getState().runStatus).toBe('completed');
+    expect(useChatStore.getState().messages.at(-1)?.content).toBe('本机原回复');
+
+    mocks.apiInvoke.mockClear();
+    await act(async () => {
+      expect(await hook.result.current.sendMessage('NATIVE_HITL')).toBe(true);
+    });
+    expect(mocks.apiInvoke).toHaveBeenCalledWith(
+      'send_chat_message',
+      expect.objectContaining({
+        request: expect.objectContaining({ conversationId, message: 'NATIVE_HITL' }),
+      })
+    );
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('queue_chat_input', expect.anything());
     hook.unmount();
   });
 
@@ -719,14 +2841,14 @@ describe('useTauriChat foreground turn recovery', () => {
     const first = agentEnvelope(
       snapshot.active_turn_id,
       1,
-      { type: 'token', data: 'first ' },
+      nativeCommentary('first ', 1),
       conversationId,
       snapshot.root_turn_id
     );
     const second = agentEnvelope(
       snapshot.active_turn_id,
       2,
-      { type: 'token', data: 'second' },
+      nativeCommentary('second', 2),
       conversationId,
       snapshot.root_turn_id
     );
@@ -756,8 +2878,11 @@ describe('useTauriChat foreground turn recovery', () => {
 
     await waitFor(() => {
       expect(
-        useChatStore.getState().messages.find((message) => message.id === snapshot.root_turn_id)
-          ?.content
+        useChatStore
+          .getState()
+          .messages.find((message) => message.id === snapshot.root_turn_id)
+          ?.assistantBlocks?.map((block) => block.content)
+          .join('')
       ).toContain('first second');
     });
     expect(mocks.apiInvoke).toHaveBeenCalledWith('replay_chat_events', {
@@ -882,7 +3007,7 @@ describe('useTauriChat foreground turn recovery', () => {
         agentEnvelope(
           activeTurnId,
           1,
-          { type: 'token', data: 'continued' },
+          nativeCommentary('continued', 1),
           conversationId,
           rootTurnId
         ),
@@ -901,7 +3026,11 @@ describe('useTauriChat foreground turn recovery', () => {
     const hook = renderHook(() => useTauriChat());
     await waitFor(() => {
       expect(
-        useChatStore.getState().messages.find((message) => message.id === rootTurnId)?.content
+        useChatStore
+          .getState()
+          .messages.find((message) => message.id === rootTurnId)
+          ?.assistantBlocks?.map((block) => block.content)
+          .join('')
       ).toBe('continued');
     });
     await act(async () => {
@@ -923,13 +3052,7 @@ describe('useTauriChat foreground turn recovery', () => {
     useChatStore.getState().startAssistantMessage(rootTurnId);
     const replay: ChatEventReplay = {
       events: [
-        agentEnvelope(
-          rootTurnId,
-          1,
-          { type: 'token', data: 'partial' },
-          conversationId,
-          rootTurnId
-        ),
+        agentEnvelope(rootTurnId, 1, nativeCommentary('partial', 1), conversationId, rootTurnId),
         agentEnvelope(
           rootTurnId,
           2,
@@ -1024,6 +3147,180 @@ describe('useTauriChat foreground turn recovery', () => {
     second.unmount();
   });
 
+  it('非零游标重开先收新尾部，随后原前缀恢复确认与告警且不重复', async () => {
+    const conversationId = 'conversation-save-rehydrate';
+    const rootTurnId = 'original-save-root';
+    const saving = (
+      sequence: number,
+      status: 'settled' | 'blocked',
+      operation: string,
+      detail: string | null
+    ) =>
+      agentEnvelope(
+        rootTurnId,
+        sequence,
+        {
+          type: 'transcript_projection_settlement',
+          data: {
+            status,
+            operation_id: operation,
+            conversation_id: conversationId,
+            generation_id: 'original-generation',
+            attempt: 1,
+            error_class: status === 'settled' ? null : 'outcome_unknown',
+            detail,
+          },
+        },
+        conversationId,
+        rootTurnId
+      );
+    const confirmed = saving(1, 'settled', 'confirmed-original', null);
+    const original = saving(2, 'blocked', 'original-unconfirmed-operation', '原保存仍未确认');
+    const tail = saving(3, 'blocked', 'new-tail-operation', '新尾部保存未确认');
+    let reloading = false;
+    useConversationStore.setState({ activeId: conversationId });
+    mocks.apiInvoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === 'get_active_chat_turn') return null;
+      if (command === 'list_queued_chat_inputs') return { queue_revision: 0, items: [] };
+      if (command === 'replay_chat_events') {
+        const all = reloading ? [confirmed, original, tail] : [confirmed, original];
+        const cursor = typeof args?.afterCursor === 'number' ? args.afterCursor : 0;
+        const events = all.filter((event) => event.sequence > cursor);
+        return {
+          ...emptyReplay(),
+          events,
+          retained_earliest_cursor: 1,
+          returned_earliest_cursor: events.at(0)?.sequence ?? null,
+          latest_cursor: reloading ? 3 : 2,
+        };
+      }
+      return { success: true };
+    });
+    const first = renderHook(() => useTauriChat());
+    await waitFor(() =>
+      expect(
+        useChatStore.getState().messages.some((note) => note.content.includes('原保存仍未确认'))
+      ).toBe(true)
+    );
+    first.unmount();
+    useChatStore.getState().replaceMessages([]);
+    reloading = true;
+    const second = renderHook(() => useTauriChat());
+    await waitFor(() => {
+      const notes = useChatStore.getState().messages;
+      expect(notes.filter((note) => note.content.includes('原保存仍未确认'))).toHaveLength(1);
+      const latest = notes.filter((note) => note.content.includes('新尾部保存未确认'));
+      expect(latest).toHaveLength(1);
+      expect(latest.at(0)?.content).toContain('2026-08-18T00:00:00.000Z');
+      expect(latest.at(0)?.content).not.toContain('暂无可核验');
+    });
+    expect(mocks.apiInvoke).toHaveBeenCalledWith('replay_chat_events', {
+      workspaceId: 'global',
+      conversationId,
+      messageKey: undefined,
+      afterCursor: 2,
+    });
+    act(() => {
+      mocks.listeners.get('chat://event')?.({ payload: tail });
+    });
+    expect(
+      useChatStore.getState().messages.filter((note) => note.content.includes('新尾部保存未确认'))
+    ).toHaveLength(1);
+    expect(useChatStore.getState().runStatus).toBe('idle');
+    expect(useChatStore.getState().isStreaming).toBe(false);
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('send_chat', expect.anything());
+    second.unmount();
+  });
+
+  it('跨轮live保存告警不丢失，也不把取消与正文重新绑定到旧轮', async () => {
+    const conversationId = 'conversation-save-live';
+    const original = 'original-turn-save';
+    const current = 'current-turn-save';
+    const snapshot = {
+      ...activeSnapshot,
+      conversation_id: conversationId,
+      root_turn_id: original,
+      active_turn_id: original,
+    };
+    useConversationStore.setState({ activeId: conversationId });
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn') return snapshot;
+      if (command === 'list_queued_chat_inputs') return { queue_revision: 0, items: [] };
+      if (command === 'replay_chat_events') return emptyReplay();
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() =>
+      expect(useChatStore.getState().messages.some((message) => message.id === original)).toBe(true)
+    );
+    const emit = (event: ChatEventEnvelope) =>
+      mocks.listeners.get('chat://event')?.({ payload: event });
+    act(() => {
+      emit(turnStatusEnvelope(original, original, 1, 'running', conversationId));
+      emit(turnStatusEnvelope(original, original, 2, 'failed', conversationId));
+      useChatStore.getState().startAssistantMessage(current);
+      emit(turnStatusEnvelope(current, current, 3, 'running', conversationId));
+      emit(
+        agentEnvelope(
+          original,
+          4,
+          {
+            type: 'transcript_projection_settlement',
+            data: {
+              status: 'blocked',
+              operation_id: 'old-save-operation',
+              conversation_id: conversationId,
+              generation_id: 'original-generation',
+              attempt: 1,
+              error_class: 'outcome_unknown',
+              detail: '旧轮保存未确认',
+            },
+          },
+          conversationId,
+          original
+        )
+      );
+      emit(agentEnvelope(current, 5, nativeCommentary('当前轮正文', 1), conversationId, current));
+      emit(
+        agentEnvelope(
+          original,
+          6,
+          nativeCommentary('不能复活旧轮正文', 2),
+          conversationId,
+          original
+        )
+      );
+    });
+    expect(
+      useChatStore.getState().messages.filter((note) => note.content.includes('旧轮保存未确认'))
+    ).toHaveLength(1);
+    expect(useChatStore.getState().runStatus).toBe('running');
+    expect(
+      useChatStore
+        .getState()
+        .messages.find((message) => message.id === current)
+        ?.assistantBlocks?.map((block) => block.content)
+        .join('')
+    ).toBe('当前轮正文');
+    expect(
+      useChatStore
+        .getState()
+        .messages.some((message) =>
+          message.assistantBlocks?.some((block) => block.content.includes('不能复活旧轮正文'))
+        )
+    ).toBe(false);
+    await act(async () => {
+      await hook.result.current.cancel();
+    });
+    expect(mocks.apiInvoke).toHaveBeenCalledWith('cancel_chat', {
+      workspaceId: 'global',
+      conversationId,
+      expectedRootTurnId: current,
+      expectedActiveTurnId: current,
+    });
+    hook.unmount();
+  });
+
   it('does not cancel or fail a replay with no active snapshot and no terminal fact', async () => {
     const conversationId = 'conversation-inactive-partial-replay';
     const rootTurnId = 'inactive-partial-turn';
@@ -1034,7 +3331,7 @@ describe('useTauriChat foreground turn recovery', () => {
         agentEnvelope(
           rootTurnId,
           1,
-          { type: 'token', data: 'durable partial output' },
+          nativeCommentary('durable partial output', 1),
           conversationId,
           rootTurnId
         ),
@@ -1053,7 +3350,13 @@ describe('useTauriChat foreground turn recovery', () => {
     const hook = renderHook(() => useTauriChat());
     await waitFor(() => expect(useChatStore.getState().runStatus).toBe('idle'));
     expect(useChatStore.getState().isStreaming).toBe(false);
-    expect(useChatStore.getState().messages.at(-1)?.content).toBe('durable partial output');
+    expect(
+      useChatStore
+        .getState()
+        .messages.at(-1)
+        ?.assistantBlocks?.map((block) => block.content)
+        .join('')
+    ).toBe('durable partial output');
     expect(mocks.apiInvoke).not.toHaveBeenCalledWith('cancel_chat', expect.anything());
     hook.unmount();
   });
@@ -1149,6 +3452,56 @@ describe('useTauriChat foreground turn recovery', () => {
       .messages.find((message) => message.id === oldRootTurnId);
     expect(oldAssistant?.content).toBe('');
     expect(oldAssistant?.isStreaming).toBe(true);
+    hook.unmount();
+  });
+
+  it('已收到 completed 后，迟到的活跃快照不能把下一条普通输入改成 Steer', async () => {
+    const conversationId = 'completed-before-recovery-snapshot';
+    const snapshot = { ...activeSnapshot, conversation_id: conversationId };
+    const lookup = deferred<typeof snapshot>();
+    useConversationStore.setState({ activeId: conversationId });
+    mocks.apiInvoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === 'get_active_chat_turn') return lookup.promise;
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs') return { queue_revision: 0, items: [] };
+      if (command === 'send_chat_message') {
+        const request = args?.request as { messageKey: string };
+        return {
+          kind: 'started',
+          root_turn_id: request.messageKey,
+          active_turn_id: request.messageKey,
+        };
+      }
+      return { success: true };
+    });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() =>
+      expect(mocks.apiInvoke).toHaveBeenCalledWith('get_active_chat_turn', {
+        workspaceId: 'global',
+        conversationId,
+      })
+    );
+    act(() => {
+      mocks.listeners.get('chat://event')?.({
+        payload: turnStatusEnvelope(
+          snapshot.active_turn_id,
+          snapshot.root_turn_id,
+          1,
+          'completed',
+          conversationId
+        ),
+      });
+    });
+    await act(async () => {
+      lookup.resolve(snapshot);
+      await lookup.promise;
+    });
+    mocks.apiInvoke.mockClear();
+    await act(async () => {
+      expect(await hook.result.current.sendMessage('完成后新要求')).toBe(true);
+    });
+    expect(mocks.apiInvoke).toHaveBeenCalledWith('send_chat_message', expect.anything());
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('queue_chat_input', expect.anything());
     hook.unmount();
   });
 
@@ -1358,31 +3711,161 @@ describe('useTauriChat foreground turn recovery', () => {
     hook.unmount();
   });
 
+  it.each(['input', 'selection'] as const)(
+    'passes original scope and kind through the real %s reply call',
+    async (kind) => {
+      const identity = { ...hitlIdentity(`request-${kind}`), kind };
+      const previous = mocks.apiInvoke.getMockImplementation();
+      mocks.apiInvoke.mockImplementation(async (command, args) =>
+        command === `send_${kind}_response`
+          ? { submitted: true, response_target: args.responseTarget }
+          : previous?.(command, args)
+      );
+      if (kind === 'input')
+        useChatStore
+          .getState()
+          .enqueueHitlRequest({ kind, requestId: identity.request_id, identity, prompt: 'input' });
+      else
+        useChatStore.getState().enqueueHitlRequest({
+          kind,
+          requestId: identity.request_id,
+          identity,
+          prompt: 'choose',
+          options: ['Continue'],
+        });
+      const hook = renderHook(() => useTauriChat());
+      await act(async () => {
+        if (kind === 'input') await hook.result.current.sendInput(identity, '中文\n🙂');
+        else await hook.result.current.sendSelection(identity, 'Continue');
+      });
+      expect(mocks.apiInvoke).toHaveBeenCalledWith(
+        `send_${kind}_response`,
+        expect.objectContaining({
+          workspaceId: 'original-workspace',
+          conversationId: 'original-conversation',
+          expectedRootTurnId: 'original-root',
+          expectedActiveTurnId: 'original-turn',
+          responseTarget: identity.response_target,
+          requestScope: identity.scope,
+          requestKind: kind,
+        })
+      );
+      expect(useChatStore.getState().pendingHitlRequests).toEqual([]);
+      hook.unmount();
+    }
+  );
+
+  it('does not let an earlier submission acknowledgement remove a reused-id successor', async () => {
+    const original = {
+      ...hitlIdentity('reusable'),
+      kind: 'input' as const,
+      response_target: 'old-target',
+    };
+    const successor = { ...original, response_target: 'new-target' };
+    let finish: ((receipt: { submitted: boolean; response_target: string }) => void) | undefined;
+    const previous = mocks.apiInvoke.getMockImplementation();
+    mocks.apiInvoke.mockImplementation((command, args) =>
+      command === 'send_input_response'
+        ? new Promise((resolve) => {
+            finish = resolve;
+          })
+        : previous?.(command, args)
+    );
+    useChatStore
+      .getState()
+      .enqueueHitlRequest({ kind: 'input', requestId: 'reusable', identity: original });
+    const hook = renderHook(() => useTauriChat());
+    let pending: Promise<boolean> | undefined;
+    await act(async () => {
+      pending = hook.result.current.sendInput(original, 'answer');
+    });
+    expect(finish).toBeTypeOf('function');
+    act(() => {
+      useChatStore.getState().removeHitlRequest(original);
+      useChatStore
+        .getState()
+        .enqueueHitlRequest({ kind: 'input', requestId: 'reusable', identity: successor });
+    });
+    await act(async () => {
+      finish?.({ submitted: true, response_target: 'old-target' });
+      await pending;
+    });
+    expect(useChatStore.getState().pendingHitlRequests).toEqual([
+      expect.objectContaining({ identity: successor }),
+    ]);
+    hook.unmount();
+  });
+
+  it.each(['input', 'selection'] as const)(
+    'keeps %s waiting when transport success is not a submission receipt',
+    async (kind) => {
+      const identity = { ...hitlIdentity('not-submitted'), kind };
+      const previous = mocks.apiInvoke.getMockImplementation();
+      mocks.apiInvoke.mockImplementation(async (command, args) =>
+        command === `send_${kind}_response` ? { success: true } : previous?.(command, args)
+      );
+      if (kind === 'input')
+        useChatStore
+          .getState()
+          .enqueueHitlRequest({ kind, requestId: identity.request_id, identity });
+      else
+        useChatStore.getState().enqueueHitlRequest({
+          kind,
+          requestId: identity.request_id,
+          identity,
+          prompt: 'choose',
+          options: ['Continue'],
+        });
+      const hook = renderHook(() => useTauriChat());
+      await act(async () => {
+        const submitted =
+          kind === 'input'
+            ? await hook.result.current.sendInput(identity, 'answer')
+            : await hook.result.current.sendSelection(identity, 'Continue');
+        expect(submitted).toBe(false);
+      });
+      expect(useChatStore.getState().pendingHitlRequests).toEqual([
+        expect.objectContaining({ identity }),
+      ]);
+      hook.unmount();
+    }
+  );
+
   it('removes only the acknowledged HITL request and keeps the next one waiting', async () => {
+    mocks.apiInvoke.mockImplementation(async (command, args) =>
+      command === 'send_approval_response'
+        ? { submitted: true, response_target: args.responseTarget }
+        : undefined
+    );
     useChatStore.getState().enqueueHitlRequest({
       kind: 'approval',
       requestId: 'approval-first',
+      identity: hitlIdentity('approval-first'),
       toolName: 'write_file',
       args: { path: 'first.txt' },
     });
     useChatStore.getState().enqueueHitlRequest({
       kind: 'approval',
       requestId: 'approval-second',
+      identity: hitlIdentity('approval-second'),
       toolName: 'write_file',
       args: { path: 'second.txt' },
     });
     const hook = renderHook(() => useTauriChat());
 
     await act(async () => {
-      await hook.result.current.sendApproval('approval-first', true);
+      await hook.result.current.sendApproval(hitlIdentity('approval-first'), true);
     });
 
     expect(mocks.apiInvoke).toHaveBeenCalledWith('send_approval_response', {
-      workspaceId: 'global',
-      conversationId: null,
-      expectedRootTurnId: null,
-      expectedActiveTurnId: null,
+      workspaceId: 'original-workspace',
+      conversationId: 'original-conversation',
+      expectedRootTurnId: 'original-root',
+      expectedActiveTurnId: 'original-turn',
       requestId: 'approval-first',
+      responseTarget: 'target-approval-first',
+      requestScope: hitlIdentity('approval-first').scope,
+      requestKind: 'approval',
       approved: true,
       reason: undefined,
       scope: undefined,
@@ -1393,10 +3876,140 @@ describe('useTauriChat foreground turn recovery', () => {
     expect(useChatStore.getState().runStatus).toBe('waiting_approval');
 
     await act(async () => {
-      await hook.result.current.sendApproval('approval-second', false, 'not now');
+      await hook.result.current.sendApproval(hitlIdentity('approval-second'), false, 'not now');
     });
     expect(useChatStore.getState().pendingHitlRequests).toEqual([]);
     expect(useChatStore.getState().runStatus).toBe('running');
     hook.unmount();
+  });
+
+  describe('HITL reply feedback stays with its original presentation', () => {
+    async function pendingReply(kind: 'input' | 'selection') {
+      const identity: HitlRequestIdentity = {
+        ...hitlIdentity('reused-reply'),
+        kind,
+        scope: {
+          workspace_id: activeSnapshot.workspace_id,
+          host_generation: 'original-host',
+          conversation_id: activeSnapshot.conversation_id,
+          root_turn_id: activeSnapshot.root_turn_id,
+          turn_id: activeSnapshot.active_turn_id,
+        },
+      };
+      const reply = deferred<{ submitted: boolean; response_target: string }>();
+      const previous = mocks.apiInvoke.getMockImplementation();
+      mocks.apiInvoke.mockImplementation((command, args) => {
+        if (command === `send_${kind}_response`) return reply.promise;
+        if (command === 'get_conversation') return Promise.resolve({ messages: [] });
+        if (command === 'list_tool_executions') return Promise.resolve([]);
+        if (command === 'restore_conversation') return Promise.resolve({ success: true });
+        return previous?.(command, args);
+      });
+      useConversationStore.setState({
+        workspaceId: 'global',
+        activeId: activeSnapshot.conversation_id,
+      });
+      const hook = renderHook(() => useTauriChat());
+      await waitFor(() =>
+        expect(
+          useChatStore
+            .getState()
+            .messages.some((message) => message.id === activeSnapshot.root_turn_id)
+        ).toBe(true)
+      );
+      const enqueue = (next = identity) => {
+        if (kind === 'input')
+          useChatStore
+            .getState()
+            .enqueueHitlRequest({ kind, identity: next, requestId: next.request_id });
+        else
+          useChatStore.getState().enqueueHitlRequest({
+            kind,
+            identity: next,
+            requestId: next.request_id,
+            prompt: 'choose',
+            options: ['Continue'],
+          });
+      };
+      act(() => enqueue());
+      let operation: Promise<boolean> | undefined;
+      await act(async () => {
+        operation =
+          kind === 'input'
+            ? hook.result.current.sendInput(identity, 'original reply')
+            : hook.result.current.sendSelection(identity, 'Continue');
+      });
+      expect(mocks.apiInvoke).toHaveBeenCalledWith(
+        `send_${kind}_response`,
+        expect.objectContaining({
+          requestId: identity.request_id,
+          responseTarget: identity.response_target,
+          workspaceId: identity.scope.workspace_id,
+          conversationId: identity.scope.conversation_id,
+          requestScope: identity.scope,
+          requestKind: kind,
+        })
+      );
+      return { hook, identity, reply, operation, enqueue };
+    }
+
+    for (const kind of ['input', 'selection'] as const) {
+      it.each(['conversation', 'successor', 'released', 'revisit'] as const)(
+        `keeps a late ${kind} failure out of the current view after %s`,
+        async (transition) => {
+          const { hook, identity, reply, operation, enqueue } = await pendingReply(kind);
+          if (transition === 'conversation' || transition === 'revisit') {
+            await act(async () =>
+              useConversationStore.getState().loadConversation('other-conversation')
+            );
+            if (transition === 'revisit') {
+              await act(async () =>
+                useConversationStore.getState().loadConversation(activeSnapshot.conversation_id)
+              );
+              act(() => enqueue());
+            }
+          } else {
+            act(() => {
+              useChatStore.getState().removeHitlRequest(identity);
+              if (transition === 'successor')
+                enqueue({ ...identity, response_target: 'successor-response-target' });
+            });
+          }
+          const currentPending = useChatStore.getState().pendingHitlRequests;
+          const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+          try {
+            await act(async () => {
+              reply.reject(new Error('original response target expired'));
+              expect(await operation).toBe(false);
+            });
+            expect(useToastStore.getState().toasts).toEqual([]);
+            expect(useChatStore.getState().pendingHitlRequests).toBe(currentPending);
+          } finally {
+            consoleError.mockRestore();
+            hook.unmount();
+          }
+        }
+      );
+
+      it(`keeps a current ${kind} rejection visible and the exact request retryable`, async () => {
+        const { hook, identity, reply, operation } = await pendingReply(kind);
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+        try {
+          await act(async () => {
+            reply.reject(new Error('current answer rejected'));
+            expect(await operation).toBe(false);
+          });
+          expect(useToastStore.getState().toasts).toEqual([
+            expect.objectContaining({ message: '回复提交失败：Error: current answer rejected' }),
+          ]);
+          expect(useChatStore.getState().pendingHitlRequests).toEqual([
+            expect.objectContaining({ identity }),
+          ]);
+        } finally {
+          consoleError.mockRestore();
+          hook.unmount();
+        }
+      });
+    }
   });
 });

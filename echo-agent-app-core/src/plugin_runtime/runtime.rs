@@ -4,12 +4,12 @@ impl PluginRuntimeService {
     /// generation cannot be committed.
     pub(crate) async fn new_owned(
         agent_handle: AgentHandle,
-        lsp: PluginLspRuntime,
+        project_root: PathBuf,
         mcp_ownership: Arc<McpNameOwnershipRegistry>,
     ) -> Result<Arc<Self>, PluginBootstrapFailure> {
         Self::new_owned_with_source(
             agent_handle,
-            lsp,
+            project_root,
             mcp_ownership,
             RegistrySource::Default,
             "global".to_string(),
@@ -24,14 +24,14 @@ impl PluginRuntimeService {
     /// descriptor cleanup after project-local Skills have been loaded.
     pub(crate) async fn new_owned_for_scope_after_agent_reset(
         agent_handle: AgentHandle,
-        lsp: PluginLspRuntime,
+        project_root: PathBuf,
         mcp_ownership: Arc<McpNameOwnershipRegistry>,
         target_scope: String,
         authority_generation: Option<AgentPluginGeneration>,
     ) -> Result<Arc<Self>, PluginBootstrapFailure> {
         Self::new_owned_with_source(
             agent_handle,
-            lsp,
+            project_root,
             mcp_ownership,
             RegistrySource::Default,
             target_scope,
@@ -43,7 +43,7 @@ impl PluginRuntimeService {
 
     async fn new_owned_with_source(
         agent_handle: AgentHandle,
-        lsp: PluginLspRuntime,
+        project_root: PathBuf,
         mcp_ownership: Arc<McpNameOwnershipRegistry>,
         registry_source: RegistrySource,
         target_scope: String,
@@ -75,9 +75,15 @@ impl PluginRuntimeService {
                 ..
             } => PluginRegistry::with_paths(state_file.clone(), data_dir.clone(), None),
         };
+        for diagnostic in crate::config_discovery::retired_lsp_config_diagnostics(
+            Some(&project_root),
+            &crate::data_root::user_data_dir(),
+        ) {
+            tracing::warn!(%diagnostic);
+        }
         let service = Arc::new(Self {
             agent_handle,
-            lsp,
+            project_root: RwLock::new(project_root),
             scheduler: RwLock::new(None),
             mcp_ownership,
             integrator: PluginIntegrator::default(),
@@ -137,7 +143,7 @@ impl PluginRuntimeService {
     /// Agent, registry, scheduler and lifecycle authority. Residual debt prevents
     /// this constructor from publishing a replacement generation.
     async fn adopt_parked_cleanup_receipts(&self) -> anyhow::Result<()> {
-        let root = self.lsp.binding().await.project_root;
+        let root = self.project_root.read().await.clone();
         let parked = take_parked_cleanup_receipts(&root);
         if parked.is_empty() {
             return Ok(());
@@ -214,7 +220,7 @@ impl PluginRuntimeService {
     ) -> PluginBootstrapFailure {
         let authority = self.cleanup_authority().await;
         let mut state = self.state.lock().await;
-        let root = self.lsp.binding().await.project_root;
+        let root = self.project_root.read().await.clone();
         let claims = claims_from_ownership(&std::mem::take(&mut state.mcp_ownership));
         let cause = "bootstrap failed after candidate components were wired".to_string();
         if let Some(wiring) = state.framework_receipt.take() {
@@ -283,12 +289,10 @@ impl PluginRuntimeService {
         data_dir: PathBuf,
         mcp_ownership: Arc<McpNameOwnershipRegistry>,
     ) -> Result<Arc<Self>, PluginBootstrapFailure> {
-        let manager = Arc::new(RwLock::new(LspManager::new()));
         let target_scope = format!("test:{}", project_root.display());
-        let lsp = PluginLspRuntime::new(manager, LspConfig::default(), project_root);
         Self::new_owned_with_source(
             agent_handle,
-            lsp,
+            project_root,
             mcp_ownership,
             RegistrySource::Custom {
                 state_file,
@@ -386,6 +390,9 @@ impl PluginRuntimeService {
             .await
             .map_err(anyhow::Error::msg)?;
         publication.commit().await.map_err(anyhow::Error::msg)?;
+        pool_owner
+            .install_domain_registration_admission(&self.agent_handle)
+            .await;
         *self.agent_pool.write().await = Some(pool);
         Ok(())
     }
@@ -402,6 +409,10 @@ impl PluginRuntimeService {
             .await;
         let output_style = active_output_style_instructions_for(active_output_style, prepared);
         AgentPluginGeneration::new(revision, descriptors, prepared.agents.clone(), output_style)
+            .with_domain_components(
+                prepared.domains.clone(),
+                active_output_style.map(str::to_string),
+            )
     }
 
     /// Atomically load one EKO-owned skill into the primary and pool catalog.
@@ -479,6 +490,10 @@ impl PluginRuntimeService {
             primary.skill_descriptors(),
             state.prepared.agents.clone(),
             active_output_style_instructions(&state),
+        )
+        .with_domain_components(
+            state.prepared.domains.clone(),
+            state.active_output_style.clone(),
         )
         .with_framework_generation(state.framework_generation.clone());
         if let Some(publication) = pool_publication.as_mut()
@@ -582,6 +597,10 @@ impl PluginRuntimeService {
             state.prepared.agents.clone(),
             active_output_style_instructions(&state),
         )
+        .with_domain_components(
+            state.prepared.domains.clone(),
+            state.active_output_style.clone(),
+        )
         .with_framework_generation(state.framework_generation.clone());
         if let Some(publication) = pool_publication.as_mut()
             && let Err(error) = publication
@@ -656,24 +675,22 @@ impl PluginRuntimeService {
         let mut state = self.state.lock().await;
         self.settle_pending_receipts(&mut state, "plugin reload")
             .await?;
-        let binding = self.lsp.binding().await;
-        let mut candidate = self.registry_for(binding.project_root.clone());
+        let binding = self.project_root.read().await.clone();
+        let mut candidate = self.registry_for(binding.to_path_buf());
         self.scan_registry(&mut candidate)?;
         self.apply_candidate(&mut state, candidate, &binding).await
     }
 
     /// Validate a target generation without replacing live plugin resources.
     pub async fn preflight_workspace(&self, project_root: PathBuf) -> anyhow::Result<()> {
-        let binding = PluginLspBinding {
-            base_config: PluginLspRuntime::config_for_workspace(&project_root),
-            project_root,
-        };
-        let mut candidate = self.registry_for(binding.project_root.clone());
+        let binding = project_root;
+        let mut candidate = self.registry_for(binding.to_path_buf());
         self.scan_registry(&mut candidate)?;
         let framework_generation =
             require_applicable_generation(self.integrator.prepare(&mut candidate).await)?;
-        let prepared = prepare_application_components(&framework_generation, &self.target_scope)
-            .map_err(|errors| anyhow::anyhow!(errors.join("; ")))?;
+        let prepared =
+            prepare_application_components(&framework_generation, &self.target_scope, &candidate)
+                .map_err(|errors| anyhow::anyhow!(errors.join("; ")))?;
         let declarations = plugin_mcp_declarations(&framework_generation)?;
         let state = self.state.lock().await;
         if state.shut_down {
@@ -684,12 +701,10 @@ impl PluginRuntimeService {
         validate_plugin_mcp_claims(&ownership_guard, &declarations, &state.mcp_ownership)
             .map_err(anyhow::Error::msg)?;
         drop(ownership_guard);
-        let mut lsp = self.prepare_lsp(&prepared, &binding).await?;
-        lsp.shutdown_all().await;
         Ok(())
     }
 
-    /// Replace project/local plugins and LSP processes for a committed workspace.
+    /// Replace project/local plugin components for a committed workspace.
     /// A target failure converges to the target's User-only generation instead
     /// of clearing user-scoped plugins or retaining old workspace plugins.
     pub(crate) async fn rebind_workspace(
@@ -703,12 +718,16 @@ impl PluginRuntimeService {
     }
 
     async fn rebind_workspace_inner(&self, project_root: PathBuf) -> anyhow::Result<ReloadSummary> {
-        let previous_binding = self.lsp.binding().await;
-        let binding = PluginLspBinding {
-            base_config: PluginLspRuntime::config_for_workspace(&project_root),
-            project_root,
-        };
-        let mut candidate = self.registry_for(binding.project_root.clone());
+        for diagnostic in crate::config_discovery::retired_lsp_config_diagnostics(
+            Some(&project_root),
+            &crate::data_root::user_data_dir(),
+        ) {
+            tracing::warn!(%diagnostic);
+        }
+
+        let previous_binding = self.project_root.read().await.clone();
+        let binding = project_root;
+        let mut candidate = self.registry_for(binding.to_path_buf());
         let scan = self.scan_registry(&mut candidate);
         let mut state = self.state.lock().await;
         if state.shut_down {
@@ -728,7 +747,7 @@ impl PluginRuntimeService {
                 retirement_errors.extend(errors);
                 if !failed_plugin_ids.is_empty() {
                     state.cleanup_receipts.push(CleanupReceipt::live_lifecycle(
-                        previous_binding.project_root.clone(),
+                        previous_binding.to_path_buf(),
                         "previous workspace lifecycle retirement failed".to_string(),
                         failed_plugin_ids,
                     ));
@@ -749,7 +768,7 @@ impl PluginRuntimeService {
             }
             Err(error) => {
                 let primary = error.to_string();
-                let mut user_candidate = self.registry_for(binding.project_root.clone());
+                let mut user_candidate = self.registry_for(binding.to_path_buf());
                 let fallback =
                     match self.scan_registry_scopes(&mut user_candidate, &[PluginScope::User]) {
                         Ok(()) => self
@@ -768,7 +787,7 @@ impl PluginRuntimeService {
                         retirement_errors.extend(errors);
                         if !failed_plugin_ids.is_empty() {
                             state.cleanup_receipts.push(CleanupReceipt::live_lifecycle(
-                                previous_binding.project_root.clone(),
+                                previous_binding.to_path_buf(),
                                 "previous workspace lifecycle retirement failed".to_string(),
                                 failed_plugin_ids,
                             ));
@@ -785,7 +804,7 @@ impl PluginRuntimeService {
                             .retire_generation_fail_closed(
                                 &mut state,
                                 &binding,
-                                previous_binding.project_root.clone(),
+                                previous_binding.to_path_buf(),
                             )
                             .await;
                         let mut all_errors = retry_errors;
@@ -805,7 +824,7 @@ impl PluginRuntimeService {
     async fn retire_generation_fail_closed(
         &self,
         state: &mut PluginRuntimeState,
-        binding: &PluginLspBinding,
+        binding: &Path,
         previous_root: PathBuf,
     ) -> Vec<String> {
         let mut errors = Vec::new();
@@ -901,18 +920,16 @@ impl PluginRuntimeService {
         primary
             .replace_system_context_projection(OUTPUT_STYLE_PROJECTION, None)
             .await;
+        primary
+            .replace_system_context_projection(DOMAIN_CATALOG_PROJECTION, None)
+            .await;
         crate::runtime::configure_intent_router(&mut primary);
         release_plugin_mcp_name_claims(&mut ownership_guard, &owned_claims);
         drop(ownership_guard);
 
-        let mut previous_lsp = {
-            let mut current = self.lsp.manager.write().await;
-            std::mem::replace(&mut *current, LspManager::new())
-        };
-        previous_lsp.shutdown_all().await;
-        self.lsp.publish_binding(binding.clone()).await;
+        *self.project_root.write().await = binding.to_path_buf();
 
-        state.registry = self.registry_for(binding.project_root.clone());
+        state.registry = self.registry_for(binding.to_path_buf());
         state.active_theme = None;
         state.active_output_style = None;
         match state.generation.checked_add(1) {
@@ -1221,7 +1238,7 @@ impl PluginRuntimeService {
     }
 
     pub async fn workspace_root(&self) -> PathBuf {
-        self.lsp.binding().await.project_root
+        self.project_root.read().await.clone()
     }
 
     /// Opaque identity of the prepared framework generation currently exposed
@@ -1249,108 +1266,6 @@ impl PluginRuntimeService {
             Arc::clone(&self.mcp_ownership),
             pool,
         )
-    }
-
-    pub async fn lsp_configured_languages(&self) -> Vec<String> {
-        let _state = self.state.lock().await;
-        let manager = self.lsp.manager.read().await;
-        let mut languages = manager
-            .configured_languages()
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        languages.sort();
-        languages
-    }
-
-    pub async fn lsp_status(&self) -> Vec<LspServerStatus> {
-        let _state = self.state.lock().await;
-        let manager = self.lsp.manager.read().await;
-        let mut statuses = manager.status_all().await;
-        statuses.sort_by(|left, right| left.language.cmp(&right.language));
-        statuses
-    }
-
-    pub(crate) async fn lsp_start(self: &Arc<Self>, language: String) -> anyhow::Result<()> {
-        self.run_owned_mutation(move |service| async move {
-            let mut manager = service.lsp.manager.write().await;
-            if manager.get_client(&language).is_some() {
-                return Err(anyhow::anyhow!(
-                    "language server '{language}' is already running"
-                ));
-            }
-            manager
-                .start_server(&language)
-                .await
-                .map_err(anyhow::Error::msg)
-        })
-        .await
-    }
-
-    pub(crate) async fn lsp_stop(self: &Arc<Self>, language: String) -> anyhow::Result<()> {
-        self.run_owned_mutation(move |service| async move {
-            service
-                .lsp
-                .manager
-                .write()
-                .await
-                .stop_server(&language)
-                .await
-                .map_err(anyhow::Error::msg)
-        })
-        .await
-    }
-
-    pub(crate) async fn lsp_restart(self: &Arc<Self>, language: String) -> anyhow::Result<()> {
-        self.run_owned_mutation(move |service| async move {
-            let mut manager = service.lsp.manager.write().await;
-            manager
-                .stop_server(&language)
-                .await
-                .map_err(anyhow::Error::msg)?;
-            manager
-                .start_server(&language)
-                .await
-                .map_err(anyhow::Error::msg)
-        })
-        .await
-    }
-
-    /// Rebuild only the LSP manager for this exact target. Config-file changes
-    /// must not rescan plugins or republish Skills, MCP, Subagents and monitors.
-    pub(crate) async fn reload_lsp_generation(
-        self: &Arc<Self>,
-        project_root: PathBuf,
-    ) -> anyhow::Result<usize> {
-        self.run_owned_mutation(move |service| async move {
-            let state = service.state.lock().await;
-            if state.shut_down {
-                return Err(anyhow::anyhow!("plugin runtime is shut down"));
-            }
-            let current = service.lsp.binding().await;
-            if current.project_root != project_root {
-                anyhow::bail!(
-                    "LSP target root changed from '{}' to '{}'",
-                    current.project_root.display(),
-                    project_root.display()
-                );
-            }
-            let binding = PluginLspBinding {
-                base_config: PluginLspRuntime::config_for_workspace(&project_root),
-                project_root,
-            };
-            let replacement = service.prepare_lsp(&state.prepared, &binding).await?;
-            let configured = replacement.configured_languages().len();
-            let mut previous = {
-                let mut current = service.lsp.manager.write().await;
-                std::mem::replace(&mut *current, replacement)
-            };
-            service.lsp.publish_binding(binding).await;
-            previous.shutdown_all().await;
-            drop(state);
-            Ok(configured)
-        })
-        .await
     }
 
     pub async fn bind_scheduler(
@@ -1436,7 +1351,7 @@ impl PluginRuntimeService {
             state
                 .cleanup_receipts
                 .push(CleanupReceipt::lifecycle_shutdown(
-                    self.lsp.binding().await.project_root,
+                    self.project_root.read().await.clone(),
                     "plugin runtime shutdown could not settle lifecycle callbacks".to_string(),
                 ));
         }
@@ -1453,7 +1368,7 @@ impl PluginRuntimeService {
             let monitor_errors =
                 remove_plugin_monitors_best_effort(&scheduler, &previous_prepared.monitors).await;
             if !monitor_errors.is_empty() {
-                let root = self.lsp.binding().await.project_root;
+                let root = self.project_root.read().await.clone();
                 state.cleanup_receipts.push(CleanupReceipt::monitors(
                     root,
                     "plugin runtime shutdown could not remove plugin monitors".to_string(),
@@ -1493,7 +1408,7 @@ impl PluginRuntimeService {
                 ));
                 // Keep the exact wiring receipt and its ownership tokens: a
                 // retry must withdraw the components before releasing the names.
-                let root = self.lsp.binding().await.project_root;
+                let root = self.project_root.read().await.clone();
                 state.cleanup_receipts.push(CleanupReceipt::framework(
                     root,
                     "plugin runtime shutdown could not withdraw plugin components".to_string(),
@@ -1505,13 +1420,7 @@ impl PluginRuntimeService {
         }
         drop(ownership_guard);
 
-        let mut previous_lsp = {
-            let mut current = self.lsp.manager.write().await;
-            std::mem::replace(&mut *current, LspManager::new())
-        };
-        previous_lsp.shutdown_all().await;
-
-        let project_root = self.lsp.binding().await.project_root;
+        let project_root = self.project_root.read().await.clone();
         state.registry = self.registry_for(project_root);
         state.active_theme = None;
         state.active_output_style = None;
@@ -1544,8 +1453,8 @@ impl PluginRuntimeService {
         let mut state = self.state.lock().await;
         self.settle_pending_receipts(&mut state, "plugin enable")
             .await?;
-        let binding = self.lsp.binding().await;
-        let mut candidate = self.registry_for(binding.project_root.clone());
+        let binding = self.project_root.read().await.clone();
+        let mut candidate = self.registry_for(binding.to_path_buf());
         self.scan_registry(&mut candidate)?;
         let previously_enabled = candidate
             .get(name)
@@ -1573,8 +1482,8 @@ impl PluginRuntimeService {
         let mut state = self.state.lock().await;
         self.settle_pending_receipts(&mut state, "plugin disable")
             .await?;
-        let binding = self.lsp.binding().await;
-        let mut candidate = self.registry_for(binding.project_root.clone());
+        let binding = self.project_root.read().await.clone();
+        let mut candidate = self.registry_for(binding.to_path_buf());
         self.scan_registry(&mut candidate)?;
         let previously_enabled = candidate
             .get(name)
@@ -1615,8 +1524,8 @@ impl PluginRuntimeService {
         let mut state = self.state.lock().await;
         self.settle_pending_receipts(&mut state, "plugin install")
             .await?;
-        let binding = self.lsp.binding().await;
-        let mut candidate = self.registry_for(binding.project_root.clone());
+        let binding = self.project_root.read().await.clone();
+        let mut candidate = self.registry_for(binding.to_path_buf());
         self.scan_registry(&mut candidate)?;
         let plugin_id = candidate
             .install(source, scope)
@@ -1631,7 +1540,7 @@ impl PluginRuntimeService {
                     state
                         .cleanup_receipts
                         .push(CleanupReceipt::plugin_uninstall(
-                            binding.project_root.clone(),
+                            binding.to_path_buf(),
                             format!("install rollback failed: {rollback_error}"),
                             plugin_id.clone(),
                             false,
@@ -1695,12 +1604,6 @@ impl PluginRuntimeService {
                     .map(|components| components.mcp_servers.len())
                     .sum(),
                 agents_loaded: state.prepared.agents.len(),
-                lsp_languages_loaded: state
-                    .prepared
-                    .lsp_configs
-                    .iter()
-                    .map(|(_, config)| config.servers.len())
-                    .sum(),
                 monitors_loaded: state.prepared.monitors.len(),
                 themes_loaded: state.prepared.themes.len(),
                 output_styles_loaded: state.prepared.output_styles.len(),
@@ -1785,8 +1688,8 @@ impl PluginRuntimeService {
         let mut state = self.state.lock().await;
         self.settle_pending_receipts(&mut state, "plugin configure")
             .await?;
-        let binding = self.lsp.binding().await;
-        let mut candidate = self.registry_for(binding.project_root.clone());
+        let binding = self.project_root.read().await.clone();
+        let mut candidate = self.registry_for(binding.to_path_buf());
         self.scan_registry(&mut candidate)?;
         let previous = candidate
             .get(name)
@@ -1977,6 +1880,7 @@ impl PluginRuntimeService {
             state.prepared.agents.clone(),
             instructions,
         )
+        .with_domain_components(state.prepared.domains.clone(), selected.clone())
         .with_framework_generation(state.framework_generation.clone());
         if let Some(publication) = pool_publication.as_mut()
             && let Err(error) = publication.prepare(generation).await
@@ -2097,8 +2001,9 @@ impl PluginRuntimeService {
                     &variables,
                 );
                 let components = component_names(directory, &resolved);
+                let valid = errors.is_empty();
                 PluginValidationReport {
-                    valid: errors.is_empty(),
+                    valid,
                     name: Some(manifest.name),
                     components,
                     errors,
@@ -2117,7 +2022,7 @@ impl PluginRuntimeService {
         &self,
         state: &mut PluginRuntimeState,
         mut candidate: PluginRegistry,
-        binding: &PluginLspBinding,
+        binding: &Path,
     ) -> anyhow::Result<ReloadSummary> {
         if state.shut_down {
             return Err(anyhow::anyhow!("plugin runtime is shut down"));
@@ -2139,11 +2044,11 @@ impl PluginRuntimeService {
             .into_iter()
             .map(|entry| entry.manifest.name.clone())
             .collect::<Vec<_>>();
-        let prepared = prepare_application_components(&framework_generation, &self.target_scope)
-            .map_err(|errors| anyhow::anyhow!(errors.join("; ")))?;
+        let prepared =
+            prepare_application_components(&framework_generation, &self.target_scope, &candidate)
+                .map_err(|errors| anyhow::anyhow!(errors.join("; ")))?;
         let candidate_mcp_declarations = plugin_mcp_declarations(&framework_generation)?;
         self.validate_agent_collisions(state, &prepared).await?;
-        let mut replacement_lsp = self.prepare_lsp(&prepared, binding).await?;
 
         // Publication lock order: primary execution, primary agent write,
         // then pool transition/agents. No primary or pooled turn can observe
@@ -2165,7 +2070,6 @@ impl PluginRuntimeService {
             match pool.begin_plugin_publication().await {
                 Ok(publication) => Some(publication),
                 Err(error) => {
-                    replacement_lsp.shutdown_all().await;
                     return Err(anyhow::anyhow!(
                         "Failed to close AgentPool plugin publication admission: {error}"
                     ));
@@ -2183,7 +2087,7 @@ impl PluginRuntimeService {
                     .lifecycle
                     .activate_enabled(previous_plugins.iter().map(String::as_str)),
             );
-            replacement_lsp.shutdown_all().await;
+
             return Err(anyhow::anyhow!(
                 "Plugin lifecycle deactivation failed: {}",
                 errors.join("; ")
@@ -2196,7 +2100,6 @@ impl PluginRuntimeService {
                 replace_plugin_monitors(scheduler, &state.prepared.monitors, &prepared.monitors)
                     .await
         {
-            replacement_lsp.shutdown_all().await;
             let mut errors = vec![error.to_string()];
             errors.extend(
                 state
@@ -2208,7 +2111,7 @@ impl PluginRuntimeService {
 
         let previous_registry = std::mem::replace(
             &mut state.registry,
-            self.registry_for(binding.project_root.clone()),
+            self.registry_for(binding.to_path_buf()),
         );
         let previous_framework = std::mem::take(&mut state.framework_components);
         let previous_framework_generation = state.framework_generation.take();
@@ -2252,7 +2155,7 @@ impl PluginRuntimeService {
                     failed.error =
                         format!("{}; rollback plugin monitors failed: {error}", failed.error);
                 }
-                replacement_lsp.shutdown_all().await;
+
                 if let Some((wiring, claims)) = failed.retained_withdrawal.take() {
                     // A withdrawal did not settle, so no generation can be
                     // described as live any more. The exact wiring receipt and its
@@ -2260,17 +2163,15 @@ impl PluginRuntimeService {
                     // before it may release a single name, and the rest of the
                     // retired generation is withdrawn fail-closed.
                     state.cleanup_receipts.push(CleanupReceipt::framework(
-                        binding.project_root.clone(),
+                        binding.to_path_buf(),
                         format!("plugin generation replacement aborted: {}", failed.error),
                         wiring,
                         claims,
                     ));
                 }
                 if !restored_live_generation {
-                    failed.error = append_errors(
-                        failed.error,
-                        Self::retire_failed_lifecycles(state, &binding.project_root),
-                    );
+                    failed.error =
+                        append_errors(failed.error, Self::retire_failed_lifecycles(state, binding));
                     primary
                         .replace_system_context_projection(OUTPUT_STYLE_PROJECTION, None)
                         .await;
@@ -2287,7 +2188,7 @@ impl PluginRuntimeService {
                     // Candidate names that were claimed and then unwound travel as
                     // a receipt; dropping them here would leak the exact tokens.
                     state.cleanup_receipts.push(CleanupReceipt::mcp_names(
-                        binding.project_root.clone(),
+                        binding.to_path_buf(),
                         format!("failed plugin generation: {}", failed.error),
                         failed.orphaned_claims,
                     ));
@@ -2304,6 +2205,10 @@ impl PluginRuntimeService {
                 state.active_output_style.as_deref(),
                 &applied.prepared,
             ),
+        )
+        .with_domain_components(
+            applied.prepared.domains.clone(),
+            state.active_output_style.clone(),
         )
         .with_framework_generation(applied.framework_generation.clone());
         if let Some(publication) = pool_publication.as_mut()
@@ -2370,7 +2275,7 @@ impl PluginRuntimeService {
                     ));
                     if let Some((wiring, claims)) = failed.retained_withdrawal.take() {
                         state.cleanup_receipts.push(CleanupReceipt::framework(
-                            binding.project_root.clone(),
+                            binding.to_path_buf(),
                             format!(
                                 "AgentPool rollback retained plugin withdrawal: {}",
                                 failed.error
@@ -2381,7 +2286,7 @@ impl PluginRuntimeService {
                     }
                     if !failed.orphaned_claims.is_empty() {
                         state.cleanup_receipts.push(CleanupReceipt::mcp_names(
-                            binding.project_root.clone(),
+                            binding.to_path_buf(),
                             format!(
                                 "AgentPool rollback retained plugin name claims: {}",
                                 failed.error
@@ -2402,7 +2307,7 @@ impl PluginRuntimeService {
                                 .activate_enabled(candidate_plugins.iter().map(String::as_str)),
                         );
                     } else {
-                        errors.extend(Self::retire_failed_lifecycles(state, &binding.project_root));
+                        errors.extend(Self::retire_failed_lifecycles(state, binding));
                         primary
                             .replace_system_context_projection(OUTPUT_STYLE_PROJECTION, None)
                             .await;
@@ -2410,14 +2315,9 @@ impl PluginRuntimeService {
                     }
                 }
             }
-            replacement_lsp.shutdown_all().await;
+
             return Err(anyhow::anyhow!(errors.join("; ")));
         }
-
-        let mut previous_lsp = {
-            let mut current = self.lsp.manager.write().await;
-            std::mem::replace(&mut *current, replacement_lsp)
-        };
 
         let activation_errors = state
             .lifecycle
@@ -2433,7 +2333,7 @@ impl PluginRuntimeService {
                 state
                     .cleanup_receipts
                     .push(CleanupReceipt::lifecycle_shutdown(
-                        binding.project_root.clone(),
+                        binding.to_path_buf(),
                         "candidate Plugin generation failed activation".to_string(),
                     ));
                 errors.extend(shutdown_errors);
@@ -2443,7 +2343,7 @@ impl PluginRuntimeService {
                     remove_plugin_monitors_best_effort(scheduler, &applied.prepared.monitors).await;
                 if !monitor_errors.is_empty() {
                     state.cleanup_receipts.push(CleanupReceipt::monitors(
-                        binding.project_root.clone(),
+                        binding.to_path_buf(),
                         "candidate Plugin generation failed activation".to_string(),
                         applied.prepared.monitors.clone(),
                     ));
@@ -2463,7 +2363,7 @@ impl PluginRuntimeService {
                         // the exact wiring receipt and tokens so a retry can
                         // withdraw before releasing the names.
                         state.cleanup_receipts.push(CleanupReceipt::framework(
-                            binding.project_root.clone(),
+                            binding.to_path_buf(),
                             "candidate Plugin generation failed activation".to_string(),
                             receipt.clone(),
                             candidate_claims.clone(),
@@ -2479,7 +2379,7 @@ impl PluginRuntimeService {
             crate::runtime::configure_intent_router(&mut primary);
             if !retained_claims && !candidate_claims.is_empty() {
                 state.cleanup_receipts.push(CleanupReceipt::mcp_names(
-                    binding.project_root.clone(),
+                    binding.to_path_buf(),
                     "candidate Plugin generation failed activation".to_string(),
                     candidate_claims,
                 ));
@@ -2498,13 +2398,8 @@ impl PluginRuntimeService {
                     errors.push(error);
                 }
             }
-            {
-                let mut current = self.lsp.manager.write().await;
-                let mut candidate_lsp = std::mem::replace(&mut *current, LspManager::new());
-                candidate_lsp.shutdown_all().await;
-            }
-            previous_lsp.shutdown_all().await;
-            state.registry = self.registry_for(binding.project_root.clone());
+
+            state.registry = self.registry_for(binding.to_path_buf());
             state.framework_components.clear();
             state.framework_generation = None;
             state.framework_receipt = None;
@@ -2548,26 +2443,22 @@ impl PluginRuntimeService {
             let cause = "AgentPool plugin generation commit failed".to_string();
             match applied.wiring {
                 Some(receipt) => state.cleanup_receipts.push(CleanupReceipt::framework(
-                    binding.project_root.clone(),
+                    binding.to_path_buf(),
                     cause,
                     receipt,
                     claims,
                 )),
                 None => state.cleanup_receipts.push(CleanupReceipt::mcp_names(
-                    binding.project_root.clone(),
+                    binding.to_path_buf(),
                     cause,
                     claims,
                 )),
             }
-            // The candidate LSP generation was already published above, and the
-            // previous generation is still owned locally: release both.
-            shutdown_published_plugin_lsp(&self.lsp).await;
-            previous_lsp.shutdown_all().await;
+
             return Err(anyhow::anyhow!(errors.join("; ")));
         }
 
-        previous_lsp.shutdown_all().await;
-        self.lsp.publish_binding(binding.clone()).await;
+        *self.project_root.write().await = binding.to_path_buf();
 
         let active_style = state.active_output_style.clone();
         let active_theme = state.active_theme.clone();
@@ -2582,6 +2473,12 @@ impl PluginRuntimeService {
         state.mcp_ownership = applied.mcp_ownership;
         state.prepared = applied.prepared;
         state.generation = candidate_revision;
+        primary
+            .replace_system_context_projection(
+                DOMAIN_CATALOG_PROJECTION,
+                state.prepared.domains.catalog_prompt(),
+            )
+            .await;
         if let Some(style) = active_style {
             if state
                 .prepared
@@ -2641,7 +2538,6 @@ impl PluginRuntimeService {
             total,
             enabled,
             agents = summary.agents_loaded,
-            lsp = summary.lsp_languages_loaded,
             monitors = summary.monitors_loaded,
             themes = summary.themes_loaded,
             output_styles = summary.output_styles_loaded,
@@ -2714,6 +2610,11 @@ impl PluginRuntimeService {
         candidate_mcp_declarations: PluginMcpDeclarations,
         candidate_prepared: PreparedApplicationComponents,
     ) -> Result<AppliedAgentComponents, FailedAgentComponents> {
+        // This service root is EKO's local workspace data, not the project's
+        // remote code cwd. Project I/O comes from the parent Agent resources.
+        let local_state_dir = Some(crate::workspace::layout::WorkspaceLayout::state_dir(
+            &self.project_root.read().await,
+        ));
         let candidate_monitors = candidate_prepared.monitors.clone();
         let previous_mcp_declarations = match previous_framework_generation
             .as_deref()
@@ -2835,10 +2736,13 @@ impl PluginRuntimeService {
                         }
                         None => None,
                     };
-                    let restore_agent_error =
-                        register_plugin_agents(agent, &previous_prepared.agents)
-                            .await
-                            .err();
+                    let restore_agent_error = register_plugin_agents(
+                        agent,
+                        &previous_prepared.agents,
+                        local_state_dir.clone(),
+                    )
+                    .await
+                    .err();
                     crate::runtime::configure_intent_router(agent);
                     let mut errors = vec![error];
                     if let Some(error) = restore_agent_error {
@@ -2875,7 +2779,13 @@ impl PluginRuntimeService {
         // receipt's clients stay connected until a retry withdraws them. Keep the
         // typed error until the receipt and the candidate tokens are in hand.
         let candidate_outcome: Result<AppliedCandidate, RejectedCandidate> = match wiring {
-            Ok(wiring) => match register_plugin_agents(agent, &candidate_prepared.agents).await {
+            Ok(wiring) => match register_plugin_agents(
+                agent,
+                &candidate_prepared.agents,
+                local_state_dir.clone(),
+            )
+            .await
+            {
                 Ok(_) => {
                     crate::runtime::configure_intent_router(agent);
                     Ok((candidate, wiring))
@@ -2996,9 +2906,13 @@ impl PluginRuntimeService {
                         ));
                     }
                 };
-                let restore_agent_error = register_plugin_agents(agent, &previous_prepared.agents)
-                    .await
-                    .err();
+                let restore_agent_error = register_plugin_agents(
+                    agent,
+                    &previous_prepared.agents,
+                    local_state_dir.clone(),
+                )
+                .await
+                .err();
                 crate::runtime::configure_intent_router(agent);
                 let registry = previous_registry;
                 let mut errors = vec![error];
@@ -3059,55 +2973,8 @@ impl PluginRuntimeService {
         }
     }
 
-    async fn prepare_lsp(
-        &self,
-        prepared: &PreparedApplicationComponents,
-        binding: &PluginLspBinding,
-    ) -> anyhow::Result<LspManager> {
-        let mut config = binding.base_config.clone();
-        let current_binding = self.lsp.binding().await;
-        let mut required = if current_binding.project_root == binding.project_root {
-            self.lsp
-                .manager
-                .read()
-                .await
-                .running_servers()
-                .into_iter()
-                .map(str::to_string)
-                .collect::<HashSet<_>>()
-        } else {
-            HashSet::new()
-        };
-        for (_, plugin_config) in &prepared.lsp_configs {
-            required.extend(plugin_config.servers.keys().cloned());
-            config.merge(plugin_config.clone());
-        }
-        let mut manager = LspManager::new();
-        manager
-            .load_config(&config)
-            .map_err(|error| anyhow::anyhow!("Plugin LSP config failed: {error}"))?;
-        manager.set_project_root(&binding.project_root);
-        let languages = manager
-            .configured_languages()
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        for language in languages {
-            if let Err(error) = manager.start_server(&language).await {
-                if required.contains(&language) {
-                    manager.shutdown_all().await;
-                    return Err(anyhow::anyhow!(
-                        "Plugin LSP server '{language}' failed to start: {error}"
-                    ));
-                }
-                tracing::warn!(%language, %error, "base LSP server unavailable during plugin reload");
-            }
-        }
-        Ok(manager)
-    }
-
     pub(crate) async fn project_root(&self) -> PathBuf {
-        self.lsp.binding().await.project_root
+        self.project_root.read().await.clone()
     }
 
     fn registry_for(&self, project_root: PathBuf) -> PluginRegistry {

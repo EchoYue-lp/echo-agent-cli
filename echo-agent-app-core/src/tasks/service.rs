@@ -67,12 +67,17 @@ trait TaskAgentProvider: Send + Sync {
     async fn acquire_for_task(
         &self,
         task_key: &str,
+        domain_binding: Option<&crate::domain_plugin::DomainBinding>,
+        run_projection: Option<
+            Arc<super::task_runtime::compact_context::TaskRuntimeProjectionRegistration>,
+        >,
     ) -> Result<TaskAgentLease, echo_agent::error::ReactError>;
 }
 
 struct TaskAgentLease {
     agent: AgentHandle,
     pool_receipt: Option<crate::agent_pool::OwnedRunPoolReceipt>,
+    invocation_resources: Vec<echo_agent::tools::InvocationResourceGuard>,
 }
 
 impl TaskAgentLease {
@@ -110,10 +115,20 @@ impl TaskAgentProvider for SingleAgentTaskProvider {
     async fn acquire_for_task(
         &self,
         _task_key: &str,
+        domain_binding: Option<&crate::domain_plugin::DomainBinding>,
+        _run_projection: Option<
+            Arc<super::task_runtime::compact_context::TaskRuntimeProjectionRegistration>,
+        >,
     ) -> Result<TaskAgentLease, echo_agent::error::ReactError> {
+        if domain_binding.is_some() {
+            return Err(echo_agent::error::ReactError::Other(
+                "domain execution requires the original pooled plugin generation".to_string(),
+            ));
+        }
         Ok(TaskAgentLease {
             agent: self.agent.clone(),
             pool_receipt: None,
+            invocation_resources: Vec::new(),
         })
     }
 }
@@ -127,16 +142,35 @@ impl TaskAgentProvider for PoolTaskAgentProvider {
     async fn acquire_for_task(
         &self,
         task_key: &str,
+        domain_binding: Option<&crate::domain_plugin::DomainBinding>,
+        run_projection: Option<
+            Arc<super::task_runtime::compact_context::TaskRuntimeProjectionRegistration>,
+        >,
     ) -> Result<TaskAgentLease, echo_agent::error::ReactError> {
         let key = format!("__task__:{task_key}");
         let pool_execution = self.pool.acquire(&key).await.map_err(|error| {
             echo_agent::error::ReactError::Other(format!("Failed to acquire task agent: {error}"))
         })?;
+        if let Some(binding) = domain_binding {
+            self.pool
+                .verify_domain_binding(&pool_execution, binding)
+                .await
+                .map_err(echo_agent::error::ReactError::Other)?;
+        }
+        let invocation_resources = match domain_binding {
+            Some(binding) => vec![
+                pool_execution
+                    .domain_resource_guard(task_key, binding, run_projection)
+                    .map_err(echo_agent::error::ReactError::Other)?,
+            ],
+            None => Vec::new(),
+        };
         let agent = pool_execution.agent();
         let pool_receipt = self.pool.retain_for_supervised_run(key, pool_execution);
         Ok(TaskAgentLease {
             agent,
             pool_receipt: Some(pool_receipt),
+            invocation_resources,
         })
     }
 }
@@ -402,6 +436,7 @@ impl BackgroundTaskService {
             },
             Some((true, true, None, None)),
             TaskPlan {
+                domain_binding: None,
                 plan_id: uuid::Uuid::new_v4().to_string(),
                 run_id: run_id.clone(),
                 revision: 1,
@@ -899,7 +934,37 @@ async fn drive_background_run(
         .map(crate::evolution::ReviewGenerationLease::layer_manager)
         .transpose()
         .map_err(|error| format!("memory layer unavailable: {error}"))?;
-    let lease = match agent_provider.acquire_for_task(&run_id).await {
+    let domain_run_id = run_id.clone();
+    let domain_state = blocking
+        .run_store("load original background domain binding", move |store| {
+            store
+                .get_run_state(&domain_run_id)?
+                .ok_or(super::task_runtime::StoreError::RunNotFound(domain_run_id))
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let run_projection = if domain_state.domain_binding.is_some() {
+        Some(Arc::new(
+            super::task_runtime::compact_context::task_runtime_projection_registry()
+                .retain_for_invocation(&run_id, store.clone())?,
+        ))
+    } else {
+        None
+    };
+    let acquisition = if domain_state.domain_binding.is_none()
+        && domain_state.run.domain_profile != super::task_runtime::DomainProfile::General
+    {
+        Err(echo_agent::error::ReactError::Other("historical professional TaskRun has no trusted plugin binding; create a new domain-bound task".to_string()))
+    } else {
+        agent_provider
+            .acquire_for_task(
+                &run_id,
+                domain_state.domain_binding.as_ref(),
+                run_projection,
+            )
+            .await
+    };
+    let mut lease = match acquisition {
         Ok(lease) => lease,
         Err(error) => {
             let message = format!("acquire agent: {error}");
@@ -917,6 +982,7 @@ async fn drive_background_run(
         }
     };
     let agent = lease.agent();
+    let invocation_resources = std::mem::take(&mut lease.invocation_resources);
     receipt_owner.retain(lease)?;
     if let Some(manager) = layer_manager.as_ref() {
         let manager = manager.clone();
@@ -934,7 +1000,7 @@ async fn drive_background_run(
         .await
         .map_err(|error| format!("read plan before background execution: {error}"))?;
     let result = if has_plan {
-        super::task_runtime::execute_run(
+        super::task_runtime::executor::execute_run_with_resources(
             store.clone(),
             Some(agent),
             reviewer_llm,
@@ -945,12 +1011,13 @@ async fn drive_background_run(
             cancel,
             MemoryPolicy::None,
             None,
+            invocation_resources,
         )
         .await
         .map(|_| run_id.clone())
     } else {
         register_task_execute(&agent, store.clone()).await;
-        super::task_runtime::drive_unattended_run(
+        super::task_runtime::executor::drive_agent_run_with_resources(
             store.clone(),
             agent,
             &run_id,
@@ -959,7 +1026,10 @@ async fn drive_background_run(
             &prompt,
             cancel,
             UnattendedWriteMode::default(),
+            domain_state.execution_profile.plan_policy,
             None,
+            None,
+            invocation_resources,
         )
         .await
     };
@@ -1179,6 +1249,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
                 plan_id: format!("{run_id}-plan"),
                 run_id: run_id.to_string(),
                 revision: 1,
@@ -1477,6 +1548,7 @@ mod tests {
         };
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
                 plan_id: "retry-plan".to_string(),
                 run_id: "retry-run".to_string(),
                 revision: 1,
@@ -1640,6 +1712,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
                 plan_id: "run-plan".to_string(),
                 run_id: "run".to_string(),
                 revision: 1,

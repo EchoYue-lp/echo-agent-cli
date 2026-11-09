@@ -77,6 +77,17 @@ cargo gui-bundle
 The Tauri bundle, rather than a raw binary, contains frontend resources and
 platform metadata.
 
+In the GUI, a Workspace is a project. New task opens a conversation draft in
+the selected Workspace without creating a directory. Use the Workspace menu
+to select an existing local folder, create a folder, or open an SSH device and
+remote project directory.
+
+You can add input while a conversation is running. “Received” means the input
+has been saved; the unchanged submitted text and attachments clear without
+waiting for the model or tools. It does not mean execution or task completion.
+Preparation or admission failure preserves the draft, and late results do not
+clear a newer draft after navigation or editing. Stop remains a separate action.
+
 ## JSONL
 
 ```bash

@@ -1,0 +1,108 @@
+/* 仅设置页呈现：沿用现有主题变量，不改变字段、状态和保存行为。 */
+.settings-panel-content {
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+/* 旧面板自带一层内边距，统一由设置容器负责，避免重复留白。 */
+.settings-panel-content > :where(div) {
+  padding: 0;
+}
+
+.settings-panel-content :where(h2, h3) {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.settings-panel-content :where(label),
+.settings-editor-surface :where(label) {
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.settings-panel-content
+  :where(
+    input:not([type='checkbox']):not([type='radio']):not([type='range']):not([type='file']),
+    select,
+    textarea
+  ),
+.settings-editor-surface
+  :where(
+    input:not([type='checkbox']):not([type='radio']):not([type='range']):not([type='file']),
+    select,
+    textarea
+  ) {
+  min-height: 40px;
+  max-width: 100%;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-primary);
+  background: var(--bg-input);
+  padding: 9px 12px;
+  color: var(--text-primary);
+  font-size: 14px;
+  line-height: 1.5;
+  box-shadow: none;
+  transition:
+    border-color 150ms ease,
+    box-shadow 150ms ease;
+}
+
+.settings-panel-content :where(input, select, textarea):focus-visible,
+.settings-editor-surface :where(input, select, textarea):focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+.settings-panel-content :where(input, textarea)::placeholder,
+.settings-editor-surface :where(input, textarea)::placeholder {
+  color: var(--text-tertiary);
+}
+
+.settings-panel-content :where(input, select, textarea):disabled,
+.settings-editor-surface :where(input, select, textarea):disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.settings-panel-toolbar {
+  min-height: 40px;
+}
+
+.settings-panel-toolbar > :where(p) {
+  font-size: 13px;
+}
+
+.settings-config-field > :where(textarea) {
+  display: block;
+}
+
+.settings-editor-surface :where(button:not([aria-label])) {
+  min-height: 36px;
+}
+
+@media (max-width: 640px) {
+  .settings-navigation {
+    width: 132px;
+  }
+
+  .settings-navigation :where(nav) {
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+
+  .settings-navigation :where(button) {
+    gap: 6px;
+  }
+
+  .settings-panel-toolbar {
+    align-items: flex-start;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .settings-panel-content *,
+  .settings-editor-surface * {
+    transition-duration: 0.01ms;
+  }
+}

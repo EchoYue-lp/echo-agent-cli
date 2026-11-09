@@ -1,123 +1,164 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { X, Plus, Minimize2 } from 'lucide-react';
 import { useUiStore } from '../../stores/uiStore';
-import { Terminal } from '../terminal/Terminal';
-import { terminalApi } from '../../api/endpoints';
-import { isTauri, apiInvoke } from '../../lib/tauri-bridge';
-import { useToastStore } from '../../stores/toastStore';
+import { Terminal, type TerminalViewState } from './Terminal';
+import type { TerminalTarget, ProductDataScope } from '../../api/endpoints';
+import { isTauri } from '../../lib/tauri-bridge';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
+import { productDataScope } from '../../lib/productDataScope';
 
 interface TerminalTab {
   id: string;
   label: string;
+  target: TerminalTarget;
+  projectScope?: ProductDataScope;
+  closeRequest: number;
+  state: TerminalViewState;
+}
+function targetLabel(target: TerminalTarget): string {
+  return target.kind === 'local'
+    ? '本地'
+    : `SSH ${target.user ? `${target.user}@` : ''}${target.host}${target.port ? `:${target.port}` : ''}`;
+}
+
+function hasControlCharacters(value: string): boolean {
+  return Array.from(value).some(
+    (character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127
+  );
 }
 
 export function TerminalDrawer() {
-  const terminalOpen = useUiStore((s) => s.terminalOpen);
-  const closeTerminal = useUiStore((s) => s.closeTerminal);
-
+  const workspace = useWorkspaceStore((store) => store.current);
+  const terminalOpen = useUiStore((store) => store.terminalOpen);
+  const hideTerminal = useUiStore((store) => store.closeTerminal);
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
-  const [activeTabId, setActiveTabId] = useState<string | null>(null);
+  const tabRef = useRef(tabs);
+  const sequence = useRef(0);
+  const [activeId, setActiveId] = useState<string | null>(null);
   const [height, setHeight] = useState(300);
   const [dragging, setDragging] = useState(false);
-  const addToast = useToastStore((s) => s.addToast);
-
-  const createNewTerminal = useCallback(async () => {
-    const newId = `term-${Date.now()}`;
-    const newLabel = `Terminal ${tabs.length + 1}`;
-
-    if (isTauri()) {
-      try {
-        await apiInvoke('create_terminal', { id: newId, rows: 24, cols: 80 });
-      } catch (e: unknown) {
-        console.error('Failed to create terminal via IPC:', e);
-        addToast('error', `创建终端失败: ${e instanceof Error ? e.message : 'Unknown error'}`);
-        return;
-      }
-    } else {
-      try {
-        const session = await terminalApi.create();
-        setTabs((prev) => [...prev, { id: session.id, label: newLabel }]);
-        setActiveTabId(session.id);
-        return;
-      } catch (e: unknown) {
-        console.error('Failed to create terminal session:', e);
-        addToast('error', `创建终端失败: ${e instanceof Error ? e.message : 'Unknown error'}`);
-        return;
-      }
+  const [sshForm, setSshForm] = useState(false);
+  const [host, setHost] = useState('');
+  const [user, setUser] = useState('');
+  const [port, setPort] = useState('');
+  const [formError, setFormError] = useState('');
+  const updateTabs = useCallback((update: (current: TerminalTab[]) => TerminalTab[]) => {
+    const next = update(tabRef.current);
+    tabRef.current = next;
+    setTabs(next);
+  }, []);
+  const createTab = useCallback(
+    (target: TerminalTarget, projectScope?: ProductDataScope, label?: string) => {
+      const id = `term-${crypto.randomUUID()}`;
+      sequence.current += 1;
+      updateTabs((current) => [
+        ...current,
+        {
+          id,
+          label: label ?? `Terminal ${sequence.current}`,
+          target,
+          projectScope,
+          closeRequest: 0,
+          state: { phase: 'preparing' },
+        },
+      ]);
+      setActiveId(id);
+    },
+    [updateTabs]
+  );
+  const createLocal = useCallback(() => createTab({ kind: 'local' }), [createTab]);
+  const createProject = useCallback(() => {
+    if (!workspace) {
+      createLocal();
+      return;
     }
-
-    setTabs((prev) => [...prev, { id: newId, label: newLabel }]);
-    setActiveTabId(newId);
-  }, [addToast, tabs.length]);
-
-  // Create initial terminal session on first open
+    const location = workspace.metadata.project_location;
+    const target: TerminalTarget =
+      location.kind === 'ssh'
+        ? { kind: 'ssh', host: location.host, user: location.user, port: location.port }
+        : { kind: 'local' };
+    createTab(target, productDataScope(workspace), `项目 ${workspace.name}`);
+  }, [workspace, createLocal, createTab]);
   useEffect(() => {
-    if (terminalOpen && tabs.length === 0) {
-      void createNewTerminal();
-    }
-  }, [createNewTerminal, tabs.length, terminalOpen]);
-
-  const closeTab = async (tabId: string) => {
-    if (isTauri()) {
-      try {
-        await apiInvoke('close_terminal', { id: tabId });
-      } catch {
-        // ignore
-      }
-    } else {
-      try {
-        await terminalApi.close(tabId);
-      } catch {
-        // ignore
-      }
-    }
-    setTabs((prev) => {
-      const next = prev.filter((t) => t.id !== tabId);
-      if (activeTabId === tabId) {
-        setActiveTabId(next.at(-1)?.id ?? null);
-      }
-      if (next.length === 0) {
-        closeTerminal();
-      }
-      return next;
-    });
-  };
-
-  // Drag-to-resize
+    if (terminalOpen && tabRef.current.length === 0) createProject();
+  }, [terminalOpen, createProject]);
+  const onState = useCallback(
+    (id: string, state: TerminalViewState) => {
+      updateTabs((current) => current.map((tab) => (tab.id === id ? { ...tab, state } : tab)));
+    },
+    [updateTabs]
+  );
+  const onClosed = useCallback(
+    (id: string) => {
+      const next = tabRef.current.filter((tab) => tab.id !== id);
+      updateTabs(() => next);
+      setActiveId((current) => (current === id ? (next.at(-1)?.id ?? null) : current));
+      if (next.length === 0) hideTerminal();
+    },
+    [hideTerminal, updateTabs]
+  );
+  const closeTab = (id: string) =>
+    updateTabs((current) =>
+      current.map((tab) => (tab.id === id ? { ...tab, closeRequest: tab.closeRequest + 1 } : tab))
+    );
   useEffect(() => {
     if (!dragging) return;
-
-    const handleMouseMove = (e: MouseEvent) => {
-      const newHeight = window.innerHeight - e.clientY;
-      setHeight(Math.max(150, Math.min(newHeight, window.innerHeight - 100)));
-    };
-
-    const handleMouseUp = () => {
-      setDragging(false);
-    };
-
-    document.addEventListener('mousemove', handleMouseMove);
-    document.addEventListener('mouseup', handleMouseUp);
+    const move = (event: MouseEvent) =>
+      setHeight(
+        Math.max(150, Math.min(window.innerHeight - event.clientY, window.innerHeight - 100))
+      );
+    const end = () => setDragging(false);
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', end);
     return () => {
-      document.removeEventListener('mousemove', handleMouseMove);
-      document.removeEventListener('mouseup', handleMouseUp);
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', end);
     };
   }, [dragging]);
-
-  if (!terminalOpen) return null;
-
-  const activeTab = tabs.find((t) => t.id === activeTabId);
+  const startSsh = (event: React.FormEvent) => {
+    event.preventDefault();
+    const destination = host.trim();
+    const account = user.trim();
+    const number = port.trim() ? Number(port) : undefined;
+    if (
+      !destination ||
+      destination.startsWith('-') ||
+      /[\s@]/.test(destination) ||
+      hasControlCharacters(destination) ||
+      destination.includes('://')
+    ) {
+      setFormError('主机仅填 host 或现有 SSH alias；账号请单独填写。');
+      return;
+    }
+    if (number !== undefined && (!Number.isInteger(number) || number < 1 || number > 65535)) {
+      setFormError('端口必须在 1–65535 之间，或留空使用 SSH 配置。');
+      return;
+    }
+    if (hasControlCharacters(account)) {
+      setFormError('账号含无效控制字符。');
+      return;
+    }
+    createTab({
+      kind: 'ssh',
+      host: destination,
+      ...(account ? { user: account } : {}),
+      ...(number !== undefined ? { port: number } : {}),
+    });
+    setFormError('');
+    setSshForm(false);
+  };
 
   return (
-    <div
+    <section
+      aria-label="终端面板"
+      hidden={!terminalOpen}
       className="flex flex-col border-t border-[var(--border-primary)] bg-[var(--bg-primary)]"
-      style={{ height: `${height}px` }}
+      style={{ height, display: terminalOpen ? undefined : 'none' }}
     >
-      {/* Resize handle */}
       <button
         type="button"
         aria-label="调整终端高度"
-        className="h-1 cursor-row-resize hover:bg-[var(--accent)]/30 transition-colors"
+        className="h-1 cursor-row-resize hover:bg-[var(--accent)]/30"
         onMouseDown={() => setDragging(true)}
         onKeyDown={(event) => {
           if (event.key === 'ArrowUp')
@@ -125,78 +166,160 @@ export function TerminalDrawer() {
           if (event.key === 'ArrowDown') setHeight((current) => Math.max(current - 20, 150));
         }}
       />
-
-      {/* Tab bar */}
       <div className="flex items-center justify-between border-b border-[var(--border-primary)] bg-[var(--bg-sidebar)] px-2">
-        <div className="flex items-center gap-0.5 overflow-x-auto">
+        <div
+          role="tablist"
+          aria-label="终端会话"
+          className="flex min-w-0 items-center gap-0.5 overflow-x-auto"
+        >
           {tabs.map((tab) => (
             <div
               key={tab.id}
               role="tab"
-              tabIndex={tab.id === activeTabId ? 0 : -1}
-              aria-selected={tab.id === activeTabId}
-              className={`group flex items-center gap-1.5 rounded-t-md px-3 py-1.5 text-xs cursor-pointer transition-colors
-                ${
-                  tab.id === activeTabId
-                    ? 'bg-[var(--bg-primary)] text-[var(--text-primary)] border-b-2 border-b-[var(--accent)]'
-                    : 'text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]'
-                }`}
-              onClick={() => setActiveTabId(tab.id)}
+              tabIndex={tab.id === activeId ? 0 : -1}
+              aria-selected={tab.id === activeId}
+              aria-controls={`panel-${tab.id}`}
+              className={`group flex cursor-pointer items-center gap-1.5 rounded-t-md px-3 py-1.5 text-xs ${tab.id === activeId ? 'border-b-2 border-b-[var(--accent)] bg-[var(--bg-primary)] text-[var(--text-primary)]' : 'text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)]'}`}
+              onClick={() => setActiveId(tab.id)}
               onKeyDown={(event) => {
                 if (event.key === 'Enter' || event.key === ' ') {
                   event.preventDefault();
-                  setActiveTabId(tab.id);
+                  setActiveId(tab.id);
                 }
               }}
             >
-              <span>{tab.label}</span>
+              <span title={targetLabel(tab.state.session?.target ?? tab.target)}>
+                {tab.label} · {targetLabel(tab.state.session?.target ?? tab.target)}
+              </span>
               <button
-                onClick={(e) => {
-                  e.stopPropagation();
+                aria-label={`${tab.state.phase === 'error' ? '重试关闭' : '关闭'} ${tab.label}`}
+                disabled={tab.state.phase === 'closing'}
+                onClick={(event) => {
+                  event.stopPropagation();
                   closeTab(tab.id);
                 }}
-                className="ml-1 rounded-md p-0.5 opacity-0 group-hover:opacity-100 hover:bg-[var(--bg-hover)] transition-opacity"
+                className="rounded p-0.5 hover:bg-[var(--bg-hover)] disabled:opacity-40"
               >
-                <X size={10} />
+                <X size={12} />
               </button>
             </div>
           ))}
           <button
-            onClick={createNewTerminal}
-            className="rounded-md p-1 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-sidebar-hover)] transition-colors"
+            onClick={createProject}
             title="New terminal"
+            aria-label={workspace ? '新建项目终端' : '新建本地终端'}
+            className="rounded-md p-1 text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
           >
-            <Plus size={12} />
+            <Plus size={14} />
+          </button>
+          {workspace && (
+            <button
+              type="button"
+              onClick={createLocal}
+              aria-label="新建独立本地终端"
+              className="rounded px-2 py-1 text-xs text-[var(--text-secondary)]"
+            >
+              本地
+            </button>
+          )}
+          <button
+            disabled={!isTauri()}
+            onClick={() => setSshForm((open) => !open)}
+            title={isTauri() ? '系统 OpenSSH 交互终端' : 'SSH 需要 Eclip 桌面应用'}
+            className="rounded px-2 py-1 text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] disabled:opacity-40"
+          >
+            SSH
           </button>
         </div>
         <div className="flex items-center gap-1">
           <button
-            onClick={() => setHeight((h) => Math.max(150, h - 50))}
-            className="rounded-md p-1 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-sidebar-hover)] transition-colors"
+            onClick={() => setHeight((current) => Math.max(150, current - 50))}
             title="Shrink"
+            aria-label="缩小终端"
+            className="rounded-md p-1 text-[var(--text-tertiary)]"
           >
             <Minimize2 size={12} />
           </button>
           <button
-            onClick={closeTerminal}
-            className="rounded-md p-1 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-sidebar-hover)] transition-colors"
-            title="Close terminal"
+            onClick={hideTerminal}
+            title="隐藏终端（保留会话）"
+            aria-label="隐藏终端"
+            className="rounded-md p-1 text-[var(--text-tertiary)]"
           >
             <X size={14} />
           </button>
         </div>
       </div>
-
-      {/* Terminal content — min-h-0 is critical for xterm.js flex sizing */}
-      <div className="flex-1 min-h-0 overflow-hidden">
-        {activeTab ? (
-          <Terminal sessionId={activeTab.id} />
-        ) : (
-          <div className="flex h-full items-center justify-center text-xs text-[var(--text-tertiary)]">
-            No terminal sessions. Click + to create one.
+      {sshForm && (
+        <form
+          onSubmit={startSsh}
+          className="flex flex-wrap items-end gap-2 border-b border-[var(--border-primary)] p-2 text-xs"
+        >
+          <label className="flex flex-1 flex-col gap-1">
+            主机 / SSH alias
+            <input
+              autoFocus
+              value={host}
+              onChange={(event) => setHost(event.target.value)}
+              placeholder="主机或现有 SSH alias"
+              className="rounded border border-[var(--border-primary)] bg-[var(--bg-primary)] px-2 py-1 text-[var(--text-primary)]"
+            />
+          </label>
+          <label className="flex flex-col gap-1">
+            账号（可选）
+            <input
+              value={user}
+              onChange={(event) => setUser(event.target.value)}
+              className="rounded border border-[var(--border-primary)] bg-[var(--bg-primary)] px-2 py-1 text-[var(--text-primary)]"
+            />
+          </label>
+          <label className="flex w-24 flex-col gap-1">
+            端口（可选）
+            <input
+              inputMode="numeric"
+              value={port}
+              onChange={(event) => setPort(event.target.value)}
+              className="rounded border border-[var(--border-primary)] bg-[var(--bg-primary)] px-2 py-1 text-[var(--text-primary)]"
+            />
+          </label>
+          <button
+            type="submit"
+            className="rounded bg-[var(--accent)] px-3 py-1 text-[var(--text-on-accent)]"
+          >
+            启动 SSH
+          </button>
+          <span className="basis-full text-[var(--text-tertiary)]">
+            留空项沿用系统 SSH 配置；认证与 host-key 交互在终端完成，不保存凭据。
+          </span>
+          {formError && (
+            <span role="alert" className="basis-full text-[var(--danger)]">
+              {formError}
+            </span>
+          )}
+        </form>
+      )}
+      <div className="min-h-0 flex-1 overflow-hidden">
+        {tabs.map((tab) => (
+          <div
+            key={tab.id}
+            id={`panel-${tab.id}`}
+            role="tabpanel"
+            aria-label={tab.label}
+            className="h-full min-h-0 flex-col"
+            style={{ display: tab.id === activeId ? 'flex' : 'none' }}
+          >
+            <Terminal
+              sessionId={tab.id}
+              target={tab.target}
+              projectScope={tab.projectScope}
+              visible={terminalOpen && tab.id === activeId}
+              closeRequest={tab.closeRequest}
+              onStateChange={onState}
+              onClosed={onClosed}
+            />
           </div>
-        )}
+        ))}
       </div>
-    </div>
+    </section>
   );
 }

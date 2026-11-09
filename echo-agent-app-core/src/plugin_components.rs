@@ -5,8 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use echo_agent::agent::{Agent, ReactAgent, ReactAgentBuilder};
-use echo_agent::lsp::LspConfig;
-use echo_agent::plugin::{PluginVariables, PreparedPluginSet, ResolvedComponents};
+use echo_agent::plugin::{PluginRegistry, PluginVariables, PreparedPluginSet, ResolvedComponents};
 use echo_agent::subagent::{
     AgentFactory, ExecutionMode, FnAgentFactory, SubagentAccessMode, SubagentExecutionBoundary,
     SubagentKind, SubagentPromptCompiler, SubagentSystemPromptInput, ToolCapabilitySnapshot,
@@ -46,10 +45,10 @@ pub struct PluginOutputStyle {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PreparedApplicationComponents {
     pub agents: Vec<PreparedPluginAgent>,
-    pub lsp_configs: Vec<(String, LspConfig)>,
     pub monitors: Vec<CronTask>,
     pub themes: Vec<PluginThemeDefinition>,
     pub output_styles: Vec<PluginOutputStyle>,
+    pub domains: crate::domain_plugin::PreparedDomainComponents,
 }
 
 #[derive(Debug, Clone)]
@@ -73,9 +72,12 @@ struct PluginAgentResources {
     sandbox: Option<Arc<dyn echo_agent::sandbox::SandboxExecutor>>,
     working_dir: Option<PathBuf>,
     tool_visibility: echo_agent::agent::ToolVisibilityPolicy,
+    files: Arc<dyn echo_agent::tools::filesystem::FileSystem>,
+    local_state_dir: Option<PathBuf>,
+    local_skill_source: echo_agent::skills::external::loader::SkillFileSource,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct MonitorDefinition {
     name: String,
     cron: String,
@@ -105,10 +107,10 @@ fn default_true() -> bool {
 pub(crate) fn prepare_application_components(
     generation: &PreparedPluginSet,
     target_scope: &str,
+    registry: &PluginRegistry,
 ) -> Result<PreparedApplicationComponents, Vec<String>> {
     let mut prepared = PreparedApplicationComponents::default();
     let mut agent_names = HashSet::new();
-    let mut lsp_languages = HashSet::new();
     let mut monitor_ids = HashSet::new();
     let mut theme_names = HashSet::new();
     let mut output_style_names = HashSet::new();
@@ -118,6 +120,50 @@ pub(crate) fn prepare_application_components(
         let plugin_id = plugin.id();
         let root = plugin.root();
         let variables = plugin.variables();
+        let Some(entry) = registry.get(plugin_id) else {
+            errors.push(format!("Plugin '{plugin_id}' has no registry manifest"));
+            continue;
+        };
+        let sensitive_values = entry
+            .manifest
+            .config
+            .iter()
+            .filter(|(_, config)| config.sensitive)
+            .filter_map(|(key, _)| variables.user_config.get(key))
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        let declaration = match crate::domain_plugin::read_declaration(root) {
+            Ok(value) => value,
+            Err(error) => {
+                errors.push(format!("Plugin '{plugin_id}': {error}"));
+                continue;
+            }
+        };
+        let inputs = match crate::domain_plugin::read_inputs(
+            plugin_id,
+            root,
+            declaration.as_ref().map(|(value, _)| value),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                errors.push(format!("Plugin '{plugin_id}': {error}"));
+                continue;
+            }
+        };
+        let closure = match generation.dependency_closure(plugin_id) {
+            Ok(value) => value.iter().map(|member| member.id().to_string()).collect(),
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
+        // Compare decoded semantic fields. JSON escaping must not hide a
+        // configured credential containing quotes, backslashes or newlines.
+        let declaration_sensitive = declaration
+            .as_ref()
+            .is_some_and(|(value, _)| value.contains_sensitive_value(&sensitive_values));
+        let mut monitor_identity: Option<String> = None;
+        let mut style_identity = Vec::new();
         let eko_components = match resolve_eko_components(root) {
             Ok(components) => components,
             Err(error) => {
@@ -142,32 +188,10 @@ pub(crate) fn prepare_application_components(
             }
         }
 
-        if let Some(document) = plugin.lsp_document() {
-            match LspConfig::from_yaml(document.contents()) {
-                Ok(config) => {
-                    let duplicate = config
-                        .servers
-                        .keys()
-                        .find(|language| lsp_languages.contains(*language));
-                    if let Some(language) = duplicate {
-                        errors.push(format!(
-                            "Plugin '{plugin_id}' declares duplicate LSP language '{language}'"
-                        ));
-                    } else {
-                        lsp_languages.extend(config.servers.keys().cloned());
-                        prepared.lsp_configs.push((plugin_id.to_string(), config));
-                    }
-                }
-                Err(error) => errors.push(format!(
-                    "Plugin '{plugin_id}' LSP config '{}': {error}",
-                    document.source_path().display()
-                )),
-            }
-        }
-
         if let Some(path) = eko_components.monitors_file {
-            match read_monitors_with_variables(plugin_id, &path, Some(variables)) {
-                Ok(monitors) => {
+            match prepare_monitors_with_variables(plugin_id, &path, Some(variables)) {
+                Ok((monitors, identity)) => {
+                    monitor_identity = Some(identity);
                     for monitor in monitors {
                         let monitor = scope_monitor(target_scope, monitor);
                         if !monitor_ids.insert(monitor.id.clone()) {
@@ -209,14 +233,54 @@ pub(crate) fn prepare_application_components(
                             style.name
                         ));
                     } else {
+                        let sensitive = sensitive_values
+                            .iter()
+                            .any(|secret| style.instructions.contains(secret.as_str()));
+                        prepared.domains.output_styles.insert(
+                            style.name.clone(),
+                            (plugin_id.to_string(), style.instructions.clone(), sensitive),
+                        );
+                        style_identity.push(style.clone());
                         prepared.output_styles.push(style);
                     }
                 }
                 Err(error) => errors.push(error),
             }
         }
+        // Hash exactly the immutable values published above. GUI theme colors
+        // are presentation-only and never contribute to automated task rules.
+        let identity = crate::domain_plugin::content_digest(&serde_json::json!({
+            "framework": plugin.content_identity(),
+            "declaration": declaration.as_ref().map(|(_, digest)| digest),
+            "inputs": inputs,
+            "monitors": monitor_identity,
+            "output_styles": style_identity,
+        }));
+        match identity {
+            Ok(content_sha256) => {
+                prepared.domains.plugins.insert(plugin_id.to_string(), crate::domain_plugin::PreparedDomainPlugin {
+                    identity: crate::domain_plugin::DomainPluginIdentity {
+                        plugin_id: plugin_id.to_string(), version: entry.manifest.version.clone(), content_sha256,
+                    },
+                    root: root.to_path_buf(), closure,
+                    declaration: declaration.map(|(value, _)| value), inputs,
+                    binding_error: declaration_sensitive.then(|| format!("domain '{plugin_id}' contains sensitive configuration content and cannot be persisted")),
+                });
+            }
+            Err(error) => errors.push(error),
+        }
     }
 
+    if errors.is_empty() {
+        for plugin_agent in &prepared.agents {
+            if let Err(error) = prepared
+                .domains
+                .record_prepared_role(&framework_definition(plugin_agent))
+            {
+                errors.push(error);
+            }
+        }
+    }
     if errors.is_empty() {
         Ok(prepared)
     } else {
@@ -250,15 +314,7 @@ pub(crate) fn validate_application_component_files(
             errors.push(error);
         }
     }
-    if let Some(path) = &resolved.lsp_config_file
-        && let Err(error) = read_component_text(path, Some(variables))
-            .and_then(|content| LspConfig::from_yaml(&content))
-    {
-        errors.push(format!(
-            "Plugin '{plugin}' LSP config '{}': {error}",
-            path.display()
-        ));
-    }
+
     let eko_components = match resolve_eko_components(root) {
         Ok(components) => components,
         Err(error) => {
@@ -575,6 +631,14 @@ fn read_monitors_with_variables(
     path: &Path,
     variables: Option<&PluginVariables>,
 ) -> Result<Vec<CronTask>, String> {
+    prepare_monitors_with_variables(plugin, path, variables).map(|(tasks, _)| tasks)
+}
+
+fn prepare_monitors_with_variables(
+    plugin: &str,
+    path: &Path,
+    variables: Option<&PluginVariables>,
+) -> Result<(Vec<CronTask>, String), String> {
     let content = read_component_text(path, variables).map_err(|error| {
         format!(
             "Plugin '{plugin}' monitors '{}': failed to read: {error}",
@@ -591,6 +655,7 @@ fn read_monitors_with_variables(
         MonitorDocument::List(definitions) => definitions,
         MonitorDocument::Wrapped { monitors } => monitors,
     };
+    let identity = crate::domain_plugin::content_digest(&definitions)?;
     let mut tasks = Vec::with_capacity(definitions.len());
     for definition in definitions {
         let name = definition.name.trim();
@@ -628,7 +693,7 @@ fn read_monitors_with_variables(
         }
         tasks.push(task);
     }
-    Ok(tasks)
+    Ok((tasks, identity))
 }
 
 fn read_theme_with_variables(
@@ -721,6 +786,7 @@ fn read_component_text(path: &Path, variables: Option<&PluginVariables>) -> Resu
 pub(crate) async fn register_plugin_agents(
     agent: &mut ReactAgent,
     prepared: &[PreparedPluginAgent],
+    local_state_dir: Option<PathBuf>,
 ) -> Result<Vec<String>, String> {
     let resources = PluginAgentResources {
         llm_client: agent.llm_client().cloned(),
@@ -730,6 +796,11 @@ pub(crate) async fn register_plugin_agents(
         sandbox: agent.sandbox_manager().cloned(),
         working_dir: agent.working_dir(),
         tool_visibility: agent.tool_visibility_policy(),
+        files: agent
+            .file_system()
+            .unwrap_or_else(|| Arc::new(echo_agent::tools::files::LocalFileSystem)),
+        local_state_dir,
+        local_skill_source: agent.default_skill_source(),
     };
     let mut registered = Vec::with_capacity(prepared.len());
     for plugin_agent in prepared {
@@ -742,17 +813,43 @@ pub(crate) async fn register_plugin_agents(
             let definition = factory_definition.clone();
             let resources = factory_resources.clone();
             Box::pin(async move {
-                build_plugin_agent(&definition, &resources)
-                    .map(|agent| Box::new(agent) as Box<dyn Agent>)
+                let agent = build_plugin_agent(&definition, &resources)?;
+                box_project_plugin_agent(agent, &resources).await
             })
         }));
-        agent.register_subagent_with_definition(framework_definition.clone(), Box::new(instance));
+        let instance = box_project_plugin_agent(instance, &resources)
+            .await
+            .map_err(|error| error.to_string())?;
+        agent.register_subagent_with_definition(framework_definition.clone(), instance);
         agent.register_subagent_factory(framework_definition, factory);
         registered.push(plugin_agent.definition.name.clone());
     }
     let disabled_tools = agent.disabled_tool_names();
     crate::subagent_prompt::refresh_primary_system_prompt(agent, &disabled_tools);
     Ok(registered)
+}
+
+async fn box_project_plugin_agent(
+    agent: ReactAgent,
+    resources: &PluginAgentResources,
+) -> echo_agent::error::Result<Box<dyn Agent>> {
+    let executor = resources
+        .sandbox
+        .clone()
+        .or_else(|| agent.sandbox_manager().cloned())
+        .ok_or_else(|| {
+            echo_agent::error::ReactError::Other(
+                "Plugin Subagent project executor is unavailable".to_string(),
+            )
+        })?;
+    Ok(crate::project::agent_adapter::boxed_project_agent(
+        crate::agent_handle::AgentHandle::new(agent),
+        resources.files.clone(),
+        executor,
+        resources.local_state_dir.clone(),
+        resources.working_dir.clone(),
+    )
+    .await)
 }
 
 fn framework_definition(
@@ -822,6 +919,8 @@ fn build_plugin_agent(
         .model(&model)
         .system_prompt(&definition.system_prompt)
         .enable_tools()
+        .file_system(resources.files.clone())
+        .auto_project_rules(false)
         .enable_memory()
         .working_dir(
             resources
@@ -848,11 +947,14 @@ fn build_plugin_agent(
         builder = builder.llm_config(config);
     }
     let mut agent = builder.build()?;
-    if !definition.readonly
-        && let Some(sandbox) = resources.sandbox.clone()
-    {
+    crate::tasks::task_runtime::compact_context::install_domain_context_projection(&mut agent);
+    if let Some(sandbox) = resources.sandbox.clone() {
         agent.set_sandbox_executor(sandbox);
     }
+    agent.tool_manager().set_native_execution_admission(Some(
+        crate::tasks::task_runtime::executor::process_execution_governor().native_shell_admission(),
+    ));
+    agent.set_default_skill_source(resources.local_skill_source.clone());
     agent.use_tool_visibility_policy(resources.tool_visibility.clone());
     let disabled_tools = resources.tool_visibility.disabled_names();
     let capabilities =
@@ -882,6 +984,51 @@ fn build_plugin_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn registered_plugin_instances_and_real_forks_keep_final_native_manager_policy()
+    -> Result<(), String> {
+        use crate::infra::native_manager_runtime_contract::{Case, Fixture};
+        let mut fixture = Fixture::new().await?;
+        let outcome = async {
+            for (label, fresh) in [("plugin-initial", false), ("plugin-fork", true)] {
+                let case = Case::new(&fixture, label)?;
+                // 只替换模型传输；实际走原注册、实例/工厂、项目 adapter 与最终 manager。
+                fixture.created.agent.set_llm_client(case.client.clone());
+                let prepared = PreparedPluginAgent {
+                    plugin: "native-policy-contract".to_string(),
+                    definition: crate::subagent_loader::parse_subagent_md(
+                        &format!("---\nname: {label}\ndescription: controlled native policy contract\nreadonly: false\n---\n执行本次受控 shell。\n"), None,
+                    )?,
+                };
+                register_plugin_agents(&mut fixture.created.agent, &[prepared], Some(fixture.root.path().join("plugin-state"))).await?;
+                let registry = fixture.created.agent.subagent_registry().clone();
+                let target = if fresh {
+                    registry.create_fresh_agent(label).await.map_err(|error| error.to_string())?
+                } else {
+                    registry.get_agent(label).await
+                }.ok_or("actual registered Plugin agent missing")?;
+                case.run(&fixture, target).await?;
+            }
+            let prepared = PreparedPluginAgent {
+                plugin: "native-policy-contract".to_string(),
+                definition: crate::subagent_loader::parse_subagent_md(
+                    "---\nname: native-readonly\ndescription: readonly boundary\nreadonly: true\n---\n只读检查。\n", None,
+                )?,
+            };
+            register_plugin_agents(&mut fixture.created.agent, &[prepared], Some(fixture.root.path().join("plugin-state"))).await?;
+            let readonly = fixture.created.agent.subagent_registry().get_agent("native-readonly").await
+                .ok_or("actual registered readonly Plugin agent missing")?;
+            if readonly.tool_names().iter().any(|name| name == "shell") {
+                return Err("readonly Plugin unexpectedly gained shell".to_string());
+            }
+            Ok::<(), String>(())
+        }.await;
+        let closed = fixture.finish().await;
+        outcome?;
+        closed
+    }
 
     #[test]
     fn monitor_binding_keys_are_qualified_by_target_scope() {
@@ -943,6 +1090,153 @@ mod tests {
             style
                 .instructions
                 .contains(&data_dir.to_string_lossy().to_string())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actual_agent_tool_plugin_factory_projects_persisted_domain_without_prompt_payload()
+    -> Result<(), String> {
+        use crate::tasks::task_runtime::compact_context::{
+            DOMAIN_METHOD_MARKER, task_runtime_projection_registry,
+        };
+        use crate::tasks::task_runtime::{
+            AttendedMode, DomainProfile, RunPlanPolicy, TaskRunExecutionProfile, TaskRuntimeStore,
+        };
+        // agent_tool constructs prompt_payload=None. The actual registered
+        // plugin factory must still read the original RunCreated projection.
+        let client = Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .with_response("Bound evidence inspected")
+                .with_response("General follow-up complete"),
+        );
+        let project =
+            crate::tasks::task_runtime::project_environment_tests::EnvironmentFixture::new()?;
+        // Model a real target repository boundary inside this routing fixture;
+        // VCS discovery must not need ancestors outside its bounded namespace.
+        crate::tasks::task_runtime::worktree::run_git(
+            &project.target_root,
+            &["init", "-b", "main"],
+        )
+        .map_err(|error| error.to_string())?;
+        for root in [&project.visible_root, &project.target_root] {
+            std::fs::write(root.join("Cargo.toml"), "fixture marker")
+                .map_err(|error| error.to_string())?;
+        }
+        std::fs::write(
+            project.visible_root.join("AGENTS.md"),
+            "WRONG_LOCAL_PLUGIN_RULE",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            project.target_root.join("AGENTS.md"),
+            "ACTUAL_PLUGIN_PROJECT_RULE",
+        )
+        .map_err(|error| error.to_string())?;
+        let mut primary = ReactAgentBuilder::new()
+            .name("domain-parent")
+            .llm_client(client.clone())
+            .enable_tools()
+            .enable_subagent()
+            .file_system(project.files.clone())
+            .working_dir(project.visible_root.clone())
+            .register_agent_dispatch_tool()
+            .build()
+            .map_err(|error| error.to_string())?;
+        primary.set_sandbox_executor(project.executor.clone());
+        let prepared = PreparedPluginAgent {
+            plugin: "evidence-domain".to_string(),
+            definition: crate::subagent_loader::parse_subagent_md(
+                "---\nname: projected-domain-role\ndescription: Inspect domain evidence\nreadonly: true\n---\nInspect the supplied evidence.\n",
+                None,
+            )?,
+        };
+        register_plugin_agents(&mut primary, &[prepared], None).await?;
+        let tool = primary
+            .tool_manager()
+            .get_tool("agent_tool")
+            .ok_or("agent_tool missing")?;
+        let binding = crate::domain_plugin::test_binding(false)?;
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        store
+            .create_run_for_active_workspace_with_domain(
+                &run_id,
+                "domain-projection-conversation",
+                "root",
+                DomainProfile::General,
+                "inspect",
+                "task",
+                AttendedMode::Attended,
+                TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+                Some(&binding),
+            )
+            .map_err(|error| error.to_string())?;
+        let projection =
+            task_runtime_projection_registry().retain_for_invocation(&run_id, store)?;
+        let parameters = std::collections::HashMap::from([
+            (
+                "agent_name".to_string(),
+                serde_json::json!("projected-domain-role"),
+            ),
+            ("task".to_string(), serde_json::json!("inspect evidence")),
+            ("mode".to_string(), serde_json::json!("sync")),
+        ]);
+        let context = echo_agent::tools::ToolContext {
+            run_id: Some(run_id),
+            working_dir: Some(project.visible_root.clone()),
+            ..Default::default()
+        };
+        let result = tool
+            .execute_with_context(parameters.clone(), &context)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(result.success);
+        let bound_calls = client.all_calls();
+        let bound_messages = bound_calls
+            .first()
+            .ok_or("bound plugin did not call the model")?;
+        assert!(
+            bound_messages
+                .iter()
+                .filter_map(|message| message.content.as_text())
+                .any(|text| text.contains(DOMAIN_METHOD_MARKER)
+                    && text.contains(&binding.snapshot.method))
+        );
+        let bound_text = bound_messages
+            .iter()
+            .filter_map(|message| message.content.as_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(bound_text.matches("ACTUAL_PLUGIN_PROJECT_RULE").count(), 1);
+        assert!(!bound_text.contains("WRONG_LOCAL_PLUGIN_RULE"));
+        drop(projection);
+        let result = tool
+            .execute_with_context(
+                parameters,
+                &echo_agent::tools::ToolContext {
+                    working_dir: Some(project.visible_root.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(result.success);
+        let calls = client.all_calls();
+        let general_messages = calls
+            .last()
+            .ok_or("General plugin did not call the model")?;
+        assert!(
+            general_messages
+                .iter()
+                .filter_map(|message| message.content.as_text())
+                .all(|text| !text.contains(DOMAIN_METHOD_MARKER))
+        );
+        assert!(
+            general_messages
+                .iter()
+                .filter_map(|message| message.content.as_text())
+                .any(|text| text.contains("ACTUAL_PLUGIN_PROJECT_RULE"))
         );
         Ok(())
     }

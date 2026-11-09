@@ -1,3 +1,4 @@
+import { AgentSentMessage } from './AgentSentMessage';
 import { memo, useState } from 'react';
 import {
   AlertTriangle,
@@ -9,18 +10,25 @@ import {
   Wrench,
 } from 'lucide-react';
 import { useToolExecutionStore } from '../../stores/toolExecutionStore';
+import { transcriptToolExecution, type TranscriptToolRecord } from '../../types/api';
 import { InlineToolCall } from './InlineToolCall';
 
 interface ToolExecutionGroupProps {
   toolIds: string[];
+  transcriptTools?: readonly TranscriptToolRecord[];
+  grouped?: boolean;
+  /** 外层已提供折叠摘要时，直接显示原工具行，避免重复的摘要层。 */
+  detailsOnly?: boolean;
 }
 
 export function toolExecutionGroupPresentation(
   toolIds: readonly string[],
-  toolsById: ReturnType<typeof useToolExecutionStore.getState>['tools']
+  toolsById: ReturnType<typeof useToolExecutionStore.getState>['tools'],
+  transcriptTools: readonly TranscriptToolRecord[] = []
 ) {
   const tools = toolIds.flatMap((toolId) => {
-    const tool = toolsById[toolId];
+    const transcript = transcriptTools.find((record) => record.id === toolId);
+    const tool = transcript ? transcriptToolExecution(transcript, toolsById) : toolsById[toolId];
     return tool ? [tool] : [];
   });
   const runningCount = tools.filter((tool) => tool.status === 'running').length;
@@ -52,11 +60,14 @@ export function toolExecutionGroupPresentation(
 
 export const ToolExecutionGroup = memo(function ToolExecutionGroup({
   toolIds,
+  transcriptTools = [],
+  grouped = false,
+  detailsOnly = false,
 }: ToolExecutionGroupProps) {
   const [expanded, setExpanded] = useState(false);
   const toolsById = useToolExecutionStore((state) => state.tools);
   const { runningCount, failedCount, cancelledCount, uncertainCount, missingCount, label } =
-    toolExecutionGroupPresentation(toolIds, toolsById);
+    toolExecutionGroupPresentation(toolIds, toolsById, transcriptTools);
   const statusSuffix = [
     failedCount > 0 ? `${failedCount} 个失败` : '',
     cancelledCount > 0 ? `${cancelledCount} 个已取消` : '',
@@ -77,12 +88,55 @@ export const ToolExecutionGroup = memo(function ToolExecutionGroup({
       <Check size={12} className="text-[var(--color-success)]" />
     );
 
+  if (!grouped) {
+    // Preserve original execution-step order while surfacing communication results outside collapsed tools.
+    const communication = toolIds.some((id) => {
+      const record = transcriptTools.find((row) => row.id === id);
+      const tool = record ? transcriptToolExecution(record, toolsById) : toolsById[id];
+      return tool != null && ['agent_message', 'agent_followup'].includes(tool.name);
+    });
+    if (communication)
+      return (
+        <>
+          {toolIds.map((id) => {
+            const record = transcriptTools.find((row) => row.id === id);
+            const tool = record ? transcriptToolExecution(record, toolsById) : toolsById[id];
+            return tool && ['agent_message', 'agent_followup'].includes(tool.name) ? (
+              <AgentSentMessage key={id} tool={tool} transcript={record} />
+            ) : (
+              <ToolExecutionGroup
+                key={id}
+                toolIds={[id]}
+                transcriptTools={transcriptTools}
+                grouped
+                detailsOnly={detailsOnly}
+              />
+            );
+          })}
+        </>
+      );
+  }
+  const details = toolIds.map((toolId, index) => {
+    const transcript = transcriptTools.find((record) => record.id === toolId);
+    if (!toolsById[toolId] && !transcript)
+      return (
+        <div
+          key={toolId}
+          role="status"
+          className="break-all py-1 text-xs text-[var(--text-tertiary)]"
+        >
+          工具记录 {toolId} · 详情未恢复
+        </div>
+      );
+    return <InlineToolCall key={toolId} toolId={toolId} index={index} transcript={transcript} />;
+  });
+  if (detailsOnly) return <div className="min-w-0">{details}</div>;
   return (
-    <div className="my-1 min-w-0 pl-2">
+    <div className="min-w-0 pl-2">
       <button
         type="button"
         onClick={() => setExpanded((value) => !value)}
-        className="flex min-h-7 w-full min-w-0 items-center gap-1.5 rounded-md px-1.5 py-0.5 -ml-1.5 text-left text-[12px] text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-secondary)]"
+        className="flex min-h-6 w-full min-w-0 items-center gap-1.5 rounded-md px-1.5 py-0.5 -ml-1.5 text-left text-[12px] text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-secondary)]"
         aria-expanded={expanded}
         aria-label={expanded ? '折叠工具执行过程' : '展开工具执行过程'}
       >
@@ -94,11 +148,7 @@ export const ToolExecutionGroup = memo(function ToolExecutionGroup({
       </button>
 
       {expanded && (
-        <div className="ml-3 border-l border-[var(--border-primary)] pl-2">
-          {toolIds.map((toolId, index) => (
-            <InlineToolCall key={toolId} toolId={toolId} index={index} />
-          ))}
-        </div>
+        <div className="ml-3 border-l border-[var(--border-primary)] pl-2">{details}</div>
       )}
     </div>
   );

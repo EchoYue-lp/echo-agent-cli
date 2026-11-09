@@ -27,7 +27,7 @@ use echo_agent::compression::ContextProjection;
 use echo_agent::llm::types::Message;
 use sha2::{Digest, Sha256};
 
-const INSTRUCTION_CONTEXT_PROJECTION: &str = "eko:instruction-context";
+pub(crate) const INSTRUCTION_CONTEXT_PROJECTION: &str = "eko:instruction-context";
 pub(crate) const HOT_MEMORY_CONTEXT_PROJECTION: &str = "eko:hot-memory-context";
 
 /// One strictly-read instruction generation shared by the primary agent and
@@ -39,6 +39,13 @@ pub(crate) struct InstructionProjectionSnapshot {
 }
 
 impl InstructionProjectionSnapshot {
+    pub(crate) fn projection(&self) -> echo_agent::compression::ContextProjection {
+        // 规则正文是固定指令：它只在文件内容变化时更新 generation，属于 boundary。
+        echo_agent::compression::ContextProjection::replacing(
+            INSTRUCTION_CONTEXT_PROJECTION,
+            self.message.clone(),
+        )
+    }
     pub(crate) fn revision(&self) -> &str {
         &self.revision
     }
@@ -90,10 +97,13 @@ impl HotMemoryProjectionSource {
     }
 
     pub(crate) fn projection(&self) -> ContextProjection {
-        ContextProjection {
-            marker: HOT_MEMORY_CONTEXT_PROJECTION.to_string(),
-            message: self.snapshot().and_then(|snapshot| snapshot.message),
-        }
+        // hot-memory 是人工维护的 MEMORY.md（规则与事实混写，无法可靠自动分类）：
+        // 沿固定指令 generation 更新，内容变化时接受一次正常冷 miss，而不是把任意
+        // 记忆文本自动降权成历史内事实。
+        ContextProjection::replacing(
+            HOT_MEMORY_CONTEXT_PROJECTION,
+            self.snapshot().and_then(|snapshot| snapshot.message),
+        )
     }
 }
 
@@ -228,6 +238,42 @@ pub(crate) fn load_instruction_projection_strict_with_state(
         }
         None => InstructionProvider::load_for_strict(project_root)?,
     };
+    Ok(instruction_projection_from_provider(provider))
+}
+
+pub(crate) fn load_instruction_projection_with_file_system(
+    project_root: Option<&std::path::Path>,
+    state_dir: Option<&std::path::Path>,
+    files: &dyn echo_agent::tools::filesystem::FileSystem,
+) -> echo_agent::error::Result<InstructionProjectionSnapshot> {
+    Ok(instruction_projection_from_provider(
+        InstructionProvider::load_for_file_system(project_root, state_dir, files)?,
+    ))
+}
+
+/// 每条消息的准备入口：项目根与 cwd 已解析，严格读取当前规则正文。
+///
+/// 项目正文由当前调用的严格读取获得；同轮投影复用已准备值，不能用
+/// mtime/长度命中跳过下一次调用的内容读取。传输复用归原只读会话。
+pub(crate) fn load_resolved_instruction_projection(
+    working_dir: Option<&std::path::Path>,
+    project_root: Option<&std::path::Path>,
+    state_dir: Option<&std::path::Path>,
+    files: &dyn echo_agent::tools::filesystem::FileSystem,
+) -> echo_agent::error::Result<InstructionProjectionSnapshot> {
+    Ok(instruction_projection_from_provider(
+        InstructionProvider::load_for_resolved_project(
+            working_dir,
+            project_root,
+            state_dir,
+            files,
+        )?,
+    ))
+}
+
+fn instruction_projection_from_provider(
+    provider: InstructionProvider,
+) -> InstructionProjectionSnapshot {
     let suffix = provider
         .get_instruction_suffix()
         .filter(|value| !value.trim().is_empty())
@@ -237,10 +283,10 @@ pub(crate) fn load_instruction_projection_strict_with_state(
     if let Some(value) = suffix.as_deref() {
         hasher.update(value.as_bytes());
     }
-    Ok(InstructionProjectionSnapshot {
+    InstructionProjectionSnapshot {
         revision: format!("{:x}", hasher.finalize()),
         message: suffix.map(Message::system),
-    })
+    }
 }
 
 /// Publish an already-read snapshot. This function never touches disk, so all
@@ -318,6 +364,10 @@ mod tests {
         let second = temp.path().join("second");
         std::fs::create_dir_all(first.join(".eko"))?;
         std::fs::create_dir_all(second.join(".eko"))?;
+        for root in [&first, &second] {
+            std::fs::create_dir(root.join(".git"))?;
+            assert_eq!(crate::utils::find_project_root(root).as_ref(), Some(root));
+        }
         std::fs::write(first.join(".eko/project.md"), "FIRST_WORKSPACE_RULE")?;
         std::fs::write(second.join(".eko/project.md"), "SECOND_WORKSPACE_RULE")?;
 

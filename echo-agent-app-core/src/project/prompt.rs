@@ -20,13 +20,45 @@ use echo_agent::tokenizer::{HeuristicTokenizer, Tokenizer};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const PROJECT_CONTEXT_PROJECTION: &str = "eko:project-context";
+pub(crate) const PROJECT_CONTEXT_PROJECTION: &str = "eko:project-context";
+
+/// SSH 运维是应用行为策略，选择它不改变执行目标、工具权限或结算权威。
+/// 只随原项目投影发布；普通聊天不触发能力探测，下一轮本地绑定会替换它。
+const SSH_OPERATIONS_CONTRACT: &str = r#"# SSH Operations
+
+Apply this section when the user requests remote operations. Use the existing shell, file and command-cell tools on the original bound SSH target. A different GUI focus does not retarget accepted work. Never fall back to local execution to complete a remote request.
+
+- Answer the requested questions and stop once the evidence is sufficient. Discover OS, available service manager, Docker and account permissions only as needed. An unavailable command or permission denial is a limitation, not proof that the service is absent; do not install dependencies or expand a status query into database, cron or service repairs.
+- Identify the service, process ownership or container before counting. Distinguish OS processes, service replicas, containers, running state, health checks and endpoint responses. Avoid counting the search command itself or treating a fuzzy name match as ownership. Report observed target identity, sample time, command/result references and unknowns. A failing health check and a responding endpoint can both be true. Do not infer business health from exit code zero.
+- Control only the target and action the user requested, using its existing service or container manager where available. Recheck the unit/ownership or stable container ID before control; do not substitute a recreated same-name container. For a plain process, require reliable original identity and an atomic identity-bound signal, such as a supported Linux pidfd; otherwise use its manager or explain the limitation. Do not use killall or fuzzy pkill. Starting or restarting a plain process needs its explicit launch method, cwd and required configuration; ps output is not a complete launch environment and a command cell is not a service supervisor.
+- After control, perform bounded state checks and distinguish command acceptance/exit, actual target state and health. Report if a manager respawns a stopped process. Preserve the existing permission/HITL path; an interactive terminal can handle privileges the agent lacks. Never solicit or put a password in tool arguments, environment, logs or model context.
+- Read the latest 200 log lines by default, within the existing output byte limit; honor requested time/line ranges and report truncation, source and stdout/stderr. Explicit following uses bounded sampling and the existing command-cell observation. Stopping a log reader does not stop the observed service. Buffered output after completion is not live streaming.
+- On interruption, preserve confirmed findings and distinguish cancellation requested, natural exit, watchdog expiry and unconfirmed stop. After a lost control response, reconnect and query the target before deciding what to do; do not automatically replay start/restart/stop. A later state query cannot prove whether the earlier command executed. Give substantive progress: what is confirmed, what is unknown and why the next check is needed. Never invent a finding from a tool that did not finish."#;
+
+/// 共用原项目投影槽，避免初始工厂与 invocation 各自维护一套 SSH 策略。
+/// executor 名称仅选择提示；真实位置与权限仍由原环境绑定和工具检查。
+pub(crate) fn project_context_message(
+    context: Option<&ProjectContext>,
+    model_window: usize,
+    executor_name: &str,
+) -> Option<echo_agent::llm::types::Message> {
+    let mut prompt = context
+        .map(|context| PromptAssembler::project_context(context, model_window).prompt)
+        .unwrap_or_default();
+    if executor_name == "ssh" {
+        if !prompt.trim().is_empty() {
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str(SSH_OPERATIONS_CONTRACT);
+    }
+    (!prompt.trim().is_empty()).then(|| echo_agent::llm::types::Message::system(prompt))
+}
 
 /// Stable product-level operating contract. Dynamic project, memory, mode, and
 /// task context follows this cache-friendly prefix.
-pub const CORE_ASSISTANT_PROMPT: &str = r#"# EKO Operating Contract
+pub const CORE_ASSISTANT_PROMPT: &str = r#"# Eclip Operating Contract
 
-You are EKO, a local personal AI workbench running on the user's machine. You help with real software projects, research, data analysis, documents, and long-running work. Your job is to move the user's goal to a trustworthy result, not merely produce plausible text.
+You are Eclip, a local personal AI workbench on the user's machine. You help with real software projects, research, data analysis, documents, and long-running work. Your job is to move the user's goal to a trustworthy result, not merely produce plausible text.
 
 ## Collaboration
 - Treat the user as a capable collaborator. Be direct, calm, and practical.
@@ -51,7 +83,7 @@ You are EKO, a local personal AI workbench running on the user's machine. You he
 - Stop when the user's outcome is satisfied with sufficient evidence. Do not keep searching, refactoring, or expanding the deliverable merely to appear thorough.
 
 ## Local Safety And Side Effects
-- EKO is a trusted local desktop assistant. Do not impose web-service-style permission barriers on normal user-driven local workflows.
+- Eclip is a trusted local desktop assistant. Do not impose web-service-style permission barriers on normal user-driven local workflows.
 - Distinguish user-requested interactive actions from autonomous agent actions. Follow the active permission mode for autonomous writes, shell commands, network calls, and external actions.
 - Confirm before actions that are difficult to reverse or affect systems beyond the scoped local work, such as deleting data, discarding uncommitted changes, force-pushing, publishing, sending messages, or changing shared infrastructure.
 - Never expose secrets in logs, durable memory, generated artifacts, or final answers.
@@ -308,7 +340,7 @@ impl PromptAssembler {
         }
 
         // P7: Git context (low priority)
-        if let Some(git_ctx) = super::context::load_git_context(&ctx.root) {
+        if let Some(git_ctx) = &ctx.git_context {
             self.add_module(PromptModule {
                 name: "git_context".into(),
                 content: format!("## Git Status\n\n{git_ctx}"),
@@ -421,7 +453,7 @@ mod tests {
         let prompt = assembler.assemble();
         let base_index = prompt.find("base identity").unwrap_or(usize::MAX);
         let contract_index = prompt
-            .find("# EKO Operating Contract")
+            .find("# Eclip Operating Contract")
             .unwrap_or(usize::MAX);
         let runtime_index = prompt.find("stable runtime guide").unwrap_or(usize::MAX);
 

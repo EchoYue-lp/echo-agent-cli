@@ -25,8 +25,6 @@ pub struct ConversationInputAddress {
 #[serde(rename_all = "snake_case")]
 pub enum ConversationInputSource {
     Gui,
-    Tui,
-    Cli,
     Channel,
 }
 
@@ -34,8 +32,6 @@ impl ConversationInputSource {
     fn as_str(self) -> &'static str {
         match self {
             Self::Gui => "gui",
-            Self::Tui => "tui",
-            Self::Cli => "cli",
             Self::Channel => "channel",
         }
     }
@@ -92,9 +88,21 @@ pub struct ConversationInputAttempt {
 pub struct ConversationInputObservation {
     drained: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
+    #[cfg(test)]
+    mailbox_invocations: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ConversationInputObservation {
+    #[cfg(test)]
+    pub(crate) fn mark_mailbox_invocation(&self) {
+        self.mailbox_invocations.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(all(test, feature = "channels"))]
+    pub(crate) fn mailbox_invocations(&self) -> usize {
+        self.mailbox_invocations.load(Ordering::Acquire)
+    }
+
     pub fn mark_drained(&self) {
         self.drained.store(true, Ordering::Release);
     }
@@ -146,9 +154,127 @@ pub enum ConversationInputPhase {
 /// lossy conversion at this boundary.
 pub use echo_agent::agent::AgentSteerTurnOutcome as ConversationInputOutcome;
 
+/// Non-secret persisted projection of the exact provider reference. It is
+/// available without the channels feature so opening history never erases a
+/// binding. The channels adapter converts all four fields losslessly and asks
+/// the ORIGINAL provider to validate association/token presence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelContextReference {
+    pub account_id: String,
+    pub generation: String,
+    pub peer: String,
+    pub reference: String,
+}
+
+#[cfg(feature = "channels")]
+impl From<echo_agent::channels::weixin::WeixinContextRef> for ChannelContextReference {
+    fn from(value: echo_agent::channels::weixin::WeixinContextRef) -> Self {
+        Self {
+            account_id: value.account_id,
+            generation: value.generation,
+            peer: value.peer,
+            reference: value.reference,
+        }
+    }
+}
+
+#[cfg(feature = "channels")]
+impl From<ChannelContextReference> for echo_agent::channels::weixin::WeixinContextRef {
+    fn from(value: ChannelContextReference) -> Self {
+        Self {
+            account_id: value.account_id,
+            generation: value.generation,
+            peer: value.peer,
+            reference: value.reference,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export, tag = "kind", content = "reference", rename_all = "snake_case")]
+#[serde(
+    tag = "kind",
+    content = "reference",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum FrozenChannelContext {
+    Absent,
+    Reference(ChannelContextReference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export, tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChannelExecutionIntent {
+    Chat,
+    Resume {
+        expected: crate::tasks::task_runtime::TaskRunResumeIdentity,
+        driver_continuation_enabled: bool,
+    },
+}
+
+/// DATA in the SAME original Persisted frame, never another route store.
+/// Every field is required when this optional binding is present; in particular
+/// missing context/generation cannot be silently defaulted to Absent/current.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelInputBinding {
+    pub version: u16,
+    pub channel_id: String,
+    pub account_id: String,
+    pub credential_generation: String,
+    pub peer_id: String,
+    pub provider_message_id: String,
+    pub workspace_generation: String,
+    pub context: FrozenChannelContext,
+    pub execution: ChannelExecutionIntent,
+}
+
+impl ChannelInputBinding {
+    pub fn validate_data(&self) -> Result<(), ConversationInputError> {
+        if self.version != 1
+            || self.channel_id != "weixin"
+            || [
+                &self.account_id,
+                &self.credential_generation,
+                &self.peer_id,
+                &self.provider_message_id,
+                &self.workspace_generation,
+            ]
+            .iter()
+            .any(|value| value.trim().is_empty())
+        {
+            return Err(ConversationInputError::Validation(
+                "invalid persisted channel binding identity".to_string(),
+            ));
+        }
+        if let FrozenChannelContext::Reference(context) = &self.context
+            && (context.account_id != self.account_id
+                || context.generation != self.credential_generation
+                || context.peer != self.peer_id
+                || context.reference.trim().is_empty())
+        {
+            return Err(ConversationInputError::Validation(
+                "persisted context reference belongs to another channel identity".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[ts(export, rename = "ConversationInputPayload")]
 pub struct ConversationInputPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub channel_binding: Option<ChannelInputBinding>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub domain_plugin: Option<String>,
     pub text: String,
     pub attachments: Vec<crate::types::AttachmentData>,
     #[ts(type = "number")]
@@ -157,10 +283,74 @@ pub struct ConversationInputPayload {
 }
 
 impl ConversationInputPayload {
+    pub fn new_for_channel(
+        address: &ConversationInputAddress,
+        text: String,
+        attachments: Vec<crate::types::AttachmentData>,
+        domain_plugin: Option<String>,
+        binding: ChannelInputBinding,
+    ) -> Result<Self, ConversationInputError> {
+        validate_address(address)?;
+        binding.validate_data()?;
+        let mut payload = Self::new_with_domain(text, attachments, domain_plugin)?;
+        payload.channel_binding = Some(binding);
+        payload.payload_sha256 = payload.channel_digest(address)?;
+        Ok(payload)
+    }
+
+    /// Recompute only bound DATA. Ordinary None retains the central Domain
+    /// constructor's exact existing tuple/digest behavior.
+    pub(crate) fn validate_channel_digest(
+        &self,
+        address: &ConversationInputAddress,
+    ) -> Result<(), ConversationInputError> {
+        if let Some(binding) = &self.channel_binding {
+            binding.validate_data()?;
+            if self.channel_digest(address)? != self.payload_sha256 {
+                return Err(ConversationInputError::Validation(
+                    "persisted channel binding digest mismatch".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn channel_digest(
+        &self,
+        address: &ConversationInputAddress,
+    ) -> Result<String, ConversationInputError> {
+        let canonical = echo_agent::utils::canonical_json::canonical_json_bytes(&(
+            "channel-input-binding-v1",
+            address,
+            self.text.as_str(),
+            self.attachments.as_slice(),
+            self.domain_plugin.as_deref(),
+            self.channel_binding.as_ref(),
+        ))
+        .map_err(|error| ConversationInputError::Validation(error.to_string()))?;
+        Ok(format!("{:x}", Sha256::digest(canonical)))
+    }
+
     pub fn new(
         text: String,
         attachments: Vec<crate::types::AttachmentData>,
     ) -> Result<Self, ConversationInputError> {
+        Self::new_with_domain(text, attachments, None)
+    }
+
+    pub fn new_with_domain(
+        text: String,
+        attachments: Vec<crate::types::AttachmentData>,
+        domain_plugin: Option<String>,
+    ) -> Result<Self, ConversationInputError> {
+        if domain_plugin
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty())
+        {
+            return Err(ConversationInputError::Validation(
+                "domain_plugin must not be empty".to_string(),
+            ));
+        }
         if text.trim().is_empty() && attachments.is_empty() {
             return Err(ConversationInputError::Validation(
                 "conversation input must contain text or attachments".to_string(),
@@ -168,13 +358,24 @@ impl ConversationInputPayload {
         }
         crate::attachments::validate_attachment_batch(&attachments)
             .map_err(|error| ConversationInputError::Validation(error.to_string()))?;
-        let canonical = echo_agent::utils::canonical_json::canonical_json_bytes(&(
-            text.as_str(),
-            attachments.as_slice(),
-        ))
+        // Preserve the original General identity. A selected domain is part
+        // of the same durable queue payload, never reconstructed from the UI.
+        let canonical = match domain_plugin.as_deref() {
+            None => echo_agent::utils::canonical_json::canonical_json_bytes(&(
+                text.as_str(),
+                attachments.as_slice(),
+            )),
+            Some(plugin) => echo_agent::utils::canonical_json::canonical_json_bytes(&(
+                text.as_str(),
+                attachments.as_slice(),
+                plugin,
+            )),
+        }
         .map_err(|error| ConversationInputError::Validation(error.to_string()))?;
         let payload_sha256 = format!("{:x}", Sha256::digest(canonical));
         Ok(Self {
+            channel_binding: None,
+            domain_plugin,
             text,
             attachments,
             submitted_at_ms: echo_agent::utils::time::now_millis(),
@@ -219,11 +420,35 @@ impl ConversationInputReceipt {
     }
 }
 
+/// 原队列中的唯一任务去向；绑定版本与当前可编辑版本分开，不能借编辑覆盖旧归属。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+pub struct ConversationInputTaskTarget {
+    pub run_id: String,
+    pub turn_id: String,
+    pub identity: ConversationInputIdentity,
+}
+
+/// 原日志绑定成功后的临时参数；无store/锁/序列化，不能取代原输入或TaskRuntime权威。
+/// 外部surface只能接收原应用准入返回值，不能自行拼接未绑定的目标。
+#[derive(Debug, Clone)]
+pub struct BoundRunInput {
+    pub(crate) snapshot: crate::tasks::task_runtime::RunInputSnapshot,
+    pub(crate) target: ConversationInputTaskTarget,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[ts(export, rename = "ConversationInputProjection")]
 pub struct ConversationInputProjection {
     pub receipt: ConversationInputReceipt,
     pub payload: ConversationInputPayload,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub task_target: Option<ConversationInputTaskTarget>,
+    /// 从原ever_claimed重放派生；用于区分旧记录的未知去向，不建立另一权威。
+    #[serde(skip, default)]
+    #[ts(skip)]
+    pub claimed_before_current: bool,
     #[serde(skip, default)]
     #[ts(skip)]
     pub active_attempt: Option<ConversationInputAttempt>,
@@ -243,12 +468,27 @@ pub struct ConversationInputFrontier {
 pub enum ConversationInputFact {
     Persisted {
         identity: ConversationInputIdentity,
-        payload: ConversationInputPayload,
+        // 仅缩小Rust枚举内存布局；serde与TS投影仍保同一payload结构和原事实语义。
+        payload: Box<ConversationInputPayload>,
     },
     AttemptStarted {
         attempt: ConversationInputAttempt,
         #[ts(type = "number")]
         started_at_ms: u64,
+    },
+    /// 先固定原源版本的唯一任务去向；不是TaskRuntime接受、mailbox或Applied证明。
+    TaskRunTargetBound {
+        attempt: ConversationInputAttempt,
+        run_id: String,
+        #[ts(type = "number")]
+        bound_at_ms: u64,
+    },
+    /// The original TaskRun launch accepted this intent. This is not a ReAct
+    /// mailbox receipt: planned execution has its own physical driver owner.
+    DriverAccepted {
+        attempt: ConversationInputAttempt,
+        #[ts(type = "number")]
+        accepted_at_ms: u64,
     },
     MailboxAccepted {
         attempt: ConversationInputAttempt,
@@ -287,6 +527,14 @@ pub enum ConversationInputFact {
         #[ts(type = "number")]
         detected_at_ms: u64,
     },
+    /// Original journal observation of an uncertain route/history. No attempt
+    /// is fabricated for DATA that was never claimed. Uses RecoveryRequired.
+    RecoveryUncertain {
+        identity: ConversationInputIdentity,
+        reason: String,
+        #[ts(type = "number")]
+        detected_at_ms: u64,
+    },
     Cancelled {
         identity: ConversationInputIdentity,
         attempt: Option<ConversationInputAttempt>,
@@ -300,9 +548,13 @@ pub enum ConversationInputFact {
 impl ConversationInputFact {
     pub fn identity(&self) -> &ConversationInputIdentity {
         match self {
-            Self::Persisted { identity, .. } | Self::Cancelled { identity, .. } => identity,
+            Self::Persisted { identity, .. }
+            | Self::Cancelled { identity, .. }
+            | Self::RecoveryUncertain { identity, .. } => identity,
             Self::Reordered { anchor, .. } => anchor,
             Self::AttemptStarted { attempt, .. }
+            | Self::TaskRunTargetBound { attempt, .. }
+            | Self::DriverAccepted { attempt, .. }
             | Self::MailboxAccepted { attempt, .. }
             | Self::Drained { attempt, .. }
             | Self::TurnSettled { attempt, .. }
@@ -364,15 +616,87 @@ impl ConversationInputService {
         text: String,
         attachments: Vec<crate::types::AttachmentData>,
     ) -> Result<ConversationInputReceipt, ConversationInputError> {
+        self.submit_with_domain(address, input_id, text, attachments, None)
+            .await
+    }
+
+    pub async fn submit_with_domain(
+        &self,
+        address: ConversationInputAddress,
+        input_id: String,
+        text: String,
+        attachments: Vec<crate::types::AttachmentData>,
+        domain_plugin: Option<String>,
+    ) -> Result<ConversationInputReceipt, ConversationInputError> {
         validate_address(&address)?;
         if input_id.trim().is_empty() {
             return Err(ConversationInputError::Validation(
                 "conversation input id must not be empty".to_string(),
             ));
         }
-        let payload = ConversationInputPayload::new(text, attachments)?;
+        let payload = ConversationInputPayload::new_with_domain(text, attachments, domain_plugin)?;
         self.log
             .submit_conversation_input(address, input_id, payload)
+            .await
+    }
+
+    #[cfg(any(test, feature = "channels"))]
+    pub(crate) async fn submit_channel(
+        &self,
+        address: ConversationInputAddress,
+        input_id: String,
+        text: String,
+        attachments: Vec<crate::types::AttachmentData>,
+        domain_plugin: Option<String>,
+        binding: ChannelInputBinding,
+    ) -> Result<ConversationInputReceipt, ConversationInputError> {
+        let payload = ConversationInputPayload::new_for_channel(
+            &address,
+            text,
+            attachments,
+            domain_plugin,
+            binding,
+        )?;
+        if input_id.trim().is_empty() {
+            return Err(ConversationInputError::Validation(
+                "conversation input id must not be empty".to_string(),
+            ));
+        }
+        self.log
+            .submit_conversation_input(address, input_id, payload)
+            .await
+    }
+
+    /// Replace one still-dispatchable queued input in the canonical journal.
+    /// The input id and queue position stay stable; the identity revision and
+    /// payload hash advance under the existing ChatEventLog CAS authority.
+    pub async fn replace(
+        &self,
+        identity: ConversationInputIdentity,
+        expected_queue_revision: u64,
+        text: String,
+        attachments: Vec<crate::types::AttachmentData>,
+        domain_plugin: Option<String>,
+    ) -> Result<ConversationInputReceipt, ConversationInputError> {
+        validate_address(&identity.address)?;
+        let payload = ConversationInputPayload::new_with_domain(text, attachments, domain_plugin)?;
+        let revision = identity.revision.checked_add(1).ok_or_else(|| {
+            ConversationInputError::Validation("conversation input revision overflow".into())
+        })?;
+        let next_identity = ConversationInputIdentity {
+            address: identity.address,
+            input_id: identity.input_id,
+            revision,
+            payload_sha256: payload.payload_sha256.clone(),
+        };
+        self.log
+            .append_conversation_input_fact_expected_queue_revision(
+                ConversationInputFact::Persisted {
+                    identity: next_identity,
+                    payload: Box::new(payload),
+                },
+                expected_queue_revision,
+            )
             .await
     }
 
@@ -464,6 +788,22 @@ impl ConversationInputService {
         self.log.cancel_conversation_input(identity).await
     }
 
+    /// 用户明确放弃一条待恢复（RecoveryRequired）的原渠道输入。
+    ///
+    /// 只追加原日志的 Cancelled 事实并保留原 attempt、reason、drained 与
+    /// 副作用/发送结论；当前 phase 与队列 revision 在原 authority 锁内复核，
+    /// 调用方观察到的版本不构成第二权威。
+    #[cfg(any(test, feature = "channels"))]
+    pub async fn cancel_pending_recovery(
+        &self,
+        identity: ConversationInputIdentity,
+        expected_queue_revision: u64,
+    ) -> Result<ConversationInputReceipt, ConversationInputError> {
+        self.log
+            .cancel_recovery_conversation_input(identity, expected_queue_revision)
+            .await
+    }
+
     pub async fn reorder(
         &self,
         address: &ConversationInputAddress,
@@ -473,6 +813,23 @@ impl ConversationInputService {
         validate_address(address)?;
         self.log
             .reorder_conversation_inputs(address, expected_queue_revision, input_ids)
+            .await
+    }
+
+    /// 沿原日志锁绑定已claim输入；dispatch原事务已核全队列revision。
+    /// 此处只核准确源版本/attempt/turn：其它DATA入队不撤销当前claim。
+    /// 编辑、排序与dispatch仍保留原全队列fence，成功前必须确认原物理耐久屏障。
+    pub async fn bind_task_target(
+        &self,
+        attempt: ConversationInputAttempt,
+        run_id: String,
+    ) -> Result<ConversationInputReceipt, ConversationInputError> {
+        self.log
+            .append_conversation_input_fact(ConversationInputFact::TaskRunTargetBound {
+                attempt,
+                run_id,
+                bound_at_ms: echo_agent::utils::time::now_millis(),
+            })
             .await
     }
 
@@ -556,6 +913,21 @@ impl ConversationInputService {
     /// A `Drained` return deliberately ends this observation. The surface
     /// adapter must retain its existing `ForegroundTurnSettlement` waiter and
     /// call [`Self::turn_settled`] for the same exact attempt.
+    /// 原同一个attempt观察owner区分接受拒绝与框架真实结果，不伪造TurnSteerError。
+    pub async fn observe_durable_steer_through_drain(
+        &self,
+        attempt: ConversationInputAttempt,
+        result: Result<
+            Result<echo_agent::agent::AgentSteerReceipt, echo_agent::agent::TurnSteerError>,
+            String,
+        >,
+    ) -> Result<ConversationInputReceipt, ConversationInputError> {
+        match result {
+            Ok(result) => self.observe_steer_through_drain(attempt, result).await,
+            Err(reason) => self.recovery_required(attempt, reason).await,
+        }
+    }
+
     pub async fn observe_steer_through_drain(
         &self,
         attempt: ConversationInputAttempt,
@@ -753,6 +1125,18 @@ impl ConversationInputService {
         }
     }
 
+    #[cfg(feature = "channels")]
+    pub(crate) async fn accept_task_run_driver(
+        &self,
+        attempt: ConversationInputAttempt,
+    ) -> Result<ConversationInputReceipt, ConversationInputError> {
+        self.append_fact(ConversationInputFact::DriverAccepted {
+            attempt,
+            accepted_at_ms: echo_agent::utils::time::now_millis(),
+        })
+        .await
+    }
+
     async fn append_fact(
         &self,
         fact: ConversationInputFact,
@@ -842,6 +1226,650 @@ mod tests {
             .count())
     }
 
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn abandon_recovery_requires_exact_revision_and_blocks_late_uncertainty()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let log = Arc::new(ChatEventLog::open(
+            directory.path(),
+            ChatEventRetention::default(),
+        )?);
+        let service = ConversationInputService::new(Arc::clone(&log));
+        let blocked = service
+            .submit(
+                address(),
+                "channel-blocked".into(),
+                "旧的待恢复消息".into(),
+                Vec::new(),
+            )
+            .await?;
+        let started = service
+            .dispatch_selected(
+                blocked.identity.clone(),
+                blocked.queue_revision,
+                "turn-blocked".into(),
+            )
+            .await?;
+        service
+            .recovery_required(exact_attempt(&started)?, "原驱动中断，副作用未知".into())
+            .await?;
+        let blocked_frontier = service.list(&address()).await?;
+        assert_eq!(blocked_frontier.items.len(), 1);
+        assert_eq!(
+            blocked_frontier.items[0].receipt.phase,
+            ConversationInputPhase::RecoveryRequired
+        );
+        // 同地址后续消息仍被原 RecoveryRequired 阻塞。
+        let queued = service
+            .submit(
+                address(),
+                "channel-next".into(),
+                "下一条消息".into(),
+                Vec::new(),
+            )
+            .await?;
+        assert!(
+            service
+                .dispatch_next(&address(), "turn-next".into())
+                .await?
+                .is_none()
+        );
+        let latest = service.list(&address()).await?;
+        // 陈旧队列版本不能放弃。
+        let stale = service
+            .cancel_pending_recovery(blocked.identity.clone(), blocked.queue_revision)
+            .await;
+        assert!(matches!(
+            stale,
+            Err(ConversationInputError::StaleRevision { .. })
+        ));
+        // 只有 RecoveryRequired 项可用此用户动作；普通排队项仍走原取消入口。
+        let live = latest
+            .items
+            .iter()
+            .find(|item| item.receipt.identity == queued.identity)
+            .cloned()
+            .ok_or("next input is missing")?;
+        let wrong = service
+            .cancel_pending_recovery(live.receipt.identity, latest.queue_revision)
+            .await;
+        assert!(matches!(
+            wrong,
+            Err(ConversationInputError::NotDispatchable { .. })
+        ));
+        let receipt = service
+            .cancel_pending_recovery(blocked.identity.clone(), latest.queue_revision)
+            .await?;
+        assert_eq!(receipt.phase, ConversationInputPhase::Cancelled);
+        assert_eq!(receipt.attempt, Some(1));
+        assert_eq!(receipt.reason.as_deref(), Some("原驱动中断，副作用未知"));
+        assert!(!receipt.drained);
+        // 重复成功是幂等观察，不产生第二个终态。
+        let duplicate_frontier = service.list(&address()).await?;
+        let duplicate = service
+            .cancel_pending_recovery(blocked.identity.clone(), duplicate_frontier.queue_revision)
+            .await?;
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.phase, ConversationInputPhase::Cancelled);
+        // 解除阻塞后同一队列的下一项只产生一次 claim。
+        assert!(
+            service
+                .dispatch_next(&address(), "turn-next".into())
+                .await?
+                .is_some()
+        );
+        assert!(
+            service
+                .dispatch_next(&address(), "turn-next".into())
+                .await?
+                .is_none()
+        );
+        // 旧 owner 的迟到 RecoveryUncertain 不能复活已放弃项。
+        log.mark_channel_input_uncertain_checked(
+            blocked.identity.clone(),
+            None,
+            "迟到的不确定结果".into(),
+        )
+        .await?;
+        let settled = service.list(&address()).await?;
+        for item in &settled.items {
+            if item.receipt.identity == blocked.identity {
+                assert_ne!(
+                    item.receipt.phase,
+                    ConversationInputPhase::RecoveryRequired,
+                    "late uncertainty resurrected a cancelled input"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn recovery_abandon_and_live_claim_linearize_across_two_journal_handles()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let log_a = Arc::new(ChatEventLog::open(
+            directory.path(),
+            ChatEventRetention::default(),
+        )?);
+        let log_b = Arc::new(ChatEventLog::open(
+            directory.path(),
+            ChatEventRetention::default(),
+        )?);
+        let service_a = ConversationInputService::new(log_a.clone());
+        let service_b = ConversationInputService::new(log_b.clone());
+        let blocked = service_a
+            .submit(
+                address(),
+                "racing-blocked".into(),
+                "原失败输入".into(),
+                Vec::new(),
+            )
+            .await?;
+        let original = service_a
+            .dispatch_next(&address(), "original-racing-turn".into())
+            .await?
+            .ok_or("original attempt missing")?;
+        let attempt = exact_attempt(&original)?;
+        service_a.mailbox_accepted(attempt.clone()).await?;
+        let failed = service_a
+            .turn_settled(attempt, ConversationInputOutcome::Failed, false)
+            .await?;
+        log_a
+            .mark_channel_input_uncertain_checked(
+                blocked.identity.clone(),
+                Some(failed.queue_revision),
+                "原效果UNKNOWN".into(),
+            )
+            .await?;
+        let queued = service_a
+            .submit(
+                address(),
+                "racing-next".into(),
+                "后续输入".into(),
+                Vec::new(),
+            )
+            .await?;
+        let frontier = service_a.list(&address()).await?;
+        let original_events = log_a.replay(
+            &address().workspace_id,
+            Some(&address().conversation_id),
+            &blocked.identity.input_id,
+            0,
+        )?;
+        let start = tokio::sync::Barrier::new(3);
+        // 测试屏障只负责同时起跑；三条操作仍通过原spawn_blocking和同一日志authority串行化。
+        let abandon = async {
+            start.wait().await;
+            service_a
+                .cancel_pending_recovery(blocked.identity.clone(), frontier.queue_revision)
+                .await
+        };
+        let recovery = async {
+            start.wait().await;
+            log_b
+                .mark_channel_input_uncertain_checked(
+                    blocked.identity.clone(),
+                    Some(frontier.queue_revision),
+                    "并发原效果UNKNOWN".into(),
+                )
+                .await
+        };
+        let claim = async {
+            start.wait().await;
+            service_b
+                .dispatch_next(&address(), "racing-next-turn".into())
+                .await
+        };
+        let (abandon, recovery, claim) = tokio::join!(abandon, recovery, claim);
+        recovery?;
+        let claim = claim?;
+        let cancelled = match abandon {
+            Ok(receipt) => receipt,
+            Err(ConversationInputError::StaleRevision { .. }) => {
+                // 原恢复先提交时必须保留新版本，用户只可用新观察重试明确放弃。
+                let latest = service_a.list(&address()).await?;
+                assert!(
+                    latest
+                        .items
+                        .iter()
+                        .any(|input| input.receipt.identity == blocked.identity
+                            && input.receipt.phase == ConversationInputPhase::RecoveryRequired)
+                );
+                assert!(claim.is_none());
+                service_a
+                    .cancel_pending_recovery(blocked.identity.clone(), latest.queue_revision)
+                    .await?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        assert_eq!(cancelled.phase, ConversationInputPhase::Cancelled);
+        assert_eq!(cancelled.attempt, Some(1));
+        assert!(!cancelled.drained);
+        let claimed_next = match claim {
+            Some(input) => input,
+            None => service_b
+                .dispatch_next(&address(), "racing-next-turn".into())
+                .await?
+                .ok_or("next input did not become dispatchable")?,
+        };
+        assert_eq!(claimed_next.receipt.identity, queued.identity);
+        assert_eq!(claimed_next.receipt.attempt, Some(1));
+        assert!(
+            service_a
+                .dispatch_next(&address(), "duplicate-racing-turn".into())
+                .await?
+                .is_none()
+        );
+        // 保留确定顺序的None版本负控；不能靠本次竞态恰好先读旧snapshot掩盖复活缺陷。
+        log_b
+            .mark_channel_input_uncertain_checked(
+                blocked.identity.clone(),
+                None,
+                "取消后的迟到UNKNOWN".into(),
+            )
+            .await?;
+        let current = service_a.list(&address()).await?;
+        let duplicate = service_a
+            .cancel_pending_recovery(blocked.identity.clone(), current.queue_revision)
+            .await?;
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.phase, ConversationInputPhase::Cancelled);
+        let old_events = log_b.replay(
+            &address().workspace_id,
+            Some(&address().conversation_id),
+            &blocked.identity.input_id,
+            0,
+        )?;
+        for (before, after) in original_events.events.iter().zip(&old_events.events) {
+            assert_eq!(serde_json::to_value(before)?, serde_json::to_value(after)?);
+        }
+        assert!(old_events.events.len() > original_events.events.len());
+        let (cancelled_facts, old_claims, drained_facts) = old_events.events.iter().fold(
+            (0_usize, 0_usize, 0_usize),
+            |(cancelled, claimed, drained), event| match &event.payload {
+                crate::chat_driver::ChatDriverEvent::InputLifecycle(fact)
+                    if fact.identity() == &blocked.identity =>
+                {
+                    match fact.as_ref() {
+                        ConversationInputFact::Cancelled { .. } => {
+                            (cancelled.saturating_add(1), claimed, drained)
+                        }
+                        ConversationInputFact::AttemptStarted { .. } => {
+                            (cancelled, claimed.saturating_add(1), drained)
+                        }
+                        ConversationInputFact::Drained { .. } => {
+                            (cancelled, claimed, drained.saturating_add(1))
+                        }
+                        _ => (cancelled, claimed, drained),
+                    }
+                }
+                _ => (cancelled, claimed, drained),
+            },
+        );
+        assert_eq!((cancelled_facts, old_claims, drained_facts), (1, 1, 0));
+        let next_events = log_b.replay(
+            &address().workspace_id,
+            Some(&address().conversation_id),
+            &queued.identity.input_id,
+            0,
+        )?;
+        let claims = next_events
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(&event.payload,
+            crate::chat_driver::ChatDriverEvent::InputLifecycle(fact)
+            if fact.identity() == &queued.identity && matches!(fact.as_ref(), ConversationInputFact::AttemptStarted {..}))
+            })
+            .count();
+        assert_eq!(claims, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_task_target_unclaimed_edit_and_legacy_claim_cold_reopen_use_real_guards()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let service = ConversationInputService::new(Arc::new(ChatEventLog::open(
+            directory.path(),
+            ChatEventRetention::default(),
+        )?));
+        let saved = service
+            .submit(
+                address(),
+                "legacy-source".into(),
+                "尚未claim的原文".into(),
+                Vec::new(),
+            )
+            .await?;
+        // 仅未claim输入走原公开允许的编辑路径；不清flag或放宽guard来造fixture。
+        let edited = service
+            .replace(
+                saved.identity,
+                saved.queue_revision,
+                "合法编辑后的新版本".into(),
+                Vec::new(),
+                None,
+            )
+            .await?;
+        assert_eq!(edited.identity.revision, 2);
+        let started = service
+            .dispatch_selected(edited.identity, edited.queue_revision, "old-turn".into())
+            .await?;
+        assert_eq!(started.receipt.attempt, Some(1));
+        assert!(!started.claimed_before_current);
+        service
+            .deferred(exact_attempt(&started)?, "旧实现未保存TaskRun去向".into())
+            .await?;
+        drop(service);
+        let service = ConversationInputService::new(Arc::new(ChatEventLog::open(
+            directory.path(),
+            ChatEventRetention::default(),
+        )?));
+        let frontier = service.list(&address()).await?;
+        let item = frontier.items.first().ok_or("旧输入缺失")?;
+        assert!(item.task_target.is_none());
+        let current = service
+            .dispatch_selected(
+                item.receipt.identity.clone(),
+                frontier.queue_revision,
+                "new-turn".into(),
+            )
+            .await?;
+        let attempt = exact_attempt(&current)?;
+        assert_eq!(attempt.attempt, 2);
+        assert!(current.claimed_before_current);
+        assert!(
+            service
+                .bind_task_target(attempt.clone(), "taskrun:new-turn".into())
+                .await
+                .is_err()
+        );
+        service
+            .recovery_required(attempt, "旧claim的任务去向未知，不能重放".into())
+            .await?;
+        assert_eq!(
+            service
+                .list(&address())
+                .await?
+                .items
+                .first()
+                .map(|item| item.receipt.phase),
+            Some(ConversationInputPhase::RecoveryRequired)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_task_target_cancel_before_bind_cannot_admit_and_claimed_queue_cancel_stays_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let service = ConversationInputService::new(Arc::new(ChatEventLog::open(
+            directory.path(),
+            ChatEventRetention::default(),
+        )?));
+        let saved = service
+            .submit(
+                address(),
+                "cancel-first".into(),
+                "取消前仍保留原文".into(),
+                Vec::new(),
+            )
+            .await?;
+        let cancelled = service.cancel(saved.identity.clone()).await?;
+        assert_eq!(cancelled.phase, ConversationInputPhase::Cancelled);
+        assert!(
+            service
+                .dispatch_selected(
+                    saved.identity,
+                    cancelled.queue_revision,
+                    "never-started".into()
+                )
+                .await
+                .is_err()
+        );
+        let saved = service
+            .submit(
+                address(),
+                "claimed-source".into(),
+                "原attempt已准入".into(),
+                Vec::new(),
+            )
+            .await?;
+        let started = service
+            .dispatch_selected(
+                saved.identity.clone(),
+                saved.queue_revision,
+                "exact-turn".into(),
+            )
+            .await?;
+        let attempt = exact_attempt(&started)?;
+        service
+            .bind_task_target(attempt, "exact-run".into())
+            .await?;
+        // 原公开queue删除只处理dispatchable/RecoveryRequired；Stop仍走准确foreground token。
+        assert!(service.cancel(saved.identity).await.is_err());
+        let frontier = service.list(&address()).await?;
+        let item = frontier.items.first().ok_or("原输入缺失")?;
+        assert_eq!(item.receipt.phase, ConversationInputPhase::AttemptStarted);
+        assert!(!item.receipt.drained);
+        assert_eq!(
+            item.task_target
+                .as_ref()
+                .map(|target| target.run_id.as_str()),
+            Some("exact-run")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_task_target_survives_deferred_reopen_and_blocks_cold_retarget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let log = Arc::new(ChatEventLog::open(
+            directory.path(),
+            ChatEventRetention::default(),
+        )?);
+        let service = ConversationInputService::new(log.clone());
+        let saved = service
+            .submit(
+                address(),
+                "bound-source".into(),
+                "完整原文尾部🧭".into(),
+                Vec::new(),
+            )
+            .await?;
+        let started = service
+            .dispatch_selected(saved.identity, saved.queue_revision, "original-turn".into())
+            .await?;
+        let attempt = exact_attempt(&started)?;
+        service
+            .bind_task_target(attempt.clone(), "taskrun:original-turn".into())
+            .await?;
+        let deferred = service.deferred(attempt, "旧轮次尚未接纳".into()).await?;
+        assert_eq!(deferred.phase, ConversationInputPhase::Deferred);
+        drop(service);
+        drop(log);
+        let service = ConversationInputService::new(Arc::new(ChatEventLog::open(
+            directory.path(),
+            ChatEventRetention::default(),
+        )?));
+        let frontier = service.list(&address()).await?;
+        let item = frontier.items.first().ok_or("原输入未保留")?;
+        assert_eq!(item.payload.text, "完整原文尾部🧭");
+        assert_eq!(
+            item.task_target
+                .as_ref()
+                .map(|target| target.run_id.as_str()),
+            Some("taskrun:original-turn")
+        );
+        assert!(
+            service
+                .dispatch_selected(
+                    item.receipt.identity.clone(),
+                    frontier.queue_revision,
+                    "different-turn".into()
+                )
+                .await
+                .is_err()
+        );
+        let same = service
+            .dispatch_selected(
+                item.receipt.identity.clone(),
+                frontier.queue_revision,
+                "original-turn".into(),
+            )
+            .await?;
+        let same_attempt = exact_attempt(&same)?;
+        assert_eq!(same_attempt.attempt, 2);
+        assert!(
+            service
+                .bind_task_target(same_attempt.clone(), "taskrun:other".into())
+                .await
+                .is_err()
+        );
+        let accepted = service
+            .bind_task_target(same_attempt, "taskrun:original-turn".into())
+            .await?;
+        assert_eq!(accepted.phase, ConversationInputPhase::AttemptStarted);
+        assert!(!accepted.drained);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_task_target_keeps_local_attempt_fence_when_other_inputs_arrive()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let service = ConversationInputService::new(Arc::new(ChatEventLog::open(
+            directory.path(),
+            ChatEventRetention::default(),
+        )?));
+        let saved = service
+            .submit(
+                address(),
+                "racing-source".into(),
+                "同一原输入".into(),
+                Vec::new(),
+            )
+            .await?;
+        // 选择输入仍保留原全队列fence，不能把局部绑定规则扩散到dispatch。
+        service
+            .submit(
+                address(),
+                "another-source".into(),
+                "另一输入".into(),
+                Vec::new(),
+            )
+            .await?;
+        assert!(
+            service
+                .dispatch_selected(
+                    saved.identity.clone(),
+                    saved.queue_revision,
+                    "exact-turn".into()
+                )
+                .await
+                .is_err()
+        );
+        let frontier = service.list(&address()).await?;
+        let started = service
+            .dispatch_selected(saved.identity, frontier.queue_revision, "exact-turn".into())
+            .await?;
+        let attempt = exact_attempt(&started)?;
+        // claim后另一DATA入队不撤销当前准确attempt；原锁只允许唯一target胜出。
+        service
+            .submit(
+                address(),
+                "third-source".into(),
+                "并发新输入".into(),
+                Vec::new(),
+            )
+            .await?;
+        let (a, b) = tokio::join!(
+            service.bind_task_target(attempt.clone(), "run-a".into()),
+            service.bind_task_target(attempt.clone(), "run-b".into()),
+        );
+        assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+        let frontier = service.list(&address()).await?;
+        let selected = frontier
+            .items
+            .iter()
+            .find(|item| item.receipt.identity == attempt.identity)
+            .ok_or("原输入缺失")?;
+        let target = selected.task_target.as_ref().ok_or("唯一任务去向缺失")?;
+        let mut stale = attempt;
+        stale.attempt_id = "old-attempt-id".into();
+        assert!(
+            service
+                .bind_task_target(stale, target.run_id.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            selected.receipt.phase,
+            ConversationInputPhase::AttemptStarted
+        );
+        assert!(!selected.receipt.drained);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_task_target_deferred_bound_input_keeps_original_edit_rejection_and_cancel_history()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let service = ConversationInputService::new(Arc::new(ChatEventLog::open(
+            directory.path(),
+            ChatEventRetention::default(),
+        )?));
+        let saved = service
+            .submit(
+                address(),
+                "edited-source".into(),
+                "原始正文".into(),
+                Vec::new(),
+            )
+            .await?;
+        let started = service
+            .dispatch_selected(saved.identity, saved.queue_revision, "exact-turn".into())
+            .await?;
+        let attempt = exact_attempt(&started)?;
+        service
+            .bind_task_target(attempt.clone(), "original-run".into())
+            .await?;
+        let deferred = service
+            .deferred(attempt.clone(), "尚未mailbox".into())
+            .await?;
+        // 现有原active_attempt guard拒绝该编辑；不能为测试绕过或冒称新版本已被接受。
+        assert!(
+            service
+                .replace(
+                    deferred.identity.clone(),
+                    deferred.queue_revision,
+                    "未获准的新正文".into(),
+                    Vec::new(),
+                    None
+                )
+                .await
+                .is_err()
+        );
+        let frontier = service.list(&address()).await?;
+        let item = frontier.items.first().ok_or("原版本缺失")?;
+        assert_eq!(item.payload.text, "原始正文");
+        assert_eq!(item.receipt.identity.revision, 1);
+        assert_eq!(
+            item.task_target.as_ref().map(|target| &target.identity),
+            Some(&attempt.identity)
+        );
+        let cancelled = service.cancel(deferred.identity).await?;
+        assert_eq!(cancelled.phase, ConversationInputPhase::Cancelled);
+        assert!(!cancelled.drained);
+        assert!(service.list(&address()).await?.items.is_empty());
+        Ok(())
+    }
+
     #[test]
     fn scoped_input_id_is_stable_and_source_isolated() -> Result<(), String> {
         let gui = stable_scoped_input_id(&address(), ConversationInputSource::Gui, "external-1")
@@ -853,7 +1881,7 @@ mod tests {
                 .map_err(|error| error.to_string())?;
         assert_eq!(gui, same);
         assert_ne!(gui, channel);
-        assert!(stable_scoped_input_id(&address(), ConversationInputSource::Tui, "").is_err());
+        assert!(stable_scoped_input_id(&address(), ConversationInputSource::Gui, "").is_err());
         Ok(())
     }
 
@@ -1564,6 +2592,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_replace_advances_revision_preserves_order_and_rejects_stale_or_active()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let service = ConversationInputService::new(Arc::new(
+            ChatEventLog::open(temp.path(), ChatEventRetention::default())
+                .map_err(|error| error.to_string())?,
+        ));
+        let first = service
+            .submit(
+                address(),
+                "replace-first".into(),
+                "first".into(),
+                Vec::new(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let _second = service
+            .submit(
+                address(),
+                "replace-second".into(),
+                "second".into(),
+                Vec::new(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let before = service.list(&address()).await.map_err(|e| e.to_string())?;
+        let replaced = service
+            .replace(
+                first.identity.clone(),
+                before.queue_revision,
+                "edited first".into(),
+                Vec::new(),
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(replaced.identity.input_id, first.identity.input_id);
+        assert_eq!(
+            replaced.identity.revision,
+            first
+                .identity
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| "test revision overflow".to_string())?
+        );
+        let after = service.list(&address()).await.map_err(|e| e.to_string())?;
+        assert_eq!(
+            after
+                .items
+                .iter()
+                .map(|item| item.receipt.identity.input_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["replace-first", "replace-second"]
+        );
+        let first_after = after
+            .items
+            .first()
+            .ok_or_else(|| "replacement disappeared".to_string())?;
+        assert_eq!(first_after.payload.text, "edited first");
+        assert_eq!(
+            first_after.receipt.identity.revision,
+            replaced.identity.revision
+        );
+        assert!(after.queue_revision > before.queue_revision);
+        assert!(matches!(
+            service
+                .replace(
+                    first.identity,
+                    before.queue_revision,
+                    "stale".into(),
+                    Vec::new(),
+                    None
+                )
+                .await,
+            Err(ConversationInputError::StaleRevision { .. })
+        ));
+        let active = service
+            .dispatch_next(&address(), "replace-active".into())
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "replacement head was not dispatchable".to_string())?;
+        assert!(matches!(
+            service
+                .replace(
+                    active.receipt.identity,
+                    after.queue_revision,
+                    "active edit".into(),
+                    Vec::new(),
+                    None,
+                )
+                .await,
+            Err(ConversationInputError::StaleRevision { .. })
+                | Err(ConversationInputError::NotDispatchable { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_replace_rejects_reordered_snapshot_and_survives_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let service = ConversationInputService::new(Arc::new(ChatEventLog::open(
+            temp.path(),
+            ChatEventRetention::default(),
+        )?));
+        let first = service
+            .submit(address(), "first".into(), "original".into(), Vec::new())
+            .await?;
+        service
+            .submit(address(), "second".into(), "second".into(), Vec::new())
+            .await?;
+        let old = service.list(&address()).await?;
+        let revision = service
+            .reorder(
+                &address(),
+                old.queue_revision,
+                vec!["second".into(), "first".into()],
+            )
+            .await?;
+        assert!(matches!(
+            service
+                .replace(
+                    first.identity.clone(),
+                    old.queue_revision,
+                    "late edit".into(),
+                    Vec::new(),
+                    None
+                )
+                .await,
+            Err(ConversationInputError::StaleRevision { .. })
+        ));
+        let edited = service
+            .replace(
+                first.identity.clone(),
+                revision,
+                "current edit 中文🙂".into(),
+                Vec::new(),
+                None,
+            )
+            .await?;
+        assert!(matches!(
+            service.cancel(first.identity).await,
+            Err(ConversationInputError::StaleRevision { .. })
+        ));
+        drop(service);
+        let reopened = ConversationInputService::new(Arc::new(ChatEventLog::open(
+            temp.path(),
+            ChatEventRetention::default(),
+        )?));
+        let restored = reopened.list(&address()).await?;
+        assert_eq!(
+            restored
+                .items
+                .iter()
+                .map(|item| item.receipt.identity.input_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "first"]
+        );
+        let restored_edit = restored
+            .items
+            .iter()
+            .find(|item| item.receipt.identity == edited.identity)
+            .ok_or("edited input missing after recovery")?;
+        assert_eq!(restored_edit.payload.text, "current edit 中文🙂");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn undrained_settlement_requeues_at_fifo_head_and_reorder_is_cas() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let service = ConversationInputService::new(Arc::new(
@@ -2069,6 +3265,304 @@ mod tests {
         assert_eq!(terminal.phase, ConversationInputPhase::TurnSettled);
         assert!(terminal.drained);
         assert_eq!(terminal.outcome, Some(ConversationInputOutcome::Dropped));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod domain_input_tests {
+    use super::*;
+
+    #[test]
+    fn queued_domain_selection_is_durable_and_part_of_payload_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let general = ConversationInputPayload::new("inspect".to_string(), Vec::new())?;
+        let unchanged =
+            ConversationInputPayload::new_with_domain("inspect".to_string(), Vec::new(), None)?;
+        assert_eq!(general.payload_sha256, unchanged.payload_sha256);
+        let domain = ConversationInputPayload::new_with_domain(
+            "inspect".to_string(),
+            Vec::new(),
+            Some("evidence-domain".to_string()),
+        )?;
+        assert_ne!(general.payload_sha256, domain.payload_sha256);
+        let restored: ConversationInputPayload =
+            serde_json::from_slice(&serde_json::to_vec(&domain)?)?;
+        assert_eq!(restored.domain_plugin.as_deref(), Some("evidence-domain"));
+        assert_eq!(restored.payload_sha256, domain.payload_sha256);
+        assert!(
+            ConversationInputPayload::new_with_domain(
+                "inspect".to_string(),
+                Vec::new(),
+                Some(String::new())
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod channel_binding_tests {
+    use super::*;
+    use crate::chat_event_log::ChatEventRetention;
+
+    #[test]
+    fn channel_typescript_tags_match_serialized_wire() -> Result<(), Box<dyn std::error::Error>> {
+        let context = <FrozenChannelContext as ts_rs::TS>::decl();
+        assert!(context.contains(r#""kind": "absent""#));
+        assert!(context.contains(r#""kind": "reference""#));
+        assert!(context.contains(r#""reference": ChannelContextReference"#));
+        assert_eq!(
+            serde_json::to_value(FrozenChannelContext::Absent)?,
+            serde_json::json!({ "kind": "absent" }),
+        );
+        let intent = <ChannelExecutionIntent as ts_rs::TS>::decl();
+        assert!(intent.contains(r#""kind": "chat""#));
+        assert!(intent.contains(r#""kind": "resume""#));
+        assert!(intent.contains("expected: TaskRunResumeIdentity"));
+        assert!(intent.contains("driver_continuation_enabled: boolean"));
+        assert_eq!(
+            serde_json::to_value(ChannelExecutionIntent::Chat)?,
+            serde_json::json!({ "kind": "chat" }),
+        );
+        Ok(())
+    }
+
+    fn binding() -> ChannelInputBinding {
+        ChannelInputBinding {
+            version: 1,
+            channel_id: "weixin".into(),
+            account_id: "账户🙂".into(),
+            credential_generation: "credential-generation".into(),
+            peer_id: "原联系人".into(),
+            provider_message_id: "provider-original".into(),
+            workspace_generation: "global".into(),
+            context: FrozenChannelContext::Absent,
+            execution: ChannelExecutionIntent::Chat,
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_replace_cannot_erase_original_channel_route()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let address = ConversationInputAddress {
+            workspace_id: "global".into(),
+            conversation_id: "channel-origin".into(),
+        };
+        let service = ConversationInputService::new(Arc::new(ChatEventLog::open(
+            temp.path(),
+            ChatEventRetention::default(),
+        )?));
+        let original = service
+            .submit_channel(
+                address.clone(),
+                "channel-input".into(),
+                "原消息".into(),
+                Vec::new(),
+                None,
+                binding(),
+            )
+            .await?;
+        assert!(matches!(
+            service
+                .replace(
+                    original.identity.clone(),
+                    original.queue_revision,
+                    "edited".into(),
+                    Vec::new(),
+                    None
+                )
+                .await,
+            Err(ConversationInputError::StaleRevision { .. })
+        ));
+        let frontier = service.list(&address).await?;
+        assert_eq!(frontier.queue_revision, original.queue_revision);
+        let saved = frontier.items.first().ok_or("channel input disappeared")?;
+        assert_eq!(saved.receipt.identity, original.identity);
+        assert_eq!(saved.payload.channel_binding.as_ref(), Some(&binding()));
+        assert_eq!(saved.payload.text, "原消息");
+        Ok(())
+    }
+
+    #[test]
+    fn optional_binding_preserves_both_original_domain_digests()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for plugin in [None, Some("research".to_string())] {
+            let payload = ConversationInputPayload::new_with_domain(
+                "中文🙂".into(),
+                Vec::new(),
+                plugin.clone(),
+            )?;
+            let expected = match plugin.as_deref() {
+                None => echo_agent::utils::canonical_json::canonical_json_bytes(&(
+                    "中文🙂",
+                    Vec::<crate::types::AttachmentData>::new(),
+                ))?,
+                Some(plugin) => echo_agent::utils::canonical_json::canonical_json_bytes(&(
+                    "中文🙂",
+                    Vec::<crate::types::AttachmentData>::new(),
+                    plugin,
+                ))?,
+            };
+            assert_eq!(
+                payload.payload_sha256,
+                format!("{:x}", Sha256::digest(expected))
+            );
+            assert!(
+                serde_json::to_value(payload)?
+                    .get("channel_binding")
+                    .is_none()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn channel_digest_covers_address_domain_and_every_frozen_field()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let address = ConversationInputAddress {
+            workspace_id: "global".into(),
+            conversation_id: "原会话".into(),
+        };
+        let original = ConversationInputPayload::new_for_channel(
+            &address,
+            "原消息🙂".into(),
+            Vec::new(),
+            Some("research".into()),
+            binding(),
+        )?;
+        original.validate_channel_digest(&address)?;
+        let encoded = serde_json::to_value(original.channel_binding.as_ref())?;
+        for field in [
+            "version",
+            "channel_id",
+            "account_id",
+            "credential_generation",
+            "peer_id",
+            "provider_message_id",
+            "workspace_generation",
+            "context",
+            "execution",
+        ] {
+            let mut changed = encoded.clone();
+            if let Some(object) = changed.as_object_mut() {
+                object.remove(field);
+            }
+            assert!(
+                serde_json::from_value::<ChannelInputBinding>(changed).is_err(),
+                "missing {field} must not default"
+            );
+        }
+        let mut altered = original.clone();
+        altered.domain_plugin = Some("analysis".into());
+        assert!(altered.validate_channel_digest(&address).is_err());
+        let elsewhere = ConversationInputAddress {
+            workspace_id: "other".into(),
+            ..address.clone()
+        };
+        assert!(original.validate_channel_digest(&elsewhere).is_err());
+        let mut altered = original.clone();
+        if let Some(binding) = altered.channel_binding.as_mut() {
+            binding.provider_message_id.push_str("-changed");
+        }
+        assert!(altered.validate_channel_digest(&address).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn full_resume_identity_and_independent_driver_switch_round_trip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tasks::task_runtime::{
+            ProjectExecutionBinding, TaskRunExecutionProfile, TaskRunResumeIdentity,
+        };
+        let created_at =
+            chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).ok_or("timestamp unavailable")?;
+        let expected = TaskRunResumeIdentity {
+            run_id: "run-original".into(),
+            workspace_id: "workspace-original".into(),
+            conversation_id: "conversation-original".into(),
+            root_message_id: "root-original".into(),
+            created_at,
+            goal_revision: 7,
+            journal_sequence: 19,
+            continuation_enabled: false,
+            execution_profile: TaskRunExecutionProfile::conversation_turn()
+                .with_subagent_depth_limit(crate::subagent_policy::SubagentDepthLimit::new(2)?),
+            project_binding: Some(ProjectExecutionBinding {
+                workspace_id: "workspace-original".into(),
+                location_sha256: "original-location".into(),
+                revision: 3,
+            }),
+        };
+        let mut frozen = binding();
+        frozen.execution = ChannelExecutionIntent::Resume {
+            expected: expected.clone(),
+            driver_continuation_enabled: true,
+        };
+        let address = ConversationInputAddress {
+            workspace_id: "workspace-original".into(),
+            conversation_id: "conversation-original".into(),
+        };
+        let original = ConversationInputPayload::new_for_channel(
+            &address,
+            "/task-run resume run-original".into(),
+            Vec::new(),
+            Some("research".into()),
+            frozen,
+        )?;
+        let restored: ConversationInputPayload =
+            serde_json::from_value(serde_json::to_value(&original)?)?;
+        restored.validate_channel_digest(&address)?;
+        match restored
+            .channel_binding
+            .as_ref()
+            .map(|binding| &binding.execution)
+        {
+            Some(ChannelExecutionIntent::Resume {
+                expected: restored,
+                driver_continuation_enabled,
+            }) => {
+                assert_eq!(restored, &expected);
+                assert!(*driver_continuation_enabled);
+                assert!(!restored.continuation_enabled);
+            }
+            _ => return Err("resume intent was flattened or lost".into()),
+        }
+        let mut changed = restored;
+        if let Some(ChannelInputBinding {
+            execution: ChannelExecutionIntent::Resume { expected, .. },
+            ..
+        }) = changed.channel_binding.as_mut()
+        {
+            expected.journal_sequence = expected.journal_sequence.saturating_add(1);
+        }
+        assert!(changed.validate_channel_digest(&address).is_err());
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[test]
+    fn provider_context_projection_is_lossless_and_contains_no_token()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider = echo_agent::channels::weixin::WeixinContextRef {
+            account_id: "账户🙂".into(),
+            generation: "generation".into(),
+            peer: "peer".into(),
+            reference: "opaque-original-reference".into(),
+        };
+        let metadata = ChannelContextReference::from(provider.clone());
+        let roundtrip = echo_agent::channels::weixin::WeixinContextRef::from(metadata.clone());
+        assert_eq!(provider, roundtrip);
+        let wire = serde_json::to_value(FrozenChannelContext::Reference(metadata))?;
+        let reference = wire
+            .get("reference")
+            .and_then(serde_json::Value::as_object)
+            .ok_or("reference missing")?;
+        assert_eq!(reference.len(), 4);
+        assert!(reference.get("token").is_none());
+        assert!(reference.get("context_token").is_none());
         Ok(())
     }
 }

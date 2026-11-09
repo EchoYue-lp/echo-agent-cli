@@ -163,11 +163,24 @@ impl TaskRuntimeStore {
         &self,
         request: &OccurrenceRunRequest,
     ) -> Result<(TaskRun, bool), StoreError> {
+        self.get_or_create_occurrence_run_with_weixin(request, None)
+    }
+
+    /// Freeze a configured direct destination in the original admission frame.
+    /// Re-delivery reads the first frame and never changes its target.
+    pub fn get_or_create_occurrence_run_with_weixin(
+        &self,
+        request: &OccurrenceRunRequest,
+        notification: Option<&super::weixin_delivery::WeixinDeliveryTarget>,
+    ) -> Result<(TaskRun, bool), StoreError> {
+        if let Some(target) = notification {
+            target.validate_for_occurrence(&request.identity)?;
+        }
         request.identity.validate()?;
         let run_id = request.identity.run_id();
         // `create_run_with_profile_result` takes the run lock itself; do not
         // hold it here (the lock is not reentrant).
-        self.create_run_with_profile_result(
+        self.create_run_with_profile_and_notification_result(
             &run_id,
             &request.identity.workspace_id,
             &request.conversation_id,
@@ -177,6 +190,8 @@ impl TaskRuntimeStore {
             &request.route,
             request.attended_mode,
             request.execution_profile,
+            notification,
+            Some(&request.identity),
         )
     }
 }

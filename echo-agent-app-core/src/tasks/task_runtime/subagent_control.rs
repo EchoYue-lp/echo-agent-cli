@@ -837,6 +837,17 @@ impl TaskRuntimeStore {
         target: &SubagentControlIdentity,
         executor: &SubagentExecutor,
     ) -> Result<usize, StoreError> {
+        // 与本次派发使用同一 durable identity 投影；不能把有 Run 的应用指导
+        // 放进框架原 None/None 队列，否则共享 registry 会跨运行串流。
+        let attempt = target
+            .attempt_identity()
+            .map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
+        let scope_id = attempt.control_scope_id.as_deref().ok_or_else(|| {
+            StoreError::InvalidPlan("Subagent guidance target has no control scope".to_string())
+        })?;
+        let run_id = attempt.run_id.as_deref().ok_or_else(|| {
+            StoreError::InvalidPlan("Subagent guidance target has no Run identity".to_string())
+        })?;
         self.with_run_lock(&target.run_id, || {
             // Audit allowlist: queued guidance transfer folds the complete
             // durable command journal for one logical attempt.
@@ -885,7 +896,13 @@ impl TaskRuntimeStore {
                     .and_then(serde_json::Value::as_str)
                     .and_then(parse_actor_source)
                     .unwrap_or(SubagentControlActorSource::Cli);
-                match executor.queue_guidance(&target.task_id, target.attempt, instruction) {
+                match executor.queue_guidance_scoped(
+                    scope_id,
+                    run_id,
+                    &attempt.task_id,
+                    attempt.attempt,
+                    instruction,
+                ) {
                     Ok(receipt) => {
                         append_guidance_event(
                             self,
@@ -1945,9 +1962,11 @@ pub(crate) fn attempt_identity(
         attempt,
         command_id: String::new(),
     };
-    let framework =
-        SubagentAttemptIdentity::new(task_id.to_string(), execution_id.to_string(), attempt)
-            .map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
+    // 命令尚未发出时保留空 command_id；只复用既有 attempt 投影，完整保留
+    // 同一个 TaskRun 的 Run/scope，不重建无 Run 的逻辑尝试身份。
+    let framework = identity
+        .attempt_identity()
+        .map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
     Ok((identity, framework))
 }
 
@@ -2041,6 +2060,78 @@ mod tests {
             self.execute_stream_with_cancel("", cancel)
         }
 
+        fn execute_stream_message_with_invocation_context<'a>(
+            &'a self,
+            message: echo_agent::prelude::Message,
+            cancel: echo_agent::agent::CancellationToken,
+            invocation: echo_agent::agent::AgentInvocationContext,
+        ) -> futures::future::BoxFuture<
+            'a,
+            echo_agent::error::Result<
+                futures::stream::BoxStream<
+                    'a,
+                    echo_agent::error::Result<echo_agent::agent::AgentEvent>,
+                >,
+            >,
+        > {
+            Box::pin(async move {
+                use echo_agent::agent::{
+                    AgentEvent, AgentPhase, ExecutionStatus, ExecutionStatusKind,
+                };
+                let execution = invocation
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.execution_id.clone())
+                    .ok_or_else(|| {
+                        echo_agent::error::ReactError::Other(
+                            "slow fixture needs its admitted execution identity".to_string(),
+                        )
+                    })?;
+                // This is the original test source: retain the whole typed invocation through physical EOF.
+                let source = futures::stream::unfold(
+                    (0_u8, message, invocation, cancel, execution),
+                    |(step, message, invocation, cancel, execution)| async move {
+                        let event = match step {
+                            0 => AgentEvent::ExecutionStatus(ExecutionStatus {
+                                adapter_generated: false,
+                                execution_id: execution.clone(),
+                                request_id: None,
+                                sequence: 0,
+                                phase: AgentPhase::Thinking,
+                                status: ExecutionStatusKind::Started,
+                                reason: None,
+                            }),
+                            1 => {
+                                cancel.cancelled().await;
+                                AgentEvent::ExecutionStatus(ExecutionStatus {
+                                    adapter_generated: false,
+                                    execution_id: execution.clone(),
+                                    request_id: None,
+                                    sequence: 1,
+                                    phase: AgentPhase::Terminal,
+                                    status: ExecutionStatusKind::Cancelled,
+                                    reason: None,
+                                })
+                            }
+                            2 => AgentEvent::Cancelled,
+                            _ => return None,
+                        };
+                        Some((
+                            Ok(event),
+                            (
+                                step.saturating_add(1),
+                                message,
+                                invocation,
+                                cancel,
+                                execution,
+                            ),
+                        ))
+                    },
+                );
+                Ok(Box::pin(source) as futures::stream::BoxStream<'a, _>)
+            })
+        }
+
         fn steer_input(
             &self,
             expected_turn_id: Option<&str>,
@@ -2129,6 +2220,8 @@ mod tests {
             .collect();
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+
                 plan_id: format!("plan-{run_id}"),
                 run_id: run_id.to_string(),
                 revision: 1,
@@ -2188,6 +2281,360 @@ mod tests {
             attempt,
             command_id: command_id.to_string(),
         }
+    }
+
+    fn identity_probe_request() -> echo_agent::subagent::DispatchRequest {
+        echo_agent::subagent::DispatchRequest {
+            agent_name: "identity-probe".to_string(),
+            task: "执行同一逻辑任务".to_string(),
+            mode_override: Some(echo_agent::subagent::ExecutionMode::Sync),
+            cancel: echo_agent::agent::CancellationToken::new(),
+            parent_agent: "shared-primary".to_string(),
+            parent_context: None,
+            delegation_policy: echo_agent::subagent::DispatchRequest::policy_from_depth(0),
+            runtime_context: None,
+            message: None,
+            prompt_payload: None,
+            prompt_context: None,
+            constraints: Vec::new(),
+            background: false,
+        }
+    }
+
+    async fn identity_probe_executor() -> (SubagentExecutor, echo_agent::testing::MockAgent) {
+        let registry = Arc::new(echo_agent::subagent::SubagentRegistry::new());
+        let probe =
+            echo_agent::testing::MockAgent::new("identity-probe").with_default_success("已完成");
+        registry
+            .register(
+                echo_agent::subagent::SubagentDefinition::new("identity-probe", "运行身份探针"),
+                Box::new(probe.clone()),
+            )
+            .await;
+        (
+            SubagentExecutor::new(
+                registry,
+                echo_agent::subagent::SubagentExecutorConfig::default(),
+            ),
+            probe,
+        )
+    }
+
+    #[tokio::test]
+    async fn application_attempt_helper_isolates_settled_runs_and_rejects_duplicates()
+    -> Result<(), String> {
+        let (executor, probe) = identity_probe_executor().await;
+        let (_, first) = attempt_identity("run-a", "same-task", "claim-a", 1, 1)
+            .map_err(|error| error.to_string())?;
+        executor
+            .dispatch_attempt(identity_probe_request(), first)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        // 使用真实应用 helper 和同一个 control registry；前一 Run 的 settled
+        // 去重记录保留，后一 Run 只改变其原始 claim/execution 与 Run 身份。
+        let (_, second) = attempt_identity("run-b", "same-task", "claim-b", 1, 1)
+            .map_err(|error| error.to_string())?;
+        let result = executor
+            .dispatch_attempt(identity_probe_request(), second)
+            .await;
+        assert!(
+            result.is_ok(),
+            "不同 Run 不得碰撞旧 settled attempt: {result:?}"
+        );
+        assert_eq!(probe.call_count(), 2);
+
+        for execution in ["claim-b", "claim-b-duplicate"] {
+            let (_, repeated) = attempt_identity("run-b", "same-task", execution, 1, 1)
+                .map_err(|error| error.to_string())?;
+            assert!(
+                executor
+                    .dispatch_attempt(identity_probe_request(), repeated)
+                    .await
+                    .is_err(),
+                "同一 Run 的同一逻辑 attempt 只能准入一次"
+            );
+        }
+        let (_, wrong_execution_owner) = attempt_identity("run-c", "same-task", "claim-a", 1, 1)
+            .map_err(|error| error.to_string())?;
+        assert!(
+            executor
+                .dispatch_attempt(identity_probe_request(), wrong_execution_owner)
+                .await
+                .is_err(),
+            "已使用 execution 不能改绑到其它 Run"
+        );
+        assert_eq!(probe.call_count(), 2, "拒绝路径不能调用子 Agent");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn application_attempt_helper_isolates_simultaneously_active_runs() -> Result<(), String>
+    {
+        let registry = Arc::new(echo_agent::subagent::SubagentRegistry::new());
+        registry
+            .register(
+                echo_agent::subagent::SubagentDefinition::new("identity-probe", "活跃身份探针"),
+                Box::new(SteerableSlowAgent {
+                    steer_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    settle: None,
+                }),
+            )
+            .await;
+        let executor = SubagentExecutor::new(
+            registry.clone(),
+            echo_agent::subagent::SubagentExecutorConfig::default(),
+        );
+        let (_, first_identity) = attempt_identity("active-a", "same-task", "active-claim-a", 1, 1)
+            .map_err(|error| error.to_string())?;
+        let first = executor
+            .dispatch_background_attempt(identity_probe_request(), first_identity)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (_, second_identity) =
+            attempt_identity("active-b", "same-task", "active-claim-b", 1, 1)
+                .map_err(|error| error.to_string())?;
+        let second = executor
+            .dispatch_background_attempt(identity_probe_request(), second_identity)
+            .await;
+        let second_error = second.as_ref().err().map(ToString::to_string);
+        let active = registry.control_registry().active_snapshot(8);
+        let (_, duplicate_identity) =
+            attempt_identity("active-a", "same-task", "active-claim-duplicate", 1, 1)
+                .map_err(|error| error.to_string())?;
+        let duplicate = executor
+            .dispatch_background_attempt(identity_probe_request(), duplicate_identity)
+            .await;
+        let duplicate_rejected = duplicate.is_err();
+
+        // 红版也先取消并真实 join 所有已启动 owner，再报告断言失败，避免测试
+        // 自己遗留后台执行。这里没有等待第二个 Run 自然结束来绕过冲突。
+        for handle in [Some(first), second.ok(), duplicate.ok()]
+            .into_iter()
+            .flatten()
+        {
+            handle.cancel();
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), handle.join())
+                .await
+                .map_err(|_| "身份探针取消后没有真实结算".to_string())?;
+            match outcome {
+                Ok(result) => assert_eq!(
+                    result.outcome.status,
+                    echo_agent::subagent::SubagentStatus::Cancelled,
+                    "真实取消结果可以成功返回 typed Cancelled，但不能是成功执行"
+                ),
+                Err(error) => assert!(
+                    !matches!(
+                        error,
+                        echo_agent::error::ReactError::ExecutionNotSettled { .. }
+                    ),
+                    "取消必须取得真实物理结算，不能遗留未知 owner"
+                ),
+            }
+        }
+        assert!(
+            second_error.is_none(),
+            "不同 Run 不得碰撞活跃 attempt: {second_error:?}"
+        );
+        assert!(duplicate_rejected, "同 Run 的重复活跃 attempt 必须拒绝");
+        let actual = active
+            .iter()
+            .map(|attempt| attempt.execution_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            actual,
+            std::collections::HashSet::from(["active-claim-a", "active-claim-b"])
+        );
+        assert!(registry.control_registry().active_snapshot(8).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn application_attempt_helper_rejects_empty_run_and_invalid_attempt_identity()
+    -> Result<(), String> {
+        for (run, task, execution, attempt) in [
+            (" ", "task", "claim", 1),
+            ("run", " ", "claim", 1),
+            ("run", "task", " ", 1),
+            ("run", "task", "claim", 0),
+        ] {
+            assert!(attempt_identity(run, task, execution, 1, attempt).is_err());
+        }
+        let (durable, projected) =
+            attempt_identity("run", "task", "claim", 1, 1).map_err(|error| error.to_string())?;
+        assert!(durable.command_id.is_empty(), "尚未发出的控制命令不虚构 ID");
+        assert_eq!(projected.run_id.as_deref(), Some("run"));
+        assert_eq!(projected.control_scope_id.as_deref(), Some("run"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_guidance_transfer_isolated_by_run_scope_and_consumed_once()
+    -> Result<(), String> {
+        let store = store_with_plan("guidance-a", &["task-1"])?;
+        seed_plan(&store, "guidance-b", &["task-1"])?;
+        let service = SubagentControlService::new(store.clone());
+        let (executor, probe) = identity_probe_executor().await;
+        let mut targets = Vec::new();
+        for (run, instruction) in [
+            ("guidance-a", "只处理甲的指导"),
+            ("guidance-b", "只处理乙的指导"),
+        ] {
+            let command = identity(run, "task-1", 1, "same-command");
+            let queued = service
+                .queue_guidance(
+                    command.clone(),
+                    instruction,
+                    SubagentControlActorSource::Gui,
+                )
+                .map_err(|error| error.to_string())?;
+            assert_eq!(queued.status, SubagentControlStatus::Pending);
+            let replay = service
+                .queue_guidance(
+                    command.clone(),
+                    instruction,
+                    SubagentControlActorSource::Gui,
+                )
+                .map_err(|error| error.to_string())?;
+            assert!(replay.duplicate);
+            assert!(
+                service
+                    .queue_guidance(command.clone(), "冲突重放", SubagentControlActorSource::Gui)
+                    .is_err()
+            );
+            assert!(
+                service
+                    .queue_guidance(
+                        SubagentControlIdentity {
+                            plan_revision: 2,
+                            command_id: "stale-revision".to_string(),
+                            ..command.clone()
+                        },
+                        "过期修订指导",
+                        SubagentControlActorSource::Gui,
+                    )
+                    .is_err()
+            );
+            let target = SubagentControlIdentity {
+                execution_id: format!("{run}:task-1:1:1:claim"),
+                command_id: String::new(),
+                ..command
+            };
+            assert_eq!(
+                store
+                    .deliver_pending_subagent_guidance(&target, &executor)
+                    .map_err(|error| error.to_string())?,
+                1
+            );
+            assert_eq!(
+                store
+                    .deliver_pending_subagent_guidance(&target, &executor)
+                    .map_err(|error| error.to_string())?,
+                0
+            );
+            let stale_target = SubagentControlIdentity {
+                plan_revision: 2,
+                ..target.clone()
+            };
+            assert_eq!(
+                store
+                    .deliver_pending_subagent_guidance(&stale_target, &executor)
+                    .map_err(|error| error.to_string())?,
+                0
+            );
+            targets.push(target);
+        }
+
+        // Scope 和 Run 分开控制；另一个合法 scope 不能取走当前 Run 的指导。
+        let first = targets
+            .first()
+            .ok_or_else(|| "首个指导目标缺失".to_string())?;
+        let mut other_scope = first
+            .attempt_identity()
+            .map_err(|error| error.to_string())?;
+        other_scope.control_scope_id = Some("other-scope".to_string());
+        other_scope.execution_id = "other-scope-execution".to_string();
+        executor
+            .dispatch_attempt(identity_probe_request(), other_scope)
+            .await
+            .map_err(|error| error.to_string())?;
+        let observed = probe
+            .last_task()
+            .ok_or_else(|| "scope 探针没有执行".to_string())?;
+        assert!(!observed.contains("只处理甲的指导") && !observed.contains("只处理乙的指导"));
+
+        executor
+            .queue_guidance("task-1", 1, "原 unscoped 指导")
+            .map_err(|error| error.to_string())?;
+        let legacy = SubagentAttemptIdentity::new("task-1", "legacy-execution", 1)
+            .map_err(|error| error.to_string())?;
+        executor
+            .dispatch_attempt(identity_probe_request(), legacy)
+            .await
+            .map_err(|error| error.to_string())?;
+        let observed = probe
+            .last_task()
+            .ok_or_else(|| "legacy 探针没有执行".to_string())?;
+        assert_eq!(observed.matches("原 unscoped 指导").count(), 1);
+        assert!(!observed.contains("只处理甲的指导") && !observed.contains("只处理乙的指导"));
+
+        for target in targets {
+            let instruction = if target.run_id == "guidance-a" {
+                "只处理甲的指导"
+            } else {
+                "只处理乙的指导"
+            };
+            let other = if target.run_id == "guidance-a" {
+                "只处理乙的指导"
+            } else {
+                "只处理甲的指导"
+            };
+            let framework = target
+                .attempt_identity()
+                .map_err(|error| error.to_string())?;
+            executor
+                .dispatch_attempt(identity_probe_request(), framework.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            let observed = probe
+                .last_task()
+                .ok_or_else(|| "指导探针没有执行".to_string())?;
+            assert_eq!(observed.matches(instruction).count(), 1);
+            assert!(!observed.contains(other) && !observed.contains("原 unscoped 指导"));
+            assert!(
+                executor
+                    .dispatch_attempt(identity_probe_request(), framework.clone())
+                    .await
+                    .is_err()
+            );
+            let mut next = framework;
+            next.attempt = 2;
+            next.execution_id = format!("{}:task-1:1:2:claim", target.run_id);
+            executor
+                .dispatch_attempt(identity_probe_request(), next)
+                .await
+                .map_err(|error| error.to_string())?;
+            let observed = probe
+                .last_task()
+                .ok_or_else(|| "后继探针没有执行".to_string())?;
+            assert!(!observed.contains(instruction) && !observed.contains(other));
+            let events = store
+                .list_events(&target.run_id, 0)
+                .map_err(|error| error.to_string())?;
+            for kind in [
+                RuntimeEventKind::SubagentGuidanceQueued,
+                RuntimeEventKind::SubagentGuidanceMailboxAccepted,
+            ] {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event.event_type == kind)
+                        .count(),
+                    1
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]

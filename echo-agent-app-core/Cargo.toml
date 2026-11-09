@@ -4,11 +4,12 @@ version = "1.0.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
-description = "Shared state and infrastructure for EKO"
+description = "Shared state and infrastructure for Eclip"
 
 [dependencies]
+qrcodegen = { version = "=1.8.0", optional = true, default-features = false }
 echo-agent = { version = "0.2", package = "echo_agent", path = "../../echo-agent", default-features = false, features = [
-    "mcp", "lsp", "human-loop", "subagent", "git",
+    "mcp", "human-loop", "subagent", "git",
     "shell", "files", "web",
     "chart", "research", "media",
     "rag", "project-rules",
@@ -28,6 +29,7 @@ base64 = "0.22"
 serde_yaml = { package = "yaml_serde", version = "0.10.7" }
 dashmap = "6"
 portable-pty = "0.9"
+openssh-sftp-client = { version = "=0.15.10", default-features = false }
 config = "0.14"
 notify = "8.2"
 tokio-util = "0.7"
@@ -46,7 +48,11 @@ axum = { version = "0.7" }
 nu-ansi-term = "0.50"
 tempfile = "3"  # Sprint 10: EkoDataWorkspaceFactory per-subagent tmpdir (was dev-only)
 
+async-stream = { version = "0.3", optional = true }
+shell-words = { version = "1", optional = true }
+
 [features]
+channels = ["echo-agent/channels", "dep:async-stream", "dep:shell-words", "dep:qrcodegen"]
 telemetry = ["echo-agent/telemetry"]
 test-utils = []
 
@@ -55,3 +61,16 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("__ts_rs")
 
 [dev-dependencies]
 echo-agent = { version = "0.2", package = "echo_agent", path = "../../echo-agent", default-features = false, features = ["testing"] }
+# Activate only for consumer tests; use the existing echo-agent channel reexport.
+echo_integration = { version = "0.2", path = "../../echo-agent/echo-integration", default-features = false, features = ["channel-test-support"] }
+
+# 两个原耐久历史压力用例各占一个 target；完整 workspace 测试仍必须执行。
+[[test]]
+name = "native_presentation_retention"
+path = "tests/native_presentation_retention.rs"
+required-features = ["test-utils"]
+
+[[test]]
+name = "native_usage_retention"
+path = "tests/native_usage_retention.rs"
+required-features = ["test-utils"]

@@ -1,6 +1,7 @@
 import { useState } from 'react';
-import { Sparkles, AlertCircle } from 'lucide-react';
+import { AlertCircle } from 'lucide-react';
 import { useAuthStore } from '../../stores/authStore';
+import { BrandIcon } from '../common/BrandIcon';
 
 export function LoginForm() {
   const [username, setUsername] = useState('');
@@ -27,15 +28,14 @@ export function LoginForm() {
       <div className="glass animate-fade-up relative z-10 w-full max-w-sm rounded-xl p-8 shadow-[var(--shadow-xl)]">
         {/* Brand */}
         <div className="mb-8 flex flex-col items-center">
-          <div
-            className="animate-glow-pulse mb-4 flex h-[64px] w-[64px] items-center justify-center rounded-xl"
-            style={{
-              background: 'linear-gradient(135deg, var(--accent) 0%, var(--color-purple) 100%)',
-            }}
-          >
-            <Sparkles size={28} color="white" />
+          <div className="mb-4">
+            <BrandIcon size="lg" />
           </div>
-          <h1 className="text-xl font-semibold tracking-tight text-[var(--text-primary)]">EKO</h1>
+          <h1 className="text-xl font-semibold tracking-tight text-[var(--text-primary)]">Eclip</h1>
+          <p className="mt-1 text-sm text-[var(--text-tertiary)]" aria-label="品牌读音">
+            /ˈɛk.lɪp/
+          </p>
+          <p className="mt-2 text-sm text-[var(--text-secondary)]">听见你的声音，让想法飞跃。</p>
           <p className="mt-1 text-sm text-[var(--text-secondary)]">登录以继续使用</p>
         </div>
 

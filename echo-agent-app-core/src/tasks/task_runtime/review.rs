@@ -82,17 +82,18 @@ pub async fn review_task(
     run_id: &str,
     task: &PlanTask,
     subagent_output: &str,
+    binding: Option<&crate::domain_plugin::DomainBinding>,
 ) -> Result<ReviewResult, ReviewError> {
-    let template = ProfileTemplate::for_profile(task.domain_profile);
+    let template = ProfileTemplate::general();
     let prompt = build_review_prompt(task, subagent_output, template);
+    let system_prompt = binding.map_or_else(|| review_preamble(template), |binding| {
+        format!("{}\n\n{}\nApply the fixed domain methodology to this task's assigned scope. Its typed task criteria own the graph's assigned obligations; do not invent another completion authority.", review_preamble(template), binding.prompt_instructions())
+    });
 
     // (stage4 P4.1) cache_user_id single source — read directly.
     let cache_user_id = crate::infra::load_or_create_cache_user_id();
     let request = ChatRequest {
-        messages: vec![
-            Message::system(review_preamble(template)),
-            Message::user(prompt),
-        ],
+        messages: vec![Message::system(system_prompt), Message::user(prompt)],
         response_format: Some(ResponseFormat::JsonObject),
         user_id: Some(cache_user_id),
         ..Default::default()
@@ -249,6 +250,9 @@ pub fn build_fix_task(original: &PlanTask, review: &ReviewResult) -> PlanTask {
         .collect::<Vec<_>>()
         .join("\n");
     PlanTask {
+        domain_binding: original.domain_binding.clone(),
+        domain_role: original.domain_role.clone(),
+
         // Keep the SAME id so downstream depends_on keeps pointing at it; the
         // retry_count bump tracks how many times this node has been retried.
         id: original.id.clone(),

@@ -222,10 +222,49 @@ impl WorkspaceKind {
     }
 }
 
+/// Authoritative project location. EKO state remains at `Workspace::root`.
+///
+/// Remote paths deliberately stay strings: local path resolution must never
+/// reinterpret a remote directory or resolve a same-named local checkout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectLocation {
+    Local {
+        path: PathBuf,
+    },
+    Ssh {
+        host: String,
+        user: Option<String>,
+        port: Option<u16>,
+        path: String,
+    },
+}
+
+/// Creation intent, consumed once by the existing workspace lifecycle owner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectSource {
+    ExistingLocal {
+        path: PathBuf,
+    },
+    NewLocal {
+        parent: PathBuf,
+        directory_name: String,
+    },
+    Ssh {
+        host: String,
+        user: Option<String>,
+        port: Option<u16>,
+        path: String,
+        /// Ephemeral TerminalService owner; never persisted in the manifest.
+        connection_id: String,
+    },
+}
+
 // ── WorkspaceMetadata ───────────────────────────────────────────────
 
 /// 工作区元数据。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceMetadata {
     /// 描述信息。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -240,6 +279,26 @@ pub struct WorkspaceMetadata {
     /// second generation store.
     #[serde(default)]
     pub project_root_revision: u64,
+    /// 当前 manifest 必须显式记录用户选择的位置，与 revision 归同一 registry 权威。
+    /// 不从产品数据目录或旧 project_root 推断缺失的位置。
+    pub project_location: ProjectLocation,
+    /// Verified execution identity for indirect locations (SSH config aliases
+    /// and remote paths). It is published atomically with the user location
+    /// and the existing revision, never reconstructed from a socket name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_execution_location: Option<ProjectLocation>,
+}
+
+impl WorkspaceMetadata {
+    pub fn new(project_location: ProjectLocation) -> Self {
+        Self {
+            description: None,
+            tags: Vec::new(),
+            project_root_revision: 0,
+            project_location,
+            project_execution_location: None,
+        }
+    }
 }
 
 // ── Workspace ───────────────────────────────────────────────────────
@@ -262,7 +321,6 @@ pub struct Workspace {
     /// 工作区类型。
     pub kind: WorkspaceKind,
     /// 元数据。
-    #[serde(default)]
     pub metadata: WorkspaceMetadata,
     /// Backend-issued opaque incarnation token for product-data IPC.
     ///
@@ -279,6 +337,26 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    pub fn project_location(&self) -> ProjectLocation {
+        self.metadata.project_location.clone()
+    }
+
+    /// A local project path is only available for a local location. Remote
+    /// consumers must select the host's transport, never fall back to root.
+    pub fn local_project_root(&self) -> Option<PathBuf> {
+        match self.project_location() {
+            ProjectLocation::Local { path } => Some(path),
+            ProjectLocation::Ssh { .. } => None,
+        }
+    }
+
+    pub fn execution_location(&self) -> ProjectLocation {
+        self.metadata
+            .project_execution_location
+            .clone()
+            .unwrap_or_else(|| self.project_location())
+    }
+
     /// 更新最后活跃时间为当前时间。
     pub fn touch(&mut self) {
         self.last_active = Utc::now();
@@ -416,7 +494,9 @@ mod tests {
             root: PathBuf::from("/tmp/test"),
             project_root: None,
             kind: WorkspaceKind::General,
-            metadata: WorkspaceMetadata::default(),
+            metadata: WorkspaceMetadata::new(crate::workspace::ProjectLocation::Local {
+                path: PathBuf::from("/tmp/test"),
+            }),
             product_data_generation: String::new(),
             created_at: Utc::now(),
             last_active: Utc::now(),
@@ -437,7 +517,7 @@ mod tests {
                 "name": "Timezone",
                 "root": "/tmp/timezone",
                 "kind": { "type": "general" },
-                "metadata": { "tags": [], "project_root_revision": 7 },
+                "metadata": { "tags": [], "project_root_revision": 7, "project_location": { "kind":"local", "path":"/tmp/timezone" } },
                 "product_data_generation": "forged-or-stale-token",
                 "created_at": created_at,
                 "last_active": created_at
@@ -458,6 +538,71 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(utc.product_data_generation.as_str())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_requires_explicit_current_project_location() -> anyhow::Result<()> {
+        let mut value = serde_json::json!({
+            "id":"current", "name":"Current", "root":"/local/product-data", "project_root":"/local/code",
+            "kind":{"type":"general"}, "metadata":{"tags":[],"project_root_revision":0},
+            "created_at":"2026-10-28T00:00:00Z", "last_active":"2026-10-28T00:00:00Z"
+        });
+        assert!(serde_json::from_value::<Workspace>(value.clone()).is_err());
+        let metadata = value
+            .get_mut("metadata")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| anyhow::anyhow!("metadata missing"))?;
+        metadata.insert(
+            "project_location".into(),
+            serde_json::json!({"kind":"local","path":"/explicit/code"}),
+        );
+        let workspace: Workspace = serde_json::from_value(value)?;
+        assert_eq!(
+            workspace.project_location(),
+            ProjectLocation::Local {
+                path: PathBuf::from("/explicit/code")
+            }
+        );
+        assert_eq!(workspace.root, PathBuf::from("/local/product-data"));
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_manifest_round_trip_preserves_raw_configuration_and_verified_identity()
+    -> anyhow::Result<()> {
+        let raw = ProjectLocation::Ssh {
+            host: "my-alias".to_string(),
+            user: None,
+            port: None,
+            path: "~/代码/../project".to_string(),
+        };
+        let actual = ProjectLocation::Ssh {
+            host: "resolved.example".to_string(),
+            user: Some("echo".to_string()),
+            port: Some(2222),
+            path: "/srv/project".to_string(),
+        };
+        let timestamp =
+            chrono::DateTime::parse_from_rfc3339("2026-08-24T00:00:00Z")?.with_timezone(&Utc);
+        let mut workspace = Workspace {
+            id: WorkspaceId::from_raw("remote".to_string()),
+            name: "Remote".to_string(),
+            root: PathBuf::from("/local/data"),
+            project_root: None,
+            kind: WorkspaceKind::Code { repo_url: None },
+            metadata: WorkspaceMetadata::new(raw.clone()),
+            product_data_generation: String::new(),
+            created_at: timestamp,
+            last_active: timestamp,
+        };
+        workspace.metadata.project_location = raw.clone();
+        workspace.metadata.project_execution_location = Some(actual.clone());
+        let parsed: Workspace = serde_json::from_slice(&serde_json::to_vec(&workspace)?)?;
+        assert_eq!(parsed.project_location(), raw);
+        assert_eq!(parsed.execution_location(), actual);
+        assert!(parsed.local_project_root().is_none());
+        assert_eq!(parsed.root, PathBuf::from("/local/data"));
         Ok(())
     }
 }

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import type { Result as ChartResult, VisualizationSpec } from 'vega-embed';
 import { Maximize2, Minimize2 } from 'lucide-react';
 
 interface ChartCardProps {
@@ -42,90 +43,97 @@ function extractVegaLiteSpec(result: string): unknown | null {
 
 export { extractVegaLiteSpec };
 
-function buildChartHtml(spec: unknown): string {
-  // Escape `<`, `>`, `&` as JSON unicode escapes so a user-controlled spec
-  // containing `</script>` cannot terminate the inline script element early
-  // (N-P1-14). JSON.parse decodes them back, so the rendered spec is unchanged.
-  const specJson = JSON.stringify(spec)
-    .replace(/</g, '\\u003c')
-    .replace(/>/g, '\\u003e')
-    .replace(/&/g, '\\u0026');
-  // Store spec in a <script type="application/json"> element to avoid
-  // </script> injection from user-controlled Vega-Lite spec data.
-  return `<!DOCTYPE html>
-<html>
-<head>
-  <script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
-  <script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
-  <script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
-  <style>
-    body { margin: 0; display: flex; justify-content: center; background: transparent; }
-    #vis { width: 100%; }
-  </style>
-</head>
-<body>
-  <div id="vis"></div>
-  <script id="vega-spec" type="application/json">${specJson}</script>
-  <script>
-    var specEl = document.getElementById('vega-spec');
-    var spec = JSON.parse(specEl.textContent || '{}');
-    vegaEmbed('#vis', spec, {
-      actions: { export: true, source: false, compiled: false, editor: false }
-    }).catch(function(err) {
-      // err.message 可能含用户可控数据(spec 内容回显)。虽然此 iframe 已是
-      // sandboxed null-origin (无 allow-same-origin, 爆炸半径为零), 仍用
-      // textContent 而非 innerHTML 让纵深防御一致 — 不依赖单一沙箱兜底。
-      document.body.innerHTML = '';
-      var p = document.createElement('p');
-      p.style.cssText = 'color:red;padding:1rem';
-      p.textContent = 'Chart render error: ' + (err && err.message ? err.message : String(err));
-      document.body.appendChild(p);
-    });
-  </script>
-</body>
-</html>`;
-}
-
 export function ChartCard({ spec }: ChartCardProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [expanded, setExpanded] = useState(false);
+  const [state, setState] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [error, setError] = useState('');
 
   useEffect(() => {
-    if (!containerRef.current || !spec) return;
-
     const container = containerRef.current;
-    container.innerHTML = '';
-
-    const iframe = document.createElement('iframe');
-    iframe.style.width = '100%';
-    iframe.style.height = expanded ? '600px' : '400px';
-    iframe.style.border = 'none';
-    // Sandbox with allow-scripts only: omit allow-same-origin so a malicious
-    // spec cannot reach out to the parent document's origin (N-P1-14).
-    iframe.sandbox.add('allow-scripts');
-    iframe.srcdoc = buildChartHtml(spec);
-    container.appendChild(iframe);
-  }, [spec, expanded]);
+    if (!container) return;
+    const surface = document.createElement('div');
+    container.replaceChildren(surface);
+    let disposed = false;
+    let chart: ChartResult | undefined;
+    // 本地模块与官方AST解释器保留既有spec语义，适用桌面原CSP；不依赖CDN、
+    // srcdoc内联脚本或unsafe-eval。每次渲染有独立surface，迟到结果不能污染新图。
+    void (async () => {
+      try {
+        // 同一提交内已卸载的卡片不再启动体积较大的图表模块加载。
+        await Promise.resolve();
+        if (disposed) return;
+        const [{ default: embed }, { expressionInterpreter }] = await Promise.all([
+          import('vega-embed'),
+          import('vega-interpreter'),
+        ]);
+        if (disposed) return;
+        setState('loading');
+        setError('');
+        const result = await embed(surface, spec as VisualizationSpec, {
+          renderer: 'svg',
+          ast: true,
+          expr: expressionInterpreter,
+          actions: { export: true, source: false, compiled: false, editor: false },
+        });
+        if (disposed) {
+          result.finalize();
+          return;
+        }
+        chart = result;
+        setState('ready');
+      } catch (failure) {
+        if (!disposed) {
+          setError(failure instanceof Error ? failure.message : '图表绘制失败');
+          setState('error');
+        }
+      }
+    })();
+    return () => {
+      disposed = true;
+      chart?.finalize();
+      surface.remove();
+    };
+  }, [spec]);
 
   return (
     <div
-      className={`rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] overflow-hidden`}
+      className="min-w-0 overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)]"
+      data-chart-state={state}
     >
-      <div className="flex items-center justify-between px-4 py-2 border-b border-[var(--border-primary)] bg-[var(--bg-secondary)]">
-        <span className="text-xs font-medium text-[var(--text-secondary)]">Chart</span>
+      <div className="flex items-center justify-between border-b border-[var(--border-primary)] bg-[var(--bg-secondary)] px-4 py-2">
+        <span className="text-xs font-medium text-[var(--text-secondary)]">图表</span>
         <button
-          onClick={() => setExpanded(!expanded)}
-          className="p-1 rounded-md hover:bg-[var(--bg-hover)] text-[var(--text-tertiary)] transition-colors"
-          title={expanded ? 'Collapse' : 'Expand'}
+          onClick={() => setExpanded((value) => !value)}
+          className="rounded-md p-1 hover:bg-[var(--bg-hover)] text-[var(--text-tertiary)] transition-colors"
+          title={expanded ? '收起图表' : '展开图表'}
         >
           {expanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
         </button>
       </div>
+      {state === 'loading' && (
+        <p role="status" className="px-4 py-2 text-xs text-[var(--text-tertiary)]">
+          正在绘制图表
+        </p>
+      )}
+      {state === 'error' && (
+        <p role="status" className="px-4 py-2 text-xs text-[var(--color-error)]">
+          图表绘制失败：{error}。可查看原始数据。
+        </p>
+      )}
       <div
         ref={containerRef}
-        className="p-2 flex justify-center"
-        style={{ minHeight: expanded ? '600px' : '400px' }}
+        role="group"
+        aria-label="图表"
+        className="max-w-full overflow-auto p-2"
+        style={{ maxHeight: expanded ? undefined : 420 }}
       />
+      <details className="border-t border-[var(--border-secondary)] px-4 py-2 text-xs text-[var(--text-tertiary)]">
+        <summary className="cursor-pointer">查看图表数据</summary>
+        <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words">
+          {JSON.stringify(spec, null, 2)}
+        </pre>
+      </details>
     </div>
   );
 }

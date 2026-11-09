@@ -21,18 +21,12 @@
 //
 // # Usage
 //
-// ```rust,ignore
-// // After bootstrap:
-// let pool = AgentPool::from_runtime(&runtime, PoolConfig::default(), None).await;
-//
-// // Acquire an agent for a conversation:
-// let lease = pool.acquire("conv-001").await?;
-// let agent = lease.agent();
-// agent.chat_stream("Hello").await;  // Keep `lease` until execution settles.
-// ```
+// 产品模型循环通过 ScopedChatRuntime / drive_chat 取得并保留执行lease，
+// 由原invocation准备与turn registration发布规则。不要把取得AgentHandle
+// 等同于模型准入或直接调用裸chat；reflection等普通消费者可读取完整快照。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -99,6 +93,8 @@ pub(crate) struct AgentPluginGeneration {
     skill_descriptors: Vec<echo_agent::skills::external::SkillDescriptor>,
     plugin_agents: Vec<PreparedPluginAgent>,
     output_style: Option<String>,
+    domain_components: Arc<crate::domain_plugin::PreparedDomainComponents>,
+    domain_output_style: Option<String>,
     framework_generation: Option<Arc<echo_agent::plugin::PreparedPluginSet>>,
 }
 
@@ -120,8 +116,20 @@ impl AgentPluginGeneration {
             skill_descriptors,
             plugin_agents,
             output_style,
+            domain_components: Arc::new(Default::default()),
+            domain_output_style: None,
             framework_generation: None,
         }
+    }
+
+    pub(crate) fn with_domain_components(
+        mut self,
+        components: crate::domain_plugin::PreparedDomainComponents,
+        active_style: Option<String>,
+    ) -> Self {
+        self.domain_components = Arc::new(components);
+        self.domain_output_style = active_style;
+        self
     }
 
     pub(crate) fn with_framework_generation(
@@ -244,6 +252,9 @@ pub struct SharedResources {
     pub tool_manager: Option<Arc<echo_agent::tools::ToolManager>>,
     pub hook_registry: Option<Arc<tokio::sync::RwLock<echo_agent::skills::hooks::HookRegistry>>>,
     pub sandbox_manager: Option<Arc<dyn echo_agent::sandbox::SandboxExecutor>>,
+    pub local_skill_executor: Option<Arc<dyn echo_agent::sandbox::SandboxExecutor>>,
+    pub file_system: Option<Arc<dyn echo_agent::tools::filesystem::FileSystem>>,
+    pub workspace_data_root: Option<std::path::PathBuf>,
     pub store: Option<Arc<dyn echo_agent::memory::Store>>,
     pub conversation_store: Option<Arc<dyn echo_agent::memory::ConversationStore>>,
     pub run_store: Option<Arc<dyn echo_agent::trace::RunStore>>,
@@ -265,6 +276,9 @@ pub struct SharedResources {
 
 pub(crate) struct WorkspaceAgentPoolResources {
     pub root: std::path::PathBuf,
+    pub execution_root: std::path::PathBuf,
+    pub file_system: Arc<dyn echo_agent::tools::filesystem::FileSystem>,
+    pub executor: Arc<dyn echo_agent::sandbox::SandboxExecutor>,
     pub project_root: Option<std::path::PathBuf>,
     pub kind: WorkspaceKind,
     pub conversation_store: Arc<dyn echo_agent::memory::ConversationStore>,
@@ -303,7 +317,10 @@ impl SharedResources {
                     subagent_event_bus,
                     tool_manager,
                     hook_registry,
+                    local_skill_executor: sandbox_manager.clone(),
                     sandbox_manager,
+                    file_system: None,
+                    workspace_data_root: None,
                     store,
                     conversation_store,
                     run_store,
@@ -331,9 +348,12 @@ impl SharedResources {
 struct PooledAgent {
     handle: AgentHandle,
     model_consumers: infra::AgentModelConsumers,
+    subagent_registry: Arc<echo_agent::subagent::SubagentRegistry>,
+    tool_manager: Arc<echo_agent::tools::ToolManager>,
     _conversation_id: String,
     created_at: Instant,
     last_used: Instant,
+    raw_context_initialized: Arc<AtomicBool>,
 }
 
 struct AgentPoolAdmission {
@@ -419,10 +439,18 @@ impl AgentPoolAdmission {
         );
         drop(leases);
         Ok(AgentPoolExecutionLease {
-            token: Some(token),
+            context_initialization: None,
+            physical: Arc::new(AgentPoolPhysicalLease {
+                token: Some(token),
+                admission: Some((Arc::clone(self), key.to_string())),
+                framework_lease: Some(framework_lease),
+                projections: AtomicUsize::new(0),
+                projection_progress: Arc::new(tokio::sync::Notify::new()),
+            }),
             agent,
-            admission: Some((Arc::clone(self), key.to_string())),
-            framework_lease: Some(framework_lease),
+            domain_generation: None,
+            admitted_catalogs: None,
+            admitted_tool_control: None,
         })
     }
 
@@ -467,13 +495,25 @@ impl AgentPoolAdmission {
 
     fn observe_unsettled(&self, token: u64, run: &str, execution: Option<&str>) {
         let changed = {
-            let mut leases = self.leases.lock().unwrap_or_else(|error| error.into_inner());
+            let mut leases = self
+                .leases
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             if let Some(entry) = leases.live.get_mut(&token) {
                 let owner = Some((run.to_string(), execution.map(str::to_string)));
-                if entry.owner == owner { false } else { entry.owner = owner; true }
-            } else { false }
+                if entry.owner == owner {
+                    false
+                } else {
+                    entry.owner = owner;
+                    true
+                }
+            } else {
+                false
+            }
         };
-        if changed { self.notify_progress(); }
+        if changed {
+            self.notify_progress();
+        }
     }
 
     fn has_unsettled(&self) -> bool {
@@ -579,39 +619,253 @@ impl Drop for AgentPoolRetirementAdmission {
 /// receipt to drop before clearing or rebinding pooled agents.
 #[must_use]
 pub struct AgentPoolExecutionLease {
-    token: Option<u64>,
+    context_initialization: Option<Arc<AtomicBool>>,
+    physical: Arc<AgentPoolPhysicalLease>,
     agent: AgentHandle,
+    domain_generation: Option<(
+        Arc<crate::domain_plugin::PreparedDomainComponents>,
+        Option<String>,
+    )>,
+    admitted_tool_control: Option<Arc<crate::tool_control::ToolControlService>>,
+    admitted_catalogs: Option<(
+        Arc<echo_agent::subagent::SubagentRegistry>,
+        Arc<echo_agent::tools::ToolManager>,
+    )>,
+}
+
+/// Read-only, short-lived view of an already issued foreground lease. It
+/// cannot issue a token or release/retire the original receipt. Drop it before
+/// awaiting driver settlement; only actual invocation guards cross that point.
+pub(crate) struct AgentPoolExecutionProjection {
+    // Field order matters: drop the borrowed snapshot before notifying the
+    // final physical-reference waiter through the retention field.
+    execution: AgentPoolExecutionLease,
+    _retention: AgentPoolPhysicalProjection,
+}
+
+impl AgentPoolExecutionProjection {
+    pub(crate) fn execution(&self) -> &AgentPoolExecutionLease {
+        &self.execution
+    }
+}
+
+/// The original lease accounting, retained until its final physical projection.
+/// It deliberately has no Agent/factory reference and cannot form an Agent cycle.
+struct AgentPoolPhysicalLease {
+    token: Option<u64>,
     admission: Option<(Arc<AgentPoolAdmission>, String)>,
     framework_lease: Option<KeyedExecutionLease>,
+    projections: AtomicUsize,
+    projection_progress: Arc<tokio::sync::Notify>,
+}
+
+pub(crate) struct AgentPoolPhysicalProjection {
+    physical: Option<Arc<AgentPoolPhysicalLease>>,
+    // The original projection registration is not another TaskRun authority.
+    // It keeps cross-spawn reads bound to that same RunCreated/store lifetime.
+    _run_projection:
+        Option<Arc<crate::tasks::task_runtime::compact_context::TaskRuntimeProjectionRegistration>>,
+}
+
+impl Drop for AgentPoolPhysicalProjection {
+    fn drop(&mut self) {
+        let Some(physical) = self.physical.take() else {
+            return;
+        };
+        let progress = physical.projection_progress.clone();
+        if physical
+            .projections
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .is_err()
+        {
+            tracing::error!("AgentPool physical projection accounting was already released");
+        }
+        // The last supervised remover must observe the actual reference gone,
+        // not a zero counter followed by a still-live keyed lease.
+        drop(physical);
+        progress.notify_waiters();
+    }
 }
 
 impl AgentPoolExecutionLease {
+    pub(crate) fn context_initialization_for(
+        &self,
+        agent: &AgentHandle,
+    ) -> Option<Arc<AtomicBool>> {
+        // ambient foreground scope 可包裹其它调用，只有原实例能确认其缓存事实。
+        if Arc::ptr_eq(self.agent.inner(), agent.inner()) {
+            self.context_initialization.clone()
+        } else {
+            None
+        }
+    }
+
     pub fn agent(&self) -> AgentHandle {
         self.agent.clone()
     }
 
+    fn with_plugin_generation(
+        mut self,
+        generation: &AgentPluginGeneration,
+        registry: Arc<echo_agent::subagent::SubagentRegistry>,
+        tools: Arc<echo_agent::tools::ToolManager>,
+        tool_control: Arc<crate::tool_control::ToolControlService>,
+        context_initialization: Arc<AtomicBool>,
+    ) -> Self {
+        self.context_initialization = Some(context_initialization);
+        self.domain_generation = Some((
+            generation.domain_components.clone(),
+            generation.domain_output_style.clone(),
+        ));
+        self.admitted_catalogs = Some((registry, tools));
+        self.admitted_tool_control = Some(tool_control);
+        self
+    }
+
+    /// Validate the actual target generation while this original lease keeps
+    /// publication/retirement closed. Cross-workspace dispatch keeps its own
+    /// target receipt; a leader pool cannot vouch for another workspace.
+    pub(crate) async fn verify_domain_binding(
+        &self,
+        binding: &crate::domain_plugin::DomainBinding,
+    ) -> Result<(), String> {
+        let (owner, key) = self.physical.admission.as_ref().ok_or_else(|| {
+            "domain execution cannot use an unpooled handle as a receipt".to_string()
+        })?;
+        if !self.owns(owner, key) {
+            return Err("domain execution lease is not live".to_string());
+        }
+        let (components, style) = self.domain_generation.as_ref().ok_or_else(|| {
+            "domain execution lease has no published plugin generation".to_string()
+        })?;
+        let (registry, tools) = self
+            .admitted_catalogs
+            .as_ref()
+            .ok_or_else(|| "domain lease lost its original Agent catalog handles".to_string())?;
+        let policy = self
+            .admitted_tool_control
+            .as_ref()
+            .ok_or_else(|| "domain lease lost its original tool policy owner".to_string())?
+            .snapshot()
+            .map_err(|error| error.to_string())?;
+        binding.check_capabilities(&tools.list_tools(), &policy.disabled_tools)?;
+        components.verify_binding(binding, style.as_deref(), &registry.list_available().await)
+    }
+
+    pub(crate) fn project_for_invocation(&self) -> Result<AgentPoolExecutionProjection, String> {
+        let retention = self.retain_physical_projection(None)?;
+        Ok(AgentPoolExecutionProjection {
+            execution: Self {
+                context_initialization: self.context_initialization.clone(),
+                physical: self.physical.clone(),
+                agent: self.agent.clone(),
+                domain_generation: self.domain_generation.clone(),
+                admitted_tool_control: self.admitted_tool_control.clone(),
+                admitted_catalogs: self.admitted_catalogs.clone(),
+            },
+            _retention: retention,
+        })
+    }
+
+    fn retain_physical_projection(
+        &self,
+        run_projection: Option<
+            Arc<crate::tasks::task_runtime::compact_context::TaskRuntimeProjectionRegistration>,
+        >,
+    ) -> Result<AgentPoolPhysicalProjection, String> {
+        let (owner, key) =
+            self.physical.admission.as_ref().ok_or_else(|| {
+                "domain physical retention requires a pooled admission".to_string()
+            })?;
+        if !self.owns(owner, key) {
+            return Err(
+                "domain physical retention requires the original live pool lease".to_string(),
+            );
+        }
+        self.physical
+            .projections
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
+            .map_err(|_| "domain physical retention capacity exhausted".to_string())?;
+        Ok(AgentPoolPhysicalProjection {
+            physical: Some(self.physical.clone()),
+            _run_projection: run_projection,
+        })
+    }
+
+    pub(crate) fn domain_resource_guard(
+        &self,
+        run_id: &str,
+        binding: &crate::domain_plugin::DomainBinding,
+        run_projection: Option<
+            Arc<crate::tasks::task_runtime::compact_context::TaskRuntimeProjectionRegistration>,
+        >,
+    ) -> Result<echo_agent::tools::InvocationResourceGuard, String> {
+        let (owner, _) =
+            self.physical.admission.as_ref().ok_or_else(|| {
+                "domain physical retention requires a pooled admission".to_string()
+            })?;
+        Ok(echo_agent::tools::InvocationResourceGuard::new_identified(
+            self.retain_physical_projection(run_projection)?,
+            crate::domain_plugin::DomainInvocationIdentity::new(
+                run_id,
+                binding.reference(),
+                Arc::as_ptr(owner) as usize,
+            ),
+        ))
+    }
+
+    async fn wait_for_physical_projections(&self) {
+        loop {
+            let progress = self.physical.projection_progress.notified();
+            tokio::pin!(progress);
+            progress.as_mut().enable();
+            if self.physical.projections.load(Ordering::Acquire) == 0
+                && Arc::strong_count(&self.physical) == 1
+            {
+                return;
+            }
+            progress.await;
+        }
+    }
+
     pub(crate) fn unpooled(agent: AgentHandle) -> Self {
         Self {
-            token: None,
+            context_initialization: None,
+            physical: Arc::new(AgentPoolPhysicalLease {
+                token: None,
+                admission: None,
+                framework_lease: None,
+                projections: AtomicUsize::new(0),
+                projection_progress: Arc::new(tokio::sync::Notify::new()),
+            }),
             agent,
-            admission: None,
-            framework_lease: None,
+            domain_generation: None,
+            admitted_catalogs: None,
+            admitted_tool_control: None,
         }
     }
 
     fn owns(&self, admission: &Arc<AgentPoolAdmission>, key: &str) -> bool {
-        self.admission.as_ref().is_some_and(|(owner, owned_key)| {
-            Arc::ptr_eq(owner, admission)
-                && owned_key == key
-                && self
-                    .framework_lease
-                    .as_ref()
-                    .is_some_and(|lease| lease.owns(&admission.framework, key))
-        })
+        self.physical
+            .admission
+            .as_ref()
+            .is_some_and(|(owner, owned_key)| {
+                Arc::ptr_eq(owner, admission)
+                    && owned_key == key
+                    && self
+                        .physical
+                        .framework_lease
+                        .as_ref()
+                        .is_some_and(|lease| lease.owns(&admission.framework, key))
+            })
     }
 }
 
-impl Drop for AgentPoolExecutionLease {
+impl Drop for AgentPoolPhysicalLease {
     fn drop(&mut self) {
         let admission = self.admission.take();
         if let (Some((owner, _)), Some(token)) = (admission.as_ref(), self.token.take()) {
@@ -631,13 +885,16 @@ impl Drop for AgentPoolExecutionLease {
 
 impl crate::tasks::task_runtime::store::RunDriverExecutionReceipt for AgentPoolExecutionLease {
     fn observe_unsettled(&self, run_id: &str, execution_id: Option<&str>) {
-        if let (Some((admission, _)), Some(token)) = (self.admission.as_ref(), self.token) {
+        if let (Some((admission, _)), Some(token)) =
+            (self.physical.admission.as_ref(), self.physical.token)
+        {
             admission.observe_unsettled(token, run_id, execution_id);
         }
     }
 
     fn release(self: Box<Self>) -> futures::future::BoxFuture<'static, ()> {
         Box::pin(async move {
+            self.wait_for_physical_projections().await;
             drop(self);
         })
     }
@@ -649,12 +906,22 @@ impl crate::tasks::task_runtime::store::RunDriverExecutionReceipt
     for Arc<std::sync::Mutex<Option<AgentPoolExecutionLease>>>
 {
     fn observe_unsettled(&self, run_id: &str, execution_id: Option<&str>) {
-        if let Some(execution) = self.lock().unwrap_or_else(|error| error.into_inner()).as_ref() {
-            crate::tasks::task_runtime::store::RunDriverExecutionReceipt::observe_unsettled(execution, run_id, execution_id);
+        if let Some(execution) = self
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            crate::tasks::task_runtime::store::RunDriverExecutionReceipt::observe_unsettled(
+                execution,
+                run_id,
+                execution_id,
+            );
         }
     }
     fn release(self: Box<Self>) -> futures::future::BoxFuture<'static, ()> {
-        Box::pin(async move { drop(self); })
+        Box::pin(async move {
+            drop(self);
+        })
     }
 }
 
@@ -688,19 +955,125 @@ impl crate::tasks::task_runtime::store::RunDriverExecutionReceipt for OwnedRunPo
     }
 }
 
+/// Thin EKO policy on the framework's original selected registration. No
+/// registry lookup or second dispatcher may replace the record passed here.
+struct DomainRegistrationAdmission {
+    registry: std::sync::Weak<echo_agent::subagent::SubagentRegistry>,
+    generation: std::sync::Weak<RwLock<AgentPluginGeneration>>,
+    admission: std::sync::Weak<AgentPoolAdmission>,
+    store: Option<std::sync::Weak<crate::tasks::task_runtime::store::TaskRuntimeStore>>,
+}
+
+#[async_trait::async_trait]
+impl echo_agent::subagent::SubagentRegistrationAdmission for DomainRegistrationAdmission {
+    async fn admit(
+        &self,
+        registration: &echo_agent::subagent::SubagentRegistration,
+        request: &echo_agent::subagent::DispatchRequest,
+    ) -> echo_agent::error::Result<()> {
+        let fail = |message: String| echo_agent::error::ReactError::Other(message);
+        let Some(context) = request.runtime_context.as_ref() else {
+            return Ok(());
+        };
+        let physical = context
+            .resource_guards
+            .iter()
+            .any(|guard| guard.retains::<AgentPoolPhysicalProjection>());
+        let Some(run_id) = context.run_id.as_deref() else {
+            return if physical {
+                Err(fail(
+                    "bound domain Subagent lost its original TaskRun identity".to_string(),
+                ))
+            } else {
+                Ok(())
+            };
+        };
+        if run_id.trim().is_empty() {
+            return Err(fail("Subagent TaskRun identity is empty".to_string()));
+        }
+        let store = crate::tasks::task_runtime::compact_context::task_runtime_projection_registry()
+            .store(run_id)
+            .or_else(|| self.store.as_ref().and_then(std::sync::Weak::upgrade))
+            .ok_or_else(|| fail("Subagent TaskRun has no original runtime owner".to_string()))?;
+        let owned_run_id = run_id.to_string();
+        let snapshot = crate::tasks::task_runtime::TaskRuntimeOperation::new(store)
+            .run_store("admit exact domain Subagent registration", move |store| {
+                store.get_run_state(&owned_run_id)?.ok_or(
+                    crate::tasks::task_runtime::StoreError::RunNotFound(owned_run_id),
+                )
+            })
+            .await
+            .map_err(|error| fail(error.to_string()))?;
+        let Some(binding) = snapshot.domain_binding else {
+            if physical
+                || snapshot.run.domain_profile != crate::tasks::task_runtime::DomainProfile::General
+            {
+                return Err(fail(
+                    "Subagent TaskRun is missing its original domain binding".to_string(),
+                ));
+            }
+            return Ok(());
+        };
+        if snapshot.run.domain_binding.as_ref() != Some(&binding.reference()) {
+            return Err(fail(
+                "Subagent TaskRun domain projection does not match RunCreated".to_string(),
+            ));
+        }
+        let owner = self
+            .admission
+            .upgrade()
+            .ok_or_else(|| fail("Subagent pool admission owner is unavailable".to_string()))?;
+        let expected = crate::domain_plugin::DomainInvocationIdentity::new(
+            run_id,
+            binding.reference(),
+            Arc::as_ptr(&owner) as usize,
+        );
+        if !context.resource_guards.iter().any(|guard| {
+            guard.retains::<AgentPoolPhysicalProjection>() && guard.matches_identity(&expected)
+        }) {
+            return Err(fail("domain Subagent has no physical retention for its actual target pool and original binding".to_string()));
+        }
+        // Keep the actual registry alive through this check, but do not resolve
+        // the selected name again. F already proves this record's owner.
+        let _registry = self
+            .registry
+            .upgrade()
+            .ok_or_else(|| fail("Subagent registry owner is unavailable".to_string()))?;
+        let generation = self
+            .generation
+            .upgrade()
+            .ok_or_else(|| fail("Subagent plugin generation is unavailable".to_string()))?;
+        let (components, style) = {
+            let generation = generation.read().await;
+            (
+                generation.domain_components.clone(),
+                generation.domain_output_style.clone(),
+            )
+        };
+        components
+            .admit_registration(&binding, style.as_deref(), registration.definition())
+            .map_err(fail)
+    }
+}
+
 impl PooledAgent {
     fn new(
         handle: AgentHandle,
         model_consumers: infra::AgentModelConsumers,
         conversation_id: String,
+        subagent_registry: Arc<echo_agent::subagent::SubagentRegistry>,
+        tool_manager: Arc<echo_agent::tools::ToolManager>,
     ) -> Self {
         let now = Instant::now();
         Self {
             handle,
             model_consumers,
+            subagent_registry,
+            tool_manager,
             _conversation_id: conversation_id,
             created_at: now,
             last_used: now,
+            raw_context_initialized: Arc::new(AtomicBool::new(true)),
         }
     }
 }

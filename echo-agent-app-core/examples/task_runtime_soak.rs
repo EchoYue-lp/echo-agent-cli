@@ -457,6 +457,7 @@ async fn open_runtime(task_root: &Path, ledger: &mut SoakLedger) -> Result<Arc<T
 
 fn soak_plan(run_id: &str) -> TaskPlan {
     TaskPlan {
+        domain_binding: None,
         plan_id: format!("{run_id}-plan"),
         run_id: run_id.to_string(),
         revision: 1,
@@ -467,6 +468,8 @@ fn soak_plan(run_id: &str) -> TaskPlan {
         risks: vec!["host interruption extends active-time completion".to_string()],
         execution_mode: ExecutionMode::Sequential,
         tasks: vec![PlanTask {
+            domain_binding: None,
+            domain_role: None,
             id: "soak-runtime-invariants".to_string(),
             title: "Maintain long-horizon runtime invariants".to_string(),
             description: "Exercise checkpoint, continuation, accounting, and boot recovery"

@@ -109,8 +109,14 @@ pub fn prepare_runtime_llm(
 ) -> Result<PreparedRuntimeLlm, String> {
     model_config::validate_runtime_model_requirements(runtime)?;
     let config = build_runtime_llm_config(runtime)?;
+    // 产品身份由应用统一注入：连接测试、主 Agent 和 Subagent 共用真实 Eclip 标识。
+    // 部分兼容网关会拒绝缺少 User-Agent 的请求；版本随应用包构建，不借用其它产品身份。
+    let http_client = reqwest::Client::builder()
+        .user_agent(concat!("Eclip/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|error| format!("Failed to create Eclip HTTP client: {error}"))?;
     let client: Arc<dyn LlmClient> = config
-        .build_client()
+        .build_client_with_http_client(Arc::new(http_client))
         .map(Arc::from)
         .map_err(|error| format!("Failed to create client: {error}"))?;
     Ok(PreparedRuntimeLlm {
@@ -120,7 +126,7 @@ pub fn prepare_runtime_llm(
     })
 }
 
-/// Result of the shared EKO connection probe used by GUI, TUI, and CLI.
+/// GUI 与应用运行时共用的模型连接测试结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeLlmConnectionTest {
     pub response: String,
@@ -128,8 +134,7 @@ pub struct RuntimeLlmConnectionTest {
 }
 
 /// Send one minimal request through the exact client configuration used by the
-/// live agent. Surface-specific code only resolves user input and renders this
-/// result; protocol behavior remains identical across GUI, TUI, and CLI.
+/// live agent. GUI只负责解析输入和展示结果；temperature不再是EKO产品配置或请求来源。
 pub async fn test_runtime_llm_connection(
     runtime: &model_config::ModelRuntimeConfig,
 ) -> Result<RuntimeLlmConnectionTest, String> {
@@ -137,7 +142,13 @@ pub async fn test_runtime_llm_connection(
     let messages = vec![Message::user("Hi, respond with just 'OK'.".to_string())];
     let response = prepared
         .client
-        .chat_simple(messages)
+        .chat_simple_with_options(
+            messages,
+            echo_agent::llm::SimpleChatOptions {
+                temperature: None,
+                ..Default::default()
+            },
+        )
         .await
         .map_err(|error| format!("API call failed: {error}"))?;
     Ok(RuntimeLlmConnectionTest {
@@ -180,7 +191,7 @@ pub(crate) async fn prepare_agent_model_publication(
         .prepare_model_generation(
             prepared.config.clone(),
             prepared.client.clone(),
-            runtime.temperature,
+            None,
             runtime.max_tokens.or(Some(DEFAULT_MAX_TOKENS)),
             prepared.thinking.clone(),
             token_limit,
@@ -195,7 +206,7 @@ pub(crate) async fn prepare_agent_model_publication(
             .prepare_model_generation(
                 prepared.config.clone(),
                 prepared.client.clone(),
-                runtime.temperature,
+                None,
                 runtime.max_tokens.or(Some(DEFAULT_MAX_TOKENS)),
                 prepared.thinking.clone(),
                 token_limit,

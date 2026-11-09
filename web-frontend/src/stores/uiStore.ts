@@ -3,10 +3,8 @@ import { extensionRequestScope, pluginApi, type PluginThemeDefinition } from '..
 import { useWorkspaceStore } from './workspaceStore';
 
 export type SettingsTabId =
-  | 'overview'
   | 'tools'
   | 'mcp'
-  | 'lsp'
   | 'skills'
   | 'memory'
   | 'config'
@@ -20,10 +18,12 @@ export type SettingsTabId =
   | 'evolution'
   | 'plugins'
   | 'hooks'
+  | 'channels'
   | 'scheduler'
   | 'worktree';
 
 type Theme = 'light' | 'dark';
+export type WorkspaceSourceKind = 'existing_local' | 'new_local' | 'ssh';
 
 interface UiState {
   leftSidebarOpen: boolean;
@@ -32,6 +32,17 @@ interface UiState {
   theme: Theme;
   activePluginTheme: string | null;
   terminalOpen: boolean;
+  workspaceDialogOpen: boolean;
+  workspaceDialogSource: WorkspaceSourceKind;
+  workspaceDialogReconnect: { workspaceId: string; workspaceGeneration: string } | null;
+  /** Presentation intent only; canonical Workspace/Conversation stores own transitions. */
+  navigationEpoch: number;
+  beginNavigation: () => number;
+  openWorkspaceDialog: (
+    source?: WorkspaceSourceKind,
+    reconnect?: { workspaceId: string; workspaceGeneration: string }
+  ) => void;
+  closeWorkspaceDialog: () => void;
   toggleLeftSidebar: () => void;
   openSettings: () => void;
   closeSettings: () => void;
@@ -101,13 +112,30 @@ export function applyPluginTheme(pluginTheme: PluginThemeDefinition | null) {
 export const useUiStore = create<UiState>((set, get) => ({
   leftSidebarOpen: typeof window !== 'undefined' && window.innerWidth >= 768,
   settingsOpen: false,
-  activeSettingsTab: 'overview',
+  activeSettingsTab: 'providers',
   theme: getInitialTheme(),
   activePluginTheme: null,
   terminalOpen: false,
+  workspaceDialogOpen: false,
+  workspaceDialogSource: 'existing_local',
+  workspaceDialogReconnect: null,
+  navigationEpoch: 0,
+  beginNavigation: () => {
+    const epoch = get().navigationEpoch + 1;
+    set({ navigationEpoch: epoch });
+    return epoch;
+  },
+  openWorkspaceDialog: (source = 'existing_local', reconnect) =>
+    set((state) => ({
+      workspaceDialogOpen: true,
+      workspaceDialogSource: source,
+      workspaceDialogReconnect: reconnect ?? null,
+      navigationEpoch: state.navigationEpoch + 1,
+    })),
+  closeWorkspaceDialog: () => set({ workspaceDialogOpen: false, workspaceDialogReconnect: null }),
 
   toggleLeftSidebar: () => set((s) => ({ leftSidebarOpen: !s.leftSidebarOpen })),
-  openSettings: () => set({ settingsOpen: true, activeSettingsTab: 'overview' }),
+  openSettings: () => set({ settingsOpen: true, activeSettingsTab: 'providers' }),
   closeSettings: () => set({ settingsOpen: false }),
   setActiveSettingsTab: (tab) => set({ activeSettingsTab: tab, settingsOpen: true }),
   toggleTheme: async () => {

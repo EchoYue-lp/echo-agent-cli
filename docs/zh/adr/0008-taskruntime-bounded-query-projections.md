@@ -1,5 +1,12 @@
 # ADR 0008: TaskRuntime 有界查询投影
 
+## 状态
+
+Accepted（已采纳）
+
+有限 GUI 历史查询适配已在任务列表分支实现；Rust、真实生成合同、高数据量与原生资格分别记录，不能从源码推定通过。
+
+
 ## 背景
 
 TaskRuntime 已经以 `events.jsonl` 作为唯一事实权威，并通过 framework 的
@@ -100,3 +107,31 @@ cursor 只记录已经从 journal 完整投影到所有相关 segment 的 source
   completion 形状，以及按 query dimension 选择 read-model segment。
 - 适配边界：`RunAuthority` 把 `RuntimeJournalEvent` 无损折叠为 EKO `EventFoldState` 和可丢弃
   history segments；它不重新实现 journal、DAG、task 状态机、sequence 或 mutation authority。
+
+## GUI 运行与事件的有限读取
+
+`list_task_runs` 按创建时间与 run_id 降序返回至多20个原 TaskRun。调用者携带的不透明 continuation 绑定原 Workspace/product-data generation、规范化状态筛选、页大小与排序位置，不建立查询会话或持久化状态。正式任务可见性与原会话 latest-task 查询共用 provenance/已提交计划判定，不凭诊断 route 字符串推导。
+
+新读路径只保留一页加一个前瞻 header，但仍枚举 run ID 并恢复原 authority，不宣称常量扫描成本或已有索引。候选读取失败必须反馈，不能静默省略后冒完整成功页。分页读取实时事实，不是跨请求事务快照；状态/计划变化及新运行可能需要显式刷新。
+
+原事件 IPC 复用 `query_events_bounded`，返回至多256条事件、无精度损失的字符串 next_after_sequence 与 has_more。缺口、非法位置和恢复失败仍是错误；前端保留事件数量不是传输上限，尚未读取的尾部继续显示不完整。journal、写入接受、操作准入和物理结算不变。暂停/取消/继续/重试展示原类型化回执；no-op 或已接受请求不等于执行完成。
+
+参考 [GitHub 官方 REST 分页](https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api)的服务端有界响应和明确续页模式；EKO沿原本机IPC复用，不照搬远端服务限制。
+
+历史检查在同一个 Zustand store 中至多额外保留一份呈现快照，不替换当前聊天的 activeRun、任务数量、失败提示或消息归属。任务面板操作携带实际显示的 run_id；冲突提示的 Continue 使用原准入 Workspace/run 与类型化回执，不读取选中历史的状态来判断目标。迟到结果不能清除后继提示或覆盖另一个呈现快照。
+
+仅有投影的孤儿目录仍按原 journal 权威规则视为非运行；有限库存不从投影推断一个丢失的 TaskRun，也不新增注册表。非 NotFound 的 I/O、损坏 journal 与恢复错误仍明确反馈。
+
+### GUI 任务控制绑定捕获的代次
+
+原任务面板的暂停、取消、继续、重试，以及 Goal、续行预算、任务图、恢复决定与验收跳过等变更，均连同工作空间和运行身份传递捕获的 `workspace_generation`。`AppState::workspace_control_for_generation` 在同一个原控制回执上校验该 token；命令继续使用该回执的运行时克隆，保留原 host 租约直到实际操作结束，不能先校验一个 host 再按工作空间 id 查另一个。旧项目根版本的迟到动作因此不能修改替代代次。Continue 使用原输入准入捕获的范围，详情操作使用原渲染目标；这是目标身份约束，不是 Agent 权限门控。
+
+显式历史选择即使与当前聊天运行相同，也保留唯一一份有界历史快照；后续聊天运行不能替换已选详情。详情和事件请求代次只结算各自的忙碌标记，跟随聊天或选择另一历史会转交对应标记，旧回调不能清除后继请求的忙碌状态。
+
+### 持久化排队 Steer 替换
+
+排队 Steer 编辑属于应用层对现有 ConversationInput journal 的消费。替换复用既有 `Persisted` fact，保持 input id，使用下一个 identity revision 和新的 payload hash，并继续校验原队列 revision。投影保留原队列位置和 first sequence。只有没有 active attempt 且仍可派发的输入允许替换；过期或正在执行的 identity 返回类型化校验错误。不新增第二个队列存储或 CRUD 权威。
+
+## 当前只读查询与可选修复（2026-10-30）
+
+completion report 已从原 RunAuthority 取得 journal 校验后的同一 projection，项目绑定校验直接使用同一 projection 携带的原 journal binding；不得为相同校验再次打开带派生写副作用的 run-state reader。当前 checkpoint 与合法 journal 在只读目录中仍可查询，可选派生修复失败继续保留 degraded 诊断；损坏或不连续 journal、异项目 binding、authority closed 与真实耐久性欠账仍按原边界拒绝。此调整不增加旧业务 schema reader、第二 store 或 validator，也不把缺失 checkpoint 当事实权威。测试分别保留当前 schema 冷读、坏 cache 重建、损坏 journal 拒绝和连续查询不重复全量 replay；实际运行资格按精确源码与日志记录。内部查询适配不涉及 examples 或官网公开 API，故无需新增示例或产品宣称。

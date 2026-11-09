@@ -1190,11 +1190,7 @@ impl ConversationDeletionService {
         let store = conversation_store
             .as_ref()
             .ok_or(ConversationDeletionError::StoreUnavailable)?;
-        if runtime_state.is_some()
-            && store.projection_capability()
-                == echo_agent::memory::ConversationProjectionCapability::AtomicV1
-            && tombstone.managed_delete.is_none()
-        {
+        if runtime_state.is_some() && tombstone.managed_delete.is_none() {
             tombstone.managed_delete =
                 Some(prepare_managed_delete(store.as_ref(), &conversation_id).await?);
             let prepared = tombstone.clone();
@@ -1217,24 +1213,15 @@ impl ConversationDeletionService {
         .await?;
         match runtime_state.as_deref() {
             Some(runtime_state) => {
-                let deleted = match tombstone.managed_delete.clone() {
-                    Some(delete) => {
-                        echo_agent::state::delete_persisted_conversation_managed(
-                            store.as_ref(),
-                            runtime_state,
-                            delete,
-                        )
-                        .await
-                    }
-                    None => {
-                        echo_agent::state::delete_persisted_conversation(
-                            store.as_ref(),
-                            runtime_state,
-                            &conversation_id,
-                        )
-                        .await
-                    }
-                }
+                let delete = tombstone.managed_delete.clone().ok_or_else(|| {
+                    ConversationDeletionError::AmbiguousAuthorityCommit(conversation_id.clone())
+                })?;
+                let deleted = echo_agent::state::delete_persisted_conversation_managed(
+                    store.as_ref(),
+                    runtime_state,
+                    delete,
+                )
+                .await
                 .map_err(|error| ConversationDeletionError::RuntimeState(error.to_string()))?;
                 require_managed_retirement_complete(&deleted)?;
                 delete_runtime_transcripts(
@@ -1322,24 +1309,16 @@ impl ConversationDeletionService {
         }
         match runtime_state {
             Some(runtime_state) => {
-                let deleted = match tombstone.managed_delete.clone() {
-                    Some(delete) => {
-                        echo_agent::state::delete_persisted_conversation_managed(
-                            store,
-                            runtime_state,
-                            delete,
-                        )
-                        .await
-                    }
-                    None => {
-                        echo_agent::state::delete_persisted_conversation(
-                            store,
-                            runtime_state,
-                            conversation_id,
-                        )
-                        .await
-                    }
-                }
+                // 已跨越 commit 的恢复只能复用原请求，不能从当前同名会话猜 epoch。
+                let delete = tombstone.managed_delete.clone().ok_or_else(|| {
+                    ConversationDeletionError::AmbiguousAuthorityCommit(conversation_id.to_string())
+                })?;
+                let deleted = echo_agent::state::delete_persisted_conversation_managed(
+                    store,
+                    runtime_state,
+                    delete,
+                )
+                .await
                 .map_err(|error| ConversationDeletionError::RuntimeState(error.to_string()))?;
                 require_managed_retirement_complete(&deleted)?;
                 delete_runtime_transcripts(store, conversation_id, &deleted.runtime_state_ids)
@@ -2024,6 +2003,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_started_without_managed_identity_preserves_live_generation()
+    -> Result<(), Box<dyn Error>> {
+        let temp = tempfile::tempdir()?;
+        let store = file_store(&temp.path().join("state"))?;
+        let runtime_state: Arc<dyn RuntimeStateStore> = Arc::new(FileRuntimeStateStore::new(
+            temp.path().join("runtime-state"),
+        )?);
+        let service = ConversationDeletionService::new(temp.path().join("deletions"));
+        let id = "missing-managed-delete-identity";
+        store.create_conversation(conversation(id)).await?;
+        let original = prepare_managed_delete(store.as_ref(), id).await?;
+        let mut checkpoint = AgentCheckpoint::new(id);
+        checkpoint.messages_json = AgentCheckpoint::serialize_payload(Vec::new(), None)?;
+        runtime_state
+            .save_checkpoint_for_scope(id, &checkpoint)
+            .await?;
+        let path = service.tombstone_path(id);
+        let mut tombstone = DeletionTombstone::new(id);
+        tombstone
+            .completed
+            .insert(DeletionStep::ConversationCommitStarted);
+        service.persist_tombstone(&path, &tombstone)?;
+        let (router, deliveries) = router_context(temp.path());
+
+        let error = service
+            .recover_committed_deletions(recovery_context(
+                temp.path(),
+                store.clone(),
+                Some(runtime_state.clone()),
+                router,
+                deliveries,
+            )?)
+            .await
+            .err()
+            .ok_or_else(|| std::io::Error::other("missing delete identity was accepted"))?;
+        assert!(matches!(
+            error,
+            ConversationDeletionError::AmbiguousAuthorityCommit(ref found) if found == id
+        ));
+        assert!(store.get_conversation(id).await?.is_some());
+        assert!(runtime_state.get_checkpoint(id).await?.is_some());
+        assert_eq!(
+            serde_json::to_value(prepare_managed_delete(store.as_ref(), id).await?)?,
+            serde_json::to_value(original)?
+        );
+        assert!(path.is_file());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn commit_started_recovery_retries_runtime_lineage_and_transcript_delete()
     -> Result<(), Box<dyn Error>> {
         let temp = tempfile::tempdir()?;
@@ -2037,7 +2066,7 @@ mod tests {
         store.create_conversation(conversation(id)).await?;
         store.create_conversation(conversation(runtime_id)).await?;
         let mut checkpoint = AgentCheckpoint::new(runtime_id);
-        checkpoint.messages_json = "[]".to_string();
+        checkpoint.messages_json = AgentCheckpoint::serialize_payload(Vec::new(), None)?;
         runtime_state
             .save_checkpoint_for_scope(id, &checkpoint)
             .await?;
@@ -2275,7 +2304,7 @@ mod tests {
             .create_conversation(conversation(initial_runtime_id))
             .await?;
         let mut initial_checkpoint = AgentCheckpoint::new(initial_runtime_id);
-        initial_checkpoint.messages_json = "[]".to_string();
+        initial_checkpoint.messages_json = AgentCheckpoint::serialize_payload(Vec::new(), None)?;
         runtime_state
             .save_checkpoint_for_scope(product_id, &initial_checkpoint)
             .await?;
@@ -2322,7 +2351,7 @@ mod tests {
             .create_conversation(conversation(late_runtime_id))
             .await?;
         let mut late_checkpoint = AgentCheckpoint::new(late_runtime_id);
-        late_checkpoint.messages_json = "[]".to_string();
+        late_checkpoint.messages_json = AgentCheckpoint::serialize_payload(Vec::new(), None)?;
         runtime_state
             .save_checkpoint_for_scope(product_id, &late_checkpoint)
             .await?;
@@ -2428,7 +2457,7 @@ mod tests {
         for runtime_id in runtime_ids {
             store.create_conversation(conversation(runtime_id)).await?;
             let mut checkpoint = AgentCheckpoint::new(runtime_id);
-            checkpoint.messages_json = "[]".to_string();
+            checkpoint.messages_json = AgentCheckpoint::serialize_payload(Vec::new(), None)?;
             runtime_state
                 .save_checkpoint_for_scope(id, &checkpoint)
                 .await?;

@@ -1,8 +1,6 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogTarget {
     Stderr,
-    TuiFile,
-    MachineReadableFile,
 }
 
 /// Load shell environment variables by spawning the user's login shell.
@@ -89,15 +87,6 @@ pub fn load_shell_env(app_config: &EkoConfig) {
     let _ = app_config;
 }
 
-pub fn init_logging_for_tui(level: &str) {
-    init_logging_with_target(level, LogTarget::TuiFile);
-}
-
-/// Keep stdout and stderr free of tracing output for a machine protocol.
-pub fn init_logging_for_machine_output(level: &str) {
-    init_logging_with_target(level, LogTarget::MachineReadableFile);
-}
-
 pub fn init_logging(level: &str) {
     init_logging_with_target(level, LogTarget::Stderr);
 }
@@ -169,91 +158,35 @@ pub fn init_logging_with_target(level: &str, target: LogTarget) {
                     .unwrap_or_else(|_| tracing_subscriber::filter::EnvFilter::new(&default_filter))
             };
 
-            match target {
-                LogTarget::TuiFile => {
-                    if let Ok(file) = std::fs::File::create(tui_log_path()) {
-                        let _ = tracing_subscriber::registry()
-                            .with(env_filter())
-                            .with(
-                                tracing_subscriber::fmt::layer()
-                                    .with_writer(std::sync::Mutex::new(file))
-                                    .with_ansi(false)
-                                    .with_timer(LocalTimer),
-                            )
-                            .try_init();
-                    }
-                }
-                LogTarget::MachineReadableFile => {
-                    let registry = tracing_subscriber::registry().with(env_filter());
-                    if let Some(file) = app_log_file() {
-                        let _ = registry
-                            .with(
-                                tracing_subscriber::fmt::layer()
-                                    .with_writer(std::sync::Mutex::new(file))
-                                    .with_ansi(false)
-                                    .with_timer(LocalTimer),
-                            )
-                            .try_init();
-                    } else {
-                        let _ = registry.try_init();
-                    }
-                }
-                LogTarget::Stderr => {
-                    // Dual sink: keep the stderr console output (visible in the
-                    // `cargo tauri dev` terminal) AND mirror to a rotating-ish
-                    // file at ~/.eko/logs/app.log so issues can be
-                    // diagnosed after the fact without re-running. Append mode
-                    // so restarts don't wipe the log.
-                    use tracing_subscriber::layer::SubscriberExt;
-                    let registry = tracing_subscriber::registry().with(env_filter());
-                    let file_layer = app_log_file().map(|file| {
-                        tracing_subscriber::fmt::layer()
-                            .with_writer(std::sync::Mutex::new(file))
-                            .with_ansi(false)
-                            .with_timer(LocalTimer)
-                    });
-                    if let Some(file_layer) = file_layer {
-                        let _ = registry
-                            .with(
-                                tracing_subscriber::fmt::layer().with_timer(LocalTimer),
-                            )
-                            .with(file_layer)
-                            .try_init();
-                    } else {
-                        let _ = registry
-                            .with(tracing_subscriber::fmt::layer().with_timer(LocalTimer))
-                            .try_init();
-                    }
-                }
+            // 仅桌面/共享应用日志路径；旧console专属sink已退出。
+            let _ = target;
+
+            // Dual sink: keep the stderr console output (visible in the
+            // `cargo tauri dev` terminal) AND mirror to a rotating-ish
+            // file at ~/.eko/logs/app.log so issues can be
+            // diagnosed after the fact without re-running. Append mode
+            // so restarts don't wipe the log.
+            let registry = tracing_subscriber::registry().with(env_filter());
+            let file_layer = app_log_file().map(|file| {
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::sync::Mutex::new(file))
+                    .with_ansi(false)
+                    .with_timer(LocalTimer)
+            });
+            if let Some(file_layer) = file_layer {
+                let _ = registry
+                    .with(
+                        tracing_subscriber::fmt::layer().with_timer(LocalTimer),
+                    )
+                    .with(file_layer)
+                    .try_init();
+            } else {
+                let _ = registry
+                    .with(tracing_subscriber::fmt::layer().with_timer(LocalTimer))
+                    .try_init();
             }
         }
     });
-}
-
-#[cfg(not(feature = "telemetry"))]
-fn tui_log_path() -> std::path::PathBuf {
-    if let Ok(cwd) = std::env::current_dir() {
-        let mut current = cwd.as_path();
-        loop {
-            let state_dir = crate::workspace::layout::WorkspaceLayout::state_dir(current);
-            if state_dir.exists()
-                || crate::workspace::layout::WorkspaceLayout::manifest(current).exists()
-            {
-                let dir = state_dir.join("logs");
-                let _ = std::fs::create_dir_all(&dir);
-                return dir.join("tui.log");
-            }
-
-            match current.parent() {
-                Some(parent) => current = parent,
-                None => break,
-            }
-        }
-    }
-
-    let dir = crate::data_root::user_data_path("logs");
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join("tui.log")
 }
 
 /// Open the shared GUI app log file for appending: `~/.eko/logs/app.log`.

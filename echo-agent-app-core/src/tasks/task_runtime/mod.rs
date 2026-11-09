@@ -12,8 +12,8 @@
 //!   `TaskPlan`/`PlanTask` spec-execution join used by the runtime.
 //! - [`store`] — file-backed `TaskRuntimeStore`; every state mutation appends a
 //!   `RuntimeTaskEvent` before rebuilding the projections.
-//! - [`profiles`] — per-domain plan templates (subagent roles, prompt suffix,
-//!   review checklist).
+//! - [`profiles`] — General host role mappings; professional methods and
+//!   completion rules come from the TaskRun-bound plugin snapshot.
 //! - [`planner`] — structured plan generation via a JSON-mode LLM call, with
 //!   plan-quality validation.
 //! - [`executor`] — EKO controller/dispatcher integration for the framework
@@ -59,6 +59,8 @@ pub mod memory_bridge;
 pub mod occurrence;
 pub mod planner;
 pub mod profiles;
+#[cfg(test)]
+pub(crate) mod project_environment_tests;
 pub mod register;
 pub mod review;
 pub mod revisioned_runtime;
@@ -72,6 +74,7 @@ pub mod task_tools;
 pub(crate) mod turn_lifecycle;
 pub mod types;
 pub mod uplink;
+pub mod weixin_delivery;
 pub mod worktree;
 
 pub use boot_reconciler::{TaskRunBootOutcome, TaskRunBootReconciler};
@@ -80,7 +83,6 @@ pub use command_cells::{
 };
 pub use completion_gate::requirements_for_plan;
 pub use execution_target::TaskExecutionTargetResolver;
-pub(crate) use executor::drive_unattended_run;
 pub use executor::{
     EkoExecutionLimits, ExecError, ExecSink, PreflightRejection, ProcessExecutionResourceSnapshot,
     RunOutcome, TaskRunResumeLaunch, TaskRuntimeOperation, execute_run, launch_task_run_resume,

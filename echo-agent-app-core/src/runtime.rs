@@ -66,6 +66,9 @@ pub struct ApplicationLifecycleReceipt {
     pub failures: Vec<ApplicationLifecycleFailure>,
     // Rust ownership only; public diagnostic fields and wire shapes are unchanged.
     continuation: Option<Arc<ApplicationLifecycleRetention>>,
+    // Set only by the original owner's final publication. Absence of a
+    // continuation alone cannot prove that physical settlement happened.
+    physically_final: bool,
 }
 
 impl std::fmt::Debug for ApplicationLifecycleReceipt {
@@ -93,6 +96,7 @@ impl ApplicationLifecycleReceipt {
             primary_error: primary_error.map(|error| error.to_string()),
             failures: Vec::new(),
             continuation: None,
+            physically_final: false,
         }
     }
 
@@ -105,6 +109,56 @@ impl ApplicationLifecycleReceipt {
 
     pub fn is_clean(&self) -> bool {
         self.continuation.is_none() && self.primary_error.is_none() && self.failures.is_empty()
+    }
+
+    /// Keep the EKO host runtime alive until the same original owner publishes
+    /// physical finality. This does not retry cleanup or manufacture progress;
+    /// bounded `ApplicationLifecycleSettlement::wait` remains unchanged.
+    pub async fn wait_final(mut self) -> Self {
+        if self.physically_final {
+            return self;
+        }
+        let Some(retention) = self.continuation.as_ref() else {
+            self.record_retained(
+                "application lifecycle",
+                "physical final receipt unavailable; original continuation is missing",
+            );
+            return self;
+        };
+        let publications = retention.publications.subscribe();
+        self.wait_final_publications(publications).await
+    }
+
+    async fn wait_final_publications(
+        mut self,
+        mut publications: tokio::sync::watch::Receiver<Option<LifecyclePublication>>,
+    ) -> Self {
+        loop {
+            let publication = publications.borrow().clone();
+            if let Some(publication) = publication
+                && publication.final_receipt
+            {
+                let mut final_receipt = publication.receipt;
+                // The desktop can attach its launch/exit error to an earlier
+                // observation. A later physical receipt must not erase it.
+                if self.primary_error.is_some() {
+                    final_receipt.primary_error = self.primary_error.take();
+                }
+                for failure in self.failures {
+                    final_receipt.record_retained(failure.owner, failure.error);
+                }
+                final_receipt.continuation = None;
+                final_receipt.physically_final = true;
+                return final_receipt;
+            }
+            if publications.changed().await.is_err() {
+                self.record_retained(
+                    "application lifecycle",
+                    "final observation closed without physical settlement evidence",
+                );
+                return self;
+            }
+        }
     }
 
     fn record_retained(&mut self, owner: impl Into<String>, error: impl std::fmt::Display) {
@@ -336,6 +390,7 @@ impl ApplicationLifecycleRetention {
                 };
             receipt.continuation = None;
             let final_receipt = !retained;
+            receipt.physically_final = final_receipt;
             {
                 let mut state = root.state.lock().unwrap_or_else(|error| error.into_inner());
                 if retained {
@@ -432,6 +487,8 @@ pub struct ApplicationLifecycleOwner {
         Option<Arc<crate::subagent_event_projection::SubagentEnvelopeProjectionService>>,
     background_tasks: Vec<ApplicationBackgroundTask>,
     external_owners: Vec<ApplicationExternalOwner>,
+    #[cfg(feature = "channels")]
+    channel_runtime: Option<Arc<crate::channel_runtime::ChannelRuntime>>,
     #[cfg(test)]
     specialist_teardown_started: Option<tokio::sync::oneshot::Sender<()>>,
     shutdown_begun: bool,
@@ -473,6 +530,8 @@ impl ApplicationLifecycleOwner {
             subagent_projection: None,
             background_tasks: Vec::new(),
             external_owners: Vec::new(),
+            #[cfg(feature = "channels")]
+            channel_runtime: None,
             #[cfg(test)]
             specialist_teardown_started: None,
             shutdown_begun: false,
@@ -494,6 +553,22 @@ impl ApplicationLifecycleOwner {
     pub fn bind_app_state(&mut self, state: Arc<AppState>) {
         self.bind_app_state_components(&state);
         self.app_state = Some(state);
+    }
+
+    #[cfg(feature = "channels")]
+    pub fn bind_channel_runtime(&mut self, channels: Arc<crate::channel_runtime::ChannelRuntime>) {
+        if let Some(root) = self.retention.upgrade() {
+            channels.bind_lifecycle_retention(&root);
+        }
+        let admission = channels.clone();
+        // Phase one only. Physical settlement stays in the original explicit
+        // slot below; generic external Err must not discard this channel owner.
+        self.track_external_owner(
+            "IM channel admission",
+            move || admission.begin_shutdown(),
+            async { Ok(()) },
+        );
+        self.channel_runtime = Some(channels);
     }
 
     pub fn bind_primary_agent(&mut self, agent: AgentHandle) {
@@ -629,6 +704,9 @@ impl ApplicationLifecycleOwner {
         // Phase one: no joins. Every producer sees admission close or a shared
         // cancellation broadcast before teardown waits on a dependent owner.
         self.root_cancel.cancel();
+        if let Some(state) = self.app_state.as_ref() {
+            state.terminal.begin_shutdown();
+        }
         if let Some(product_data_io) = self.product_data_io.as_ref()
             && let Err(error) = product_data_io.begin_shutdown()
         {
@@ -800,6 +878,27 @@ impl ApplicationLifecycleOwner {
         } else {
             false
         };
+        #[cfg(feature = "channels")]
+        let channels_uncertain = if let Some(channels) = self.channel_runtime.as_ref() {
+            match channels.observe_shutdown().await {
+                Ok(Some(failures)) => {
+                    for error in failures {
+                        receipt.record_retained("IM channel completed failure", error);
+                    }
+                    false
+                }
+                // 原producer还在关闭；continuation保有原资源，这个观察不是失败事实。
+                Ok(None) => true,
+                Err(error) => {
+                    receipt.record_retained("IM channel original owners", error);
+                    true
+                }
+            }
+        } else {
+            false
+        };
+        #[cfg(not(feature = "channels"))]
+        let channels_uncertain = false;
         if !self.normal_drained {
             if let Some(store) = self.task_runtime_store.as_ref() {
                 if let Err(error) = store.shutdown_run_drivers().await {
@@ -836,6 +935,17 @@ impl ApplicationLifecycleOwner {
                 receipt.record_retained("analysis original cleanup debt", error);
             }
         }
+        // Human PTYs may retain a Workspace I/O receipt. Close and observe
+        // only those sessions before joining host/data owners; the shared SSH
+        // authentication masters remain dependencies of Agent/file execution
+        // and are closed by the original close_all stage after it settles.
+        let mut interactive_terminal_uncertain = false;
+        if let Some(state) = self.app_state.as_ref()
+            && let Err(error) = state.terminal.close_interactive_sessions().await
+        {
+            interactive_terminal_uncertain = true;
+            receipt.record_retained("interactive terminal original child/reader", error);
+        }
         // Product-data admission was sealed in phase one. Extension mutations
         // hold an owned flow while their durable commit and specialist fanout
         // settle, so this join must complete while the pool and specialist
@@ -853,8 +963,10 @@ impl ApplicationLifecycleOwner {
         {
             receipt.record_retained("config watcher", error);
         }
-        let mut uncertain =
-            scheduler_uncertain || self.external_owners.iter().any(|owner| owner.join_panicked);
+        let mut uncertain = interactive_terminal_uncertain
+            || scheduler_uncertain
+            || channels_uncertain
+            || self.external_owners.iter().any(|owner| owner.join_panicked);
         if let Some(state) = self.app_state.as_ref() {
             if let Err(error) = state.workspace.runtimes.join_known_shutdown().await {
                 receipt.record_retained("workspace execution owners", error);
@@ -895,10 +1007,8 @@ impl ApplicationLifecycleOwner {
             }
         }
         if uncertain {
-            receipt.record_retained(
-                "application lifecycle",
-                "original execution ownership is not physically settled; resources retained",
-            );
+            // 保留原Owner/continuation即表达未完成；不能把‘仍在途’写成永久failure。
+            // 上方已保留真实错误，后续原物理final不会清删那些历史失败。
             // Keep the original Owner, AppState and dependency resources; the
             // publication is observation only, never a final drained receipt.
             return (true, receipt);
@@ -920,7 +1030,8 @@ impl ApplicationLifecycleOwner {
         if let Some(state) = self.app_state.as_ref()
             && let Err(error) = state.terminal.close_all().await
         {
-            receipt.record("terminal sessions", error);
+            receipt.record_retained("terminal sessions original child/reader", error);
+            return (true, receipt);
         }
 
         if let Some(runtime) = self.plugin_runtime.as_ref()
@@ -1037,6 +1148,8 @@ pub struct AgentRuntime {
 /// accidentally bypass the shared shutdown order.
 pub struct ApplicationServices {
     pub app_state: Arc<AppState>,
+    #[cfg(feature = "channels")]
+    pub channel_runtime: Arc<crate::channel_runtime::ChannelRuntime>,
     pub pool: Arc<crate::agent_pool::AgentPool>,
     pub subagent_projection:
         Arc<crate::subagent_event_projection::SubagentEnvelopeProjectionService>,
@@ -1252,8 +1365,23 @@ impl ApplicationServices {
         }
 
         let app_state = Arc::new(state);
-        app_state.register_agent_control_tools().await;
         lifecycle.bind_app_state(app_state.clone());
+        // Publish the original channel binding before recovery awaits: an
+        // admitted cron callback may already hold its workspace generation.
+        #[cfg(feature = "channels")]
+        let channel_runtime = {
+            let channels = Arc::new(crate::channel_runtime::ChannelRuntime::new(&app_state));
+            lifecycle.bind_channel_runtime(channels.clone());
+            if let Err(error) = app_state
+                .scheduler
+                .weixin_notifications
+                .bind(&app_state, &channels)
+            {
+                return Err(rollback_composition(lifecycle, anyhow::anyhow!(error)).await);
+            }
+            channels
+        };
+        app_state.register_agent_control_tools().await;
         if let Err(error) = app_state.recover_pending_conversation_handoffs().await {
             return Err(rollback_composition(lifecycle, anyhow::anyhow!(error)).await);
         }
@@ -1289,6 +1417,8 @@ impl ApplicationServices {
 
         Ok(Self {
             app_state,
+            #[cfg(feature = "channels")]
+            channel_runtime,
             pool,
             subagent_projection,
             lifecycle: Some(lifecycle),
@@ -1432,7 +1562,6 @@ impl AgentRuntime {
     /// 7. Create hook bridges (task + subagent lifecycle)
     /// 8. Initialize unified memory
     /// 9. Load plugins (skills / hooks / MCP)
-    /// 10. Register LSP tools
     /// 11. Fire startup hook
     pub async fn bootstrap(
         app_config: &EkoConfig,
@@ -1579,12 +1708,11 @@ impl AgentRuntime {
             tracing::warn!(%error, "Failed to load project-local skills");
         }
 
-        // ── NOTE: ExecuteTaskTool + the task-management tools are NOT registered
-        // here. The TaskRuntimeStore doesn't exist yet at primary-agent build
-        // time (GUI: AppState creates it later; TUI: built in main.rs after
-        // bootstrap), so BOTH entry points call `register_task_tools_on_agent`
-        // (in app-core `tasks/task_runtime/register.rs`) post-hoc once the store
-        // is ready. TUI/GUI functional parity (AGENTS.md).
+        // Shared ApplicationServices composition registers task tools once
+        // AppState exposes the canonical TaskRuntimeStore. Pool initialization
+        // receives the same store. This early primary-agent build has no store
+        // yet; remaining legacy callers retain their existing post-hoc hook
+        // while GUI, IM and cron converge on shared application composition.
         // Chat 可用 agent_tool 做单个临时子任务;Auto/Task 的委派统一进入正式 TaskRuntime。
         // ── 4. HITL dispatcher ──
         let hitl_dispatcher = {
@@ -1616,7 +1744,17 @@ impl AgentRuntime {
         // bug where eko.yaml inline hooks disappeared whenever any
         // hooks.yaml file existed.
         let hook_project_root = agent_handle.read(|agent| agent.working_dir()).await;
-        infra::load_user_hooks(&agent_handle, app_config, hook_project_root.as_deref()).await;
+        if let Err(error) =
+            infra::load_user_hooks(&agent_handle, app_config, hook_project_root.as_deref()).await
+        {
+            let receipt = bootstrap_lifecycle
+                .settle(
+                    ApplicationLifecycleReason::BootstrapRollback,
+                    Some(anyhow::Error::msg(error)),
+                )
+                .await;
+            return Err(anyhow::Error::new(receipt.into_error()));
+        }
 
         // ── 8b. Review integration — create when Store is available so
         //       /memory-review and session-end hooks can access it. ──
@@ -1790,15 +1928,10 @@ impl AgentRuntime {
             tracing::info!("Layered memory, evidence sink, and skill policy installed");
         }
 
-        // ── 9. LSP runtime ──
-        // Plugins and built-in project discovery share this single manager;
-        // plugin reload atomically replaces its contents while every LSP tool
-        // keeps the same Arc handle.
-        let lsp_project_root = agent_handle
+        let plugin_project_root = agent_handle
             .read(|agent| agent.working_dir())
             .await
             .unwrap_or_else(crate::data_root::user_data_dir);
-        let lsp_runtime = register_lsp_tools(&agent_handle, &lsp_project_root).await;
 
         // ── 10. Plugins ──
         // Discovery, initial wiring, and later live mutations all go through
@@ -1809,7 +1942,7 @@ impl AgentRuntime {
         // adopts and retries.
         let plugin_runtime = match crate::plugin_runtime::PluginRuntimeService::new_owned(
             agent_handle.clone(),
-            lsp_runtime,
+            plugin_project_root,
             mcp_config_runtime.ownership(),
         )
         .await
@@ -2021,65 +2154,6 @@ pub(crate) fn configure_intent_router(
         "IntentRouter replaced from committed skill catalog"
     );
     keyword_classifier
-}
-
-/// Register the shared LSP specialist for one explicit workspace identity.
-///
-/// The caller owns workspace selection. Keeping cwd fallback out of this
-/// function prevents a process-level directory from being mistaken for the
-/// active GUI/headless workspace during generation changes.
-pub(crate) async fn register_lsp_tools(
-    agent_handle: &AgentHandle,
-    project_root: &std::path::Path,
-) -> crate::plugin_runtime::PluginLspRuntime {
-    use echo_agent::lsp::LspManager;
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
-
-    let config = crate::plugin_runtime::PluginLspRuntime::config_for_workspace(project_root);
-    if !config.servers.is_empty() {
-        tracing::info!(
-            root = %project_root.display(),
-            languages = config.servers.len(),
-            "LSP servers auto-discovered"
-        );
-    }
-
-    let mut lsp_manager = LspManager::new();
-    if let Err(error) = lsp_manager.load_config(&config) {
-        tracing::warn!(%error, "LSP config failed to load for workspace");
-    }
-    lsp_manager.set_project_root(project_root);
-    let languages: Vec<String> = lsp_manager
-        .configured_languages()
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    for language in languages {
-        if let Err(error) = lsp_manager.start_server(&language).await {
-            tracing::warn!(%language, %error, "LSP server unavailable");
-        }
-    }
-
-    let shared_lsp = Arc::new(RwLock::new(lsp_manager));
-    agent_handle
-        .write_async(|a| {
-            let shared_lsp = shared_lsp.clone();
-            Box::pin(async move {
-                use echo_agent::tools::lsp::{
-                    LspDiagnosticsTool, LspFindReferencesTool, LspGotoDefinitionTool, LspHoverTool,
-                    LspStatusTool,
-                };
-                a.add_tool(Box::new(LspDiagnosticsTool::new(shared_lsp.clone())));
-                a.add_tool(Box::new(LspGotoDefinitionTool::new(shared_lsp.clone())));
-                a.add_tool(Box::new(LspFindReferencesTool::new(shared_lsp.clone())));
-                a.add_tool(Box::new(LspHoverTool::new(shared_lsp.clone())));
-                a.add_tool(Box::new(LspStatusTool::new(shared_lsp)));
-            })
-        })
-        .await;
-    tracing::info!("LSP tools registered");
-    crate::plugin_runtime::PluginLspRuntime::new(shared_lsp, config, project_root.to_path_buf())
 }
 
 #[cfg(test)]
@@ -2560,6 +2634,11 @@ mod tests {
             WorkspaceKind::General,
             temp.path().join("workspace"),
         )?;
+        std::fs::create_dir(workspace.root.join(".git"))?;
+        assert_eq!(
+            crate::utils::find_project_root(&workspace.root).as_ref(),
+            Some(&workspace.root)
+        );
         let state_dir = WorkspaceLayout::state_dir(&workspace.root);
         let receipts = ReviewReceiptStore::open(&state_dir).map_err(anyhow::Error::msg)?;
         receipts
@@ -2603,8 +2682,9 @@ mod tests {
             Some(ReviewTerminal::Interrupted { .. })
         ));
 
-        let global_cwd = temp.path().join("outside-project");
-        std::fs::create_dir_all(&global_cwd)?;
+        // Only cwd is an existing project-free volume root. All writable fixtures remain owned here.
+        let global_cwd = std::path::PathBuf::from("/");
+        assert!(crate::utils::find_project_root(&global_cwd).is_none());
         let global_root = temp.path().join("global-data");
         let receipts = ReviewReceiptStore::open(&global_root).map_err(anyhow::Error::msg)?;
         receipts
@@ -2652,6 +2732,23 @@ mod tests {
         let Some(fixture_dir) = std::env::var_os("EKO_BOOTSTRAP_WORKSPACE_FIXTURE") else {
             return Ok(());
         };
+        let cwd = std::env::current_dir()?;
+        let resolved = crate::infra::resolve_memory_store_paths(None);
+        if crate::utils::find_project_root(&cwd).is_none() {
+            assert_eq!(resolved, crate::infra::global_memory_paths());
+            assert_eq!(
+                resolved.1,
+                PathBuf::from(
+                    std::env::var_os("EKO_DATA_DIR")
+                        .ok_or_else(|| anyhow::anyhow!("owned global fixture root missing"))?
+                )
+            );
+        } else {
+            assert_eq!(
+                resolved.1,
+                crate::workspace::layout::WorkspaceLayout::state_dir(&cwd)
+            );
+        }
         let runtime = bootstrap_review_fixture(None, &PathBuf::from(fixture_dir)).await?;
         runtime
             .lifecycle_owner(tokio_util::sync::CancellationToken::new())?
@@ -3567,6 +3664,352 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn channel_pending_observation_is_not_a_final_cleanup_failure() -> anyhow::Result<()> {
+        use crate::channel_runtime::test_support;
+        use std::sync::atomic::Ordering;
+        let (plugin, mut probe) = test_support::channel(true, false, false);
+        let channels = crate::channel_runtime::ChannelRuntime::with_original_test_plugin(
+            std::sync::Weak::new(),
+            plugin,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let mut owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        owner.bind_channel_runtime(channels);
+        let initial = owner.begin_shutdown(ApplicationLifecycleReason::Shutdown, None);
+        let settlement = owner.start_join(initial);
+        let first =
+            tokio::time::timeout(std::time::Duration::from_secs(2), settlement.wait()).await;
+        let entered =
+            tokio::time::timeout(std::time::Duration::from_secs(2), probe.started.notified()).await;
+        // 包括观察失败时也先释放真实producer；不通过额外kick或预join掩盖首次Pending。
+        probe
+            .release
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("original stop release missing"))?
+            .send(())
+            .map_err(|_| anyhow::anyhow!("original stop owner vanished"))?;
+        entered?;
+        let first = first?;
+        let was_pending =
+            first.continuation.is_some() && !first.physically_final && !first.is_clean();
+        let initial_failures = first.failures.clone();
+        // wait_final只订阅原进度，原stop postcommit负责唤醒同一个Root。
+        let final_receipt =
+            tokio::time::timeout(std::time::Duration::from_secs(2), first.wait_final()).await?;
+        assert!(
+            was_pending,
+            "pending cleanup escaped original resource retention"
+        );
+        assert!(
+            initial_failures.is_empty(),
+            "in-flight cleanup was recorded as a failure: {initial_failures:?}"
+        );
+        assert!(final_receipt.physically_final && final_receipt.continuation.is_none());
+        assert!(
+            final_receipt.is_clean(),
+            "normal original stop became a permanent failure: {final_receipt}"
+        );
+        assert_eq!(probe.stops.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn channel_postcommit_finalizes_original_root_without_an_external_wait_kick()
+    -> anyhow::Result<()> {
+        use crate::channel_runtime::test_support;
+        use std::sync::atomic::Ordering;
+        let (plugin, mut probe) = test_support::channel(true, false, false);
+        let channels = crate::channel_runtime::ChannelRuntime::with_original_test_plugin(
+            std::sync::Weak::new(),
+            plugin,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let weak_channels = Arc::downgrade(&channels);
+        let mut owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        owner.bind_channel_runtime(channels.clone());
+        let (dependency_closed, dependency_observer) = tokio::sync::oneshot::channel();
+        owner.specialist_teardown_started = Some(dependency_closed);
+        let root = owner
+            .retention
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("root absent"))?;
+        let mut publications = root.publications.subscribe();
+        let initial = owner.begin_shutdown(
+            ApplicationLifecycleReason::Shutdown,
+            Some(anyhow::anyhow!("original desktop exit error")),
+        );
+        let settlement = owner.start_join(initial);
+        let first =
+            tokio::time::timeout(std::time::Duration::from_secs(2), settlement.wait()).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), probe.started.notified()).await?;
+        assert!(first.continuation.is_some());
+        assert!(!first.physically_final);
+        assert_eq!(probe.stops.load(Ordering::SeqCst), 1);
+        let waiter = tokio::spawn(first.clone().wait_final());
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        waiter.abort();
+        assert!(waiter.await.is_err());
+        drop(channels);
+        assert!(weak_channels.upgrade().is_some());
+        assert!(
+            !root
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .owner
+                .as_ref()
+                .is_some_and(|(owner, _)| owner.primary_closed)
+        );
+        probe
+            .release
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("release absent"))?
+            .send(())
+            .map_err(|_| anyhow::anyhow!("original stop owner vanished"))?;
+        // Observe publication directly: no Settlement.wait/note_progress/kick
+        // is allowed to make this post-commit completion happen.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if publications
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|p| p.final_receipt)
+                {
+                    break;
+                }
+                publications
+                    .changed()
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        dependency_observer.await?;
+        let final_receipt =
+            tokio::time::timeout(std::time::Duration::from_secs(2), first.wait_final()).await?;
+        assert!(final_receipt.physically_final);
+        assert!(final_receipt.continuation.is_none());
+        assert_eq!(
+            final_receipt.primary_error.as_deref(),
+            Some("original desktop exit error")
+        );
+        assert!(final_receipt.into_result().is_err());
+        assert_eq!(probe.stops.load(Ordering::SeqCst), 1);
+        assert!(weak_channels.upgrade().is_none());
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn channel_stop_error_keeps_original_dependencies_and_repeated_wait_does_not_retry()
+    -> anyhow::Result<()> {
+        use crate::channel_runtime::test_support;
+        use std::sync::atomic::Ordering;
+        let (plugin, probe) = test_support::channel(false, true, false);
+        let channels = crate::channel_runtime::ChannelRuntime::with_original_test_plugin(
+            std::sync::Weak::new(),
+            plugin,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let mut owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        owner.bind_channel_runtime(channels.clone());
+        let root = owner
+            .retention
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("root absent"))?;
+        let mut publications = root.publications.subscribe();
+        let initial = owner.begin_shutdown(ApplicationLifecycleReason::Shutdown, None);
+        let settlement = owner.start_join(initial);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let failed = publications.borrow().as_ref().is_some_and(|p| {
+                    p.receipt
+                        .failures
+                        .iter()
+                        .any(|failure| failure.error.contains("mock_stop_error"))
+                });
+                if failed {
+                    break;
+                }
+                publications
+                    .changed()
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        for _ in 0..3 {
+            let observed = settlement.clone().wait().await;
+            assert!(observed.continuation.is_some());
+            assert!(!observed.physically_final);
+        }
+        // Cached wait can move the original owner into its single-flight poll.
+        // Wait only for that poll, then inspect the parked owner under one lock.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                {
+                    let state = root.state.lock().unwrap_or_else(|error| error.into_inner());
+                    if !state.polling {
+                        assert!(state.owner.as_ref().is_some_and(|(owner, _)| {
+                            !owner.primary_closed && owner.channel_runtime.is_some()
+                        }));
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(probe.stops.load(Ordering::SeqCst), 1);
+        // A changed test flag is not physical evidence. Only a successful
+        // explicit stop of the original handle can wake legal final cleanup.
+        probe.fail.store(false, Ordering::SeqCst);
+        channels
+            .retry_original_stop_for_test()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if publications
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|p| p.final_receipt)
+                {
+                    break;
+                }
+                publications
+                    .changed()
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        let final_receipt = publications
+            .borrow()
+            .as_ref()
+            .map(|publication| publication.receipt.clone())
+            .ok_or_else(|| anyhow::anyhow!("original final publication missing"))?;
+        assert!(final_receipt.physically_final && !final_receipt.is_clean());
+        assert!(
+            final_receipt
+                .failures
+                .iter()
+                .any(|failure| failure.error.contains("mock_stop_error")),
+            "legal cleanup retry erased the original failed stop fact"
+        );
+        assert_eq!(probe.stops.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn channel_cleanup_unwind_retains_original_slot_without_repolling_the_producer()
+    -> anyhow::Result<()> {
+        use crate::channel_runtime::test_support;
+        use std::sync::atomic::Ordering;
+        let (plugin, probe) = test_support::channel(false, false, true);
+        let channels = crate::channel_runtime::ChannelRuntime::with_original_test_plugin(
+            std::sync::Weak::new(),
+            plugin,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let mut owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        owner.bind_channel_runtime(channels.clone());
+        let root = owner
+            .retention
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("root absent"))?;
+        let mut publications = root.publications.subscribe();
+        let initial = owner.begin_shutdown(ApplicationLifecycleReason::Shutdown, None);
+        let settlement = owner.start_join(initial);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if publications.borrow().as_ref().is_some_and(|p| {
+                    p.receipt.failures.iter().any(|failure| {
+                        failure
+                            .error
+                            .contains("Original cleanup producer unavailable")
+                    })
+                }) {
+                    break;
+                }
+                publications
+                    .changed()
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        for _ in 0..3 {
+            let observed = settlement.clone().wait().await;
+            assert!(observed.continuation.is_some());
+            assert!(!observed.physically_final);
+        }
+        // The cached wait may have started the same original owner's poll.
+        // Quiescence is the observation boundary, not the assertion's outcome.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                {
+                    let state = root.state.lock().unwrap_or_else(|error| error.into_inner());
+                    if !state.polling {
+                        assert!(state.owner.as_ref().is_some_and(|(owner, _)| {
+                            !owner.primary_closed
+                                && owner
+                                    .channel_runtime
+                                    .as_ref()
+                                    .is_some_and(|original| Arc::ptr_eq(original, &channels))
+                        }));
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(probe.stops.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn final_wait_requires_original_final_evidence_and_preserves_diagnostics()
+    -> anyhow::Result<()> {
+        let missing = ApplicationLifecycleReceipt::new(ApplicationLifecycleReason::Shutdown, None)
+            .wait_final()
+            .await;
+        assert!(!missing.physically_final);
+        assert!(missing.into_result().is_err());
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        drop(sender);
+        let closed = ApplicationLifecycleReceipt::new(ApplicationLifecycleReason::Shutdown, None)
+            .wait_final_publications(receiver)
+            .await;
+        assert!(!closed.physically_final);
+        assert!(closed.into_result().is_err());
+        let owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        let mut final_receipt = owner
+            .settle(ApplicationLifecycleReason::Shutdown, None)
+            .await;
+        assert!(final_receipt.physically_final);
+        final_receipt.record("original completed cleanup", "completed error");
+        let final_receipt = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            final_receipt.wait_final(),
+        )
+        .await?;
+        assert!(final_receipt.physically_final);
+        assert_eq!(final_receipt.failures.len(), 1);
+        assert!(final_receipt.into_result().is_err());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn dropping_join_waiter_does_not_abandon_owned_settlement() {
         let join_started = Arc::new(tokio::sync::Notify::new());
@@ -3660,6 +4103,104 @@ mod tests {
         if store.active_operation_count() != 0 {
             return Err("TaskRuntime operation supervisor remained active".to_string());
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn application_shutdown_closes_project_pty_before_host_io_teardown() -> anyhow::Result<()>
+    {
+        const NAME: &str =
+            "runtime::tests::application_shutdown_closes_project_pty_before_host_io_teardown";
+        if run_isolated_bootstrap_test(NAME)? {
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let code = temp.path().join("project-code");
+        std::fs::create_dir(&code)?;
+        std::fs::write(code.join("keep.txt"), "user code")?;
+        let primary = AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("mock-model")
+                .llm_client(Arc::new(echo_agent::testing::MockLlmClient::new()))
+                .build()?,
+        );
+        let io = crate::product_data_io::ProductDataIoService::new();
+        let state = Arc::new(AppState::from_shared(
+            primary.clone(),
+            None,
+            Arc::new(HitlDispatcher::new()),
+            None,
+            None,
+            EkoConfig::default(),
+            Arc::new(crate::mcp_config_runtime::McpConfigRuntime::from_snapshot(
+                temp.path().join("mcp.json"),
+                Default::default(),
+            )),
+            io.clone(),
+        )?);
+        let mut owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        owner.bind_app_state(state.clone());
+        owner.bind_primary_agent(primary);
+        owner.bind_product_data_io(io);
+        let (workspace, _) = state
+            .create_project_workspace_owned(
+                "pty-project",
+                crate::workspace::WorkspaceKind::General,
+                crate::workspace::ProjectSource::ExistingLocal { path: code.clone() },
+            )
+            .await?;
+        let project = state
+            .project_resources_for_workspace(
+                workspace.id.as_str(),
+                &workspace.opaque_product_data_generation(),
+            )
+            .await?;
+        state
+            .terminal
+            .create_with_shell_and_resources_for_test(
+                "owned-project-pty".to_string(),
+                Some(project.working_dir().to_path_buf()),
+                "/bin/sh".to_string(),
+                project.resource_guards(),
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+        drop(project);
+        let busy_before = state
+            .ensure_workspace_idle_for_delete(&workspace.id)
+            .await
+            .is_err();
+        let controls_before = state
+            .workspace
+            .runtimes
+            .activity_snapshot()
+            .await?
+            .into_iter()
+            .find(|activity| activity.workspace_id == workspace.id)
+            .map(|activity| activity.active_controls)
+            .unwrap_or(0);
+        let initial = owner.begin_shutdown(ApplicationLifecycleReason::Shutdown, None);
+        let receipt = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            owner.start_join(initial).wait(),
+        )
+        .await?;
+        assert!(receipt.is_clean(), "project PTY did not settle: {receipt}");
+        assert!(busy_before);
+        assert_eq!(controls_before, 1);
+        assert!(state.terminal.list().is_empty());
+        let controls_after = state
+            .workspace
+            .runtimes
+            .activity_snapshot()
+            .await?
+            .into_iter()
+            .find(|activity| activity.workspace_id == workspace.id)
+            .map(|activity| activity.active_controls)
+            .unwrap_or(0);
+        assert_eq!(controls_after, 0);
+        assert_eq!(std::fs::read_to_string(code.join("keep.txt"))?, "user code");
         Ok(())
     }
 

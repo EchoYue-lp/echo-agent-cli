@@ -1,4 +1,4 @@
-//! EKO-owned product configuration.
+//! Eclip-owned product configuration.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use echo_agent::llm::{LlmApiProtocol, ModelInputModality};
 use echo_agent::skills::hooks::HooksDefinition;
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_EKO_SYSTEM_PROMPT: &str = r#"You are EKO, a local personal AI assistant running on the user's machine.
+pub const DEFAULT_EKO_SYSTEM_PROMPT: &str = r#"You are Eclip, a local personal AI assistant running on the user's machine.
 
 - Establish facts from available files, configuration, logs, tests, and tool output before making claims.
 - Use tools when they can verify, inspect, execute, or make concrete progress.
@@ -29,13 +29,14 @@ pub struct EkoConfig {
         serialize_with = "serialize_eko_agent_settings"
     )]
     pub agent: AgentSettings,
+    /// Captured by each new run/turn; changing config never rewrites active work.
+    pub max_subagent_depth: crate::subagent_policy::SubagentDepthLimit,
     pub mcp: McpYamlConfig,
     pub channels: ChannelsConfig,
     pub webhooks: WebhooksConfig,
     pub hooks: HooksDefinition,
     pub server: ServerConfig,
     pub logging: LoggingConfig,
-    pub tui: TuiConfig,
 }
 
 impl Default for EkoConfig {
@@ -45,13 +46,13 @@ impl Default for EkoConfig {
             model_providers: BTreeMap::new(),
             configured_models: Vec::new(),
             agent: default_eko_agent_settings(),
+            max_subagent_depth: crate::subagent_policy::SubagentDepthLimit::default(),
             mcp: McpYamlConfig::default(),
             channels: ChannelsConfig::default(),
             webhooks: WebhooksConfig::default(),
             hooks: HooksDefinition::default(),
             server: ServerConfig::default(),
             logging: LoggingConfig::default(),
-            tui: TuiConfig::default(),
         }
     }
 }
@@ -60,7 +61,7 @@ fn default_eko_agent_settings() -> AgentSettings {
     AgentSettings {
         name: "eko".to_string(),
         system_prompt: DEFAULT_EKO_SYSTEM_PROMPT.to_string(),
-        max_iterations: 10,
+        max_iterations: 0,
         enable_tools: true,
         enable_memory: true,
         enable_human_in_loop: true,
@@ -81,12 +82,16 @@ fn deserialize_eko_agent_settings<'de, D>(deserializer: D) -> Result<AgentSettin
 where
     D: serde::Deserializer<'de>,
 {
-    let patch = serde_json::Value::deserialize(deserializer)?;
+    let mut patch = serde_json::Value::deserialize(deserializer)?;
+    // 旧文件中的有限轮数不再是 Eclip 产品配置，不能重新限制主 Agent。
+    if let Some(fields) = patch.as_object_mut() {
+        fields.remove("max_iterations");
+    }
     if let Some(fields) = patch.as_object() {
         for removed in ["enable_tools", "enable_memory", "enable_human_in_loop"] {
             if fields.contains_key(removed) {
                 return Err(serde::de::Error::custom(format!(
-                    "agent.{removed} is not configurable in EKO"
+                    "agent.{removed} is not configurable in Eclip"
                 )));
             }
         }
@@ -106,7 +111,12 @@ where
 {
     let mut value = serde_json::to_value(settings).map_err(serde::ser::Error::custom)?;
     if let Some(fields) = value.as_object_mut() {
-        for removed in ["enable_tools", "enable_memory", "enable_human_in_loop"] {
+        for removed in [
+            "enable_tools",
+            "enable_memory",
+            "enable_human_in_loop",
+            "max_iterations",
+        ] {
             fields.remove(removed);
         }
     }
@@ -150,8 +160,10 @@ impl EkoConfig {
                     base_url: None,
                     api_protocol: Some(model.api_protocol),
                     max_tokens: model.max_tokens,
-                    temperature: model.temperature,
+                    temperature: None,
                     context_window: model.context_window,
+                    // 当前EKO配置没有额外来源事实；保留上述直接配置，不伪造provider事实。
+                    facts: Default::default(),
                 }
             }),
             agent: self.agent.clone(),
@@ -195,7 +207,6 @@ pub struct ConfiguredModel {
     pub input_modalities: Vec<ModelInputModality>,
     pub enabled: bool,
     pub max_tokens: Option<u32>,
-    pub temperature: Option<f32>,
     pub context_window: Option<u32>,
 }
 
@@ -210,7 +221,6 @@ impl Default for ConfiguredModel {
             input_modalities: ModelInputModality::text_only(),
             enabled: true,
             max_tokens: None,
-            temperature: None,
             context_window: None,
         }
     }
@@ -227,10 +237,56 @@ pub struct McpYamlConfig {
 pub struct ChannelsConfig {
     pub qq: QqChannelConfig,
     pub feishu: FeishuChannelConfig,
+    pub weixin: WeixinChannelConfig,
     pub session: SessionYamlConfig,
 }
 
+/// Eclip's local account policy. Protocol types stay optional with `channels`,
+/// so ordinary config loading does not activate a transport dependency.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct WeixinChannelConfig {
+    pub enabled: bool,
+    pub account: Option<WeixinAccountConfig>,
+    pub notifications: std::collections::HashMap<String, WeixinNotificationConfig>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct WeixinAccountConfig {
+    pub account_id: String,
+    pub bot_token: String,
+    pub base_url: String,
+    pub user_id: String,
+    /// Persisted authorization identity; a process restart does not rotate it.
+    pub generation: String,
+}
+
+impl std::fmt::Debug for WeixinAccountConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeixinAccountConfig")
+            .field("account_id", &self.account_id)
+            .field("bot_token", &"[redacted]")
+            .field("base_url", &"[redacted]")
+            .field("user_id", &self.user_id)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+/// A user-selected destination for future occurrences. The original run
+/// admission freezes this value; later configuration cannot retarget that run.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WeixinNotificationConfig {
+    pub definition_id: String,
+    pub account_id: String,
+    pub credential_generation: String,
+    pub peer_id: String,
+    pub context_ref: String,
+    pub workspace_id: String,
+    pub channel_conversation: String,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct QqChannelConfig {
     pub enabled: bool,
@@ -238,7 +294,7 @@ pub struct QqChannelConfig {
     pub client_secret: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct FeishuChannelConfig {
     pub enabled: bool,
@@ -248,6 +304,35 @@ pub struct FeishuChannelConfig {
     pub webhook_bind: String,
     pub webhook_path: String,
     pub webhook_verification_token: Option<String>,
+}
+
+impl std::fmt::Debug for QqChannelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QqChannelConfig")
+            .field("enabled", &self.enabled)
+            .field("app_id", &self.app_id)
+            .field("client_secret", &"[redacted]")
+            .finish()
+    }
+}
+impl std::fmt::Debug for FeishuChannelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FeishuChannelConfig")
+            .field("enabled", &self.enabled)
+            .field("app_id", &self.app_id)
+            .field("app_secret", &"[redacted]")
+            .field("mode", &self.mode)
+            .field("webhook_bind", &self.webhook_bind)
+            .field("webhook_path", &self.webhook_path)
+            .field(
+                "webhook_verification_token",
+                &self
+                    .webhook_verification_token
+                    .as_ref()
+                    .map(|_| "[redacted]"),
+            )
+            .finish()
+    }
 }
 
 impl Default for FeishuChannelConfig {
@@ -321,20 +406,6 @@ impl Default for LoggingConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
-pub struct TuiConfig {
-    pub max_display_chars: usize,
-}
-
-impl Default for TuiConfig {
-    fn default() -> Self {
-        Self {
-            max_display_chars: 20_000,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct WebhooksConfig {
@@ -371,7 +442,7 @@ pub fn load_config_file(path: &Path) -> Result<EkoConfig, String> {
 pub fn save_config_file(path: &Path, config: &EkoConfig) -> Result<(), String> {
     let yaml = serde_yaml::to_string(config)
         .map_err(|error| format!("configuration serialization failed: {error}"))?;
-    let content = format!("# EKO Configuration\n\n{yaml}");
+    let content = format!("# Eclip Configuration\n\n{yaml}");
     echo_agent::utils::fs::atomic_write(path, content.as_bytes())
         .map_err(|error| format!("configuration write failed: {error}"))?;
     #[cfg(unix)]
@@ -390,28 +461,33 @@ pub fn save_config(config: &EkoConfig) -> Result<(), String> {
         .find(|path| path.exists())
         .or_else(|| search.get(1))
         .or_else(|| search.first())
-        .ok_or_else(|| "no EKO configuration path is available".to_string())?;
+        .ok_or_else(|| "no Eclip configuration path is available".to_string())?;
     save_config_file(target, config)
 }
 
-pub fn load_config(explicit_path: Option<&str>) -> EkoConfig {
-    if let Some(path) = explicit_path.map(PathBuf::from) {
-        return load_config_file(&path).unwrap_or_else(|error| {
-            tracing::error!(path = %path.display(), %error, "failed to load EKO config");
-            EkoConfig::default()
-        });
+pub fn load_config(explicit_path: Option<&str>) -> Result<EkoConfig, String> {
+    let selected = explicit_path.map(PathBuf::from).or_else(|| {
+        std::env::var("EKO_CONFIG")
+            .ok()
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from)
+    });
+    if let Some(path) = selected {
+        return load_config_file(&path);
     }
     for path in config_search_paths() {
-        if path.exists() {
-            match load_config_file(&path) {
-                Ok(config) => return config,
-                Err(error) => {
-                    tracing::warn!(path = %path.display(), %error, "invalid EKO config");
-                }
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => return load_config_file(&path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Failed to inspect config file {}: {error}",
+                    path.display()
+                ));
             }
         }
     }
-    EkoConfig::default()
+    Ok(EkoConfig::default())
 }
 
 pub fn apply_env_overrides(config: &mut EkoConfig) {
@@ -439,9 +515,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explicit_config_depth_errors_are_not_replaced_by_a_default()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("eko.yaml");
+        let selected = path.to_str().ok_or("fixture config path is not UTF-8")?;
+        assert!(load_config(Some(selected)).is_err());
+        std::fs::write(&path, "max_subagent_depth: 4\n")?;
+        assert!(load_config(Some(selected)).is_err());
+        std::fs::write(&path, "max_subagent_depth: 3\n")?;
+        assert_eq!(load_config(Some(selected))?.max_subagent_depth.get(), 3);
+        std::fs::write(&path, "{}\n")?;
+        assert_eq!(load_config(Some(selected))?.max_subagent_depth.get(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn eko_defaults_are_owned_by_the_application() {
         let config = EkoConfig::default();
-        assert!(config.agent.system_prompt.contains("EKO"));
+        assert!(config.agent.system_prompt.contains("Eclip"));
         assert!(config.agent.enable_tools);
         assert!(config.agent.enable_memory);
         assert_eq!(config.server.host, "127.0.0.1");
@@ -463,6 +555,20 @@ mod tests {
         assert!(parsed.agent.enable_tools);
         assert!(parsed.agent.enable_memory);
         assert_eq!(parsed.agent.system_prompt, DEFAULT_EKO_SYSTEM_PROMPT);
+        Ok(())
+    }
+
+    #[test]
+    fn unbounded_agent_drops_retired_iteration_setting() -> Result<(), String> {
+        let parsed = serde_yaml::from_str::<EkoConfig>(
+            "agent:\n  name: existing-agent\n  max_iterations: 10\n",
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(parsed.agent.name, "existing-agent");
+        assert_eq!(parsed.agent.max_iterations, 0);
+        let yaml = serde_yaml::to_string(&parsed).map_err(|error| error.to_string())?;
+        assert!(!yaml.contains("max_iterations"));
+        assert_eq!(EkoConfig::default().agent.max_iterations, 0);
         Ok(())
     }
 

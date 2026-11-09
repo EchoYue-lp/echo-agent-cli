@@ -1,5 +1,15 @@
 # EKO Configuration Guide
 
+## Maximum Subagent depth
+
+Use the GUI configuration panel or the EKO-owned top-level YAML value below. Only integers 1, 2 and 3 are accepted; the default is 1. Primary is layer 0. Changes apply to new runs/turns; existing runs, new tasks within them, retries and recovery keep their original binding. Invalid configuration files fail explicitly instead of silently loading defaults.
+
+```yaml
+max_subagent_depth: 1
+```
+
+This does not change concurrency or Framework defaults and does not require a TaskRun for a lightweight agent_tool call. Historical runs without a trustworthy binding cannot obtain new delegation permission from this setting. See [ADR 0052](adr/0052-gui-subagent-depth-policy.md).
+
 EKO owns `EkoConfig` and the `~/.eko` data root in app-core. Runtime bootstrap
 selects the provider-neutral fields used by the framework's `FrameworkConfig`,
 typed `PermissionMode`, and explicit paths; the framework does not discover EKO
@@ -44,7 +54,6 @@ configured_models:
     input_modalities: ["text", "image"]
     enabled: true
     max_tokens: 8192
-    temperature: 0.7
     context_window: 396000
 ```
 
@@ -75,7 +84,6 @@ See [ADR 0048](./adr/0048-context-compression-product-policy.md).
 
 | Field | Meaning |
 | --- | --- |
-| `max_iterations` | Maximum ReAct iterations for one turn; `0` means no product cap |
 | `tool_timeout_ms` | Timeout for one tool call |
 | `max_tool_output_tokens` | Context budget for one tool result; full output can be persisted as an artifact |
 | `token_limit` | Explicit compression threshold; `0` uses model/application policy |
@@ -138,6 +146,82 @@ QQ and Feishu use the `channels` section and corresponding environment
 variables. Channels are a complete Agent surface and share the same chat
 driver, TaskRuntime, HITL, and memory authority as GUI and TUI.
 
+### Personal Weixin (source candidate; compilation and native checks pending)
+
+Personal Weixin uses `channels.weixin` and the existing channel page's QR flow,
+without a WeChat password, AppID or AppSecret form. QR encoding stays local.
+Numeric verification is confined to its dedicated interaction. Refresh/cancel
+retain original challenge identity; a late confirmation cannot replace newer
+configuration. The backend publishes account/token/scanner identity and persisted
+credential generation only after the original ConfigState owned-save/CAS commits.
+Ordinary configuration, status and Debug omit tokens, context, QR content and
+verification codes. Existing restrictive local file permissions remain in use;
+credentials do not enter prompts or logs. The empty configuration is:
+
+```yaml
+channels:
+  weixin:
+    enabled: false
+    account: null
+    notifications: {}
+```
+
+The candidate distinguishes configured/authorized, authenticated-poll Ready,
+and a send's Accepted. Saving or starting is not online evidence, and Accepted
+does not establish phone receipt. `-14` requires reauthentication. Forget removes
+local credentials/protocol state without claiming server revocation or deleting
+history or unsettled notifications. One active account accepts only the scanning
+user's direct text into the original Agent/TaskRun/HITL. Account replacement does
+not reuse old context, session or human-request identity. Groups/media/mixed media
+do not execute remaining text. No OpenClaw Gateway or desktop injection is used.
+
+The scheduled-task page can enable a notification for the exact task definition,
+addressed to the scanning user of the connected account. A prior phone direct
+message is required to capture its original context reference. `notifications`
+is EKO configuration, not a new product field on generic CronTask. Original
+occurrence admission freezes account, credential generation, peer, context
+reference, workspace, channel conversation and definition in the same TaskRuntime
+journal commit. Later configuration/project/login changes cannot retarget it.
+Actual completion results and artifact references use the original DeliveryLedger/
+TaskRuntime journal. Notification failure/Unknown does not alter task outcome or
+rerun its prompt; possibly sent Unknown effects are not automatically repeated.
+Sending windows, quotas, no-context and restart behavior require real service
+checks, without delivery guarantees.
+
+Control completion comes from the original effect owner's typed result, not
+rendered text or stream EOF. A confirmed no-admission result durably defers the
+same provider ID/payload and withholds ACK for retry. An uncertain or partial
+effect durably records Unknown before a recovery receipt and cannot auto-replay.
+The native channel commands explicitly accept snake_case argument keys, matching
+the existing endpoints and Tauri bridge.
+
+After original configured-channel startup, recovery scans original completed runs
+in global and registered workspace journals. Frozen occurrence/target identity
+reconstructs only notification work that never started, without rerunning the
+prompt or changing TaskRun Completed. Existing Accepted is not resent; a started
+unknown effect stays Unknown. Missing identity or durability remains a diagnostic.
+
+While queued, the original input pump's Weixin reply route retains only receiver,
+exact-message context and fenced-message-template data, without a response task,
+SessionStreamReceipt or delivery permit. After claim, the same single pump
+concurrently drives its original foreground and reply consumer through the
+original bounded sender; no Weixin inbox is added. Explicit absent context stays
+bound to the original message rather than borrowing a later peer token.
+
+**Pressure checks remain unrun:** the original pump's data route targets the
+previous 32-response-slots → blocked strict cursor → unreachable later `/reply`
+counterexample. Explicit Steer retains tracked live injection. Once durable input and the original
+supervised observer own it, the response acknowledges persistence while awaiting
+processing, without awaiting drain or adding a same-run output waiter. The original
+owner records later drain/recovery; acceptance does not claim application. The greater-than-32 plus later
+`/reply` regression, compilation and native checks have not run. Source wiring
+is not verified closure or complete Weixin/HITL Outcome acceptance. This candidate has no compilation or native
+acceptance; local fixtures, frontend checks, real GUI authentication/phone
+messages and main CI require separate evidence. Only the user performs final
+real authentication and sending in the GUI. The first-party protocol reference
+is [openclaw-weixin 874637a0, 2.4.10, MIT](https://github.com/Tencent/openclaw-weixin/tree/874637a0dbc24050f72d1385add4fc6170a2d726).
+See [ADR 0054](adr/0056-personal-weixin-channel.md).
+
 | Variable | Purpose |
 | --- | --- |
 | `EKO_DATA_DIR` | Override the `~/.eko` data root |
@@ -147,3 +231,37 @@ driver, TaskRuntime, HITL, and memory authority as GUI and TUI.
 | `EKO_UV_PATH` | `uv` path for analytics runtime |
 | `RUST_LOG` | Rust log filter |
 | `HTTP_PROXY` / `HTTPS_PROXY` | HTTP proxy |
+
+Legacy `.lsp.yaml` is no longer parsed or hot-reloaded. Discovery only reports that LSP has retired; the original file is preserved.
+
+## IM replies to human-loop requests
+
+Each active EKO channel approval, input or selection prompt supplies a response target. Reply with `/reply <response-target> <answer>`; use `/reply <response-target> /cancel` to decline. Approval answers retain `y`, `a`, `n [reason]` and `m [feedback]`; selection accepts its original option number or name. Free-text input preserves its answer suffix, including Unicode and newlines. A pending request is not answered by bare text. Missing, old, non-front or foreign-session targets are rejected and do not become normal chat; ordinary text without a pending request remains chat.
+
+Submission is distinct from the original provider/dispatcher's effective answer. GUI replies carry the original delivered scope and target across page changes; historical events without a target are not activated. See [ADR0053](adr/0053-im-cron-gui-control.md) for the contract and the pending Rust/native, live composition and IM/cron qualification boundaries. The identity source checkpoint does not claim that the complete channel management page or native platform delivery has been verified.
+
+## Domain method declarations
+
+An enabled plugin may add one package-root `domain.yaml`. It declares
+`schema_version: 1`, nonempty `method`, optional `default_subagent_roles`, and
+explicit `allowed_tools`, `required_artifacts`, `execution_checks`,
+`acceptance_criteria`, `review_checklist` and `inputs` lists. Unknown fields or
+invalid declarations reject the candidate through the original publication
+error path. No declaration means an ordinary plugin, not an implicit domain.
+Manifest name and optional version are not duplicated in this file.
+
+The existing chat/task request accepts optional `domain_plugin` (GUI camelCase
+`domainPlugin`). Omission keeps General. The original input queue stores that
+selection with its payload identity; it cannot change an active run by steering.
+New non-General `domain_profile` requests must select a plugin instead. Historical
+profile names remain readable; they do not authorize new professional execution.
+
+Inputs are normalized package-relative files. Selected/dependent package content,
+monitors, output styles and the actually active global style provider contribute
+to the binding; pure theme colors do not. A changed or missing source blocks new
+execution instead of replacing the run's original rules. Known sensitive values
+cannot be copied into a binding or journal. Manual terminal/MCP interaction is
+unaffected. See [the example](../../examples/domain-plugin/README.md). Current
+source work is uncompiled and adhoc background delegation remains incomplete.
+
+Saved, never-started Weixin inputs are restored to their original workspace and message context after authenticated Ready; attempted or uncertain work remains recovery-required. Recovery uses the original verified committed-prefix guarantee; incomplete uncommitted tails are distinct from corruption or claimed work. This source candidate has no build or native acceptance.

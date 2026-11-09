@@ -10,6 +10,16 @@ use std::path::{Path, PathBuf};
 /// Uses the shared marker set for both instruction loading and structural
 /// project context. The first matching ancestor is authoritative.
 pub fn find_project_root(start: &Path) -> Option<PathBuf> {
+    find_project_root_with_file_system(start, &echo_agent::tools::files::LocalFileSystem)
+        .ok()
+        .flatten()
+}
+
+/// Use the same marker precedence in the selected project's namespace.
+pub fn find_project_root_with_file_system(
+    start: &Path,
+    files: &dyn echo_agent::tools::filesystem::FileSystem,
+) -> echo_agent::error::Result<Option<PathBuf>> {
     const VCS_MARKERS: &[&str] = &[".git", ".hg", ".svn"];
     const FALLBACK_MARKERS: &[&str] = &[
         ".eko",
@@ -20,23 +30,18 @@ pub fn find_project_root(start: &Path) -> Option<PathBuf> {
         "pom.xml",
         "Makefile",
     ];
-    // A repository boundary outranks nested package manifests. Otherwise a
-    // workspace such as `repo/crate/Cargo.toml` would hide `repo/AGENTS.md`.
-    if let Some(root) = start.ancestors().find(|directory| {
-        VCS_MARKERS
-            .iter()
-            .any(|marker| directory.join(marker).exists())
-    }) {
-        return Some(root.to_path_buf());
+    // 按原 VCS→fallback、祖先→marker 顺序构造候选。远程提供者可
+    // 流水化已知名称的 metadata，不枚举整个仓库或用户 HOME。
+    for markers in [VCS_MARKERS, FALLBACK_MARKERS] {
+        let paths = start
+            .ancestors()
+            .flat_map(|directory| markers.iter().map(move |marker| directory.join(marker)))
+            .collect::<Vec<_>>();
+        if let Some(path) = files.first_existing_path(&paths)? {
+            return Ok(path.parent().map(Path::to_path_buf));
+        }
     }
-    start
-        .ancestors()
-        .find(|directory| {
-            FALLBACK_MARKERS
-                .iter()
-                .any(|marker| directory.join(marker).exists())
-        })
-        .map(Path::to_path_buf)
+    Ok(None)
 }
 
 /// Strip a leading YAML frontmatter block (delimited by `---` fences on their
@@ -119,7 +124,81 @@ mod tests {
         std::fs::create_dir_all(&nested)?;
         std::fs::write(root.join("package.json"), "{}")?;
 
-        assert_eq!(find_project_root(&nested).as_deref(), Some(root.as_path()));
+        use echo_agent::error::Result as FileResult;
+        use echo_agent::tools::files::LocalFileSystem;
+        use echo_agent::tools::filesystem::{FileEntry, FileMetadata, FileSystem};
+        // This unit's real filesystem has no namespace above the fixture root.
+        struct DiscoveryFiles(PathBuf);
+        impl DiscoveryFiles {
+            fn bound<'a>(&self, path: &'a Path) -> FileResult<&'a Path> {
+                if path.starts_with(&self.0) {
+                    Ok(path)
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "outside discovery fixture",
+                    )
+                    .into())
+                }
+            }
+        }
+        impl FileSystem for DiscoveryFiles {
+            fn current_dir(&self) -> FileResult<PathBuf> {
+                Ok(self.0.clone())
+            }
+            fn canonicalize(&self, p: &Path) -> FileResult<PathBuf> {
+                LocalFileSystem.canonicalize(self.bound(p)?)
+            }
+            fn metadata(&self, p: &Path) -> FileResult<FileMetadata> {
+                LocalFileSystem.metadata(self.bound(p)?)
+            }
+            fn symlink_metadata(&self, p: &Path) -> FileResult<FileMetadata> {
+                LocalFileSystem.symlink_metadata(self.bound(p)?)
+            }
+            fn read(&self, p: &Path) -> FileResult<Vec<u8>> {
+                LocalFileSystem.read(self.bound(p)?)
+            }
+            fn read_dir(&self, p: &Path) -> FileResult<Vec<FileEntry>> {
+                LocalFileSystem.read_dir(self.bound(p)?)
+            }
+            fn create_dir_all(&self, p: &Path) -> FileResult<()> {
+                LocalFileSystem.create_dir_all(self.bound(p)?)
+            }
+            fn create_file(&self, p: &Path) -> FileResult<()> {
+                LocalFileSystem.create_file(self.bound(p)?)
+            }
+            fn write(&self, p: &Path, bytes: &[u8]) -> FileResult<()> {
+                LocalFileSystem.write(self.bound(p)?, bytes)
+            }
+            fn append(&self, p: &Path, bytes: &[u8]) -> FileResult<()> {
+                LocalFileSystem.append(self.bound(p)?, bytes)
+            }
+            fn rename(&self, a: &Path, b: &Path) -> FileResult<()> {
+                LocalFileSystem.rename(self.bound(a)?, self.bound(b)?)
+            }
+            fn remove_file(&self, p: &Path) -> FileResult<()> {
+                LocalFileSystem.remove_file(self.bound(p)?)
+            }
+            fn remove_dir(&self, p: &Path) -> FileResult<()> {
+                LocalFileSystem.remove_dir(self.bound(p)?)
+            }
+            fn remove_dir_all(&self, p: &Path) -> FileResult<()> {
+                LocalFileSystem.remove_dir_all(self.bound(p)?)
+            }
+            fn set_mode(&self, p: &Path, mode: u32) -> FileResult<()> {
+                LocalFileSystem.set_mode(self.bound(p)?, mode)
+            }
+            fn atomic_write(&self, p: &Path, bytes: &[u8]) -> FileResult<()> {
+                LocalFileSystem.atomic_write(self.bound(p)?, bytes)
+            }
+            fn checkpoint(&self, p: &Path) -> FileResult<Option<String>> {
+                LocalFileSystem.checkpoint(self.bound(p)?)
+            }
+        }
+        assert_eq!(
+            find_project_root_with_file_system(&nested, &DiscoveryFiles(root.clone()))?.as_deref(),
+            Some(root.as_path())
+        );
         Ok(())
     }
 

@@ -79,7 +79,6 @@ mod tests {
     use crate::project::prompt::CORE_ASSISTANT_PROMPT;
     use crate::subagent_loader::discover_subagents;
     use crate::tasks::task_runtime::profiles::ProfileTemplate;
-    use crate::tasks::task_runtime::types::DomainProfile;
 
     fn assert_compliant(report: PromptAuditReport) -> Result<(), String> {
         if report.is_compliant() {
@@ -163,29 +162,24 @@ mod tests {
     }
 
     #[test]
-    fn domain_profiles_cover_evidence_and_completion_dimensions() -> Result<(), String> {
-        let cases = [
-            (DomainProfile::General, &["evidence", "complete"] as &[&str]),
-            (DomainProfile::AiCoding, &["verification", "repository"]),
-            (
-                DomainProfile::DataAnalysis,
-                &["reproducible", "uncertainty"],
-            ),
-            (DomainProfile::AcademicResearch, &["evidence", "citation"]),
-            (DomainProfile::MedicalResearch, &["evidence", "uncertainty"]),
-        ];
-        for (profile, required) in cases {
-            let template = ProfileTemplate::for_profile(profile);
-            assert_compliant(audit_prompt(
-                &PromptContractSpec {
-                    name: template.key,
-                    max_tokens: 320,
-                    required_phrases: required,
-                    forbidden_phrases: DEMO_PHRASES,
-                },
-                template.prompt_suffix,
-            ))?;
-        }
+    fn general_and_bound_domain_cover_evidence_without_compiled_professional_methods()
+    -> Result<(), String> {
+        let template = ProfileTemplate::general();
+        assert_compliant(audit_prompt(
+            &PromptContractSpec {
+                name: template.key,
+                max_tokens: 320,
+                required_phrases: &["evidence", "complete"],
+                forbidden_phrases: DEMO_PHRASES,
+            },
+            template.prompt_suffix,
+        ))?;
+        let binding = crate::domain_plugin::test_binding(true)?;
+        let prompt = binding.prompt_instructions();
+        assert!(prompt.contains(&binding.snapshot.method));
+        assert!(prompt.contains("cargo test --locked"));
+        assert!(prompt.contains("reports/result.md"));
+        assert!(prompt.contains(&binding.binding_sha256));
         Ok(())
     }
 }

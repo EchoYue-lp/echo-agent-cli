@@ -329,17 +329,6 @@ async fn unload_application_components(
     }
 }
 
-/// Shut down and drop the plugin LSP generation currently published on this
-/// runtime. Used when a generation was already swapped in but its publication
-/// could not be committed.
-async fn shutdown_published_plugin_lsp(lsp: &PluginLspRuntime) {
-    let mut published = {
-        let mut current = lsp.manager.write().await;
-        std::mem::replace(&mut *current, LspManager::new())
-    };
-    published.shutdown_all().await;
-}
-
 async fn replace_plugin_monitors(
     scheduler: &Arc<SchedulerRunner>,
     previous: &[CronTask],
@@ -518,7 +507,6 @@ fn write_scaffold(directory: &Path, name: &str) -> anyhow::Result<()> {
         directory.join("mcp.json"),
         "{\n  \"$schema\": \"https://agent-plugins.org/schemas/1.0.0/mcp.schema.json\",\n  \"mcpServers\": {}\n}\n",
     )?;
-    std::fs::write(directory.join("lsp.yaml"), "languages: {}\n")?;
     std::fs::write(directory.join("monitors.yaml"), "monitors: []\n")?;
     std::fs::write(
         directory.join("themes/example.json"),
@@ -552,9 +540,6 @@ fn component_names(root: &Path, resolved: &echo_agent::plugin::ResolvedComponent
     }
     if resolved.mcp_config_file.is_some() {
         names.push("mcp_servers".to_string());
-    }
-    if resolved.lsp_config_file.is_some() {
-        names.push("lsp_servers".to_string());
     }
     if let Ok(eko) = crate::plugin_components::resolve_eko_components(root) {
         if eko.monitors_file.is_some() {

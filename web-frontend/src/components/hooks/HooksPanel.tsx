@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   extensionRequestScope,
   hooksApi,
@@ -32,6 +32,13 @@ const KIND_LABEL: Record<ReturnType<typeof sourceKind>, string> = {
   other: 'Other',
 };
 
+type HookView = {
+  scope: ReturnType<typeof extensionRequestScope>;
+  active: boolean;
+  listSequence: number;
+  eventsSequence: number;
+};
+
 export function HooksPanel() {
   const workspace = useWorkspaceStore((state) => state.current);
   const requestScope = useMemo(() => extensionRequestScope(workspace), [workspace]);
@@ -40,43 +47,105 @@ export function HooksPanel() {
   const [loading, setLoading] = useState(true);
   const [testing, setTesting] = useState(false);
   const [events, setEvents] = useState<string[]>([]);
+  const [eventsLoading, setEventsLoading] = useState(false);
+  const [eventsError, setEventsError] = useState<string | null>(null);
   const [selectedEvent, setSelectedEvent] = useState('PreToolUse');
   const [matcher, setMatcher] = useState('*');
   const [error, setError] = useState<string | null>(null);
-  const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [message, setMessage] = useState<{
+    type: 'success' | 'error';
+    text: string;
+  } | null>(null);
+  const currentView = useRef<HookView | null>(null);
 
-  const loadHooks = useCallback(async () => {
-    try {
-      setLoading(true);
-      const data = await hooksApi.list(requestScope);
-      setSources(data.sources);
-      setSourcesOmitted(data.omitted);
-      setError(null);
-    } catch (e: any) {
-      setError(e.message || 'Failed to load hooks');
-    } finally {
-      setLoading(false);
-    }
-  }, [requestScope]);
+  const isCurrentView = useCallback((view: HookView) => {
+    const live = extensionRequestScope(useWorkspaceStore.getState().current);
+    return (
+      view.active &&
+      currentView.current === view &&
+      live.workspace_id === view.scope.workspace_id &&
+      live.workspace_generation === view.scope.workspace_generation &&
+      live.sender_id === view.scope.sender_id &&
+      live.sender_incarnation === view.scope.sender_incarnation
+    );
+  }, []);
 
-  useEffect(() => {
-    void loadHooks();
-    hooksApi
-      .events()
-      .then((available) => {
+  const loadHooks = useCallback(
+    async (view: HookView) => {
+      if (!isCurrentView(view)) return;
+      const sequence = ++view.listSequence;
+      const isLatest = () => isCurrentView(view) && sequence === view.listSequence;
+      try {
+        setLoading(true);
+        const data = await hooksApi.list(view.scope);
+        if (!isLatest()) return;
+        setSources(data.sources);
+        setSourcesOmitted(data.omitted);
+        setError(null);
+      } catch (e: any) {
+        if (isLatest()) setError(e.message || 'Failed to load hooks');
+      } finally {
+        if (isLatest()) setLoading(false);
+      }
+    },
+    [isCurrentView]
+  );
+
+  const loadEvents = useCallback(
+    async (view: HookView) => {
+      if (!isCurrentView(view)) return;
+      const sequence = ++view.eventsSequence;
+      const isLatest = () => isCurrentView(view) && sequence === view.eventsSequence;
+      setEventsLoading(true);
+      try {
+        const available = await hooksApi.events();
+        if (!isLatest()) return;
         setEvents(available);
         setSelectedEvent((current) =>
           available.length > 0 && !available.includes(current) ? available[0] : current
         );
-      })
-      .catch((e: any) => setError(e.message || 'Failed to load hook events'));
-  }, [loadHooks]);
+        setEventsError(null);
+      } catch (e: any) {
+        if (isLatest()) setEventsError(e.message || 'Failed to load hook events');
+      } finally {
+        if (isLatest()) setEventsLoading(false);
+      }
+    },
+    [isCurrentView]
+  );
+
+  useEffect(() => {
+    // 每次访问独立失效，避免 A→B→A 时复活第一次 A 的迟到回执。
+    // 后端操作继续由原 owner 结算；这里只限制当前面板可消费的结果。
+    const view: HookView = {
+      scope: requestScope,
+      active: true,
+      listSequence: 0,
+      eventsSequence: 0,
+    };
+    currentView.current = view;
+    setSources([]);
+    setSourcesOmitted(0);
+    setError(null);
+    setMessage(null);
+    setTesting(false);
+    setEvents([]);
+    setEventsError(null);
+    void loadHooks(view);
+    void loadEvents(view);
+    return () => {
+      view.active = false;
+    };
+  }, [isCurrentView, loadEvents, loadHooks, requestScope]);
 
   const handleReload = async () => {
+    const view = currentView.current;
+    if (!view || !isCurrentView(view)) return;
     try {
       setLoading(true);
       setMessage(null);
-      const summary: HooksReloadSummary = await hooksApi.reload(requestScope);
+      const summary: HooksReloadSummary = await hooksApi.reload(view.scope);
+      if (!isCurrentView(view)) return;
       if (summary.success) {
         const detail =
           summary.loaded_from.length > 0 ? ` from ${summary.loaded_from.join(', ')}` : '';
@@ -88,22 +157,27 @@ export function HooksPanel() {
           type: 'success',
           text: summary.message || `Reloaded ${summary.rule_count} hook rules${detail}${omitted}`,
         });
-        await loadHooks();
+        await loadHooks(view);
       } else {
         setMessage({ type: 'error', text: summary.message || 'Reload failed' });
       }
     } catch (e: any) {
-      setMessage({ type: 'error', text: e.message || 'Reload failed' });
+      if (isCurrentView(view)) {
+        setMessage({ type: 'error', text: e.message || 'Reload failed' });
+      }
     } finally {
-      setLoading(false);
+      if (isCurrentView(view)) setLoading(false);
     }
   };
 
   const handleTest = async () => {
+    const view = currentView.current;
+    if (!view || !isCurrentView(view) || eventsLoading || events.length === 0) return;
     try {
       setTesting(true);
       setMessage(null);
-      const result = await hooksApi.test(requestScope, selectedEvent, matcher);
+      const result = await hooksApi.test(view.scope, selectedEvent, matcher);
+      if (!isCurrentView(view)) return;
       const details = result.matches
         .map((item) => `${item.source}: ${item.action} (${item.matcher || '*'})`)
         .join('; ');
@@ -116,9 +190,11 @@ export function HooksPanel() {
             : `${result.event} dry-run matched no actions`,
       });
     } catch (e: any) {
-      setMessage({ type: 'error', text: e.message || 'Hook test failed' });
+      if (isCurrentView(view)) {
+        setMessage({ type: 'error', text: e.message || 'Hook test failed' });
+      }
     } finally {
-      setTesting(false);
+      if (isCurrentView(view)) setTesting(false);
     }
   };
 
@@ -133,7 +209,10 @@ export function HooksPanel() {
             value={matcher}
             onChange={(event) => setMatcher(event.target.value)}
             className="h-9 w-32 rounded-md border bg-[var(--bg-input)] px-2 text-xs"
-            style={{ color: 'var(--text-secondary)', borderColor: 'var(--border-primary)' }}
+            style={{
+              color: 'var(--text-secondary)',
+              borderColor: 'var(--border-primary)',
+            }}
             aria-label="Hook matcher"
             placeholder="Matcher"
           />
@@ -150,9 +229,12 @@ export function HooksPanel() {
           <select
             value={selectedEvent}
             onChange={(event) => setSelectedEvent(event.target.value)}
-            disabled={events.length === 0 || testing}
+            disabled={events.length === 0 || eventsLoading || testing}
             className="h-9 max-w-48 rounded-md border bg-[var(--bg-secondary)] px-2 text-xs"
-            style={{ color: 'var(--text-secondary)', borderColor: 'var(--border-primary)' }}
+            style={{
+              color: 'var(--text-secondary)',
+              borderColor: 'var(--border-primary)',
+            }}
             aria-label="Hook event"
           >
             {events.map((event) => (
@@ -163,9 +245,12 @@ export function HooksPanel() {
           </select>
           <button
             onClick={handleTest}
-            disabled={events.length === 0 || testing}
+            disabled={events.length === 0 || eventsLoading || testing}
             className="flex h-9 w-9 items-center justify-center rounded-md transition-colors disabled:opacity-50 hover:bg-[var(--bg-hover)]"
-            style={{ color: 'var(--text-secondary)', border: '1px solid var(--border-primary)' }}
+            style={{
+              color: 'var(--text-secondary)',
+              border: '1px solid var(--border-primary)',
+            }}
             title="Dry-run hook matching"
             aria-label="Dry-run hook matching"
           >
@@ -218,6 +303,28 @@ export function HooksPanel() {
           <span className="break-all">{message.text}</span>
           <button onClick={() => setMessage(null)} className="ml-auto flex-shrink-0">
             <X className="w-3 h-3" />
+          </button>
+        </div>
+      )}
+
+      {eventsError && (
+        <div
+          role="alert"
+          className="flex items-center gap-2 px-3 py-2 text-sm"
+          style={{ color: 'var(--color-error, #ef4444)' }}
+        >
+          <AlertCircle className="w-4 h-4" />
+          <span>Hook 事件列表加载失败：{eventsError}</span>
+          <button
+            type="button"
+            disabled={eventsLoading}
+            onClick={() => {
+              const view = currentView.current;
+              if (view && isCurrentView(view)) void loadEvents(view);
+            }}
+            className="ml-auto rounded border px-2 py-1 text-xs disabled:opacity-50"
+          >
+            重新加载事件
           </button>
         </div>
       )}

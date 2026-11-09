@@ -21,6 +21,7 @@ pub(crate) mod conversation_projection;
 pub(crate) mod data_root;
 pub(crate) mod developer_commands;
 pub(crate) mod diff;
+pub(crate) mod domain_plugin;
 pub(crate) mod error;
 pub(crate) mod evolution;
 pub(crate) mod export;
@@ -59,6 +60,7 @@ pub(crate) mod state;
 pub(crate) mod structured_extraction;
 pub(crate) mod subagent_event_projection;
 pub(crate) mod subagent_loader;
+pub(crate) mod subagent_policy;
 pub(crate) mod subagent_prompt;
 pub(crate) mod tasks;
 pub(crate) mod terminal;
@@ -71,6 +73,8 @@ pub(crate) mod types;
 pub(crate) mod unified_memory;
 pub(crate) mod utils;
 pub(crate) mod webhook;
+#[cfg(feature = "channels")]
+mod weixin_cron;
 pub(crate) mod workflow_service;
 pub(crate) mod workspace;
 pub(crate) mod workspace_routing;
@@ -83,3 +87,22 @@ pub(crate) mod runtime;
 /// compatibility views over the single app-core implementations; they do not
 /// own state, persistence, scheduling, or publication logic.
 pub mod api;
+
+#[cfg(feature = "channels")]
+pub(crate) mod channel_runtime;
+pub(crate) mod text_commands;
+
+/// 仅供独立集成测试复用原历史用例；不暴露应用内部类型或稳定产品 API。
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub mod test_utils {
+    /// root 由测试 wrapper 创建并保有至原用例完成。
+    pub fn native_presentation_retention(root: &std::path::Path) -> Result<(), String> {
+        crate::chat_event_log::run_native_presentation_retention_case(root)
+    }
+
+    /// root 由测试 wrapper 创建并保有至原用例完成。
+    pub fn native_usage_retention(root: &std::path::Path) -> Result<(), String> {
+        crate::chat_event_log::run_native_usage_retention_case(root)
+    }
+}

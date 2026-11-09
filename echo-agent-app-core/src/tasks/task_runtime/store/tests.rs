@@ -3,6 +3,2328 @@
 mod tests {
     use super::*;
 
+    mod performance_baseline {
+        use super::*;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/runtime_baseline.rs"
+        ));
+    }
+
+    fn durable_input_source(
+        store: &TaskRuntimeStore,
+        input_id: &str,
+        revision: u64,
+        text: &str,
+        channel: bool,
+    ) -> Result<RunInputSnapshot, Box<dyn std::error::Error>> {
+        use crate::conversation_input::{
+            ChannelExecutionIntent, ChannelInputBinding, ConversationInputAddress,
+            ConversationInputIdentity, ConversationInputPayload, ConversationInputSource,
+            FrozenChannelContext,
+        };
+        let address = ConversationInputAddress {
+            workspace_id: store.active_workspace_id().to_string(),
+            conversation_id: "same-conversation".to_string(),
+        };
+        let payload = if channel {
+            ConversationInputPayload::new_for_channel(
+                &address,
+                text.to_string(),
+                Vec::new(),
+                None,
+                ChannelInputBinding {
+                    version: 1,
+                    channel_id: "weixin".to_string(),
+                    account_id: "original-account".to_string(),
+                    credential_generation: "original-generation".to_string(),
+                    peer_id: "original-peer".to_string(),
+                    provider_message_id: input_id.to_string(),
+                    workspace_generation: "workspace-generation".to_string(),
+                    context: FrozenChannelContext::Absent,
+                    execution: ChannelExecutionIntent::Chat,
+                },
+            )?
+        } else {
+            ConversationInputPayload::new(text.to_string(), Vec::new())?
+        };
+        let identity = ConversationInputIdentity {
+            address,
+            input_id: input_id.to_string(),
+            revision,
+            payload_sha256: payload.payload_sha256.clone(),
+        };
+        Ok(RunInputSnapshot {
+            source: if channel {
+                ConversationInputSource::Channel
+            } else {
+                ConversationInputSource::Gui
+            },
+            identity,
+            payload,
+        })
+    }
+
+    fn raw_history_descriptor(
+        history: &RawInputHistoryReference,
+        config: &echo_agent::tools::artifact::ToolOutputArtifactConfig,
+    ) -> Result<echo_agent::tools::artifact::ToolOutputArtifactRef, Box<dyn std::error::Error>>
+    {
+        let artifact = history.artifact.as_ref().ok_or("原文历史文件缺失")?;
+        Ok(echo_agent::tools::artifact::ToolOutputArtifactRef {
+            path: artifact.path.clone(),
+            artifact_bytes: artifact.bytes,
+            payload_bytes: artifact.bytes,
+            sha256: artifact.sha256.clone().ok_or("原文历史SHA缺失")?,
+            retention: config.retention.clone(),
+        })
+    }
+
+    #[test]
+    fn raw_input_history_fixed_prefix_crosses_scan_pages_and_keeps_legacy_duplicates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use echo_agent::tools::files::artifact::{ArtifactPageLimit, read_artifact_page};
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".eko/tasks");
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?;
+        seed_task_query_run(
+            &store,
+            "raw-run",
+            TaskRunExecutionProfile::conversation_turn(),
+        )?;
+        let text = "相同文字是合法重复输入，不能按文字合并🧭";
+        let first = durable_input_source(&store, "first-source", 1, text, false)?;
+        store.accept_run_steer_input(
+            "raw-run",
+            "same-turn",
+            first.source,
+            &first.identity,
+            &first.payload,
+        )?;
+        store.record_run_steer("raw-run", "same-turn", text)?;
+        let old = store.raw_input_history_reference("raw-run", None)?;
+        let old_family = std::fs::read(root.join("raw-run/raw-input-history.jsonl"))?;
+        let old_family_metadata = std::fs::read(root.join("raw-run/raw-input-history.meta.jsonl"))?;
+        assert_eq!(old.source_records, 2);
+        let config = crate::infra::tool_output_artifact_config(Some(directory.path()));
+        let old_descriptor = raw_history_descriptor(&old, &config)?;
+        let old_metadata = std::fs::metadata(&old_descriptor.path)?;
+        let first_page =
+            read_artifact_page(&config, &old_descriptor, None, ArtifactPageLimit::Bytes(31))?;
+        let old_cursor = first_page.next_cursor.ok_or("原文第一页缺cursor")?;
+        for index in 0..270 {
+            store.commit_runtime_event(RuntimeJournalEvent::for_append(
+                "raw-run",
+                None,
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({"index":index,"message":"无关工具/执行事实"}),
+            ))?;
+        }
+        let no_new_input = store.raw_input_history_reference("raw-run", None)?;
+        assert!(no_new_input.observed_through_sequence > old.observed_through_sequence);
+        assert_eq!(no_new_input.source_records, old.source_records);
+        assert_eq!(no_new_input.last_source_sequence, old.last_source_sequence);
+        let no_new_descriptor = raw_history_descriptor(&no_new_input, &config)?;
+        assert_eq!(no_new_descriptor.path, old_descriptor.path);
+        assert_eq!(no_new_descriptor.sha256, old_descriptor.sha256);
+        assert_eq!(
+            std::fs::metadata(&no_new_descriptor.path)?.modified()?,
+            old_metadata.modified()?
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(&no_new_descriptor.path)?.ino(),
+                old_metadata.ino()
+            );
+        }
+        let second = durable_input_source(&store, "second-source", 1, text, false)?;
+        store.accept_run_steer_input(
+            "raw-run",
+            "same-turn",
+            second.source,
+            &second.identity,
+            &second.payload,
+        )?;
+        store.record_run_steer("raw-run", "same-turn", text)?;
+        let current = store.raw_input_history_reference("raw-run", None)?;
+        assert_eq!(current.source_records, 4);
+        assert!(current.last_source_sequence > 256);
+        let current_descriptor = raw_history_descriptor(&current, &config)?;
+        assert_ne!(current_descriptor.path, old_descriptor.path);
+        store.qualify_raw_input_history_reference("raw-run", &old)?;
+        // 旧引用的坏段恢复不能回滚整个暖族；后继非source事件也不能把丢失尾部重新盖成Current。
+        std::fs::write(
+            root.join("raw-run/raw-input-history.jsonl"),
+            "旧快照资格校验时发现坏段",
+        )?;
+        store.qualify_raw_input_history_reference("raw-run", &old)?;
+        store.commit_runtime_event(RuntimeJournalEvent::for_append(
+            "raw-run",
+            None,
+            None,
+            RuntimeEventKind::Note,
+            serde_json::json!({"message":"恢复旧快照后的无关事件"}),
+        ))?;
+        assert_eq!(
+            store
+                .raw_input_history_reference("raw-run", None)?
+                .source_records,
+            4
+        );
+        assert!(
+            read_artifact_page(
+                &config,
+                &old_descriptor,
+                Some(&old_cursor),
+                ArtifactPageLimit::Bytes(31)
+            )
+            .is_ok()
+        );
+        assert!(
+            read_artifact_page(
+                &config,
+                &current_descriptor,
+                Some(&old_cursor),
+                ArtifactPageLimit::Bytes(31)
+            )
+            .is_err()
+        );
+        let duplicate = store.accept_run_steer_input(
+            "raw-run",
+            "same-turn",
+            first.source,
+            &first.identity,
+            &first.payload,
+        )?;
+        assert!(duplicate.duplicate);
+        assert_eq!(
+            store
+                .raw_input_history_reference("raw-run", None)?
+                .source_records,
+            4
+        );
+        let contents = std::fs::read_to_string(&current_descriptor.path)?;
+        let records = contents
+            .lines()
+            .skip(1)
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(records.len(), 4);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record
+                    .pointer("/event/payload/input_snapshot/identity/input_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("first-source"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record
+                    .pointer("/event/payload/input_snapshot/identity/input_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("second-source"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record
+                    .pointer("/event/event_type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("run_steer_recorded"))
+                .count(),
+            2
+        );
+        drop(store);
+        // 段及其CRC仍互相自洽，但落后于同代cursor；必须核完整族身份并重建，不能丢后两条。
+        std::fs::write(root.join("raw-run/raw-input-history.jsonl"), old_family)?;
+        std::fs::write(
+            root.join("raw-run/raw-input-history.meta.jsonl"),
+            old_family_metadata,
+        )?;
+        let stale_segment = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?;
+        let repaired = stale_segment.raw_input_history_reference("raw-run", None)?;
+        assert_eq!(repaired.source_records, 4);
+        assert_eq!(
+            raw_history_descriptor(&repaired, &config)?.sha256,
+            current_descriptor.sha256
+        );
+        drop(stale_segment);
+        // 移除派生族迫使固定256扫描跨越270无关事件，不能只取第一个匹配页。
+        std::fs::remove_file(root.join("raw-run/raw-input-history.jsonl"))?;
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?;
+        let restored = reopened.raw_input_history_reference("raw-run", None)?;
+        assert_eq!(restored.journal_identity, current.journal_identity);
+        assert_eq!(restored.source_records, 4);
+        let restored_descriptor = raw_history_descriptor(&restored, &config)?;
+        assert_eq!(restored_descriptor.path, current_descriptor.path);
+        assert_eq!(restored_descriptor.sha256, current_descriptor.sha256);
+        Ok(())
+    }
+
+    #[test]
+    fn raw_input_history_cache_rebuild_rejects_old_cursor_and_preserves_updated_goal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use echo_agent::tools::files::artifact::{ArtifactPageLimit, read_artifact_page};
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".eko/tasks");
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?;
+        let original = format!("{}初始Goal原文尾部🧭", "完整源背景 ".repeat(300));
+        let source = durable_input_source(&store, "initial-source", 1, &original, false)?;
+        store.create_run_for_active_workspace_with_source(
+            "raw-goal",
+            "same-conversation",
+            "initial-turn",
+            DomainProfile::General,
+            &original,
+            "agent_task_plan",
+            AttendedMode::Attended,
+            TaskRunExecutionProfile::conversation_turn(),
+            None,
+            &source,
+        )?;
+        let config = crate::infra::tool_output_artifact_config(Some(directory.path()));
+        let first = store.raw_input_history_reference("raw-goal", None)?;
+        let descriptor = raw_history_descriptor(&first, &config)?;
+        let cursor = read_artifact_page(&config, &descriptor, None, ArtifactPageLimit::Bytes(31))?
+            .next_cursor
+            .ok_or("原cursor缺失")?;
+        store.transition_run("raw-goal", TaskRunStatus::Running)?;
+        store.transition_run("raw-goal", TaskRunStatus::Paused)?;
+        let updated = store.update_run_goal(
+            "raw-goal",
+            1,
+            "用户显式修改后的新Goal",
+            "用户操作",
+            RunGoalActorSource::Gui,
+        )?;
+        let after_update = store.raw_input_history_reference("raw-goal", None)?;
+        assert_eq!(
+            raw_history_descriptor(&after_update, &config)?.sha256,
+            descriptor.sha256
+        );
+        assert!(std::fs::read_to_string(&descriptor.path)?.contains(&original));
+        std::fs::write(
+            root.join("raw-goal/raw-input-history.jsonl"),
+            "损坏的派生来源族",
+        )?;
+        assert_eq!(
+            raw_history_descriptor(
+                &store.raw_input_history_reference("raw-goal", None)?,
+                &config
+            )?
+            .sha256,
+            descriptor.sha256
+        );
+        std::fs::write(&descriptor.path, "已损坏的原文缓存")?;
+        let rebuilt =
+            store.raw_input_history_reference("raw-goal", Some(first.observed_through_sequence))?;
+        let rebuilt_descriptor = raw_history_descriptor(&rebuilt, &config)?;
+        assert_eq!(rebuilt_descriptor.sha256, descriptor.sha256);
+        assert!(
+            read_artifact_page(
+                &config,
+                &rebuilt_descriptor,
+                Some(&cursor),
+                ArtifactPageLimit::Bytes(31)
+            )
+            .is_err()
+        );
+        assert!(
+            read_artifact_page(
+                &config,
+                &rebuilt_descriptor,
+                None,
+                ArtifactPageLimit::Bytes(31)
+            )
+            .is_ok()
+        );
+        std::fs::remove_file(&rebuilt_descriptor.path)?;
+        let regenerated =
+            store.raw_input_history_reference("raw-goal", Some(first.observed_through_sequence))?;
+        assert_eq!(
+            raw_history_descriptor(&regenerated, &config)?.sha256,
+            descriptor.sha256
+        );
+        let after = store.get_run("raw-goal")?.ok_or("原Goal缺失")?;
+        assert_eq!(
+            (after.goal, after.goal_revision, after.goal_sha256),
+            (
+                updated.goal.clone(),
+                updated.goal_revision,
+                updated.goal_sha256.clone()
+            )
+        );
+        drop(store);
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?;
+        let restored = reopened.raw_input_history_reference("raw-goal", None)?;
+        assert_eq!(
+            raw_history_descriptor(&restored, &config)?.sha256,
+            descriptor.sha256
+        );
+        assert_eq!(
+            reopened.get_run("raw-goal")?.ok_or("原Goal缺失")?.goal,
+            updated.goal
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_input_history_snapshots_isolate_runs_generations_and_concurrent_append()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".eko/tasks");
+        let store = std::sync::Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?);
+        for run_id in ["raw-first", "raw-second"] {
+            seed_task_query_run(&store, run_id, TaskRunExecutionProfile::conversation_turn())?;
+            store.record_run_steer(run_id, "same-turn", "同样文字，仍是不同Run")?;
+        }
+        let old = store.raw_input_history_reference("raw-first", None)?;
+        let other = store.raw_input_history_reference("raw-second", None)?;
+        assert_ne!(old.journal_identity, other.journal_identity);
+        assert!(
+            store
+                .qualify_raw_input_history_reference("raw-second", &old)
+                .is_err()
+        );
+        let mut wrong_generation = old.clone();
+        wrong_generation.journal_identity = other.journal_identity;
+        assert!(
+            store
+                .qualify_raw_input_history_reference("raw-first", &wrong_generation)
+                .is_err()
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let reader = store.clone();
+        let reader_barrier = barrier.clone();
+        let writer = store.clone();
+        let raced = std::thread::scope(
+            |scope| -> Result<RawInputHistoryReference, Box<dyn std::error::Error>> {
+                let read = scope.spawn(move || {
+                    reader_barrier.wait();
+                    reader.raw_input_history_reference("raw-first", None)
+                });
+                let write = scope.spawn(move || {
+                    barrier.wait();
+                    writer.record_run_steer("raw-first", "later-turn", "并发新输入")
+                });
+                let snapshot = read.join().map_err(|_| "原文快照线程异常")??;
+                write.join().map_err(|_| "原输入追加线程异常")??;
+                Ok(snapshot)
+            },
+        )?;
+        assert!(raced.source_records == 1 || raced.source_records == 2);
+        store.qualify_raw_input_history_reference("raw-first", &raced)?;
+        store.qualify_raw_input_history_reference("raw-first", &old)?;
+        let final_snapshot = store.raw_input_history_reference("raw-first", None)?;
+        assert_eq!(final_snapshot.source_records, 2);
+        let mut future = final_snapshot.clone();
+        future.observed_through_sequence = future.observed_through_sequence.saturating_add(1);
+        assert!(
+            store
+                .qualify_raw_input_history_reference("raw-first", &future)
+                .is_err()
+        );
+        drop(store);
+        let new_root = directory.path().join("another-workspace/.eko/tasks");
+        let replacement = TaskRuntimeStore::new_in_memory_with_shadow_root(&new_root)?;
+        seed_task_query_run(
+            &replacement,
+            "raw-first",
+            TaskRunExecutionProfile::conversation_turn(),
+        )?;
+        replacement.record_run_steer("raw-first", "same-turn", "另工作空间自己的第一条")?;
+        replacement.record_run_steer("raw-first", "later-turn", "另工作空间自己的第二条")?;
+        let new = replacement.raw_input_history_reference("raw-first", None)?;
+        assert_ne!(new.journal_identity, old.journal_identity);
+        assert!(
+            replacement
+                .qualify_raw_input_history_reference("raw-first", &old)
+                .is_err()
+        );
+        assert_eq!(
+            new.observed_through_sequence,
+            final_snapshot.observed_through_sequence
+        );
+        drop(replacement);
+        for name in [
+            "raw-input-history.jsonl",
+            "raw-input-history.meta.jsonl",
+            "history-cursor.json",
+        ] {
+            std::fs::copy(
+                root.join("raw-first").join(name),
+                new_root.join("raw-first").join(name),
+            )?;
+        }
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(&new_root)?;
+        let recovered = reopened.raw_input_history_reference("raw-first", None)?;
+        assert_eq!(recovered.journal_identity, new.journal_identity);
+        assert_eq!(
+            recovered
+                .artifact
+                .as_ref()
+                .and_then(|artifact| artifact.sha256.as_ref()),
+            new.artifact
+                .as_ref()
+                .and_then(|artifact| artifact.sha256.as_ref())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_input_history_missing_journal_never_reuses_warm_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".eko/tasks");
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?;
+        seed_task_query_run(
+            &store,
+            "raw-unavailable",
+            TaskRunExecutionProfile::conversation_turn(),
+        )?;
+        store.record_run_steer("raw-unavailable", "original-turn", "原文必须仍可验证")?;
+        let snapshot = store.raw_input_history_reference("raw-unavailable", None)?;
+        assert_eq!(snapshot.source_records, 1);
+        let original = root.join("raw-unavailable/events.jsonl");
+        let held = root.join("raw-unavailable/events.held");
+        std::fs::rename(&original, &held)?;
+        let rejected = store
+            .raw_input_history_reference("raw-unavailable", None)
+            .is_err();
+        std::fs::rename(&held, &original)?;
+        assert!(rejected, "暖缓存不能冒原journal当前可读");
+        store.qualify_raw_input_history_reference("raw-unavailable", &snapshot)?;
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_goal_host_refs_keep_legacy_and_user_versions_without_inventing_inputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use echo_agent::tools::files::artifact::{ArtifactPageLimit, read_artifact_page};
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".eko/tasks");
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?;
+        let initial = format!(
+            "{}LEGACY_INITIAL_GOAL_TAIL_3872🧭",
+            "initial goal detail ".repeat(600)
+        );
+        store.create_run(
+            "goal-host",
+            "default",
+            "same-conversation",
+            "initial-turn",
+            DomainProfile::General,
+            &initial,
+            "agent_task_plan",
+            AttendedMode::Attended,
+        )?;
+        assert_eq!(
+            store
+                .raw_input_history_reference("goal-host", None)?
+                .source_records,
+            0
+        );
+        let first = store
+            .canonical_goal_reference("goal-host")?
+            .ok_or("legacy长Goal缺host ref")?;
+        let config = crate::infra::tool_output_artifact_config(Some(directory.path()));
+        let descriptor =
+            |goal: &CanonicalGoalReference| echo_agent::tools::artifact::ToolOutputArtifactRef {
+                path: goal.artifact.path.clone(),
+                artifact_bytes: goal.artifact.bytes,
+                payload_bytes: goal.artifact.bytes,
+                sha256: goal.goal_sha256.clone(),
+                retention: config.retention.clone(),
+            };
+        let old = descriptor(&first);
+        assert!(
+            old.path
+                .starts_with(directory.path().join(".eko/artifacts"))
+        );
+        assert!(read_artifact_page(&config, &old, None, ArtifactPageLimit::Bytes(31)).is_ok());
+        let cursor = read_artifact_page(&config, &old, None, ArtifactPageLimit::Bytes(31))?
+            .next_cursor
+            .ok_or("旧Goal cursor缺失")?;
+        store.transition_run("goal-host", TaskRunStatus::Running)?;
+        store.transition_run("goal-host", TaskRunStatus::Paused)?;
+        let revised = format!(
+            "{}USER_UPDATED_GOAL_TAIL_5739🧭",
+            "updated user goal detail ".repeat(600)
+        );
+        let updated = store.update_run_goal(
+            "goal-host",
+            1,
+            &revised,
+            "用户显式修改长Goal",
+            RunGoalActorSource::Gui,
+        )?;
+        let current = store
+            .canonical_goal_reference("goal-host")?
+            .ok_or("用户长Goal缺host ref")?;
+        assert_eq!(current.goal_revision, 2);
+        assert_eq!(current.goal_sha256, updated.goal_sha256);
+        assert_ne!(current.artifact.path, first.artifact.path);
+        assert_eq!(
+            store
+                .raw_input_history_reference("goal-host", None)?
+                .source_records,
+            0,
+            "canonical Goal引用不能伪造成新的用户输入事实"
+        );
+        assert!(
+            store
+                .qualify_canonical_goal_reference("goal-host", &first)
+                .is_err()
+        );
+        store.qualify_canonical_goal_reference("goal-host", &current)?;
+        assert!(
+            read_artifact_page(&config, &old, Some(&cursor), ArtifactPageLimit::Bytes(31)).is_ok()
+        );
+        assert_eq!(std::fs::read_to_string(&first.artifact.path)?, initial);
+        assert_eq!(std::fs::read_to_string(&current.artifact.path)?, revised);
+        let new_descriptor = descriptor(&current);
+        assert!(
+            read_artifact_page(
+                &config,
+                &new_descriptor,
+                Some(&cursor),
+                ArtifactPageLimit::Bytes(31)
+            )
+            .is_err()
+        );
+        drop(store);
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?;
+        let restored = reopened
+            .canonical_goal_reference("goal-host")?
+            .ok_or("冷重开Goal ref缺失")?;
+        assert_eq!(restored.artifact.path, current.artifact.path);
+        assert_eq!(restored.goal_sha256, current.goal_sha256);
+        std::fs::write(&restored.artifact.path, "坏Goal缓存")?;
+        let repaired = reopened
+            .canonical_goal_reference("goal-host")?
+            .ok_or("Goal缓存重建缺失")?;
+        assert_eq!(std::fs::read_to_string(&repaired.artifact.path)?, revised);
+        let current_run = reopened.get_run("goal-host")?.ok_or("当前Goal缺失")?;
+        assert_eq!(
+            (
+                current_run.goal,
+                current_run.goal_revision,
+                current_run.goal_sha256
+            ),
+            (updated.goal, updated.goal_revision, updated.goal_sha256)
+        );
+        // 同一canonical Goal的已发布引用不能仅因当前投影显示模式改变而失去资格。
+        let middle = format!("{}MIDDLE_GOAL_TAIL_1672🧭", "middle detail ".repeat(40));
+        reopened.update_run_goal(
+            "goal-host",
+            2,
+            &middle,
+            "用户改中段Goal",
+            RunGoalActorSource::Gui,
+        )?;
+        let middle_ref = reopened
+            .canonical_goal_reference("goal-host")?
+            .ok_or("recovery420之外须发布中段Goal")?;
+        reopened.configure_run_continuation("goal-host", true, false, None, None)?;
+        assert!(
+            reopened.canonical_goal_reference("goal-host")?.is_none(),
+            "原GoalContract仍能内联中段Goal"
+        );
+        reopened.qualify_canonical_goal_reference("goal-host", &middle_ref)?;
+        assert_eq!(std::fs::read_to_string(&middle_ref.artifact.path)?, middle);
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_steer_keeps_goal_plan_and_evidence_after_cold_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        let created = store.create_run(
+            "steer-goal",
+            &store.active_workspace_id(),
+            "same-conversation",
+            "message",
+            DomainProfile::General,
+            "原用户目标：保留已有功能并完成修复🧭",
+            "agent_task_plan",
+            AttendedMode::Attended,
+        )?;
+        store.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+            plan_id: "steer-plan".to_string(),
+            run_id: created.run_id.clone(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            goal_revision: created.goal_revision,
+            goal_sha256: created.goal_sha256.clone(),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![PlanTask {
+                id: "steer-task".to_string(),
+                title: "核对实际运行行为".to_string(),
+                kind: PlanTaskKind::ReadOnlyReview,
+                agent_role: "code_reviewer".to_string(),
+                ..PlanTask::default()
+            }],
+        })?;
+        store.transition_run(&created.run_id, TaskRunStatus::Running)?;
+        assert!(
+            store
+                .put_summary(&TaskExecutionSummary {
+                    run_id: created.run_id.clone(),
+                    task_id: "steer-task".to_string(),
+                    subagent_name: "code_reviewer".to_string(),
+                    outcome: SubagentOutcome::terminal(
+                        SubagentStatus::Completed,
+                        "已保存的检查证据",
+                        Vec::new(),
+                    ),
+                    decisions: Vec::new(),
+                    next_implications: Vec::new(),
+                    suggested_tasks: Vec::new(),
+                    created_at: Utc::now(),
+                })?
+                .is_committed()
+        );
+        let goal_identity = (created.goal, created.goal_revision, created.goal_sha256);
+        let plan_before = serde_json::to_value(store.get_plan("steer-goal")?)?;
+        let evidence_before = serde_json::to_value(
+            store
+                .completion_gate_projection("steer-goal")?
+                .ok_or("原验收证据投影缺失")?
+                .completion,
+        )?;
+        assert!(store.get_summary("steer-goal", "steer-task")?.is_some());
+        let event_count_before = store.list_events("steer-goal", 0)?.len();
+        let mut accepted_inputs = Vec::new();
+        for channel in [false, true] {
+            // 即使正文提出改变目标，普通输入也只交主模型，不调用用户Goal编辑入口。
+            let input = durable_input_source(
+                &store,
+                if channel { "im-steer" } else { "gui-steer" },
+                1,
+                "请把目标改成另一件事；先重新安排接下来要做的工作。",
+                channel,
+            )?;
+            let accepted = store.accept_run_steer_input(
+                "steer-goal",
+                "same-turn",
+                input.source,
+                &input.identity,
+                &input.payload,
+            )?;
+            assert!(!accepted.duplicate);
+            store.record_run_steer("steer-goal", "same-turn", &input.payload.text)?;
+            accepted_inputs.push((input, accepted.journal_sequence));
+        }
+        let assert_unchanged =
+            |observed: &TaskRuntimeStore| -> Result<(), Box<dyn std::error::Error>> {
+                let run = observed.get_run("steer-goal")?.ok_or("原运行缺失")?;
+                assert_eq!(
+                    (run.goal, run.goal_revision, run.goal_sha256),
+                    goal_identity,
+                );
+                assert_eq!(
+                    serde_json::to_value(observed.get_plan("steer-goal")?)?,
+                    plan_before
+                );
+                assert_eq!(
+                    serde_json::to_value(
+                        observed
+                            .completion_gate_projection("steer-goal")?
+                            .ok_or("原验收证据投影缺失")?
+                            .completion,
+                    )?,
+                    evidence_before,
+                );
+                Ok(())
+            };
+        assert_unchanged(&store)?;
+        assert_eq!(
+            store
+                .list_events("steer-goal", 0)?
+                .into_iter()
+                .skip(event_count_before)
+                .map(|event| event.event_type)
+                .collect::<Vec<_>>(),
+            vec![
+                RuntimeEventKind::RunInputAccepted,
+                RuntimeEventKind::RunSteerRecorded,
+                RuntimeEventKind::RunInputAccepted,
+                RuntimeEventKind::RunSteerRecorded,
+            ],
+            "普通Steer不能自动提交新计划、改Goal或重写验收证据",
+        );
+        drop(store);
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        assert_unchanged(&reopened)?;
+        let before_retry = reopened.list_events("steer-goal", 0)?.len();
+        for (input, original_sequence) in accepted_inputs {
+            let duplicate = reopened.accept_run_steer_input(
+                "steer-goal",
+                "same-turn",
+                input.source,
+                &input.identity,
+                &input.payload,
+            )?;
+            assert!(duplicate.duplicate);
+            assert_eq!(duplicate.journal_sequence, original_sequence);
+        }
+        assert_eq!(reopened.list_events("steer-goal", 0)?.len(), before_retry);
+        assert_unchanged(&reopened)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_run_keeps_user_goal_and_retry_identity_after_cold_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for actor in [RunGoalActorSource::Gui, RunGoalActorSource::Channel] {
+            let directory = tempfile::tempdir()?;
+            let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+            store.create_run(
+                "cancel-goal",
+                "default",
+                "same-conversation",
+                "message",
+                DomainProfile::General,
+                "智能体仅在首次建立时设置的目标",
+                "agent_task_plan",
+                AttendedMode::Attended,
+            )?;
+            store.transition_run("cancel-goal", TaskRunStatus::Running)?;
+            store.transition_run("cancel-goal", TaskRunStatus::Paused)?;
+            let user_updated = store.update_run_goal(
+                "cancel-goal",
+                1,
+                "用户显式修改后的目标，取消执行也保留🧭",
+                "用户在原入口明确修改",
+                actor,
+            )?;
+            assert_eq!(user_updated.goal_revision, 2);
+            assert!(store.request_cancel("cancel-goal")?);
+            let after_cancel = store.get_run("cancel-goal")?.ok_or("取消后原运行缺失")?;
+            assert_eq!(after_cancel.status, TaskRunStatus::Cancelled);
+            assert_eq!(after_cancel.goal, user_updated.goal);
+            assert_eq!(after_cancel.goal_revision, user_updated.goal_revision);
+            assert_eq!(after_cancel.goal_sha256, user_updated.goal_sha256);
+            let before_duplicate_cancel = store.list_events("cancel-goal", 0)?.len();
+            assert!(!store.request_cancel("cancel-goal")?);
+            assert_eq!(
+                store.list_events("cancel-goal", 0)?.len(),
+                before_duplicate_cancel
+            );
+            drop(store);
+            let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+            let retry = reopened.create_run(
+                "cancel-goal",
+                "default",
+                "same-conversation",
+                "message",
+                DomainProfile::General,
+                "智能体仅在首次建立时设置的目标",
+                "agent_task_plan",
+                AttendedMode::Attended,
+            )?;
+            assert_eq!(retry.status, TaskRunStatus::Cancelled);
+            assert_eq!(retry.goal, user_updated.goal);
+            assert_eq!(retry.goal_revision, user_updated.goal_revision);
+            assert_eq!(retry.goal_sha256, user_updated.goal_sha256);
+            let events = reopened.list_events("cancel-goal", 0)?;
+            assert_eq!(events.len(), before_duplicate_cancel);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.event_type == RuntimeEventKind::RunGoalUpdated)
+                    .count(),
+                1,
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.event_type == RuntimeEventKind::RunCancelled)
+                    .count(),
+                1,
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn durable_input_acceptance_reopens_full_source_beyond_recent_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        seed_task_query_run(
+            &store,
+            "source-run",
+            TaskRunExecutionProfile::conversation_turn(),
+        )?;
+        let original_text = format!("{}末尾必须保留中文与🧭", "完整来源 ".repeat(1600));
+        let input = durable_input_source(&store, "source-first", 1, &original_text, true)?;
+        let accepted = store.accept_run_steer_input(
+            "source-run",
+            "exact-turn",
+            input.source,
+            &input.identity,
+            &input.payload,
+        )?;
+        assert!(!accepted.duplicate);
+        assert!(
+            store
+                .get_run_state("source-run")?
+                .ok_or("原任务缺失")?
+                .recent_constraints
+                .is_empty()
+        );
+        for index in 0..12 {
+            let later = durable_input_source(
+                &store,
+                &format!("later-{index}"),
+                1,
+                &format!("后续输入 {index}"),
+                false,
+            )?;
+            store.accept_run_steer_input(
+                "source-run",
+                "exact-turn",
+                later.source,
+                &later.identity,
+                &later.payload,
+            )?;
+            // 既有已投递近期投影独立保留，不能用新的admission历史替代它。
+            store.record_run_steer("source-run", "exact-turn", &later.payload.text)?;
+        }
+        let state = store.get_run_state("source-run")?.ok_or("原任务缺失")?;
+        assert_eq!(state.recent_constraints.len(), 8);
+        assert!(
+            state
+                .recent_constraints
+                .iter()
+                .all(|item| item.text != original_text)
+        );
+        drop(store);
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        let retried = reopened.accept_run_steer_input(
+            "source-run",
+            "exact-turn",
+            input.source,
+            &input.identity,
+            &input.payload,
+        )?;
+        assert!(retried.duplicate);
+        assert_eq!(retried.journal_sequence, accepted.journal_sequence);
+        let events = reopened.list_events("source-run", 0)?;
+        let source_events = events
+            .iter()
+            .filter(|event| {
+                event.event_type == RuntimeEventKind::RunInputAccepted
+                    && event
+                        .payload
+                        .get("input_snapshot")
+                        .and_then(|snapshot| snapshot.get("identity"))
+                        .and_then(|identity| identity.get("input_id"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("source-first")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(source_events.len(), 1);
+        let event = source_events.first().ok_or("原来源事件缺失")?;
+        let recovered: RunInputSnapshot = serde_json::from_value(
+            event
+                .payload
+                .get("input_snapshot")
+                .cloned()
+                .ok_or("原来源快照缺失")?,
+        )?;
+        assert_eq!(recovered.payload.text, original_text);
+        assert_eq!(recovered.identity, input.identity);
+        assert_eq!(
+            recovered.payload.channel_binding,
+            input.payload.channel_binding
+        );
+        assert!(recovered.validate().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn durable_input_acceptance_rejects_conflicts_stale_revision_and_foreign_address()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = fresh()?;
+        seed_task_query_run(
+            &store,
+            "source-run",
+            TaskRunExecutionProfile::conversation_turn(),
+        )?;
+        let first = durable_input_source(&store, "same-source", 2, "当前修订", false)?;
+        store.accept_run_steer_input(
+            "source-run",
+            "exact-turn",
+            first.source,
+            &first.identity,
+            &first.payload,
+        )?;
+        let mut cases = Vec::new();
+        cases.push(durable_input_source(
+            &store,
+            "same-source",
+            2,
+            "同修订不同内容",
+            false,
+        )?);
+        cases.push(durable_input_source(
+            &store,
+            "same-source",
+            1,
+            "迟到旧修订",
+            false,
+        )?);
+        let mut foreign_conversation =
+            durable_input_source(&store, "foreign-conversation", 1, "错误会话", false)?;
+        foreign_conversation.identity.address.conversation_id = "another-conversation".to_string();
+        cases.push(foreign_conversation);
+        let mut foreign_workspace =
+            durable_input_source(&store, "foreign-workspace", 1, "错误工作区", false)?;
+        foreign_workspace.identity.address.workspace_id = "another-workspace".to_string();
+        cases.push(foreign_workspace);
+        let before = store.list_events("source-run", 0)?.len();
+        for candidate in cases {
+            assert!(
+                store
+                    .accept_run_steer_input(
+                        "source-run",
+                        "exact-turn",
+                        candidate.source,
+                        &candidate.identity,
+                        &candidate.payload
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            store
+                .accept_run_steer_input(
+                    "source-run",
+                    "other-turn",
+                    first.source,
+                    &first.identity,
+                    &first.payload
+                )
+                .is_err()
+        );
+        assert_eq!(store.list_events("source-run", 0)?.len(), before);
+        let next = durable_input_source(&store, "same-source", 3, "新修订", false)?;
+        assert!(
+            !store
+                .accept_run_steer_input(
+                    "source-run",
+                    "exact-turn",
+                    next.source,
+                    &next.identity,
+                    &next.payload
+                )?
+                .duplicate
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_input_acceptance_does_not_grant_receipt_on_unconfirmed_append()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = fresh()?;
+        seed_task_query_run(
+            &store,
+            "source-run",
+            TaskRunExecutionProfile::conversation_turn(),
+        )?;
+        let input = durable_input_source(&store, "source-fault", 1, "必须原样保存", false)?;
+        store
+            .shadow
+            .fail_next_append_durability_for_test("source-run")?;
+        assert!(
+            store
+                .accept_run_steer_input(
+                    "source-run",
+                    "exact-turn",
+                    input.source,
+                    &input.identity,
+                    &input.payload
+                )
+                .is_err()
+        );
+        // 原frame已经存在不能再append；同一源版本只允许核清原barrier。
+        store
+            .shadow
+            .fail_next_durability_probe_for_test("source-run")?;
+        assert!(
+            store
+                .accept_run_steer_input(
+                    "source-run",
+                    "exact-turn",
+                    input.source,
+                    &input.identity,
+                    &input.payload
+                )
+                .is_err()
+        );
+        let accepted = store.accept_run_steer_input(
+            "source-run",
+            "exact-turn",
+            input.source,
+            &input.identity,
+            &input.payload,
+        )?;
+        assert!(accepted.duplicate);
+        assert_eq!(
+            store
+                .list_events("source-run", 0)?
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventKind::RunInputAccepted)
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_input_acceptance_projection_degradation_does_not_reappend_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        seed_task_query_run(
+            &store,
+            "source-run",
+            TaskRunExecutionProfile::conversation_turn(),
+        )?;
+        let input = durable_input_source(&store, "projection-fault", 1, "物理事实已确认", false)?;
+        store.fail_next_runtime_mutation_projection_for_test();
+        let accepted = store.accept_run_steer_input(
+            "source-run",
+            "exact-turn",
+            input.source,
+            &input.identity,
+            &input.payload,
+        )?;
+        assert!(!accepted.duplicate);
+        drop(store);
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        let duplicate = reopened.accept_run_steer_input(
+            "source-run",
+            "exact-turn",
+            input.source,
+            &input.identity,
+            &input.payload,
+        )?;
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.journal_sequence, accepted.journal_sequence);
+        assert_eq!(
+            reopened
+                .list_events("source-run", 0)?
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventKind::RunInputAccepted)
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_input_acceptance_rebuilds_identity_index_from_old_checkpoint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use echo_agent::state::journal::{CheckpointStore, FileCheckpointStore};
+        let directory = tempfile::tempdir()?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        seed_task_query_run(
+            &store,
+            "source-run",
+            TaskRunExecutionProfile::conversation_turn(),
+        )?;
+        let input = durable_input_source(
+            &store,
+            "checkpoint-source",
+            1,
+            "不能依赖投影默认空集合",
+            false,
+        )?;
+        store.accept_run_steer_input(
+            "source-run",
+            "exact-turn",
+            input.source,
+            &input.identity,
+            &input.payload,
+        )?;
+        drop(store);
+        let checkpoints = FileCheckpointStore::<super::super::event_rebuild::EventFoldState>::open(
+            directory.path().join("source-run/checkpoint.json"),
+        );
+        let mut legacy = checkpoints.load()?.ok_or("原checkpoint缺失")?;
+        let mut value = serde_json::to_value(&legacy.state)?;
+        let state = value.as_object_mut().ok_or("原checkpoint状态无效")?;
+        state.insert("query_projection_schema".to_string(), serde_json::json!(4));
+        state.remove("accepted_user_inputs");
+        legacy.state = serde_json::from_value(value)?;
+        checkpoints.save(&legacy.journal_identity, &legacy.state, legacy.sequence)?;
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        assert!(
+            reopened
+                .accept_run_steer_input(
+                    "source-run",
+                    "exact-turn",
+                    input.source,
+                    &input.identity,
+                    &input.payload
+                )?
+                .duplicate
+        );
+        assert_eq!(
+            reopened
+                .list_events("source-run", 0)?
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventKind::RunInputAccepted)
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_input_acceptance_rejects_tampered_snapshot_on_replay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = fresh()?;
+        seed_task_query_run(
+            &store,
+            "source-run",
+            TaskRunExecutionProfile::conversation_turn(),
+        )?;
+        let input = durable_input_source(&store, "tampered-source", 1, "原始正文", false)?;
+        store.shadow.append_event_batch("source-run", vec![RuntimeJournalEvent::for_append(
+            "source-run", None, Some("exact-turn"), RuntimeEventKind::RunInputAccepted,
+            serde_json::json!({ "turn_id":"exact-turn", "role":RunInputRole::Steer, "input_snapshot": { "source":input.source, "identity":input.identity, "payload": { "text":"篡改正文", "attachments":input.payload.attachments, "submitted_at_ms":input.payload.submitted_at_ms, "payload_sha256":input.payload.payload_sha256 } } }),
+        )])?;
+        assert!(store.get_run_state("source-run").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn durable_initial_goal_uses_full_source_and_exact_created_run_after_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        let original = format!("{}原始Goal尾部🧭", "完整原文 ".repeat(1600));
+        let input = durable_input_source(&store, "initial-source", 1, &original, false)?;
+        let create = |store: &TaskRuntimeStore, source: &RunInputSnapshot| {
+            store.create_run_for_active_workspace_with_source(
+                "initial-run",
+                "same-conversation",
+                "initial-turn",
+                DomainProfile::General,
+                &source.payload.text,
+                "agent_task_plan",
+                AttendedMode::Attended,
+                TaskRunExecutionProfile::conversation_turn(),
+                None,
+                source,
+            )
+        };
+        let run = create(&store, &input)?;
+        assert_eq!(run.goal, original);
+        let before = store.list_events("initial-run", 0)?;
+        assert_eq!(
+            before
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventKind::RunCreated)
+                .count(),
+            1
+        );
+        assert_eq!(
+            before
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventKind::RunInputAccepted)
+                .count(),
+            1
+        );
+        assert!(
+            store
+                .get_run_state("initial-run")?
+                .ok_or("任务缺失")?
+                .recent_constraints
+                .is_empty()
+        );
+        drop(store);
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        assert_eq!(create(&reopened, &input)?.goal, original);
+        assert_eq!(reopened.list_events("initial-run", 0)?.len(), before.len());
+        let mut foreign = input.clone();
+        foreign.identity.input_id = "different-source".to_string();
+        assert!(create(&reopened, &foreign).is_err());
+        assert_eq!(reopened.list_events("initial-run", 0)?.len(), before.len());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_input_target_and_queue_survive_task_journal_debt_without_mailbox_ack()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::chat_event_log::{ChatEventLog, ChatEventRetention};
+        use crate::conversation_input::{
+            ConversationInputAddress, ConversationInputPhase, ConversationInputService,
+            ConversationInputSource,
+        };
+        let directory = tempfile::tempdir()?;
+        let store =
+            TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path().join("tasks"))?;
+        seed_task_query_run(
+            &store,
+            "source-run",
+            TaskRunExecutionProfile::conversation_turn(),
+        )?;
+        let log = std::sync::Arc::new(ChatEventLog::open(
+            directory.path().join("chat"),
+            ChatEventRetention::default(),
+        )?);
+        let service = ConversationInputService::new(log.clone());
+        let address = ConversationInputAddress {
+            workspace_id: store.active_workspace_id(),
+            conversation_id: "same-conversation".into(),
+        };
+        let saved = service
+            .submit(
+                address.clone(),
+                "queue-source".into(),
+                "必须保留的原始输入🧭".into(),
+                Vec::new(),
+            )
+            .await?;
+        let started = service
+            .dispatch_selected(saved.identity, saved.queue_revision, "exact-turn".into())
+            .await?;
+        let attempt = started.active_attempt.clone().ok_or("真实attempt缺失")?;
+        service
+            .bind_task_target(attempt.clone(), "source-run".into())
+            .await?;
+        store
+            .shadow
+            .fail_next_append_durability_for_test("source-run")?;
+        let accepted = store.accept_run_steer_input(
+            "source-run",
+            "exact-turn",
+            ConversationInputSource::Gui,
+            &started.receipt.identity,
+            &started.payload,
+        );
+        assert!(accepted.is_err());
+        service
+            .recovery_required(attempt, "任务接受耐久未确认，未投递".into())
+            .await?;
+        drop(service);
+        drop(log);
+        drop(store);
+        let service = ConversationInputService::new(std::sync::Arc::new(ChatEventLog::open(
+            directory.path().join("chat"),
+            ChatEventRetention::default(),
+        )?));
+        let frontier = service.list(&address).await?;
+        let item = frontier.items.first().ok_or("原输入丢失")?;
+        assert_eq!(item.receipt.phase, ConversationInputPhase::RecoveryRequired);
+        assert!(!item.receipt.drained);
+        assert_eq!(item.payload.text, "必须保留的原始输入🧭");
+        assert_eq!(
+            item.task_target
+                .as_ref()
+                .map(|target| target.run_id.as_str()),
+            Some("source-run")
+        );
+        assert!(
+            service
+                .dispatch_selected(
+                    item.receipt.identity.clone(),
+                    frontier.queue_revision,
+                    "another-turn".into()
+                )
+                .await
+                .is_err()
+        );
+        let reopened =
+            TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path().join("tasks"))?;
+        assert_eq!(
+            reopened
+                .list_events("source-run", 0)?
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventKind::RunInputAccepted)
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    fn durable_input_resume_fixture(
+        store: &TaskRuntimeStore,
+    ) -> Result<TaskRunResumeIdentity, StoreError> {
+        // 恢复正控须经过真实创建入口冻结原深度策略，不能用历史查询夹具绕过资格绑定。
+        store.create_run_for_active_workspace_with_profile(
+            "resume-source",
+            "same-conversation",
+            "message",
+            DomainProfile::General,
+            "准确恢复原输入",
+            "agent_task_plan",
+            AttendedMode::Attended,
+            TaskRunExecutionProfile::conversation_turn(),
+        )?;
+        store.configure_run_continuation("resume-source", true, false, None, None)?;
+        store.transition_run("resume-source", TaskRunStatus::Running)?;
+        store.request_pause("resume-source")?;
+        Ok(TaskRunResumeIdentity::capture(
+            &store
+                .get_run_state("resume-source")?
+                .ok_or_else(|| StoreError::RunNotFound("resume-source".into()))?,
+        ))
+    }
+
+    #[test]
+    fn durable_input_resume_expected_accepts_source_and_resume_in_the_original_frame()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for continuation in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+            let expected = durable_input_resume_fixture(&store)?;
+            let input = durable_input_source(&store, "resume-input", 1, "恢复同一原任务", false)?;
+            if continuation {
+                assert!(matches!(
+                    store.resume_and_claim_run_turn_expected_with_input(
+                        &expected,
+                        "source-resume-turn",
+                        RunTurnOrigin::Resume,
+                        TurnVisibility::Visible,
+                        &input,
+                    )?,
+                    RunTurnClaimOutcome::Started(_)
+                ));
+            } else {
+                assert_eq!(
+                    store
+                        .resume_task_run_expected_with_input(
+                            &expected,
+                            "source-resume-turn",
+                            &input
+                        )?
+                        .status,
+                    TaskRunStatus::Running
+                );
+            }
+            let frame = last_frame_event_types(&store, "resume-source")?;
+            assert_eq!(
+                frame.first().map(String::as_str),
+                Some("run_input_accepted")
+            );
+            assert!(frame.iter().any(|event| event == "run_status_changed"));
+            assert_eq!(
+                frame
+                    .iter()
+                    .filter(|event| event.as_str() == "run_turn_started")
+                    .count(),
+                usize::from(continuation)
+            );
+            assert_eq!(
+                store
+                    .list_events("resume-source", 0)?
+                    .iter()
+                    .filter(|event| event.event_type == RuntimeEventKind::RunInputAccepted)
+                    .count(),
+                1
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn durable_input_resume_expected_rejects_foreign_goal_or_plan_update_before_acceptance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for continuation in [false, true] {
+            for change_goal in [false, true] {
+                let directory = tempfile::tempdir()?;
+                let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+                let expected = durable_input_resume_fixture(&store)?;
+                let input =
+                    durable_input_source(&store, "stale-source", 1, "不能覆盖其它更新", false)?;
+                // 原expected已捕获后，由另一真实执行线程提交原Goal/Plan写入口。
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| -> Result<(), StoreError> {
+                            if change_goal {
+                                store.update_run_goal(
+                                    "resume-source",
+                                    1,
+                                    "另方已改目标",
+                                    "准确更新",
+                                    RunGoalActorSource::Gui,
+                                )?;
+                            } else {
+                                let run = store.get_run("resume-source")?.ok_or_else(|| {
+                                    StoreError::RunNotFound("resume-source".into())
+                                })?;
+                                store.attach_plan_for_test(&TaskPlan {
+                                    plan_id: "foreign-plan".into(),
+                                    run_id: run.run_id,
+                                    revision: 1,
+                                    domain_profile: DomainProfile::General,
+                                    domain_binding: None,
+                                    goal_revision: run.goal_revision,
+                                    goal_sha256: run.goal_sha256,
+                                    assumptions: Vec::new(),
+                                    risks: Vec::new(),
+                                    execution_mode: ExecutionMode::Sequential,
+                                    tasks: vec![PlanTask {
+                                        id: "foreign-task".into(),
+                                        title: "另方提交的任务".into(),
+                                        ..Default::default()
+                                    }],
+                                })?;
+                            }
+                            Ok(())
+                        })
+                        .join()
+                        .map_err(|_| StoreError::InvalidPlan("原更新线程未正常结算".into()))?
+                })?;
+                let before = store.list_events("resume-source", 0)?.len();
+                if continuation {
+                    assert!(
+                        store
+                            .resume_and_claim_run_turn_expected_with_input(
+                                &expected,
+                                "source-resume-turn",
+                                RunTurnOrigin::Resume,
+                                TurnVisibility::Visible,
+                                &input
+                            )
+                            .is_err()
+                    );
+                } else {
+                    assert!(
+                        store
+                            .resume_task_run_expected_with_input(
+                                &expected,
+                                "source-resume-turn",
+                                &input
+                            )
+                            .is_err()
+                    );
+                }
+                assert_eq!(store.list_events("resume-source", 0)?.len(), before);
+                assert!(
+                    store
+                        .list_events("resume-source", 0)?
+                        .iter()
+                        .all(|event| event.event_type != RuntimeEventKind::RunInputAccepted)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn durable_input_resume_unknown_batch_never_grants_execution_permission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for continuation in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+            let expected = durable_input_resume_fixture(&store)?;
+            let input = durable_input_source(&store, "debt-source", 1, "屏障失败不得启动", false)?;
+            store
+                .shadow
+                .fail_next_append_durability_for_test("resume-source")?;
+            let result = if continuation {
+                store
+                    .resume_and_claim_run_turn_expected_with_input(
+                        &expected,
+                        "source-resume-turn",
+                        RunTurnOrigin::Resume,
+                        TurnVisibility::Visible,
+                        &input,
+                    )
+                    .map(|_| ())
+            } else {
+                store
+                    .resume_task_run_expected_with_input(&expected, "source-resume-turn", &input)
+                    .map(|_| ())
+            };
+            assert!(matches!(
+                result,
+                Err(StoreError::ResumeOutcomeUnknown { .. })
+            ));
+            assert_eq!(
+                store
+                    .list_events("resume-source", 0)?
+                    .iter()
+                    .filter(|event| event.event_type == RuntimeEventKind::RunInputAccepted)
+                    .count(),
+                1
+            );
+            let before = store.list_events("resume-source", 0)?.len();
+            // 旧expected不会因为这是自己的来源事件而获得通用后缀豁免，也不读latest替换CAS。
+            if continuation {
+                assert!(
+                    store
+                        .resume_and_claim_run_turn_expected_with_input(
+                            &expected,
+                            "source-resume-turn",
+                            RunTurnOrigin::Resume,
+                            TurnVisibility::Visible,
+                            &input
+                        )
+                        .is_err()
+                );
+            } else {
+                assert!(
+                    store
+                        .resume_task_run_expected_with_input(
+                            &expected,
+                            "source-resume-turn",
+                            &input
+                        )
+                        .is_err()
+                );
+            }
+            assert_eq!(store.list_events("resume-source", 0)?.len(), before);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn durable_input_resume_post_commit_unknown_error_preserves_original_settlement_classification()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for continuation in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+            let expected = durable_input_resume_fixture(&store)?;
+            let input = durable_input_source(
+                &store,
+                "actual-unknown-source",
+                1,
+                "真实frame后观察失败",
+                false,
+            )?;
+            store
+                .shadow
+                .fail_next_source_post_commit_validation_for_test("resume-source")?;
+            let result = if continuation {
+                store
+                    .resume_and_claim_run_turn_expected_with_input(
+                        &expected,
+                        "source-resume-turn",
+                        RunTurnOrigin::Resume,
+                        TurnVisibility::Visible,
+                        &input,
+                    )
+                    .map(|_| ())
+            } else {
+                store
+                    .resume_task_run_expected_with_input(&expected, "source-resume-turn", &input)
+                    .map(|_| ())
+            };
+            assert!(matches!(
+                result,
+                Err(StoreError::ResumeOutcomeUnknown { .. })
+            ));
+            drop(store);
+            // 原producer fault位于真实frame写入之后；原冷恢复看到同一接受+恢复事实，没有第二frame。
+            let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+            let events = reopened.list_events("resume-source", 0)?;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.event_type == RuntimeEventKind::RunInputAccepted)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                reopened
+                    .get_run("resume-source")?
+                    .ok_or("原任务缺失")?
+                    .status,
+                TaskRunStatus::Running
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.event_type == RuntimeEventKind::RunTurnStarted)
+                    .count(),
+                usize::from(continuation)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn task_history_external_runs_survive_reopen_without_plans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        let workspace = store.active_workspace_id();
+        for (id, conversation, status) in [
+            ("im-first", "channel:sha256:history", TaskRunStatus::Failed),
+            (
+                "im-second",
+                "channel:sha256:history",
+                TaskRunStatus::Cancelled,
+            ),
+            (
+                "cron-failed",
+                "cron:daily:occurrence",
+                TaskRunStatus::Failed,
+            ),
+            ("gui-hidden", "ordinary-gui", TaskRunStatus::Cancelled),
+        ] {
+            store.create_run_with_profile(
+                id,
+                &workspace,
+                conversation,
+                &format!("root-{id}"),
+                DomainProfile::General,
+                "原触发输入",
+                "agent_task_plan",
+                AttendedMode::Attended,
+                TaskRunExecutionProfile::conversation_turn(),
+            )?;
+            store.transition_run(id, TaskRunStatus::Running)?;
+            store.finalize_run(id, status, None)?;
+            assert!(store.get_plan(id)?.is_none());
+        }
+        drop(store);
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+        let first = reopened.query_task_runs_page("generation-a", &[], 1, None)?;
+        assert_eq!(
+            first.items.len(),
+            1,
+            "后台触发无plan的原Run仍须进入同一历史查询"
+        );
+        let cursor = first
+            .next_continuation
+            .as_deref()
+            .ok_or("后台多Run分页缺失")?;
+        assert!(
+            reopened
+                .query_task_runs_page("generation-b", &[], 1, Some(cursor))
+                .is_err()
+        );
+        let mut ids = first
+            .items
+            .iter()
+            .map(|run| run.run_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut next = first.next_continuation;
+        for _ in 0..3 {
+            let Some(cursor) = next.take() else {
+                break;
+            };
+            let page = reopened.query_task_runs_page("generation-a", &[], 1, Some(&cursor))?;
+            assert!(page.items.len() <= 1);
+            for run in page.items {
+                assert!(ids.insert(run.run_id), "同一scope/generation/run不能重复");
+            }
+            next = page.next_continuation;
+        }
+        assert!(next.is_none());
+        assert_eq!(
+            ids,
+            ["im-first", "im-second", "cron-failed"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<std::collections::HashSet<_>>()
+        );
+        assert!(
+            reopened
+                .latest_task_ui_run_for_conversation("channel:sha256:history")?
+                .is_some()
+        );
+        assert!(
+            reopened
+                .latest_task_ui_run_for_conversation("cron:daily:occurrence")?
+                .is_some()
+        );
+        assert!(
+            reopened
+                .latest_task_ui_run_for_conversation("ordinary-gui")?
+                .is_none()
+        );
+        assert_eq!(
+            reopened.get_run("im-first")?.ok_or("失败Run缺失")?.status,
+            TaskRunStatus::Failed
+        );
+        assert_eq!(
+            reopened.get_run("im-second")?.ok_or("取消Run缺失")?.status,
+            TaskRunStatus::Cancelled
+        );
+        Ok(())
+    }
+
+    fn seed_task_query_run(
+        store: &TaskRuntimeStore,
+        id: &str,
+        profile: TaskRunExecutionProfile,
+    ) -> Result<(), StoreError> {
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2026-10-25T01:00:00Z")
+            .map_err(|error| StoreError::InvalidPlan(error.to_string()))?
+            .with_timezone(&Utc);
+        store.commit_runtime_event(RuntimeJournalEvent::new(id, None, None, RuntimeEventKind::RunCreated,
+            serde_json::json!({ "goal": format!("目标 {id} 中文 🧭"), "workspace_id": store.active_workspace_id(),
+                "conversation_id": "same-conversation", "root_message_id": "message", "domain_profile": "general",
+                "route": "diagnostic-route-is-not-provenance", "attended_mode": "attended",
+                "created_at": timestamp, "execution_profile": profile }), timestamp))?;
+        Ok(())
+    }
+
+    #[test]
+    fn task_history_run_pages_share_formal_visibility_and_stable_tie_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = TaskRuntimeStore::new_in_memory()?;
+        for index in 0..25 {
+            seed_task_query_run(
+                &store,
+                &format!("run-{index:02}"),
+                TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+            )?;
+        }
+        seed_task_query_run(
+            &store,
+            "zz-ordinary-turn",
+            TaskRunExecutionProfile::conversation_turn(),
+        )?;
+        assert!(
+            store
+                .latest_task_ui_run_for_conversation("same-conversation")?
+                .is_some()
+        );
+        let first = store.query_task_runs_page("generation-a", &[], 20, None)?;
+        assert_eq!(first.items.len(), 20);
+        assert_eq!(
+            first.items.first().map(|run| run.run_id.as_str()),
+            Some("run-24")
+        );
+        assert_eq!(
+            first.items.last().map(|run| run.run_id.as_str()),
+            Some("run-05")
+        );
+        let cursor = first
+            .next_continuation
+            .as_deref()
+            .ok_or("missing next continuation")?;
+        let second = store.query_task_runs_page("generation-a", &[], 20, Some(cursor))?;
+        assert_eq!(second.items.len(), 5);
+        assert_eq!(
+            second.items.last().map(|run| run.run_id.as_str()),
+            Some("run-00")
+        );
+        assert!(second.next_continuation.is_none());
+        assert!(
+            first
+                .items
+                .iter()
+                .chain(second.items.iter())
+                .all(|run| run.run_id != "zz-ordinary-turn")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_history_visibility_changes_only_after_original_plan_commit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = TaskRuntimeStore::new_in_memory()?;
+        seed_task_query_run(
+            &store,
+            "ordinary",
+            TaskRunExecutionProfile::conversation_turn(),
+        )?;
+        assert!(
+            store
+                .query_task_runs_page("generation-a", &[], 20, None)?
+                .items
+                .is_empty()
+        );
+        assert!(
+            store
+                .latest_task_ui_run_for_conversation("same-conversation")?
+                .is_none()
+        );
+        store.attach_plan_for_test(&TaskPlan {
+            plan_id: "committed-plan".into(),
+            run_id: "ordinary".into(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            domain_binding: None,
+            goal_revision: 1,
+            goal_sha256: task_goal_sha256("目标 ordinary 中文 🧭"),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![PlanTask {
+                id: "task".into(),
+                title: "合法任务".into(),
+                ..Default::default()
+            }],
+        })?;
+        assert_eq!(
+            store
+                .query_task_runs_page("generation-a", &[], 20, None)?
+                .items
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .latest_task_ui_run_for_conversation("same-conversation")?
+                .map(|run| run.run_id),
+            Some("ordinary".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_history_continuations_reject_changed_scope_filters_and_invalid_limits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = TaskRuntimeStore::new_in_memory()?;
+        for id in ["a", "b", "c"] {
+            seed_task_query_run(
+                &store,
+                id,
+                TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+            )?;
+        }
+        let page = store.query_task_runs_page("generation-a", &[], 1, None)?;
+        let cursor = page.next_continuation.as_deref().ok_or("missing cursor")?;
+        assert!(
+            store
+                .query_task_runs_page("generation-b", &[], 1, Some(cursor))
+                .is_err()
+        );
+        let mut changed_scope: serde_json::Value = serde_json::from_str(cursor)?;
+        changed_scope
+            .as_object_mut()
+            .ok_or("cursor is not an object")?
+            .insert("workspace_id".into(), serde_json::json!("foreign"));
+        let changed_scope = serde_json::to_string(&changed_scope)?;
+        assert!(
+            store
+                .query_task_runs_page("generation-a", &[], 1, Some(&changed_scope))
+                .is_err()
+        );
+        assert!(
+            store
+                .query_task_runs_page("generation-a", &[TaskRunStatus::Completed], 1, Some(cursor))
+                .is_err()
+        );
+        assert!(
+            store
+                .query_task_runs_page("generation-a", &[], 2, Some(cursor))
+                .is_err()
+        );
+        assert!(
+            store
+                .query_task_runs_page("generation-a", &[], 0, None)
+                .is_err()
+        );
+        assert!(
+            store
+                .query_task_runs_page("generation-a", &[], 21, None)
+                .is_err()
+        );
+        assert!(
+            store
+                .query_task_runs_page("generation-a", &[], 1, Some("invalid"))
+                .is_err()
+        );
+        // A new header at the same timestamp sorts above the first read's upper bound.
+        seed_task_query_run(
+            &store,
+            "z-new",
+            TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+        )?;
+        let next = store.query_task_runs_page("generation-a", &[], 1, Some(cursor))?;
+        assert_eq!(next.items.first().map(|run| run.run_id.as_str()), Some("b"));
+        let refreshed = store.query_task_runs_page("generation-a", &[], 1, None)?;
+        assert_eq!(
+            refreshed.items.first().map(|run| run.run_id.as_str()),
+            Some("z-new")
+        );
+        // The authority guard remains strict for an actual foreign workspace run.
+        store.create_run(
+            "foreign",
+            "another-workspace",
+            "other-conversation",
+            "other-message",
+            DomainProfile::General,
+            "foreign",
+            "agent_task_plan",
+            AttendedMode::Attended,
+        )?;
+        assert!(
+            store
+                .query_task_runs_page("generation-a", &[], 1, None)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_history_page_recovers_projection_and_reports_invalid_journal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(root.path())?;
+        seed_task_query_run(
+            &store,
+            "readable",
+            TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+        )?;
+        std::fs::remove_file(root.path().join("readable/run-state.json"))?;
+        let orphan = root.path().join("projection-only-orphan");
+        std::fs::create_dir(&orphan)?;
+        std::fs::write(orphan.join("run-state.json"), b"{}")?;
+        assert_eq!(
+            store
+                .query_task_runs_page("generation-a", &[], 20, None)?
+                .items
+                .len(),
+            1
+        );
+        drop(store);
+        // A complete malformed journal is not a missing authority or an incomplete final write.
+        std::fs::write(root.path().join("readable/events.jsonl"), b"not-json\n")?;
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(root.path())?;
+        assert!(
+            reopened
+                .query_task_runs_page("generation-a", &[], 20, None)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_history_live_pages_keep_creation_order_and_normalize_statuses()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = TaskRuntimeStore::new_in_memory()?;
+        for id in ["a", "b", "c"] {
+            seed_task_query_run(
+                &store,
+                id,
+                TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+            )?;
+        }
+        let first = store.query_task_runs_page(
+            "generation-live",
+            &[TaskRunStatus::Running, TaskRunStatus::Pending],
+            1,
+            None,
+        )?;
+        assert_eq!(
+            first.items.first().map(|run| run.run_id.as_str()),
+            Some("c")
+        );
+        let cursor = first.next_continuation.as_deref().ok_or("缺少续页位置")?;
+        // 状态和updated_at在页间变化，不改变创建顺序；live查询可排除已不匹配的行。
+        store.transition_run("b", TaskRunStatus::Cancelled)?;
+        let second = store.query_task_runs_page(
+            "generation-live",
+            &[
+                TaskRunStatus::Pending,
+                TaskRunStatus::Pending,
+                TaskRunStatus::Running,
+            ],
+            1,
+            Some(cursor),
+        )?;
+        assert_eq!(
+            second.items.first().map(|run| run.run_id.as_str()),
+            Some("a")
+        );
+        assert!(second.next_continuation.is_none());
+        let refreshed = store.query_task_runs_page("generation-live", &[], 20, None)?;
+        assert_eq!(
+            refreshed
+                .items
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c", "b", "a"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_history_live_page_discovers_new_formal_plan_below_its_original_cut()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = TaskRuntimeStore::new_in_memory()?;
+        for id in ["a-old", "z-top"] {
+            seed_task_query_run(
+                &store,
+                id,
+                TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+            )?;
+        }
+        seed_task_query_run(
+            &store,
+            "m-turn",
+            TaskRunExecutionProfile::conversation_turn(),
+        )?;
+        let first = store.query_task_runs_page("generation-live", &[], 1, None)?;
+        let cursor = first.next_continuation.as_deref().ok_or("缺少续页位置")?;
+        // 普通turn只因原权威提交了真实plan变得可见；读取列表不创建plan/任务。
+        store.attach_plan_for_test(&TaskPlan {
+            plan_id: "new-formal-plan".into(),
+            run_id: "m-turn".into(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            domain_binding: None,
+            goal_revision: 1,
+            goal_sha256: task_goal_sha256("目标 m-turn 中文 🧭"),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![PlanTask {
+                id: "legal-task".into(),
+                title: "合法计划任务".into(),
+                ..Default::default()
+            }],
+        })?;
+        seed_task_query_run(
+            &store,
+            "zz-new-above-cut",
+            TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+        )?;
+        let second = store.query_task_runs_page("generation-live", &[], 1, Some(cursor))?;
+        assert_eq!(
+            second.items.first().map(|run| run.run_id.as_str()),
+            Some("m-turn")
+        );
+        let next = second.next_continuation.as_deref().ok_or("缺少末页位置")?;
+        let last = store.query_task_runs_page("generation-live", &[], 1, Some(next))?;
+        assert_eq!(
+            last.items.first().map(|run| run.run_id.as_str()),
+            Some("a-old")
+        );
+        assert!(last.next_continuation.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn task_history_page_recovers_torn_tail_without_inventing_an_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
+        let root = tempfile::tempdir()?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(root.path())?;
+        seed_task_query_run(
+            &store,
+            "torn",
+            TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+        )?;
+        let journal = root.path().join("torn/events.jsonl");
+        let valid = std::fs::read(&journal)?;
+        drop(store);
+        let mut writer = std::fs::OpenOptions::new().append(true).open(&journal)?;
+        writer.write_all(b"{\"seq\":")?;
+        writer.sync_all()?;
+        drop(writer);
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(root.path())?;
+        let page = reopened.query_task_runs_page("generation-live", &[], 20, None)?;
+        assert_eq!(page.items.len(), 1);
+        let events = reopened.query_task_event_page("torn", 0, 20)?;
+        assert_eq!(events.events.len(), 1);
+        assert_eq!(events.next_after_sequence, 1);
+        assert!(!events.has_more);
+        assert_eq!(std::fs::read(&journal)?, valid);
+        Ok(())
+    }
+
+    #[test]
+    fn task_history_event_pages_are_bounded_and_lossless() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let store = TaskRuntimeStore::new_in_memory()?;
+        seed_task_query_run(
+            &store,
+            "events",
+            TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+        )?;
+        for index in 0..300 {
+            store.commit_runtime_event(RuntimeJournalEvent::for_append(
+                "events",
+                None,
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({ "message": format!("记录 {index} 中文 🧭") }),
+            ))?;
+        }
+        let first = store.query_task_event_page("events", 0, 20)?;
+        assert_eq!(first.events.len(), 20);
+        assert!(first.has_more);
+        assert_eq!(first.next_after_sequence, 20);
+        let second = store.query_task_event_page("events", first.next_after_sequence, 256)?;
+        assert_eq!(second.events.len(), 256);
+        assert!(second.has_more);
+        assert_eq!(second.next_after_sequence, 276);
+        let last = store.query_task_event_page("events", second.next_after_sequence, 256)?;
+        assert_eq!(last.events.len(), 25);
+        assert!(!last.has_more);
+        assert_eq!(last.next_after_sequence, 301);
+        let empty = store.query_task_event_page("events", last.next_after_sequence, 256)?;
+        assert!(empty.events.is_empty());
+        assert_eq!(empty.next_after_sequence, 301);
+        assert!(!empty.has_more);
+        assert!(store.query_task_event_page("events", 302, 20).is_err());
+        assert!(store.query_task_event_page("events", -1, 20).is_err());
+        assert!(store.query_task_event_page("events", 0, 257).is_err());
+        let serialized = serde_json::to_value(TaskEventPage {
+            events: Vec::new(),
+            next_after_sequence: i64::MAX,
+            has_more: false,
+        })?;
+        assert_eq!(
+            serialized
+                .get("next_after_sequence")
+                .and_then(serde_json::Value::as_str),
+            Some(i64::MAX.to_string().as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn depth_binding_survives_config_changes_journal_and_checkpoint_tail()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::subagent_policy::{SubagentDepthDefaults, SubagentDepthLimit};
+        for original in [1, 3] {
+            for keep_checkpoint in [false, true] {
+                let directory = tempfile::tempdir()?;
+                let original_limit = SubagentDepthLimit::new(original)?;
+                let next_limit = SubagentDepthLimit::new(if original == 1 { 3 } else { 1 })?;
+                let defaults = std::sync::Arc::new(SubagentDepthDefaults::new(original_limit));
+                let store = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?
+                    .with_subagent_depth_defaults(defaults.clone());
+                store.create_run(
+                    "bound",
+                    "global",
+                    "conversation",
+                    "root",
+                    DomainProfile::General,
+                    "goal",
+                    "task",
+                    AttendedMode::Attended,
+                )?;
+                let first = store.get_run_state("bound")?.ok_or("run missing")?;
+                assert_eq!(
+                    first.execution_profile.subagent_depth_limit,
+                    Some(original_limit)
+                );
+                let checkpoint_path = directory.path().join("bound/checkpoint.json");
+                let identity = TaskRunResumeIdentity::capture(&first);
+                let mut changed_binding = first.clone();
+                changed_binding.execution_profile = changed_binding
+                    .execution_profile
+                    .with_subagent_depth_limit(next_limit);
+                assert!(
+                    identity
+                        .validate_resumable(&changed_binding)
+                        .is_err_and(|error| error.contains("execution_profile"))
+                );
+                let checkpoint = std::fs::read(&checkpoint_path)?;
+                defaults.publish(next_limit);
+                store.create_run(
+                    "bound",
+                    "global",
+                    "conversation",
+                    "root",
+                    DomainProfile::General,
+                    "goal",
+                    "task",
+                    AttendedMode::Attended,
+                )?;
+                assert_eq!(
+                    store
+                        .get_run_state("bound")?
+                        .ok_or("run missing")?
+                        .execution_profile
+                        .subagent_depth_limit,
+                    Some(original_limit)
+                );
+                assert!(
+                    store
+                        .create_run_with_profile(
+                            "bound",
+                            "global",
+                            "conversation",
+                            "root",
+                            DomainProfile::General,
+                            "goal",
+                            "task",
+                            AttendedMode::Attended,
+                            TaskRunExecutionProfile::default()
+                                .with_subagent_depth_limit(next_limit)
+                        )
+                        .is_err()
+                );
+                store.create_run(
+                    "new",
+                    "global",
+                    "conversation",
+                    "new-root",
+                    DomainProfile::General,
+                    "new goal",
+                    "task",
+                    AttendedMode::Attended,
+                )?;
+                assert_eq!(
+                    store
+                        .get_run_state("new")?
+                        .ok_or("new run missing")?
+                        .execution_profile
+                        .subagent_depth_limit,
+                    Some(next_limit)
+                );
+                store.transition_run("bound", TaskRunStatus::Running)?;
+                drop(store);
+                if keep_checkpoint {
+                    // Restore the valid prefix checkpoint so Running is a real
+                    // suffix replay, rather than testing only a warm snapshot.
+                    std::fs::write(&checkpoint_path, checkpoint)?;
+                } else {
+                    std::fs::remove_file(&checkpoint_path)?;
+                }
+                let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(directory.path())?;
+                let recovered = reopened
+                    .get_run_state("bound")?
+                    .ok_or("recovered run missing")?;
+                assert_eq!(
+                    recovered.execution_profile.subagent_depth_limit,
+                    Some(original_limit)
+                );
+                assert_eq!(recovered.run.status, TaskRunStatus::Running);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn missing_historical_profile_binding_is_never_a_new_default()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let legacy: TaskRunExecutionProfile = serde_json::from_value(serde_json::json!({
+            "provenance": "orchestrated", "plan_policy": "require_plan"
+        }))?;
+        assert!(legacy.subagent_depth_limit.is_none());
+        assert!(legacy.require_subagent_depth_limit().is_err());
+        assert!(
+            serde_json::to_value(legacy)?
+                .get("subagent_depth_limit")
+                .is_none()
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn aggregate_shutdown_drains_normal_io_then_reports_original_unknown_pool_owner()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -171,12 +2493,11 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         const ROOT_ENV: &str = "EKO_TASK_OWNER_CRASH_ROOT";
         const READY_ENV: &str = "EKO_TASK_OWNER_CRASH_READY";
-        if let (Some(root), Some(ready)) =
-            (std::env::var_os(ROOT_ENV), std::env::var_os(READY_ENV))
+        if let (Some(root), Some(ready)) = (std::env::var_os(ROOT_ENV), std::env::var_os(READY_ENV))
         {
-            let store = std::sync::Arc::new(
-                TaskRuntimeStore::new_in_memory_with_shadow_root(PathBuf::from(root))?,
-            );
+            let store = std::sync::Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(
+                PathBuf::from(root),
+            )?);
             let _resource_scope = store.test_resource_scope();
             store.create_run(
                 "crashed-owner",
@@ -189,6 +2510,8 @@ mod tests {
                 AttendedMode::Attended,
             )?;
             store.attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+
                 plan_id: "crashed-plan".to_string(),
                 run_id: "crashed-owner".to_string(),
                 revision: 1,
@@ -253,11 +2576,16 @@ mod tests {
                 break;
             }
             if let Some(status) = child.0.as_mut().ok_or("crash child missing")?.try_wait()? {
-                return Err(format!("crash fixture exited before owner admission: {status}").into());
+                return Err(
+                    format!("crash fixture exited before owner admission: {status}").into(),
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(ready.exists(), "crash fixture never entered its real driver");
+        assert!(
+            ready.exists(),
+            "crash fixture never entered its real driver"
+        );
         assert!(
             TaskRuntimeStore::new_in_memory_with_shadow_root(&root).is_err(),
             "a live competing process must retain its exclusive root lease"
@@ -265,42 +2593,70 @@ mod tests {
         let mut original = child.0.take().ok_or("crash child missing")?;
         original.kill()?;
         let status = original.wait()?;
-        assert!(!status.success(), "fixture must end without graceful shutdown");
-
-        let store = std::sync::Arc::new(
-            TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?,
+        assert!(
+            !status.success(),
+            "fixture must end without graceful shutdown"
         );
+
+        let store = std::sync::Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(&root)?);
         let pending = store.unresolved_physical_owner_intents("crashed-owner")?;
         assert_eq!(pending.len(), 1);
-        assert!(pending.iter().all(|intent| !intent.physical_terminal_observed));
+        assert!(
+            pending
+                .iter()
+                .all(|intent| !intent.physical_terminal_observed)
+        );
         let reconciler = crate::tasks::task_runtime::TaskRunBootReconciler::for_store(&store);
         assert_eq!(
             reconciler.recover_once().await?,
             1,
             "the dead process intent must not leave its run permanently Running"
         );
-        let state = store.get_run_state("crashed-owner")?.ok_or("recovered run missing")?;
+        let state = store
+            .get_run_state("crashed-owner")?
+            .ok_or("recovered run missing")?;
         assert_eq!(state.run.status, TaskRunStatus::Paused);
         assert_eq!(
-            state.continuation.and_then(|continuation| continuation.pause).map(|pause| pause.reason),
+            state
+                .continuation
+                .and_then(|continuation| continuation.pause)
+                .map(|pause| pause.reason),
             Some(RunPauseReason::BootRecovery)
         );
-        assert!(store.unresolved_physical_owner_intents("crashed-owner")?.is_empty());
+        assert!(
+            store
+                .unresolved_physical_owner_intents("crashed-owner")?
+                .is_empty()
+        );
         assert_eq!(store.recover_incomplete()?, 0);
         let events = store.list_events("crashed-owner", 0)?;
         assert_eq!(
-            events.iter().filter(|event| event.event_type == RuntimeEventKind::RecoveryResolved).count(),
+            events
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventKind::RecoveryResolved)
+                .count(),
             1
         );
-        assert!(events.iter().all(|event| {
-            event.payload.get("physical_owner_intent")
-                .and_then(|intent| intent.get("physical_terminal_observed"))
-                .and_then(serde_json::Value::as_bool) != Some(true)
-        }), "process interruption must not fabricate physical completion");
-        assert!(events.iter().all(|event| !matches!(
-            event.event_type,
-            RuntimeEventKind::ToolStarted | RuntimeEventKind::ToolCompleted | RuntimeEventKind::ToolFailed
-        )), "boot reconciliation must not replay model or tool work");
+        assert!(
+            events.iter().all(|event| {
+                event
+                    .payload
+                    .get("physical_owner_intent")
+                    .and_then(|intent| intent.get("physical_terminal_observed"))
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+            }),
+            "process interruption must not fabricate physical completion"
+        );
+        assert!(
+            events.iter().all(|event| !matches!(
+                event.event_type,
+                RuntimeEventKind::ToolStarted
+                    | RuntimeEventKind::ToolCompleted
+                    | RuntimeEventKind::ToolFailed
+            )),
+            "boot reconciliation must not replay model or tool work"
+        );
         Ok(())
     }
 
@@ -310,27 +2666,63 @@ mod tests {
         let store = std::sync::Arc::new(fresh()?);
         seed_history_plan(&store, "atomic-owner")?;
         store.transition_run("atomic-owner", TaskRunStatus::Running)?;
-        store.set_task_status("atomic-owner", "target-task", echo_agent::tasks::TaskStatus::Running, None, None)?;
-        store.record_tool_started("atomic-owner", "target-task", "execution", "unsafe-call", "write_file", false)?;
+        store.set_task_status(
+            "atomic-owner",
+            "target-task",
+            echo_agent::tasks::TaskStatus::Running,
+            None,
+            None,
+        )?;
+        store.record_tool_started(
+            "atomic-owner",
+            "target-task",
+            "execution",
+            "unsafe-call",
+            "write_file",
+            false,
+        )?;
         let intent = PhysicalOwnerIntent {
-            run_id: "atomic-owner".to_string(), owner_id: "dead-owner".to_string(),
-            execution_id: None, workspace_id: "test".to_string(),
-            process_epoch: Some(uuid::Uuid::new_v4().to_string()), physical_terminal_observed: false,
+            run_id: "atomic-owner".to_string(),
+            owner_id: "dead-owner".to_string(),
+            execution_id: None,
+            workspace_id: "test".to_string(),
+            process_epoch: Some(uuid::Uuid::new_v4().to_string()),
+            physical_terminal_observed: false,
         };
         store.commit_runtime_event(RuntimeJournalEvent::for_append(
-            "atomic-owner", None, None, RuntimeEventKind::RecoveryBlocked,
+            "atomic-owner",
+            None,
+            None,
+            RuntimeEventKind::RecoveryBlocked,
             serde_json::json!({"physical_owner_intent": intent}),
         ))?;
         let before = serde_json::to_value(store.list_events("atomic-owner", 0)?)?;
         store.fail_next_recovery_commit_for_test();
         assert!(store.recover_incomplete().is_err());
-        assert_eq!(store.unresolved_physical_owner_intents("atomic-owner")?, vec![intent],
-            "failed recovery must retain the original admission fence");
-        assert_eq!(serde_json::to_value(store.list_events("atomic-owner", 0)?)?, before,
-            "owner retirement must not commit before unsafe effects are classified");
-        assert!(store.reserve_run_driver_admission("atomic-owner".to_string(), echo_agent::agent::CancellationToken::new()).is_err());
+        assert_eq!(
+            store.unresolved_physical_owner_intents("atomic-owner")?,
+            vec![intent],
+            "failed recovery must retain the original admission fence"
+        );
+        assert_eq!(
+            serde_json::to_value(store.list_events("atomic-owner", 0)?)?,
+            before,
+            "owner retirement must not commit before unsafe effects are classified"
+        );
+        assert!(
+            store
+                .reserve_run_driver_admission(
+                    "atomic-owner".to_string(),
+                    echo_agent::agent::CancellationToken::new()
+                )
+                .is_err()
+        );
         assert_eq!(store.recover_incomplete()?, 1);
-        assert!(store.unresolved_physical_owner_intents("atomic-owner")?.is_empty());
+        assert!(
+            store
+                .unresolved_physical_owner_intents("atomic-owner")?
+                .is_empty()
+        );
         assert!(!store.list_recovery_blockers("atomic-owner")?.is_empty());
         assert!(store.resume_task_run("atomic-owner").is_err());
         Ok(())
@@ -344,25 +2736,61 @@ mod tests {
             if with_plan {
                 seed_history_plan(&store, "orphan-unsafe")?;
             } else {
-                store.create_run("orphan-unsafe", "global", "conversation", "message", DomainProfile::General, "goal", "task", AttendedMode::Attended)?;
+                store.create_run(
+                    "orphan-unsafe",
+                    "global",
+                    "conversation",
+                    "message",
+                    DomainProfile::General,
+                    "goal",
+                    "task",
+                    AttendedMode::Attended,
+                )?;
             }
             store.transition_run("orphan-unsafe", TaskRunStatus::Running)?;
-            store.record_tool_started("orphan-unsafe", "absent-task", "original-execution", "unsafe-call", "write_file", false)?;
+            store.record_tool_started(
+                "orphan-unsafe",
+                "absent-task",
+                "original-execution",
+                "unsafe-call",
+                "write_file",
+                false,
+            )?;
             let intent = PhysicalOwnerIntent {
-                run_id: "orphan-unsafe".to_string(), owner_id: "dead-owner".to_string(),
-                execution_id: None, workspace_id: store.active_workspace_id(),
-                process_epoch: Some(uuid::Uuid::new_v4().to_string()), physical_terminal_observed: false,
+                run_id: "orphan-unsafe".to_string(),
+                owner_id: "dead-owner".to_string(),
+                execution_id: None,
+                workspace_id: store.active_workspace_id(),
+                process_epoch: Some(uuid::Uuid::new_v4().to_string()),
+                physical_terminal_observed: false,
             };
             store.commit_runtime_event(RuntimeJournalEvent::for_append(
-                "orphan-unsafe", None, None, RuntimeEventKind::RecoveryBlocked,
+                "orphan-unsafe",
+                None,
+                None,
+                RuntimeEventKind::RecoveryBlocked,
                 serde_json::json!({"physical_owner_intent":intent}),
             ))?;
             let before = serde_json::to_value(store.list_events("orphan-unsafe", 0)?)?;
             for _ in 0..2 {
-                assert!(matches!(store.recover_incomplete(), Err(StoreError::RecoveryBlocked { .. })));
-                assert_eq!(serde_json::to_value(store.list_events("orphan-unsafe", 0)?)?, before);
-                assert_eq!(store.unresolved_physical_owner_intents("orphan-unsafe")?, vec![intent.clone()]);
-                assert_eq!(store.get_run_state("orphan-unsafe")?.map(|state| state.run.status), Some(TaskRunStatus::Running));
+                assert!(matches!(
+                    store.recover_incomplete(),
+                    Err(StoreError::RecoveryBlocked { .. })
+                ));
+                assert_eq!(
+                    serde_json::to_value(store.list_events("orphan-unsafe", 0)?)?,
+                    before
+                );
+                assert_eq!(
+                    store.unresolved_physical_owner_intents("orphan-unsafe")?,
+                    vec![intent.clone()]
+                );
+                assert_eq!(
+                    store
+                        .get_run_state("orphan-unsafe")?
+                        .map(|state| state.run.status),
+                    Some(TaskRunStatus::Running)
+                );
             }
         }
         Ok(())
@@ -374,22 +2802,50 @@ mod tests {
         let store = fresh()?;
         seed_history_plan(&store, "paused-unsafe-owner")?;
         store.transition_run("paused-unsafe-owner", TaskRunStatus::Running)?;
-        store.set_task_status("paused-unsafe-owner", "target-task", echo_agent::tasks::TaskStatus::Running, None, None)?;
-        store.record_tool_started("paused-unsafe-owner", "target-task", "execution", "unsafe-call", "write_file", false)?;
+        store.set_task_status(
+            "paused-unsafe-owner",
+            "target-task",
+            echo_agent::tasks::TaskStatus::Running,
+            None,
+            None,
+        )?;
+        store.record_tool_started(
+            "paused-unsafe-owner",
+            "target-task",
+            "execution",
+            "unsafe-call",
+            "write_file",
+            false,
+        )?;
         store.transition_run("paused-unsafe-owner", TaskRunStatus::Paused)?;
         let intent = PhysicalOwnerIntent {
-            run_id: "paused-unsafe-owner".to_string(), owner_id: "dead-owner".to_string(),
-            execution_id: None, workspace_id: "test".to_string(),
-            process_epoch: Some(uuid::Uuid::new_v4().to_string()), physical_terminal_observed: false,
+            run_id: "paused-unsafe-owner".to_string(),
+            owner_id: "dead-owner".to_string(),
+            execution_id: None,
+            workspace_id: "test".to_string(),
+            process_epoch: Some(uuid::Uuid::new_v4().to_string()),
+            physical_terminal_observed: false,
         };
         store.commit_runtime_event(RuntimeJournalEvent::for_append(
-            "paused-unsafe-owner", None, None, RuntimeEventKind::RecoveryBlocked,
+            "paused-unsafe-owner",
+            None,
+            None,
+            RuntimeEventKind::RecoveryBlocked,
             serde_json::json!({"physical_owner_intent":intent}),
         ))?;
         store.recover_incomplete()?;
-        assert!(store.unresolved_physical_owner_intents("paused-unsafe-owner")?.is_empty());
-        assert!(store.list_recovery_blockers("paused-unsafe-owner")?.iter().any(|blocker| blocker.call_id.as_deref() == Some("unsafe-call")),
-            "paused recovery must classify unsafe effects before retiring their dead owner");
+        assert!(
+            store
+                .unresolved_physical_owner_intents("paused-unsafe-owner")?
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_recovery_blockers("paused-unsafe-owner")?
+                .iter()
+                .any(|blocker| blocker.call_id.as_deref() == Some("unsafe-call")),
+            "paused recovery must classify unsafe effects before retiring their dead owner"
+        );
         assert!(store.resume_task_run("paused-unsafe-owner").is_err());
         assert_eq!(store.recover_incomplete()?, 0);
         Ok(())
@@ -400,35 +2856,73 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         const ROOT_ENV: &str = "EKO_TASK_CANCELLED_OWNER_CRASH_ROOT";
         const READY_ENV: &str = "EKO_TASK_CANCELLED_OWNER_CRASH_READY";
-        if let (Some(root), Some(ready)) = (std::env::var_os(ROOT_ENV), std::env::var_os(READY_ENV)) {
-            let store = std::sync::Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(PathBuf::from(root))?);
+        if let (Some(root), Some(ready)) = (std::env::var_os(ROOT_ENV), std::env::var_os(READY_ENV))
+        {
+            let store = std::sync::Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(
+                PathBuf::from(root),
+            )?);
             let _scope = store.test_resource_scope();
             seed_history_plan(&store, "cancelled-crash")?;
             store.transition_run("cancelled-crash", TaskRunStatus::Running)?;
-            let admission = store.reserve_run_driver_admission("cancelled-crash".to_string(), echo_agent::agent::CancellationToken::new())?;
-            let registration = store.register_observed_run_driver::<()>(admission, store.lease_active_workspace_generation()?)?;
+            let admission = store.reserve_run_driver_admission(
+                "cancelled-crash".to_string(),
+                echo_agent::agent::CancellationToken::new(),
+            )?;
+            let registration = store.register_observed_run_driver::<()>(
+                admission,
+                store.lease_active_workspace_generation()?,
+            )?;
             let driver_store = store.clone();
-            let _result = registration.start(move |_owner| async move {
-                let snapshot = driver_store.load_runtime_plan_snapshot("cancelled-crash").map_err(|error| RunDriverFailure::from(error.to_string()))?;
-                let task = snapshot.tasks.iter().find(|task| task.spec.id == "target-task").ok_or_else(|| RunDriverFailure::from("task missing".to_string()))?;
-                let claim = match driver_store.claim_runtime_task("cancelled-crash", task, snapshot.revision).map_err(|error| RunDriverFailure::from(error.to_string()))? {
-                    echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
-                    _ => return Err(RunDriverFailure::from("claim not acquired".to_string())),
-                };
-                driver_store.request_cancel("cancelled-crash").map_err(|error| RunDriverFailure::from(error.to_string()))?;
-                let execution = driver_store.runtime_task_execution("cancelled-crash", "target-task").map_err(|error| RunDriverFailure::from(error.to_string()))?.ok_or_else(|| RunDriverFailure::from("execution missing".to_string()))?;
-                if execution.interruption_requested != Some(echo_agent::tasks::RuntimeInterruptionDisposition::Cancelled) || execution.claim.as_ref() != Some(&claim) {
-                    return Err(RunDriverFailure::from("accepted interruption not persisted on original claim".to_string()));
-                }
-                std::fs::write(ready, serde_json::to_vec(&claim).map_err(|error| RunDriverFailure::from(error.to_string()))?).map_err(|error| RunDriverFailure::from(error.to_string()))?;
-                std::future::pending::<Result<(), RunDriverFailure>>().await
-            }).await?;
+            let _result = registration
+                .start(move |_owner| async move {
+                    let snapshot = driver_store
+                        .load_runtime_plan_snapshot("cancelled-crash")
+                        .map_err(|error| RunDriverFailure::from(error.to_string()))?;
+                    let task = snapshot
+                        .tasks
+                        .iter()
+                        .find(|task| task.spec.id == "target-task")
+                        .ok_or_else(|| RunDriverFailure::from("task missing".to_string()))?;
+                    let claim = match driver_store
+                        .claim_runtime_task("cancelled-crash", task, snapshot.revision)
+                        .map_err(|error| RunDriverFailure::from(error.to_string()))?
+                    {
+                        echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
+                        _ => return Err(RunDriverFailure::from("claim not acquired".to_string())),
+                    };
+                    driver_store
+                        .request_cancel("cancelled-crash")
+                        .map_err(|error| RunDriverFailure::from(error.to_string()))?;
+                    let execution = driver_store
+                        .runtime_task_execution("cancelled-crash", "target-task")
+                        .map_err(|error| RunDriverFailure::from(error.to_string()))?
+                        .ok_or_else(|| RunDriverFailure::from("execution missing".to_string()))?;
+                    if execution.interruption_requested
+                        != Some(echo_agent::tasks::RuntimeInterruptionDisposition::Cancelled)
+                        || execution.claim.as_ref() != Some(&claim)
+                    {
+                        return Err(RunDriverFailure::from(
+                            "accepted interruption not persisted on original claim".to_string(),
+                        ));
+                    }
+                    std::fs::write(
+                        ready,
+                        serde_json::to_vec(&claim)
+                            .map_err(|error| RunDriverFailure::from(error.to_string()))?,
+                    )
+                    .map_err(|error| RunDriverFailure::from(error.to_string()))?;
+                    std::future::pending::<Result<(), RunDriverFailure>>().await
+                })
+                .await?;
             return Err("cancelled crash fixture unexpectedly returned".into());
         }
         struct CrashChild(Option<std::process::Child>);
         impl Drop for CrashChild {
             fn drop(&mut self) {
-                if let Some(child) = self.0.as_mut() { let _ = child.kill(); let _ = child.wait(); }
+                if let Some(child) = self.0.as_mut() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
             }
         }
         let directory = tempfile::tempdir()?;
@@ -438,27 +2932,48 @@ mod tests {
             .arg("tasks::task_runtime::store::tests::crashed_registered_owner_preserves_accepted_claim_cancellation").arg("--exact").arg("--nocapture")
             .env(ROOT_ENV, &root).env(READY_ENV, &ready).spawn()?));
         for _ in 0..1_000 {
-            if ready.exists() { break; }
-            if let Some(status) = child.0.as_mut().ok_or("child missing")?.try_wait()? { return Err(format!("cancel fixture exited before ready: {status}").into()); }
+            if ready.exists() {
+                break;
+            }
+            if let Some(status) = child.0.as_mut().ok_or("child missing")?.try_wait()? {
+                return Err(format!("cancel fixture exited before ready: {status}").into());
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(ready.exists(), "driver never persisted exact claim cancellation");
+        assert!(
+            ready.exists(),
+            "driver never persisted exact claim cancellation"
+        );
         let claim: echo_agent::tasks::TaskClaim = serde_json::from_slice(&std::fs::read(&ready)?)?;
         let mut original = child.0.take().ok_or("child missing")?;
         original.kill()?;
         assert!(!original.wait()?.success());
         let store = TaskRuntimeStore::new_in_memory_with_shadow_root(root)?;
-        let before = store.runtime_task_execution("cancelled-crash", "target-task")?.ok_or("task missing")?;
+        let before = store
+            .runtime_task_execution("cancelled-crash", "target-task")?
+            .ok_or("task missing")?;
         assert_eq!(before.claim.as_ref(), Some(&claim));
-        assert_eq!(before.interruption_requested, Some(echo_agent::tasks::RuntimeInterruptionDisposition::Cancelled));
+        assert_eq!(
+            before.interruption_requested,
+            Some(echo_agent::tasks::RuntimeInterruptionDisposition::Cancelled)
+        );
         assert_eq!(store.recover_incomplete()?, 1);
         let snapshot = store.load_runtime_plan_snapshot("cancelled-crash")?;
-        let execution = &snapshot.tasks.iter().find(|task| task.spec.id == "target-task").ok_or("recovered task missing")?.execution;
+        let execution = &snapshot
+            .tasks
+            .iter()
+            .find(|task| task.spec.id == "target-task")
+            .ok_or("recovered task missing")?
+            .execution;
         assert_eq!(execution.status, echo_agent::tasks::TaskStatus::Cancelled);
         assert!(execution.claim.is_none());
         assert!(execution.interruption_requested.is_none());
         assert_eq!(execution.retry_count, before.retry_count);
-        assert!(store.unresolved_physical_owner_intents("cancelled-crash")?.is_empty());
+        assert!(
+            store
+                .unresolved_physical_owner_intents("cancelled-crash")?
+                .is_empty()
+        );
         assert_eq!(store.recover_incomplete()?, 0);
         Ok(())
     }
@@ -494,13 +3009,20 @@ mod tests {
             reopened.get_run("legacy-owner")?.map(|run| run.status),
             Some(TaskRunStatus::Paused)
         );
-        assert!(reopened.unresolved_physical_owner_intents("legacy-owner")?.is_empty());
+        assert!(
+            reopened
+                .unresolved_physical_owner_intents("legacy-owner")?
+                .is_empty()
+        );
         assert_eq!(reopened.recover_incomplete()?, 0);
         let events = reopened.list_events("legacy-owner", 0)?;
         assert!(events.iter().all(|event| {
-            event.payload.get("physical_owner_intent")
+            event
+                .payload
+                .get("physical_owner_intent")
                 .and_then(|intent| intent.get("physical_terminal_observed"))
-                .and_then(serde_json::Value::as_bool) != Some(true)
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
         }));
         Ok(())
     }
@@ -549,7 +3071,12 @@ mod tests {
                 physical_terminal_observed: false,
             };
             store.begin_physical_owner_intent(&mut intent)?;
-            assert!(intent.process_epoch.as_ref().is_some_and(|epoch| !epoch.is_empty()));
+            assert!(
+                intent
+                    .process_epoch
+                    .as_ref()
+                    .is_some_and(|epoch| !epoch.is_empty())
+            );
             store.record_background_cell_started(
                 "owner-run",
                 "protected-cell",
@@ -699,17 +3226,29 @@ mod tests {
             physical_terminal_observed: false,
         };
         store.begin_physical_owner_intent(&mut intent)?;
-        assert_ne!(intent.process_epoch.as_deref(), Some(foreign_epoch.as_str()));
-        assert_eq!(intent.process_epoch.as_deref(), Some(store.shadow.owner_process_epoch()?));
+        assert_ne!(
+            intent.process_epoch.as_deref(),
+            Some(foreign_epoch.as_str())
+        );
+        assert_eq!(
+            intent.process_epoch.as_deref(),
+            Some(store.shadow.owner_process_epoch()?)
+        );
         assert_eq!(store.recover_incomplete()?, 0);
-        assert_eq!(store.unresolved_physical_owner_intents("stamped-owner")?, vec![intent]);
+        assert_eq!(
+            store.unresolved_physical_owner_intents("stamped-owner")?,
+            vec![intent]
+        );
 
         for epoch in ["", " ", "not-a-valid-epoch"] {
             let invalid_store = fresh()?;
             seed_history_plan(&invalid_store, "malformed-epoch")?;
             invalid_store.transition_run("malformed-epoch", TaskRunStatus::Running)?;
             invalid_store.commit_runtime_event(RuntimeJournalEvent::for_append(
-                "malformed-epoch", None, None, RuntimeEventKind::RecoveryBlocked,
+                "malformed-epoch",
+                None,
+                None,
+                RuntimeEventKind::RecoveryBlocked,
                 serde_json::json!({ "physical_owner_intent": {
                     "run_id": "malformed-epoch", "owner_id": "owner", "execution_id": null,
                     "workspace_id": "test", "process_epoch": epoch,
@@ -717,8 +3256,14 @@ mod tests {
                 }}),
             ))?;
             let before = invalid_store.list_events("malformed-epoch", 0)?;
-            assert!(matches!(invalid_store.recover_incomplete(), Err(StoreError::RecoveryBlocked { .. })));
-            assert_eq!(serde_json::to_value(invalid_store.list_events("malformed-epoch", 0)?)?, serde_json::to_value(before)?);
+            assert!(matches!(
+                invalid_store.recover_incomplete(),
+                Err(StoreError::RecoveryBlocked { .. })
+            ));
+            assert_eq!(
+                serde_json::to_value(invalid_store.list_events("malformed-epoch", 0)?)?,
+                serde_json::to_value(before)?
+            );
         }
         Ok(())
     }
@@ -726,7 +3271,12 @@ mod tests {
     #[test]
     fn terminal_process_owner_debts_retire_without_rewriting_committed_run_status()
     -> Result<(), Box<dyn std::error::Error>> {
-        for status in [TaskRunStatus::Pending, TaskRunStatus::Completed, TaskRunStatus::Failed, TaskRunStatus::Cancelled] {
+        for status in [
+            TaskRunStatus::Pending,
+            TaskRunStatus::Completed,
+            TaskRunStatus::Failed,
+            TaskRunStatus::Cancelled,
+        ] {
             for epoch in [None, Some(uuid::Uuid::new_v4().to_string())] {
                 let store = fresh()?;
                 seed_history_plan(&store, "terminal-debt")?;
@@ -735,17 +3285,30 @@ mod tests {
                     store.transition_run("terminal-debt", status)?;
                 }
                 let intent = PhysicalOwnerIntent {
-                    run_id: "terminal-debt".to_string(), owner_id: "old-owner".to_string(),
-                    execution_id: None, workspace_id: "test".to_string(),
-                    process_epoch: epoch, physical_terminal_observed: false,
+                    run_id: "terminal-debt".to_string(),
+                    owner_id: "old-owner".to_string(),
+                    execution_id: None,
+                    workspace_id: "test".to_string(),
+                    process_epoch: epoch,
+                    physical_terminal_observed: false,
                 };
                 store.commit_runtime_event(RuntimeJournalEvent::for_append(
-                    "terminal-debt", None, None, RuntimeEventKind::RecoveryBlocked,
+                    "terminal-debt",
+                    None,
+                    None,
+                    RuntimeEventKind::RecoveryBlocked,
                     serde_json::json!({"physical_owner_intent":intent}),
                 ))?;
                 assert_eq!(store.recover_incomplete()?, 0);
-                assert_eq!(store.get_run("terminal-debt")?.map(|run|run.status), Some(status));
-                assert!(store.unresolved_physical_owner_intents("terminal-debt")?.is_empty());
+                assert_eq!(
+                    store.get_run("terminal-debt")?.map(|run| run.status),
+                    Some(status)
+                );
+                assert!(
+                    store
+                        .unresolved_physical_owner_intents("terminal-debt")?
+                        .is_empty()
+                );
                 assert_eq!(store.recover_incomplete()?, 0);
             }
         }
@@ -753,14 +3316,20 @@ mod tests {
         seed_history_plan(&store, "current-terminal")?;
         store.transition_run("current-terminal", TaskRunStatus::Running)?;
         let mut intent = PhysicalOwnerIntent {
-            run_id: "current-terminal".to_string(), owner_id: "live-owner".to_string(),
-            execution_id: None, workspace_id: "test".to_string(),
-            process_epoch: None, physical_terminal_observed: false,
+            run_id: "current-terminal".to_string(),
+            owner_id: "live-owner".to_string(),
+            execution_id: None,
+            workspace_id: "test".to_string(),
+            process_epoch: None,
+            physical_terminal_observed: false,
         };
         store.begin_physical_owner_intent(&mut intent)?;
         store.transition_run("current-terminal", TaskRunStatus::Completed)?;
         assert_eq!(store.recover_incomplete()?, 0);
-        assert_eq!(store.unresolved_physical_owner_intents("current-terminal")?, vec![intent]);
+        assert_eq!(
+            store.unresolved_physical_owner_intents("current-terminal")?,
+            vec![intent]
+        );
         Ok(())
     }
 
@@ -770,38 +3339,93 @@ mod tests {
         let store = fresh()?;
         seed_history_plan(&store, "unsafe-owner")?;
         store.transition_run("unsafe-owner", TaskRunStatus::Running)?;
-        store.set_task_status("unsafe-owner", "target-task", echo_agent::tasks::TaskStatus::Running, None, None)?;
-        store.record_tool_started("unsafe-owner", "target-task", "old-execution", "unsafe-call", "write_file", false)?;
+        store.set_task_status(
+            "unsafe-owner",
+            "target-task",
+            echo_agent::tasks::TaskStatus::Running,
+            None,
+            None,
+        )?;
+        store.record_tool_started(
+            "unsafe-owner",
+            "target-task",
+            "old-execution",
+            "unsafe-call",
+            "write_file",
+            false,
+        )?;
         let intent = PhysicalOwnerIntent {
-            run_id: "unsafe-owner".to_string(), owner_id: "dead-owner".to_string(),
-            execution_id: None, workspace_id: "test".to_string(),
-            process_epoch: Some(uuid::Uuid::new_v4().to_string()), physical_terminal_observed: false,
+            run_id: "unsafe-owner".to_string(),
+            owner_id: "dead-owner".to_string(),
+            execution_id: None,
+            workspace_id: "test".to_string(),
+            process_epoch: Some(uuid::Uuid::new_v4().to_string()),
+            physical_terminal_observed: false,
         };
         store.commit_runtime_event(RuntimeJournalEvent::for_append(
-            "unsafe-owner", None, None, RuntimeEventKind::RecoveryBlocked,
+            "unsafe-owner",
+            None,
+            None,
+            RuntimeEventKind::RecoveryBlocked,
             serde_json::json!({"physical_owner_intent": intent}),
         ))?;
         assert_eq!(store.recover_incomplete()?, 1);
-        assert_eq!(store.get_run("unsafe-owner")?.map(|run| run.status), Some(TaskRunStatus::Paused));
-        assert!(store.unresolved_physical_owner_intents("unsafe-owner")?.is_empty());
-        assert!(store.list_recovery_blockers("unsafe-owner")?.iter().any(|blocker| blocker.call_id.as_deref() == Some("unsafe-call")));
-        assert!(store.resume_task_run("unsafe-owner").is_err(), "releasing a dead process fence cannot authorize replaying an unsafe effect");
+        assert_eq!(
+            store.get_run("unsafe-owner")?.map(|run| run.status),
+            Some(TaskRunStatus::Paused)
+        );
+        assert!(
+            store
+                .unresolved_physical_owner_intents("unsafe-owner")?
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_recovery_blockers("unsafe-owner")?
+                .iter()
+                .any(|blocker| blocker.call_id.as_deref() == Some("unsafe-call"))
+        );
+        assert!(
+            store.resume_task_run("unsafe-owner").is_err(),
+            "releasing a dead process fence cannot authorize replaying an unsafe effect"
+        );
 
         seed_history_plan(&store, "paused-cell-owner")?;
         store.transition_run("paused-cell-owner", TaskRunStatus::Running)?;
         store.transition_run("paused-cell-owner", TaskRunStatus::Paused)?;
-        store.record_background_cell_started("paused-cell-owner", "old-cell", "old command", "command-hash", None, None, None)?;
+        store.record_background_cell_started(
+            "paused-cell-owner",
+            "old-cell",
+            "old command",
+            "command-hash",
+            None,
+            None,
+            None,
+        )?;
         let intent = PhysicalOwnerIntent {
-            run_id: "paused-cell-owner".to_string(), owner_id: "dead-cell-owner".to_string(),
-            process_epoch: Some(uuid::Uuid::new_v4().to_string()), ..intent
+            run_id: "paused-cell-owner".to_string(),
+            owner_id: "dead-cell-owner".to_string(),
+            process_epoch: Some(uuid::Uuid::new_v4().to_string()),
+            ..intent
         };
         store.commit_runtime_event(RuntimeJournalEvent::for_append(
-            "paused-cell-owner", None, None, RuntimeEventKind::RecoveryBlocked,
+            "paused-cell-owner",
+            None,
+            None,
+            RuntimeEventKind::RecoveryBlocked,
             serde_json::json!({"physical_owner_intent": intent}),
         ))?;
         assert_eq!(store.recover_incomplete()?, 1);
-        assert_eq!(store.get_run("paused-cell-owner")?.map(|run| run.status), Some(TaskRunStatus::Paused));
-        assert!(store.list_background_cells("paused-cell-owner")?.iter().all(|cell| !cell.is_active()));
+        assert_eq!(
+            store.get_run("paused-cell-owner")?.map(|run| run.status),
+            Some(TaskRunStatus::Paused)
+        );
+        assert!(
+            store
+                .list_background_cells("paused-cell-owner")?
+                .iter()
+                .all(|cell| !cell.is_active())
+        );
         assert_eq!(store.recover_incomplete()?, 0);
         Ok(())
     }
@@ -864,9 +3488,11 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn cancellation_intent_keeps_claim_and_running_until_same_owner_settles()
+    #[tokio::test]
+    async fn cancellation_intent_keeps_claim_and_running_until_same_owner_settles()
     -> Result<(), Box<dyn std::error::Error>> {
+        use echo_agent::tools::{Tool, ToolParameters};
+
         let store = std::sync::Arc::new(fresh()?);
         seed_plan(&store)?;
         let snapshot = store.load_runtime_plan_snapshot("r1")?;
@@ -887,7 +3513,46 @@ mod tests {
         let token = echo_agent::agent::CancellationToken::new();
         let registration = store.register_run_cancellation("r1", token.clone())?;
         let before = store.list_events("r1", 0)?.len();
-        assert!(store.request_cancel("r1")?);
+        let directory = tempfile::tempdir()?;
+        let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let foreground_cancel = echo_agent::agent::CancellationToken::new();
+        let resources = std::sync::Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: crate::workspace::WorkspaceExecutionScope::workspace(
+                &crate::workspace::WorkspaceId::from_name("ws"),
+                directory.path(),
+            ),
+            workspace_io_receipt: None,
+            pool: None,
+            store: Some(store.clone()),
+            sink: std::sync::Arc::new(crate::chat_driver::ChannelChatSink::new(events)),
+            webhook_emitter: None,
+            conv_id: Some("c1".to_string()),
+            root_message_id: "m1".to_string(),
+            attachments: Vec::new(),
+            cancel: foreground_cancel.clone(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let mut parameters = ToolParameters::new();
+        parameters.insert("run_id".to_string(), serde_json::json!("r1"));
+        let tool = crate::tasks::task_runtime::task_tools::CancelRunTool;
+        let response =
+            crate::chat_resources::with_chat_resources(resources, tool.execute(parameters)).await?;
+        assert!(
+            response.success,
+            "cancel request tool failed: {:?}",
+            response.error
+        );
+        let reply: serde_json::Value = serde_json::from_str(&response.output)?;
+        assert_eq!(
+            reply
+                .get("cancellation_requested")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(reply.get("cancelled").is_none());
+        assert!(!foreground_cancel.is_cancelled());
         assert!(token.is_cancelled());
         assert_eq!(
             store.get_run("r1")?.ok_or("run missing")?.status,
@@ -1804,6 +4469,8 @@ mod tests {
             )
             .map_err(|error| error.to_string())?;
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: format!("plan-{event_count}"),
             run_id: run_id.clone(),
             revision: 1,
@@ -1923,6 +4590,8 @@ mod tests {
             .map_err(|error| error.to_string())?;
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+
                 plan_id: format!("plan-{run_id}"),
                 run_id: run_id.to_string(),
                 revision: 1,
@@ -2248,6 +4917,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         store.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: format!("{run_id}-plan"),
             run_id: run_id.to_string(),
             revision: 1,
@@ -3016,6 +5687,8 @@ mod tests {
             .map_err(|error| error.to_string())?;
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+
                 plan_id: "parked-prepare-plan".to_string(),
                 run_id: "parked-prepare".to_string(),
                 revision: 1,
@@ -3870,6 +6543,8 @@ mod tests {
         assert_eq!(created.goal_sha256, task_goal_sha256("original goal"));
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+
                 plan_id: "goal-plan".to_string(),
                 run_id: "goal-run".to_string(),
                 revision: 1,
@@ -4119,10 +6794,10 @@ mod tests {
                 reason: "align the task graph with goal revision 2".to_string(),
                 operations: vec![TaskUpdateOperation::Update {
                     task_id: "t1".to_string(),
-                    patch: TaskPatch {
+                    patch: Box::new(TaskPatch {
                         title: Some("Review revised runtime scope".to_string()),
                         ..Default::default()
-                    },
+                    }),
                 }],
             },
         )?;
@@ -4188,6 +6863,8 @@ mod tests {
         )?;
         // attach_plan no longer changes the run status; caller decides.
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: "p1".into(),
             run_id: "r1".into(),
             revision: 1,
@@ -4339,6 +7016,8 @@ mod tests {
         let timed_out = sample_task_body("timed-out");
         let skipped = sample_task_body("skipped");
         store.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: "task-todo-characterization-plan".to_string(),
             run_id: run_id.to_string(),
             revision: 1,
@@ -4401,7 +7080,7 @@ mod tests {
                 reason: "exercise dynamic graph insertion".to_string(),
                 operations: vec![TaskUpdateOperation::Insert {
                     after_task_id: Some("upstream".to_string()),
-                    task: patched.spec(),
+                    task: Box::new(patched.spec()),
                 }],
             },
         )?;
@@ -4593,6 +7272,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         store.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: "restart-recovery-characterization-plan".to_string(),
             run_id: recovery_id.to_string(),
             revision: 1,
@@ -4795,6 +7476,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: "p1".into(),
             run_id: "r1".into(),
             revision: 1,
@@ -5669,6 +8352,8 @@ mod tests {
             attended_mode,
         )?;
         store.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: format!("{run_id}-plan"),
             run_id: run_id.to_string(),
             revision: 1,
@@ -5750,6 +8435,8 @@ mod tests {
             AttendedMode::Unattended,
         )?;
         mismatched.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: "mismatch-plan".to_string(),
             run_id: "mismatch".to_string(),
             revision: 1,
@@ -6321,6 +9008,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         store.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: "retry-plan".to_string(),
             run_id: "retry-run".to_string(),
             revision: 1,
@@ -7292,10 +9981,10 @@ mod tests {
                 reason: "exercise mutating recovery".to_string(),
                 operations: vec![TaskUpdateOperation::Update {
                     task_id: "t1".to_string(),
-                    patch: TaskPatch {
+                    patch: Box::new(TaskPatch {
                         kind: Some(PlanTaskKind::Implementation),
                         ..Default::default()
-                    },
+                    }),
                 }],
             },
         )?;
@@ -7352,10 +10041,10 @@ mod tests {
                 reason: "exercise canonical recovery skip".to_string(),
                 operations: vec![TaskUpdateOperation::Update {
                     task_id: "t1".to_string(),
-                    patch: TaskPatch {
+                    patch: Box::new(TaskPatch {
                         kind: Some(PlanTaskKind::Implementation),
                         ..Default::default()
-                    },
+                    }),
                 }],
             },
         )?;
@@ -7502,7 +10191,7 @@ mod tests {
                 reason: "new implementation dependency".to_string(),
                 operations: vec![TaskUpdateOperation::Insert {
                     after_task_id: Some("t1".to_string()),
-                    task: t2.spec(),
+                    task: Box::new(t2.spec()),
                 }],
             },
         )?;
@@ -7535,6 +10224,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: "reorder-plan".to_string(),
             run_id: "reorder-run".to_string(),
             revision: 1,
@@ -8290,10 +10981,10 @@ mod tests {
                 reason: "change blocked task contract".to_string(),
                 operations: vec![TaskUpdateOperation::Update {
                     task_id: "t1".to_string(),
-                    patch: TaskPatch {
+                    patch: Box::new(TaskPatch {
                         description: Some("review the revised runtime contract".to_string()),
                         ..Default::default()
-                    },
+                    }),
                 }],
             },
         )?;
@@ -8380,10 +11071,10 @@ mod tests {
                 reason: "clarify the blocked task".to_string(),
                 operations: vec![TaskUpdateOperation::Update {
                     task_id: "t1".to_string(),
-                    patch: TaskPatch {
+                    patch: Box::new(TaskPatch {
                         description: Some("Review the clarified runtime boundary".to_string()),
                         ..Default::default()
-                    },
+                    }),
                 }],
             },
         )?;
@@ -8440,7 +11131,7 @@ mod tests {
                 reason: "new evidence requires verification".to_string(),
                 operations: vec![TaskUpdateOperation::Insert {
                     after_task_id: Some("t1".to_string()),
-                    task: follow_up.spec(),
+                    task: Box::new(follow_up.spec()),
                 }],
             },
         )?;
@@ -8481,10 +11172,10 @@ mod tests {
                 reason: "change active ownership".to_string(),
                 operations: vec![TaskUpdateOperation::Update {
                     task_id: "t1".to_string(),
-                    patch: TaskPatch {
+                    patch: Box::new(TaskPatch {
                         files: Some(vec!["src/new-owner.rs".to_string()]),
                         ..Default::default()
-                    },
+                    }),
                 }],
             },
         );
@@ -8544,6 +11235,8 @@ mod tests {
             AttendedMode::Attended,
         )?;
         s.attach_plan_for_test(&TaskPlan {
+            domain_binding: None,
+
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
             revision: 1,
@@ -8576,10 +11269,10 @@ mod tests {
                     reason: "introduce invalid cycle".to_string(),
                     operations: vec![TaskUpdateOperation::Update {
                         task_id: "t1".to_string(),
-                        patch: TaskPatch {
+                        patch: Box::new(TaskPatch {
                             depends_on: Some(vec!["t2".into()]),
                             ..Default::default()
-                        },
+                        }),
                     }],
                 },
             )
@@ -9392,7 +12085,7 @@ mod tests {
                 .get("state")
                 .and_then(|state| state.get("query_projection_schema"))
                 .and_then(serde_json::Value::as_u64),
-            Some(3)
+            Some(5)
         );
         drop(reopened);
         let restarted = TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))
@@ -9523,6 +12216,95 @@ mod tests {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "repaired query checkpoint is missing".to_string())?;
         assert!(repaired.state.has_current_query_projection_schema());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_current_checkpoint_does_not_block_journal_derived_queries() -> Result<(), String> {
+        use echo_agent::state::journal::{CheckpointStore, FileCheckpointStore};
+        use std::os::unix::fs::PermissionsExt;
+
+        let (temp, store, run_id) = seed_public_query_fixture(1_000)?;
+        let run_directory = temp.path().join("tasks").join(&run_id);
+        let checkpoint_path = run_directory.join("checkpoint.json");
+        drop(store);
+        let checkpoints = FileCheckpointStore::<super::super::event_rebuild::EventFoldState>::open(
+            &checkpoint_path,
+        );
+        let current = checkpoints
+            .load()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "query checkpoint is missing".to_string())?;
+        assert!(current.state.has_current_query_projection_schema());
+        // A current checkpoint does not make optional cold projection writes a read prerequisite.
+        let original_permissions = std::fs::metadata(&run_directory)
+            .map_err(|error| error.to_string())?
+            .permissions();
+        let mut readonly = original_permissions.clone();
+        readonly.set_mode(0o555);
+        std::fs::set_permissions(&run_directory, readonly).map_err(|error| error.to_string())?;
+        let query = (|| {
+            let reopened =
+                TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))
+                    .map_err(|error| error.to_string())?;
+            time_public_queries(&reopened, &run_id)?;
+            let first_replays = reopened
+                .shadow
+                .history_fallback_replay_count_for_test(&run_id)
+                .map_err(|error| error.to_string())?;
+            time_public_queries(&reopened, &run_id)?;
+            let second_replays = reopened
+                .shadow
+                .history_fallback_replay_count_for_test(&run_id)
+                .map_err(|error| error.to_string())?;
+            if first_replays != second_replays {
+                return Err("readonly history fallback was replayed on every query".to_string());
+            }
+            Ok(())
+        })();
+        std::fs::set_permissions(&run_directory, original_permissions)
+            .map_err(|error| error.to_string())?;
+        query?;
+        // A current projection must still reject a foreign host's project binding.
+        let foreign = TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))
+            .map_err(|error| error.to_string())?;
+        foreign
+            .bind_project_environment(
+                &foreign.active_workspace_id(),
+                crate::workspace::ProjectLocation::Local {
+                    path: temp
+                        .path()
+                        .canonicalize()
+                        .map_err(|error| error.to_string())?,
+                },
+                1,
+                std::sync::Arc::new(echo_agent::tools::files::LocalFileSystem),
+                std::sync::Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox()),
+            )
+            .map_err(|error| error.to_string())?;
+        let binding_error = foreign
+            .completion_gate_report(&run_id)
+            .err()
+            .ok_or_else(|| {
+                "foreign project binding was accepted by the current completion query".to_string()
+            })?;
+        assert!(
+            binding_error
+                .to_string()
+                .contains("TaskRun project location or revision differs")
+        );
+        drop(foreign);
+        // A read-only cache must never turn a complete corrupt journal record into valid state.
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_directory.join("events.jsonl"))
+            .and_then(|mut file| file.write_all(b"{invalid-current-journal}\n"))
+            .map_err(|error| error.to_string())?;
+        let corrupt = TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))
+            .map_err(|error| error.to_string())?;
+        assert!(corrupt.completion_gate_report(&run_id).is_err());
         Ok(())
     }
 
@@ -9677,6 +12459,8 @@ mod tests {
             )
             .map_err(|error| error.to_string())?;
         let mut plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: "reset-plan".to_string(),
             run_id: "reset-run".to_string(),
             revision: 1,
@@ -10383,6 +13167,8 @@ mod tests {
         store.fail_next_runtime_mutation_projection_for_test();
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
+
                 plan_id: "plan-id".to_string(),
                 run_id: "plan-run".to_string(),
                 revision: 1,
@@ -10487,6 +13273,8 @@ mod tests {
         ));
         let task_id = "direct-answer";
         let plan = TaskPlan {
+            domain_binding: None,
+
             plan_id: format!("plan:{run_id}"),
             run_id: run_id.to_string(),
             revision: 0,
@@ -10553,6 +13341,9 @@ mod tests {
     /// for the cycle test above (avoids repeating the full struct literal).
     fn sample_task_body(id: &str) -> PlanTask {
         PlanTask {
+            domain_binding: None,
+            domain_role: None,
+
             id: id.to_string(),
             title: format!("task {id}"),
             description: format!("do {id}"),
@@ -11027,6 +13818,269 @@ mod tests {
             .ok_or("canonical execution missing after replay")?;
         assert_eq!(replayed, expected_execution);
         assert!(reopened.get_summary("r1", "t1")?.is_none());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod domain_binding_tests {
+    use super::*;
+
+    fn bound_graph(
+        run: &TaskRun,
+        binding: &crate::domain_plugin::DomainBinding,
+    ) -> Result<echo_agent::tasks::TaskGraphCommit, Box<dyn std::error::Error>> {
+        let task = PlanTask {
+            id: "evidence".to_string(),
+            kind: PlanTaskKind::Verification,
+            agent_role: "primary".to_string(),
+            domain_binding: Some(binding.reference()),
+            domain_role: Some(binding.role_for_kind(PlanTaskKind::Verification)?.clone()),
+            required_artifacts: binding.snapshot.required_artifacts.clone(),
+            execution_checks: binding.snapshot.execution_checks.clone(),
+            acceptance_criteria: binding.review_criteria(),
+            ..Default::default()
+        };
+        Ok(echo_agent::tasks::TaskGraphCommit {
+            expected_revision: None,
+            expected_executions: None,
+            reason: "domain initial graph".to_string(),
+            effects: Default::default(),
+            next: echo_agent::tasks::RevisionedTaskGraph {
+                snapshot: echo_agent::tasks::RuntimePlanSnapshot {
+                    revision: 1,
+                    tasks: vec![(&task).try_into()?],
+                },
+                context: echo_agent::tasks::TaskGraphContext {
+                    goal: run.goal.clone(),
+                    assumptions: Vec::new(),
+                    risks: Vec::new(),
+                    execution_mode: echo_agent::tasks::TaskGraphExecutionMode::Sequential,
+                    metadata: serde_json::to_value(EkoPlanMetadata {
+                        plan_id: "domain-plan".to_string(),
+                        domain_profile: DomainProfile::General,
+                        domain_binding: Some(binding.reference()),
+                        goal_revision: run.goal_revision,
+                        goal_sha256: run.goal_sha256.clone(),
+                    })?,
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn domain_binding_roundtrips_both_run_created_producers_and_rejects_rebinding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = super::super::project_environment_tests::EnvironmentFixture::new()?;
+        let store = project.open("domain-target.invalid", 7)?;
+        let project_binding = store
+            .project_execution_binding()
+            .ok_or("project binding missing")?;
+        let binding = crate::domain_plugin::test_binding(true)?;
+        let profile = TaskRunExecutionProfile::orchestrated(RunPlanPolicy::RequirePlan);
+        let run = store.create_run_for_active_workspace_with_domain(
+            "domain-run",
+            "conversation",
+            "root",
+            DomainProfile::General,
+            "goal",
+            "task",
+            AttendedMode::Attended,
+            profile,
+            Some(&binding),
+        )?;
+        let state = store
+            .get_run_state("domain-run")?
+            .ok_or("domain state missing")?;
+        assert_eq!(run.domain_binding, Some(binding.reference()));
+        assert_eq!(state.domain_binding, Some(binding.clone()));
+        assert_eq!(state.project_binding, Some(project_binding.clone()));
+        let replay = super::super::event_rebuild::fold_fixture_for_test(
+            &store.list_events("domain-run", 0)?,
+        )?;
+        assert_eq!(replay.domain_binding, Some(binding.clone()));
+        assert_eq!(replay.run.domain_binding, Some(binding.reference()));
+        assert_eq!(replay.project_binding, Some(project_binding.clone()));
+        // An old idempotent reader may omit a new selection but cannot fill or
+        // replace the immutable original binding from current configuration.
+        store.create_run_for_active_workspace_with_profile(
+            "domain-run",
+            "conversation",
+            "root",
+            DomainProfile::General,
+            "goal",
+            "task",
+            AttendedMode::Attended,
+            profile,
+        )?;
+        let mut changed = binding.snapshot.clone();
+        changed.plugin.version = Some("new".to_string());
+        changed.dependency_closure = vec![changed.plugin.clone()];
+        let changed = crate::domain_plugin::DomainBinding::new(changed)?;
+        assert!(
+            store
+                .create_run_for_active_workspace_with_domain(
+                    "domain-run",
+                    "conversation",
+                    "root",
+                    DomainProfile::General,
+                    "goal",
+                    "task",
+                    AttendedMode::Attended,
+                    profile,
+                    Some(&changed)
+                )
+                .is_err()
+        );
+        let mut initial = store.prepare_run_for_active_workspace(
+            "initial",
+            "conversation",
+            "initial-root",
+            DomainProfile::General,
+            "initial goal",
+            "task",
+            AttendedMode::Attended,
+        )?;
+        initial.domain_binding = Some(binding.reference());
+        let trigger = InitialRunTriggerMetadata {
+            source: "fixture".to_string(),
+            kind: "domain".to_string(),
+            prompt: initial.goal.clone(),
+            priority: 5,
+        };
+        store.compare_and_publish_initial_revisioned_task_graph_with_domain(
+            &initial,
+            &trigger,
+            None,
+            Some(&binding),
+            profile,
+            bound_graph(&initial, &binding)?,
+        )?;
+        let state = store
+            .get_run_state("initial")?
+            .ok_or("initial state missing")?;
+        assert_eq!(state.domain_binding, Some(binding.clone()));
+        assert_eq!(state.project_binding, Some(project_binding.clone()));
+        let initial_replay =
+            super::super::event_rebuild::fold_fixture_for_test(&store.list_events("initial", 0)?)?;
+        assert_eq!(initial_replay.domain_binding, Some(binding.clone()));
+        assert_eq!(
+            initial_replay.project_binding,
+            Some(project_binding.clone())
+        );
+        assert_eq!(
+            store
+                .get_plan("initial")?
+                .ok_or("initial plan missing")?
+                .domain_binding,
+            Some(binding.reference())
+        );
+        drop(store);
+        let reopened = project.open("domain-target.invalid", 7)?;
+        let reopened_state = reopened
+            .get_run_state("domain-run")?
+            .ok_or("reopened state missing")?;
+        assert_eq!(reopened_state.domain_binding, Some(binding));
+        assert_eq!(reopened_state.project_binding, Some(project_binding));
+        drop(reopened);
+        let wrong_host = project.open("another-domain-target.invalid", 7)?;
+        assert!(
+            wrong_host
+                .validate_run_project_binding("domain-run")
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_present_binding_does_not_recover_as_general()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = TaskRuntimeStore::new_in_memory()?;
+        let binding = crate::domain_plugin::test_binding(false)?;
+        store.create_run_for_active_workspace_with_domain(
+            "bad",
+            "conversation",
+            "root",
+            DomainProfile::General,
+            "goal",
+            "task",
+            AttendedMode::Attended,
+            TaskRunExecutionProfile::orchestrated(RunPlanPolicy::AllowDirect),
+            Some(&binding),
+        )?;
+        let mut events = store.list_events("bad", 0)?;
+        let event = events
+            .iter_mut()
+            .find(|event| event.event_type == RuntimeEventKind::RunCreated)
+            .ok_or("RunCreated missing")?;
+        event
+            .payload
+            .as_object_mut()
+            .ok_or("RunCreated payload is not an object")?
+            .insert(
+                "domain_binding".to_string(),
+                serde_json::json!({"binding_sha256":"invalid"}),
+            );
+        assert!(super::super::event_rebuild::fold_fixture_for_test(&events).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn domain_graph_cannot_drop_obligations_or_change_binding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = TaskRuntimeStore::new_in_memory()?;
+        let binding = crate::domain_plugin::test_binding(true)?;
+        let run = store.create_run_for_active_workspace_with_domain(
+            "rules",
+            "conversation",
+            "root",
+            DomainProfile::General,
+            "goal",
+            "task",
+            AttendedMode::Attended,
+            TaskRunExecutionProfile::orchestrated(RunPlanPolicy::RequirePlan),
+            Some(&binding),
+        )?;
+        let original = bound_graph(&run, &binding)?;
+        let mut missing = original.clone();
+        let task = missing
+            .next
+            .snapshot
+            .tasks
+            .first_mut()
+            .ok_or("task missing")?;
+        let mut extension: EkoTaskExtension = task.spec.extension_as()?;
+        extension.execution_checks.clear();
+        task.spec = task.spec.clone().with_extension(extension)?;
+        assert!(
+            store
+                .compare_and_commit_revisioned_task_graph("rules", missing)
+                .is_err()
+        );
+        let mut changed = original.clone();
+        changed
+            .next
+            .context
+            .metadata
+            .as_object_mut()
+            .ok_or("metadata is not an object")?
+            .insert("domain_binding".to_string(), serde_json::Value::Null);
+        assert!(
+            store
+                .compare_and_commit_revisioned_task_graph("rules", changed)
+                .is_err()
+        );
+        store.compare_and_commit_revisioned_task_graph("rules", original)?;
+        assert_eq!(
+            store
+                .get_plan("rules")?
+                .ok_or("plan missing")?
+                .tasks
+                .first()
+                .ok_or("task missing")?
+                .execution_checks,
+            binding.snapshot.execution_checks
+        );
         Ok(())
     }
 }

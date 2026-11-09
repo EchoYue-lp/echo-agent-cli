@@ -8,7 +8,11 @@ function workspace(createdAt: string, generation = `opaque:${createdAt}`): Works
     name: 'Same workspace',
     root: '/tmp/same-workspace',
     kind: { type: 'general' },
-    metadata: { tags: [], project_root_revision: 0 },
+    metadata: {
+      tags: [],
+      project_root_revision: 0,
+      project_location: { kind: 'local' as const, path: '/tmp/same-workspace' },
+    },
     product_data_generation: generation,
     created_at: createdAt,
     last_active: createdAt,
@@ -29,7 +33,11 @@ describe('productDataScope', () => {
     const linked = {
       ...initial,
       project_root: '/tmp/linked-project',
-      metadata: { ...initial.metadata, project_root_revision: 1 },
+      metadata: {
+        ...initial.metadata,
+        project_root_revision: 1,
+        project_location: { kind: 'local' as const, path: '/tmp/linked-project' },
+      },
       product_data_generation: 'opaque:linked-project-incarnation',
     };
 

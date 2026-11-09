@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo, useId } from 'react';
 import {
   ArrowUp,
   Square,
@@ -11,20 +11,39 @@ import {
   Brain,
   ChevronDown,
   Check,
+  FolderOpen,
+  FolderPlus,
+  Search,
+  Server,
 } from 'lucide-react';
 import { Card } from '../common/Card';
+import { workspaceLocationLabel, workspaceIsRemote } from '../../lib/workspacePresentation';
+import { useWorkspaceViewStore } from '../../stores/workspaceViewStore';
 import { permissionsApi, providerApi } from '../../api/endpoints';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
+import { useConversationStore } from '../../stores/conversationStore';
+import { productDataScope } from '../../lib/productDataScope';
+import type { ChatSendSubmission } from '../../hooks/useTauriChat';
+import type { ConversationInputReceipt } from '../../generated';
 import { workspaceIdForView } from '../../lib/viewAddress';
+import { configuredModelPresentation, modelLabel } from '../../lib/modelPresentation';
 import { useUiStore } from '../../stores/uiStore';
 import { useToastStore } from '../../stores/toastStore';
-import { useChatStore, cacheHitRate } from '../../stores/chatStore';
+import { useChatStore } from '../../stores/chatStore';
+import { useConversationUsage } from '../../hooks/useConversationUsage';
+import { ConversationStatistics } from './ConversationStatistics';
 import type { Attachment } from '../../types/api';
-import type { ConfiguredModel } from '../../generated';
+import type { ConfiguredModel, ModelProviderView } from '../../generated';
 import { CONTEXT_RING_CIRCUMFERENCE, ringDashOffset } from './contextRing';
 import { computeContextUsage, estimateDraftTokens, type ContextUsageSource } from './contextUsage';
 import { isKnownThinkingLevel, thinkingLevelOptions } from './thinkingLevels';
-import { filterCommands, groupByCategory, type SlashCommand } from '../../lib/slashCommands';
+import {
+  filterCommands,
+  groupByCategory,
+  parseGuiSlashCommand,
+  type SlashCommand,
+} from '../../lib/slashCommands';
+import { CHAT_GUTTER } from '../../lib/layoutMetrics';
 import { AgentComposerFrame } from './AgentComposerFrame';
 import {
   PERMISSION_MODES,
@@ -55,10 +74,59 @@ interface PendingFile {
 }
 
 interface ChatInputProps {
-  onSend: (text: string, attachments?: Attachment[]) => Promise<boolean>;
+  onSend: (
+    text: string,
+    attachments?: Attachment[],
+    submission?: ChatSendSubmission
+  ) => Promise<boolean>;
   isStreaming?: boolean;
   onCancel?: () => void;
   queuedCount?: number;
+  home?: boolean;
+}
+
+type DraftTarget = Pick<
+  ChatSendSubmission,
+  'workspaceId' | 'workspaceGeneration' | 'conversationId' | 'newConversationEpoch'
+>;
+
+type DraftSubmission = {
+  readonly externalId: string;
+  readonly target: DraftTarget;
+  readonly revision: number;
+  readonly draftText: string;
+  readonly files: readonly PendingFile[];
+  payload: ChatSendSubmission['payload'] | null;
+  inFlight: boolean;
+  ackSeen: boolean;
+  directSeen: boolean;
+};
+
+function readDraftTarget(): DraftTarget {
+  const conversation = useConversationStore.getState();
+  return {
+    ...productDataScope(useWorkspaceStore.getState().current),
+    conversationId: conversation.activeId,
+    newConversationEpoch: conversation.newConversationEpoch,
+  };
+}
+
+function sameDraftTarget(left: DraftTarget, right: DraftTarget, allowAdmission = false): boolean {
+  return (
+    left.workspaceId === right.workspaceId &&
+    left.workspaceGeneration === right.workspaceGeneration &&
+    left.newConversationEpoch === right.newConversationEpoch &&
+    (allowAdmission || left.conversationId === right.conversationId)
+  );
+}
+
+function draftTargetKey(target: DraftTarget): string {
+  return JSON.stringify([
+    target.workspaceId,
+    target.workspaceGeneration,
+    target.conversationId,
+    target.newConversationEpoch,
+  ]);
 }
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
@@ -68,10 +136,16 @@ function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
-      const result = reader.result as string;
-      resolve(result.split(',')[1]); // strip data:...;base64, prefix
+      const result = reader.result;
+      const separator = typeof result === 'string' ? result.indexOf(',') : -1;
+      if (typeof result !== 'string' || separator < 0) {
+        reject(new Error('附件读取未返回有效内容'));
+        return;
+      }
+      resolve(result.slice(separator + 1));
     };
     reader.onerror = reject;
+    reader.onabort = () => reject(new Error('附件读取已取消'));
     reader.readAsDataURL(file);
   });
 }
@@ -227,6 +301,9 @@ function ContextRingIndicator({
   source: ContextUsageSource;
 }) {
   const [hover, setHover] = useState(false);
+  const [pinned, setPinned] = useState(false);
+  const tooltipId = useId();
+  const showDetails = hover || pinned;
   const color =
     tier === 'critical'
       ? 'var(--color-error)'
@@ -255,57 +332,80 @@ function ContextRingIndicator({
 
   return (
     <span
-      className="relative inline-flex h-7 w-7 items-center justify-center"
+      className="relative inline-flex h-7 w-7 shrink-0 items-center justify-center"
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
     >
-      <svg width="28" height="28" viewBox="0 0 28 28" aria-hidden="true">
-        <circle
-          cx="14"
-          cy="14"
-          r="10"
-          fill="none"
-          stroke={
-            source === 'unknown'
-              ? 'var(--border-primary)'
-              : `color-mix(in srgb, ${color} 22%, var(--border-primary))`
+      <button
+        type="button"
+        aria-label={`${capacityLine}；来源：${sourceLabel}`}
+        aria-expanded={showDetails}
+        aria-describedby={showDetails ? tooltipId : undefined}
+        className="inline-flex h-7 w-7 items-center justify-center rounded-full focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
+        onClick={() => {
+          setHover(false);
+          setPinned((value) => !value);
+        }}
+        onBlur={() => {
+          setHover(false);
+          setPinned(false);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === 'Escape') {
+            setHover(false);
+            setPinned(false);
           }
-          strokeWidth="3"
-        />
-        <circle
-          cx="14"
-          cy="14"
-          r="10"
-          fill="none"
-          stroke={color}
-          strokeWidth="3.4"
-          strokeLinecap="round"
-          strokeDasharray={CONTEXT_RING_CIRCUMFERENCE}
-          strokeDashoffset={offset}
-          transform="rotate(-90 14 14)"
-          style={{
-            filter:
+        }}
+      >
+        <svg width="28" height="28" viewBox="0 0 28 28" aria-hidden="true">
+          <circle
+            cx="14"
+            cy="14"
+            r="10"
+            fill="none"
+            stroke={
               source === 'unknown'
-                ? undefined
-                : `drop-shadow(0 0 2px color-mix(in srgb, ${color} 70%, transparent))`,
-          }}
-        />
-        <text
-          x="14"
-          y="14"
-          textAnchor="middle"
-          dominantBaseline="central"
-          fill={color}
-          fontSize="7.2"
-          fontWeight="700"
-          fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
-        >
-          {centerLabel}
-        </text>
-      </svg>
-      {hover && (
+                ? 'var(--border-primary)'
+                : `color-mix(in srgb, ${color} 22%, var(--border-primary))`
+            }
+            strokeWidth="3"
+          />
+          <circle
+            cx="14"
+            cy="14"
+            r="10"
+            fill="none"
+            stroke={color}
+            strokeWidth="3.4"
+            strokeLinecap="round"
+            strokeDasharray={CONTEXT_RING_CIRCUMFERENCE}
+            strokeDashoffset={offset}
+            transform="rotate(-90 14 14)"
+            style={{
+              filter:
+                source === 'unknown'
+                  ? undefined
+                  : `drop-shadow(0 0 2px color-mix(in srgb, ${color} 70%, transparent))`,
+            }}
+          />
+          <text
+            x="14"
+            y="14"
+            textAnchor="middle"
+            dominantBaseline="central"
+            fill={color}
+            fontSize="7.2"
+            fontWeight="700"
+            fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
+          >
+            {centerLabel}
+          </text>
+        </svg>
+      </button>
+      {showDetails && (
         <span
-          className="absolute bottom-full left-1/2 z-50 mb-2 -translate-x-1/2 whitespace-nowrap rounded-md border border-[var(--border-primary)] bg-[var(--bg-primary)] px-2.5 py-1.5 text-[11px] leading-relaxed text-[var(--text-secondary)] shadow-[var(--shadow-md)]"
+          id={tooltipId}
+          className="absolute bottom-full right-0 z-50 mb-2 w-max max-w-[calc(100vw-2rem)] whitespace-normal rounded-md border border-[var(--border-primary)] bg-[var(--bg-primary)] px-2.5 py-1.5 text-left text-[11px] leading-relaxed text-[var(--text-secondary)] shadow-[var(--shadow-md)]"
           role="tooltip"
         >
           <span className="block">{capacityLine}</span>
@@ -317,11 +417,55 @@ function ContextRingIndicator({
   );
 }
 
-export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: ChatInputProps) {
+export function ChatInput({
+  onSend,
+  isStreaming,
+  onCancel,
+  queuedCount = 0,
+  home = false,
+}: ChatInputProps) {
   const [text, setText] = useState('');
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
+  const textRef = useRef('');
+  const filesRef = useRef<PendingFile[]>([]);
+  const draftRevisionRef = useRef(0);
+  const submissionRef = useRef<DraftSubmission | null>(null);
+  const mountedRef = useRef(true);
+  const [pendingSubmissionId, setPendingSubmissionId] = useState<string | null>(null);
+  const [receiptNotice, setReceiptNotice] = useState<{
+    target: string;
+    receipt: ConversationInputReceipt;
+  } | null>(null);
+  const selectedConversationId = useConversationStore((state) => state.activeId);
+  const selectedConversationEpoch = useConversationStore((state) => state.newConversationEpoch);
+  const selectedWorkspaceGeneration = useWorkspaceStore(
+    (state) => state.current?.product_data_generation ?? 'global'
+  );
+  const selectedWorkspaceId = useWorkspaceStore((state) => workspaceIdForView(state.current?.id));
+  const currentDraftTargetKey = JSON.stringify([
+    selectedWorkspaceId,
+    selectedWorkspaceGeneration,
+    selectedConversationId,
+    selectedConversationEpoch,
+  ]);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      for (const file of filesRef.current)
+        if (file.previewUrl) URL.revokeObjectURL(file.previewUrl);
+    };
+  }, []);
+
+  const updateDraftText = useCallback((value: string) => {
+    draftRevisionRef.current += 1;
+    textRef.current = value;
+    setText(value);
+    setReceiptNotice(null);
+  }, []);
   const [paletteSelectedIndex, setPaletteSelectedIndex] = useState(0);
   const [configuredModels, setConfiguredModels] = useState<ConfiguredModel[]>([]);
+  const [modelProviders, setModelProviders] = useState<ModelProviderView[]>([]);
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [switchingModelId, setSwitchingModelId] = useState<string | null>(null);
@@ -334,6 +478,31 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const thinkingPublicationRef = useRef<string | null>(null);
+  const controlsRef = useRef<HTMLDivElement>(null);
+  const controlLabelId = useId();
+  useEffect(() => {
+    if (!modelMenuOpen && !permissionMenuOpen && !thinkingMenuOpen) return;
+    const close = () => {
+      setModelMenuOpen(false);
+      setPermissionMenuOpen(false);
+      setThinkingMenuOpen(false);
+    };
+    const pointer = (event: PointerEvent) => {
+      if (event.target instanceof Node && !controlsRef.current?.contains(event.target)) close();
+    };
+    const keyboard = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        close();
+        controlsRef.current?.querySelector<HTMLButtonElement>('[aria-expanded="true"]')?.focus();
+      }
+    };
+    document.addEventListener('pointerdown', pointer);
+    document.addEventListener('keydown', keyboard);
+    return () => {
+      document.removeEventListener('pointerdown', pointer);
+      document.removeEventListener('keydown', keyboard);
+    };
+  }, [modelMenuOpen, permissionMenuOpen, thinkingMenuOpen]);
   const setActiveSettingsTab = useUiStore((s) => s.setActiveSettingsTab);
   // Reasoning-depth publication is workspace-scoped: it must reach the pooled
   // conversation Agents of the active workspace, not just the process primary.
@@ -344,7 +513,8 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
   const thinkingLevels = thinkingLevelOptions(displayModel?.thinking_levels ?? []);
   // 上下文窗口占用（来自 llm_usage 事件 → chatStore）。
   const contextWindow = useChatStore((s) => s.contextWindow);
-  const usageAccumulator = useChatStore((s) => s.usageAccumulator);
+  const statistics = useConversationUsage();
+  const contextInvalidated = useChatStore((s) => s.contextInvalidated);
   // 后端返回显式配置或模型推断后的有效窗口；无默认标记时与展示模型保持一致。
   const contextWindowSize = displayModel?.context_window ?? null;
   const activePermissionMode =
@@ -352,8 +522,9 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
 
   const loadConfiguredModels = useCallback(async () => {
     try {
-      const res = await providerApi.listConfigured();
+      const res = await configuredModelPresentation();
       setConfiguredModels(res.models);
+      setModelProviders(res.providers);
     } catch (e) {
       console.error('[ChatInput] Failed to load configured models:', e);
     } finally {
@@ -538,17 +709,22 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
           source,
         });
       }
-      setPendingFiles((prev) => [...prev, ...newFiles]);
+      if (newFiles.length === 0) return;
+      draftRevisionRef.current += 1;
+      filesRef.current = [...filesRef.current, ...newFiles];
+      setPendingFiles(filesRef.current);
+      setReceiptNotice(null);
     },
     []
   );
 
   const removeFile = useCallback((id: string) => {
-    setPendingFiles((prev) => {
-      const file = prev.find((f) => f.id === id);
-      if (file?.previewUrl) URL.revokeObjectURL(file.previewUrl);
-      return prev.filter((f) => f.id !== id);
-    });
+    const file = filesRef.current.find((entry) => entry.id === id);
+    if (file?.previewUrl) URL.revokeObjectURL(file.previewUrl);
+    draftRevisionRef.current += 1;
+    filesRef.current = filesRef.current.filter((entry) => entry.id !== id);
+    setPendingFiles(filesRef.current);
+    setReceiptNotice(null);
   }, []);
 
   const handleFileSelect = useCallback(
@@ -596,79 +772,178 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
   // ── Send ──
 
   const handleSend = async () => {
-    const trimmed = text.trim();
-    if (!trimmed && pendingFiles.length === 0) return;
-    if (!displayModel) {
+    const draftText = textRef.current;
+    const trimmed = draftText.trim();
+    const files = filesRef.current;
+    if (!trimmed && files.length === 0) return;
+    const target = readDraftTarget();
+    const previous = submissionRef.current;
+    // A first send can acquire its canonical conversation before Started comes
+    // back. That assignment must not turn repeated Enter on the same draft into
+    // a second input. A changed draft in a different target is a new intent.
+    if (
+      previous?.inFlight &&
+      (previous.revision === draftRevisionRef.current || sameDraftTarget(previous.target, target))
+    )
+      return;
+    if (!displayModel && !(files.length === 0 && parseGuiSlashCommand(trimmed))) {
       openModelSettings();
       useToastStore.getState().addToast('info', '请先添加 Provider 和模型');
       return;
     }
-
-    // If palette is open and there are filtered commands, select the highlighted one
     if (showPalette && filteredCommands.length > 0) {
-      const cmd = filteredCommands[paletteSelectedIndex];
-      if (cmd) {
-        selectCommand(cmd);
+      const command = filteredCommands[paletteSelectedIndex];
+      if (command) {
+        selectCommand(command);
         return;
       }
     }
+    const revision = draftRevisionRef.current;
+    const submission: DraftSubmission =
+      previous && previous.revision === revision && sameDraftTarget(previous.target, target)
+        ? previous
+        : {
+            externalId: crypto.randomUUID(),
+            target,
+            revision,
+            draftText,
+            files: [...files],
+            payload: null,
+            inFlight: false,
+            ackSeen: false,
+            directSeen: false,
+          };
+    submissionRef.current = submission;
+    submission.inFlight = true;
+    setPendingSubmissionId(submission.externalId);
+    setReceiptNotice(null);
 
-    // F1-1: 此前 Promise.all(fileToBase64) 无 catch, 文件编码失败时成为
-    // unhandled rejection, 用户无错误提示 (虽不丢输入, 但卡住无反馈)。改为
-    // try/catch: 失败时 toast 提示 + return (保留输入和文件让用户重试)。
-    let attachmentData: Attachment[];
+    const isOwnDraft = (allowAdmission = false) =>
+      mountedRef.current &&
+      submissionRef.current === submission &&
+      draftRevisionRef.current === submission.revision &&
+      textRef.current === submission.draftText &&
+      filesRef.current.length === submission.files.length &&
+      filesRef.current.every((file, index) => file.id === submission.files[index]?.id) &&
+      sameDraftTarget(submission.target, readDraftTarget(), allowAdmission);
+    const releaseAdmission = () => {
+      submission.inFlight = false;
+      if (mountedRef.current && submissionRef.current === submission) setPendingSubmissionId(null);
+    };
+    const clearOwnDraft = (allowAdmission = false) => {
+      if (!isOwnDraft(allowAdmission)) return;
+      for (const file of submission.files)
+        if (file.previewUrl) URL.revokeObjectURL(file.previewUrl);
+      draftRevisionRef.current += 1;
+      textRef.current = '';
+      filesRef.current = [];
+      submissionRef.current = null;
+      setText('');
+      setPendingFiles([]);
+      setPendingSubmissionId(null);
+      requestAnimationFrame(() => {
+        if (mountedRef.current && textareaRef.current) textareaRef.current.style.height = 'auto';
+      });
+    };
     try {
-      attachmentData = await Promise.all(
-        pendingFiles.map(async (pf) => ({
-          name: pf.name,
-          mime_type: pf.mime_type,
-          data: await fileToBase64(pf.file),
-          size: pf.size,
-          source: pf.source,
-        }))
+      if (!submission.payload) {
+        const attachments = await Promise.all(
+          submission.files.map(async (file) => ({
+            name: file.name,
+            mime_type: file.mime_type,
+            data: await fileToBase64(file.file),
+            size: file.size,
+            source: file.source,
+          }))
+        );
+        submission.payload = {
+          text: trimmed,
+          attachments:
+            attachments.length > 0
+              ? attachments.map((attachment) => Object.freeze(attachment))
+              : undefined,
+        };
+      }
+      // Preparing an attachment must never choose a newer sidebar target.
+      if (!mountedRef.current || !sameDraftTarget(submission.target, readDraftTarget())) return;
+      const options: ChatSendSubmission = {
+        externalId: submission.externalId,
+        ...submission.target,
+        payload: submission.payload,
+        onPersisted: (receipt, canProject) => {
+          // Observe the original fact before checking current presentation. A
+          // late boolean must not clear another draft after this callback.
+          submission.ackSeen = true;
+          releaseAdmission();
+          if (
+            !canProject() ||
+            !isOwnDraft() ||
+            receipt.identity.address.workspace_id !== submission.target.workspaceId ||
+            receipt.identity.address.conversation_id !== submission.target.conversationId
+          )
+            return;
+          setReceiptNotice({ target: draftTargetKey(submission.target), receipt });
+          clearOwnDraft();
+        },
+        onDirectAccepted: (canProject) => {
+          submission.directSeen = true;
+          releaseAdmission();
+          // Only the original sender can prove a normal first-message bootstrap
+          // or a successful local command changed the conversation legitimately.
+          if (canProject()) clearOwnDraft(true);
+        },
+      };
+      const payload = submission.payload;
+      const accepted = await onSend(
+        payload.text,
+        payload.attachments
+          ? payload.attachments.map((attachment) => ({ ...attachment }))
+          : undefined,
+        options
       );
-    } catch (e) {
-      useToastStore
-        .getState()
-        .addToast('error', `附件处理失败：${e instanceof Error ? e.message : String(e)}`);
-      return;
+      // Local/legacy boolean success is not a persisted acknowledgement. The
+      // strict same-target fallback cannot adopt an unrelated new conversation.
+      if (accepted && !submission.ackSeen && !submission.directSeen) clearOwnDraft();
+    } catch (error) {
+      if (isOwnDraft())
+        useToastStore
+          .getState()
+          .addToast(
+            'error',
+            `${submission.payload ? '发送失败' : '附件处理失败'}：${error instanceof Error ? error.message : String(error)}`
+          );
+    } finally {
+      releaseAdmission();
     }
-
-    const accepted = await onSend(trimmed, attachmentData.length > 0 ? attachmentData : undefined);
-    if (!accepted) return;
-    pendingFiles.forEach((pf) => {
-      if (pf.previewUrl) URL.revokeObjectURL(pf.previewUrl);
-    });
-    setText('');
-    setPendingFiles([]);
-
-    requestAnimationFrame(() => {
-      if (textareaRef.current) textareaRef.current.style.height = 'auto';
-    });
   };
 
   // ── Command selection ──
 
-  const selectCommand = useCallback((cmd: SlashCommand) => {
-    // Place the command name into the text input with a trailing space
-    // so the user can append arguments, or just press Enter to send.
-    setText(cmd.name + ' ');
-    setPaletteSelectedIndex(0);
-    // Refocus the textarea
-    requestAnimationFrame(() => {
-      textareaRef.current?.focus();
-    });
-  }, []);
+  const selectCommand = useCallback(
+    (cmd: SlashCommand) => {
+      // Place the command name into the text input with a trailing space
+      // so the user can append arguments, or just press Enter to send.
+      updateDraftText(cmd.name + ' ');
+      setPaletteSelectedIndex(0);
+      // Refocus the textarea
+      requestAnimationFrame(() => {
+        textareaRef.current?.focus();
+      });
+    },
+    [updateDraftText]
+  );
 
   // ── Keyboard handling ──
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // WebKit 可能先清除 isComposing；候选确认键不能启动命令。
+    if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
     // Palette navigation takes priority when palette is visible
     if (showPalette) {
       if (e.key === 'Escape') {
         e.preventDefault();
         // Clear the slash query by removing the text
-        setText('');
+        updateDraftText('');
         return;
       }
 
@@ -746,27 +1021,36 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
   );
 
   const hasContent = text.trim().length > 0 || pendingFiles.length > 0;
+  const currentSubmissionPending =
+    pendingSubmissionId !== null &&
+    submissionRef.current?.externalId === pendingSubmissionId &&
+    (submissionRef.current.revision === draftRevisionRef.current ||
+      sameDraftTarget(submissionRef.current.target, readDraftTarget()));
   const draftTokens = useMemo(() => estimateDraftTokens(text, pendingFiles), [text, pendingFiles]);
   const contextUsage = computeContextUsage(
-    contextWindow?.inputTokens ?? null,
+    contextWindow?.inputTokens ??
+      (!contextInvalidated ? (statistics.value?.main.latest_input_tokens ?? null) : null),
     draftTokens,
     contextWindowSize
   );
   const ctxUsage = {
     ...contextUsage,
     win: contextWindowSize,
-    cacheRate: cacheHitRate(usageAccumulator),
+    cacheRate:
+      statistics.value && statistics.value.main.input_tokens > 0 && !statistics.value.main.conflicts
+        ? statistics.value.main.cached_tokens / statistics.value.main.input_tokens
+        : null,
   };
 
   return (
     <div
-      className="px-3 pb-3 sm:px-5"
+      className={`w-full pb-3 ${CHAT_GUTTER}`}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
       {/* Relative container so the absolute-positioned palette anchors here */}
-      <div className="relative mx-auto max-w-[980px]">
+      <div className="relative w-full">
         {/* ── Slash Command Palette ── */}
         {showPalette && (
           <CommandPalette
@@ -776,7 +1060,7 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
           />
         )}
 
-        <div className="relative space-y-2">
+        <div className="relative overflow-visible rounded-[24px] bg-[var(--bg-secondary)] p-1 shadow-[var(--shadow-sm)]">
           {/* Drag overlay */}
           {isDragging && (
             <div className="absolute inset-0 z-10 flex items-center justify-center rounded-lg border-2 border-dashed border-[var(--accent)] bg-[var(--accent)]/5">
@@ -815,8 +1099,9 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
                     </div>
                   </div>
                   <button
+                    aria-label={`移除附件 ${pf.name}`}
                     onClick={() => removeFile(pf.id)}
-                    className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-full bg-[var(--bg-primary)] text-[var(--text-tertiary)] opacity-0 shadow-[var(--shadow-sm)] transition-opacity group-hover:opacity-100 hover:text-[var(--text-primary)]"
+                    className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-full bg-[var(--bg-primary)] text-[var(--text-tertiary)] opacity-0 shadow-[var(--shadow-sm)] transition-opacity group-hover:opacity-100 focus-visible:opacity-100 hover:text-[var(--text-primary)]"
                   >
                     <X size={10} />
                   </button>
@@ -826,12 +1111,13 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
           )}
 
           {/* Input row */}
-          <AgentComposerFrame>
+          <AgentComposerFrame variant="primary">
             {/* Attachment button */}
             <button
               onClick={() => fileInputRef.current?.click()}
-              className="mr-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-              title="Upload attachment"
+              className="absolute bottom-3 left-4 flex h-8 w-8 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+              title="添加附件"
+              aria-label="添加附件"
             >
               <Paperclip size={16} />
             </button>
@@ -847,177 +1133,244 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
             <textarea
               ref={textareaRef}
               aria-label="消息"
+              aria-busy={currentSubmissionPending}
               value={text}
-              onChange={(e) => setText(e.target.value)}
+              onChange={(e) => updateDraftText(e.target.value)}
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
               rows={1}
-              placeholder={displayModel ? 'Send follow-up' : '请先配置模型'}
-              className="max-h-[200px] min-h-[24px] flex-1 resize-none bg-transparent text-sm leading-relaxed text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
+              placeholder={
+                displayModel
+                  ? home
+                    ? '今天想做什么？描述任务，或 / 调用技能与指令'
+                    : '继续对话，或补充当前任务…'
+                  : '请先配置模型'
+              }
+              className="max-h-[240px] min-h-[64px] w-full min-w-0 flex-1 resize-none bg-transparent text-sm leading-relaxed text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
             />
             {isStreaming ? (
               <button
                 onClick={onCancel}
-                className="ml-2 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--text-secondary)] text-white transition-all hover:bg-[var(--text-primary)]"
-                title="Stop generating"
+                className="absolute bottom-3 right-4 flex h-8 w-8 items-center justify-center rounded-full bg-[var(--text-secondary)] text-white transition-all hover:bg-[var(--text-primary)]"
+                title="停止生成"
+                aria-label="停止生成"
               >
                 <Square size={14} fill="white" color="white" />
               </button>
             ) : (
               <button
                 onClick={handleSend}
-                disabled={!hasContent || !displayModel}
-                title={displayModel ? '发送' : '请先配置模型'}
-                className="ml-2 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-[var(--text-on-accent)] transition-all hover:shadow-[var(--shadow-glow)] disabled:opacity-20 disabled:hover:shadow-none"
+                disabled={
+                  !hasContent ||
+                  (!displayModel && !(pendingFiles.length === 0 && parseGuiSlashCommand(text))) ||
+                  currentSubmissionPending
+                }
+                aria-label={displayModel || parseGuiSlashCommand(text) ? '发送' : '请先配置模型'}
+                title={displayModel || parseGuiSlashCommand(text) ? '发送' : '请先配置模型'}
+                className="absolute bottom-3 right-4 flex h-8 w-8 items-center justify-center rounded-full bg-[var(--accent)] text-[var(--text-on-accent)] transition-all hover:shadow-[var(--shadow-glow)] disabled:opacity-20 disabled:hover:shadow-none"
               >
                 <ArrowUp size={16} strokeWidth={2.5} />
               </button>
             )}
-          </AgentComposerFrame>
-          <div className="flex flex-wrap items-center justify-between gap-2 px-2 text-[11px] text-[var(--text-tertiary)]">
-            <div className="flex min-w-0 flex-wrap items-center gap-1.5 sm:gap-2">
-              {queuedCount > 0 && <span>已排队 {queuedCount} 条</span>}
-              <div className="relative">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setPermissionMenuOpen((open) => !open);
+            <div
+              ref={controlsRef}
+              className="relative flex min-w-0 items-center justify-between gap-x-1 pl-8 pr-9 text-xs text-[var(--text-tertiary)]"
+            >
+              <div className="flex min-w-0 shrink-0 items-center gap-0.5 sm:gap-1">
+                <WorkspaceMenuControl
+                  onOpen={() => {
+                    setPermissionMenuOpen(false);
                     setModelMenuOpen(false);
                     setThinkingMenuOpen(false);
                   }}
-                  className="flex max-w-[180px] items-center gap-1.5 rounded-full px-2 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-                  title="切换审批模式"
-                >
-                  <ShieldCheck size={13} />
-                  <span className="truncate">{activePermissionMode.label}</span>
-                  <ChevronDown size={12} />
-                </button>
-                {permissionMenuOpen && (
-                  <MenuOverlay title="审批模式" width="w-64">
-                    <div className="p-1">
-                      {PERMISSION_MODES.map((mode) => (
-                        <button
-                          key={mode.id}
-                          type="button"
-                          onClick={() => switchPermissionMode(mode.id)}
-                          disabled={switchingPermissionMode === mode.id}
-                          className="flex w-full items-start gap-2 rounded-md px-2 py-2 text-left transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-wait disabled:opacity-70"
-                        >
-                          <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center text-[var(--accent)]">
-                            {mode.id === permissionMode && <Check size={13} />}
-                          </span>
-                          <span className="min-w-0 flex-1">
-                            <span className="block text-xs text-[var(--text-primary)]">
-                              {switchingPermissionMode === mode.id ? '切换中...' : mode.label}
+                />
+                <div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPermissionMenuOpen((open) => !open);
+                      setModelMenuOpen(false);
+                      setThinkingMenuOpen(false);
+                    }}
+                    className="flex max-w-[180px] items-center gap-1 rounded-full px-1 py-1 sm:gap-1.5 sm:px-2 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                    title="权限配置"
+                    aria-label="权限配置"
+                    aria-describedby={`${controlLabelId}-permission`}
+                    aria-expanded={permissionMenuOpen}
+                  >
+                    <span id={`${controlLabelId}-permission`} className="sr-only">
+                      当前权限：
+                      {permissionMode === 'default' ? '默认权限' : activePermissionMode.label}
+                    </span>
+                    <ShieldCheck size={13} />
+                    <span className="hidden truncate sm:inline">
+                      {permissionMode === 'default' ? '默认权限' : activePermissionMode.label}
+                    </span>
+                    <ChevronDown size={12} />
+                  </button>
+                  {permissionMenuOpen && (
+                    <MenuOverlay title="审批模式" width="w-64">
+                      <div className="p-1">
+                        {PERMISSION_MODES.map((mode) => (
+                          <button
+                            key={mode.id}
+                            type="button"
+                            onClick={() => switchPermissionMode(mode.id)}
+                            disabled={switchingPermissionMode === mode.id}
+                            className="flex w-full items-start gap-2 rounded-md px-2 py-2 text-left transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-wait disabled:opacity-70"
+                          >
+                            <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center text-[var(--accent)]">
+                              {mode.id === permissionMode && <Check size={13} />}
                             </span>
-                            <span className="block text-[10px] text-[var(--text-tertiary)]">
-                              {mode.description}
+                            <span className="min-w-0 flex-1">
+                              <span className="block text-xs text-[var(--text-primary)]">
+                                {switchingPermissionMode === mode.id ? '切换中...' : mode.label}
+                              </span>
+                              <span className="block text-[10px] text-[var(--text-tertiary)]">
+                                {mode.description}
+                              </span>
                             </span>
-                          </span>
-                        </button>
-                      ))}
-                    </div>
-                  </MenuOverlay>
-                )}
+                          </button>
+                        ))}
+                      </div>
+                    </MenuOverlay>
+                  )}
+                </div>
+                <div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPermissionMenuOpen(false);
+                      setModelMenuOpen(false);
+                      setThinkingMenuOpen((open) => !open);
+                    }}
+                    disabled={!displayModel || switchingThinking}
+                    className="flex max-w-[140px] items-center gap-1 rounded-full px-1 py-1 sm:gap-1.5 sm:px-2 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-[var(--text-tertiary)]"
+                    title={displayModel ? '切换思考深度' : '配置模型后可用'}
+                    aria-label="思考深度"
+                    aria-describedby={`${controlLabelId}-thinking`}
+                    aria-expanded={thinkingMenuOpen}
+                  >
+                    <span id={`${controlLabelId}-thinking`} className="sr-only">
+                      当前思考深度：
+                      {thinkingLevels.find((level) => level.id === thinkingLevel)?.label ?? '自动'}
+                    </span>
+                    <Brain size={13} />
+                    <span className="hidden truncate sm:inline">
+                      {thinkingLevels.find((level) => level.id === thinkingLevel)?.label ?? '自动'}
+                    </span>
+                    {displayModel && <ChevronDown size={12} />}
+                  </button>
+                  {thinkingMenuOpen && displayModel && (
+                    <MenuOverlay title="思考深度" width="w-56">
+                      <div className="p-1">
+                        {thinkingLevels.map((lvl) => (
+                          <button
+                            key={lvl.id}
+                            type="button"
+                            onClick={() => switchThinkingLevel(lvl.id)}
+                            disabled={switchingThinking}
+                            className="flex w-full items-start gap-2 rounded-md px-2 py-2 text-left transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-wait disabled:opacity-70"
+                          >
+                            <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center text-[var(--accent)]">
+                              {lvl.id === thinkingLevel && <Check size={13} />}
+                            </span>
+                            <span className="min-w-0 flex-1">
+                              <span className="block text-xs text-[var(--text-primary)]">
+                                {switchingThinking && lvl.id === thinkingLevel
+                                  ? '切换中...'
+                                  : lvl.label}
+                              </span>
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    </MenuOverlay>
+                  )}
+                </div>
               </div>
-              <div className="relative hidden sm:block">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setPermissionMenuOpen(false);
-                    setThinkingMenuOpen(false);
-                    if (visibleModels.length === 0) {
-                      openModelSettings();
-                    } else {
-                      setModelMenuOpen((open) => !open);
+              <div className="ml-auto flex min-w-0 flex-1 items-center justify-end gap-1">
+                {receiptNotice?.target === currentDraftTargetKey && (
+                  <span
+                    role="status"
+                    title="输入已保存，后续处理状态由原任务回执呈现"
+                    className="px-1 text-[var(--text-secondary)]"
+                    data-input-id={receiptNotice.receipt.identity.input_id}
+                  >
+                    已收到
+                  </span>
+                )}
+                <div className="min-w-0 max-w-full">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPermissionMenuOpen(false);
+                      setThinkingMenuOpen(false);
+                      if (visibleModels.length === 0) {
+                        openModelSettings();
+                      } else {
+                        setModelMenuOpen((open) => !open);
+                      }
+                    }}
+                    className="flex max-w-full min-w-0 sm:max-w-[min(32vw,300px)] items-center gap-1 rounded-full px-1 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] sm:px-2"
+                    title={
+                      displayModel ? `${displayModel.provider} / ${displayModel.model}` : '选择模型'
                     }
-                  }}
-                  className="flex max-w-[220px] items-center gap-1.5 rounded-full px-2 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-                  title="切换默认模型"
-                >
-                  <Cpu size={13} />
-                  <span className="truncate">
-                    {displayModel?.display_name || displayModel?.model || '配置模型'}
-                  </span>
-                  {visibleModels.length > 0 && <ChevronDown size={12} />}
-                </button>
-                {modelMenuOpen && visibleModels.length > 0 && (
-                  <MenuOverlay title="默认模型" width="w-64">
-                    <div className="max-h-64 overflow-y-auto p-1">
-                      {visibleModels.map((model) => (
-                        <button
-                          key={model.id}
-                          type="button"
-                          onClick={() => switchModel(model)}
-                          disabled={switchingModelId !== null}
-                          className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-xs text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                          <span className="flex h-4 w-4 shrink-0 items-center justify-center text-[var(--accent)]">
-                            {model.is_default && <Check size={13} />}
-                          </span>
-                          <span className="min-w-0 flex-1 truncate">
-                            {model.display_name || model.model}
-                          </span>
-                        </button>
-                      ))}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={openModelSettings}
-                      className="w-full border-t border-[var(--border-secondary)] px-3 py-2 text-left text-xs text-[var(--accent)] transition-colors hover:bg-[var(--bg-hover)]"
-                    >
-                      管理模型
-                    </button>
-                  </MenuOverlay>
-                )}
-              </div>
-              <div className="relative">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setPermissionMenuOpen(false);
-                    setModelMenuOpen(false);
-                    setThinkingMenuOpen((open) => !open);
-                  }}
-                  disabled={!displayModel || switchingThinking}
-                  className="flex max-w-[140px] items-center gap-1.5 rounded-full px-2 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-[var(--text-tertiary)]"
-                  title={displayModel ? '切换思考深度' : '配置模型后可用'}
-                >
-                  <Brain size={13} />
-                  <span className="truncate">
-                    {thinkingLevels.find((level) => level.id === thinkingLevel)?.label ?? '自动'}
-                  </span>
-                  {displayModel && <ChevronDown size={12} />}
-                </button>
-                {thinkingMenuOpen && displayModel && (
-                  <MenuOverlay title="思考深度" width="w-56">
-                    <div className="p-1">
-                      {thinkingLevels.map((lvl) => (
-                        <button
-                          key={lvl.id}
-                          type="button"
-                          onClick={() => switchThinkingLevel(lvl.id)}
-                          disabled={switchingThinking}
-                          className="flex w-full items-start gap-2 rounded-md px-2 py-2 text-left transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-wait disabled:opacity-70"
-                        >
-                          <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center text-[var(--accent)]">
-                            {lvl.id === thinkingLevel && <Check size={13} />}
-                          </span>
-                          <span className="min-w-0 flex-1">
-                            <span className="block text-xs text-[var(--text-primary)]">
-                              {switchingThinking && lvl.id === thinkingLevel
-                                ? '切换中...'
-                                : lvl.label}
+                    aria-label="选择模型"
+                    aria-expanded={modelMenuOpen}
+                  >
+                    <Cpu size={13} />
+                    <span className="truncate">
+                      {displayModel ? modelLabel(displayModel, modelProviders) : '选择模型'}
+                    </span>
+                    {visibleModels.length > 0 && <ChevronDown size={12} />}
+                  </button>
+                  {modelMenuOpen && visibleModels.length > 0 && (
+                    <MenuOverlay title="默认模型" width="w-64" align="right">
+                      <div className="max-h-64 overflow-y-auto p-1">
+                        {visibleModels.map((model) => (
+                          <button
+                            key={model.id}
+                            type="button"
+                            onClick={() => switchModel(model)}
+                            disabled={switchingModelId !== null}
+                            className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-xs text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            <span className="flex h-4 w-4 shrink-0 items-center justify-center text-[var(--accent)]">
+                              {model.is_default && <Check size={13} />}
                             </span>
-                          </span>
-                        </button>
-                      ))}
-                    </div>
-                  </MenuOverlay>
+                            <span className="min-w-0 flex-1 break-words">
+                              {modelLabel(model, modelProviders)}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={openModelSettings}
+                        className="w-full border-t border-[var(--border-secondary)] px-3 py-2 text-left text-xs text-[var(--accent)] transition-colors hover:bg-[var(--bg-hover)]"
+                      >
+                        管理模型
+                      </button>
+                    </MenuOverlay>
+                  )}
+                </div>
+                {queuedCount > 0 && (
+                  <span className="hidden lg:inline">已排队 {queuedCount} 条</span>
                 )}
               </div>
             </div>
-            <div className="ml-auto flex shrink-0 items-center gap-2">
+          </AgentComposerFrame>
+          <div
+            className="flex min-h-7 items-center justify-center gap-x-1 px-2 pt-1 text-[10px] text-[var(--text-tertiary)] sm:gap-x-3 sm:text-xs"
+            aria-label="运行统计"
+          >
+            <ConversationStatistics
+              streaming={isStreaming === true}
+              value={statistics.value}
+              error={statistics.error}
+            />
+            {ctxUsage.source !== 'unknown' && (
               <ContextRingIndicator
                 pct={ctxUsage.pct}
                 used={ctxUsage.used}
@@ -1026,8 +1379,8 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
                 cacheRate={ctxUsage.cacheRate}
                 source={ctxUsage.source}
               />
-              {text.length > 0 && <span>{text.length} 字</span>}
-            </div>
+            )}
+            {text.length > 0 && <span className="hidden shrink-0 sm:inline">{text.length} 字</span>}
           </div>
         </div>
       </div>
@@ -1046,20 +1399,182 @@ function MenuOverlay({
   title,
   width = 'w-64',
   children,
+  align = 'left',
 }: {
   title: string;
   width?: string;
+  align?: 'left' | 'right';
   children: React.ReactNode;
 }) {
   return (
     <Card
       variant="overlay"
-      className={`absolute bottom-full left-0 z-50 mb-2 overflow-hidden ${width}`}
+      className={`absolute bottom-full z-50 mb-2 max-w-full overflow-hidden ${align === 'right' ? 'right-0' : 'left-0'} ${width}`}
     >
       <div className="border-b border-[var(--border-secondary)] px-3 py-2 text-[10px] font-medium text-[var(--text-tertiary)]">
         {title}
       </div>
       {children}
     </Card>
+  );
+}
+
+function WorkspaceMenuControl({ onOpen }: { onOpen: () => void }) {
+  const current = useWorkspaceStore((state) => state.current);
+  const workspaces = useWorkspaceStore((state) => state.workspaces);
+  const isLoading = useWorkspaceStore((state) => state.isLoading);
+  const openWorkspaceDialog = useUiStore((state) => state.openWorkspaceDialog);
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const [error, setError] = useState('');
+  const container = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const search = useRef<HTMLInputElement>(null);
+  const close = useCallback(() => {
+    setOpen(false);
+    trigger.current?.focus();
+  }, []);
+  useEffect(() => {
+    if (!open) return;
+    search.current?.focus();
+    const pointer = (event: PointerEvent) => {
+      if (event.target instanceof Node && !container.current?.contains(event.target))
+        setOpen(false);
+    };
+    const keyboard = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        close();
+      }
+    };
+    document.addEventListener('pointerdown', pointer);
+    document.addEventListener('keydown', keyboard);
+    return () => {
+      document.removeEventListener('pointerdown', pointer);
+      document.removeEventListener('keydown', keyboard);
+    };
+  }, [open, close]);
+  const choose = async (id: string, generation: string) => {
+    const epoch = useUiStore.getState().beginNavigation();
+    setError('');
+    try {
+      if (useWorkspaceStore.getState().current?.id !== id)
+        await useWorkspaceStore.getState().switchTo(id);
+      const actual = useWorkspaceStore.getState().current;
+      if (useUiStore.getState().navigationEpoch !== epoch) return;
+      if (actual?.id !== id || actual.product_data_generation !== generation) {
+        throw new Error('工作空间已变化，请重新选择');
+      }
+      useWorkspaceViewStore.getState().openChat();
+      close();
+    } catch (cause) {
+      if (useUiStore.getState().navigationEpoch === epoch)
+        setError(cause instanceof Error ? cause.message : '切换工作空间失败');
+    }
+  };
+  const filtered = (workspaces ?? []).filter((workspace) =>
+    `${workspace.name} ${workspaceLocationLabel(workspace)}`
+      .toLowerCase()
+      .includes(query.trim().toLowerCase())
+  );
+  return (
+    <div ref={container} className="min-w-0 shrink-0">
+      <button
+        ref={trigger}
+        type="button"
+        aria-label="选择工作空间"
+        aria-expanded={open}
+        onClick={() => {
+          if (!open) onOpen();
+          setOpen((value) => !value);
+          setError('');
+        }}
+        title={current ? workspaceLocationLabel(current) : '选择工作空间'}
+        className="flex max-w-[min(18vw,160px)] min-w-0 items-center gap-1 rounded-lg px-1 py-1.5 text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] sm:px-2"
+      >
+        {current && workspaceIsRemote(current) ? <Server size={14} /> : <FolderOpen size={14} />}
+        <span className="truncate">{current?.name || '选择工作空间'}</span>
+        <ChevronDown size={12} className="shrink-0" />
+      </button>
+      {open && (
+        <Card
+          variant="overlay"
+          role="dialog"
+          aria-label="工作空间选择"
+          className="absolute bottom-full left-0 z-50 mb-3 w-[330px] max-w-full overflow-hidden rounded-2xl"
+        >
+          <label className="eko-workspace-search m-2 flex items-center gap-2 rounded-xl bg-[var(--bg-secondary)] px-3 py-2.5">
+            <Search size={15} className="shrink-0" />
+            <input
+              ref={search}
+              aria-label="搜索工作空间"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="搜索工作空间"
+              className="min-w-0 flex-1 bg-transparent text-sm text-[var(--text-primary)] outline-none"
+            />
+          </label>
+          <div className="max-h-[min(240px,40vh)] overflow-y-auto px-2 pb-2">
+            {filtered.map((workspace) => (
+              <button
+                key={workspace.id}
+                type="button"
+                disabled={isLoading}
+                onClick={() => void choose(workspace.id, workspace.product_data_generation)}
+                className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-left hover:bg-[var(--bg-hover)] disabled:opacity-50"
+              >
+                {workspaceIsRemote(workspace) ? (
+                  <Server size={16} className="shrink-0" />
+                ) : (
+                  <FolderOpen size={16} className="shrink-0" />
+                )}
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-sm text-[var(--text-primary)]">
+                    {workspace.name}
+                  </span>
+                  <span
+                    className="block truncate text-[11px]"
+                    title={workspaceLocationLabel(workspace)}
+                  >
+                    {workspaceLocationLabel(workspace)}
+                  </span>
+                </span>
+                {current?.id === workspace.id && <Check size={14} className="shrink-0" />}
+              </button>
+            ))}
+            {filtered.length === 0 && (
+              <p className="px-3 py-3 text-xs">{query ? '没有匹配的工作空间' : '还没有工作空间'}</p>
+            )}
+          </div>
+          {error && (
+            <p role="alert" className="px-4 pb-2 text-xs text-[var(--color-error)]">
+              {error}
+            </p>
+          )}
+          <div className="border-t border-[var(--border-secondary)] p-2">
+            {(
+              [
+                ['new_local', '新建工作空间', FolderPlus],
+                ['existing_local', '打开本地文件夹', FolderOpen],
+                ['ssh', '连接远程 SSH 设备', Server],
+              ] as const
+            ).map(([source, label, Icon]) => (
+              <button
+                key={source}
+                type="button"
+                onClick={() => {
+                  close();
+                  openWorkspaceDialog(source);
+                }}
+                className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-left text-sm text-[var(--text-primary)] hover:bg-[var(--bg-hover)]"
+              >
+                <Icon size={16} />
+                {label}
+              </button>
+            ))}
+          </div>
+        </Card>
+      )}
+    </div>
   );
 }

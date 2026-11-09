@@ -236,6 +236,7 @@ mod model_mutation_tests {
     async fn agent_projection(handle: &AgentHandle) -> Result<AgentModelProjection, String> {
         handle
             .read(|agent| {
+                assert_eq!(agent.config().get_temperature(), None);
                 let llm = agent
                     .llm_config()
                     .ok_or_else(|| "agent has no LLM config".to_string())?;
@@ -500,10 +501,12 @@ mod model_mutation_tests {
                 .switch_workspace(Workspace {
                     id: crate::workspace::WorkspaceId::from_name(&name),
                     name,
-                    root,
+                    root: root.clone(),
                     project_root: None,
                     kind: crate::workspace::WorkspaceKind::General,
-                    metadata: crate::workspace::WorkspaceMetadata::default(),
+                    metadata: crate::workspace::WorkspaceMetadata::new(
+                        crate::workspace::ProjectLocation::Local { path: root.clone() },
+                    ),
                     product_data_generation: String::new(),
                     created_at: Utc::now(),
                     last_active: Utc::now(),
@@ -544,6 +547,175 @@ mod model_mutation_tests {
     }
 
     #[tokio::test]
+    async fn tool_choice_keeps_inflight_snapshot_and_only_changes_next_invocation()
+    -> Result<(), String> {
+        let fixture = fixture(valid_config()?, false).await?;
+        let primary = fixture.state.connection.primary_agent();
+        let original = primary
+            .read(echo_agent::agent::AgentRunSnapshot::from_agent)
+            .await;
+        assert!(
+            original
+                .tools
+                .tools_for_llm()
+                .iter()
+                .any(|tool| tool.function.name == "shell")
+        );
+        let disabled = fixture
+            .state
+            .set_tool_enabled(&primary, "shell", false)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(!disabled.policy_enabled);
+        let later = primary
+            .read(echo_agent::agent::AgentRunSnapshot::from_agent)
+            .await;
+        assert!(
+            !later
+                .tools
+                .tools_for_llm()
+                .iter()
+                .any(|tool| tool.function.name == "shell")
+        );
+        assert!(
+            original
+                .tools
+                .tools_for_llm()
+                .iter()
+                .any(|tool| tool.function.name == "shell"),
+            "设置不得热改原执行已捕获的工具选择"
+        );
+        let enabled = fixture
+            .state
+            .set_tool_enabled(&primary, "shell", true)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(enabled.revision > disabled.revision);
+        assert!(
+            !later
+                .tools
+                .tools_for_llm()
+                .iter()
+                .any(|tool| tool.function.name == "shell"),
+            "后继开启也不能改写先前已禁用的快照"
+        );
+        let newest = primary
+            .read(echo_agent::agent::AgentRunSnapshot::from_agent)
+            .await;
+        assert!(
+            newest
+                .tools
+                .tools_for_llm()
+                .iter()
+                .any(|tool| tool.function.name == "shell")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_choice_enable_does_not_widen_readonly_positive_invocation_bound()
+    -> Result<(), String> {
+        let fixture = fixture(valid_config()?, false).await?;
+        let primary = fixture.state.connection.primary_agent();
+        fixture
+            .state
+            .set_tool_enabled(&primary, "shell", false)
+            .await
+            .map_err(|error| error.to_string())?;
+        fixture
+            .state
+            .set_tool_enabled(&primary, "shell", true)
+            .await
+            .map_err(|error| error.to_string())?;
+        let invocation = echo_agent::agent::AgentInvocationContext {
+            allowed_tools: Some(std::collections::HashSet::from([
+                "read_artifact".to_string()
+            ])),
+            tool_access: Some(echo_agent::tools::ToolAccess::ReadOnly),
+            ..Default::default()
+        };
+        let bounded = primary
+            .read(|agent| {
+                echo_agent::agent::AgentRunSnapshot::from_agent_with_invocation(agent, &invocation)
+            })
+            .await;
+        let names = bounded
+            .tools
+            .tools_for_llm()
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["read_artifact".to_string()],
+            "GUI选择不得把系统必需或已启用shell加入原只读正上界以外"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_product_tool_control_rejects_required_before_policy_mutation()
+    -> Result<(), String> {
+        let fixture = fixture(valid_config()?, false).await?;
+        let primary = fixture.state.connection.primary_agent();
+        primary
+            .write(|agent| {
+                if !agent.tool_names().iter().any(|name| name == "task_create") {
+                    agent.add_tool(Box::new(echo_agent::testing::MockTool::new("task_create")));
+                }
+            })
+            .await;
+        let before = fixture
+            .state
+            .tool_control
+            .snapshot()
+            .map_err(|error| error.to_string())?;
+        let rejected = fixture
+            .state
+            .set_tool_enabled(&primary, "task_create", false)
+            .await;
+        assert!(
+            matches!(rejected, Err(crate::tool_control::ToolControlError::Required { name, .. }) if name == "task_create")
+        );
+        let after = fixture
+            .state
+            .tool_control
+            .snapshot()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(before.revision, after.revision);
+        assert_eq!(before.disabled_tools, after.disabled_tools);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn product_tool_scope_rejects_stale_focus_and_keeps_original_publication_guard()
+    -> Result<(), String> {
+        let fixture = fixture(valid_config()?, false).await?;
+        assert!(
+            fixture
+                .state
+                .tool_control_runtime_for_scope("foreign", "global")
+                .await
+                .is_err()
+        );
+        assert!(
+            fixture
+                .state
+                .tool_control_runtime_for_scope("global", "stale")
+                .await
+                .is_err()
+        );
+        let (publication, _runtime) = fixture
+            .state
+            .tool_control_runtime_for_scope("global", "global")
+            .await?;
+        assert!(fixture.state.workspace.transition.try_write().is_err());
+        drop(publication);
+        assert!(fixture.state.workspace.transition.try_write().is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn tool_control_generation_reaches_loaded_and_future_workspace_agents()
     -> Result<(), String> {
         let fixture = fixture(valid_config()?, false).await?;
@@ -562,10 +734,12 @@ mod model_mutation_tests {
                 .switch_workspace(Workspace {
                     id: crate::workspace::WorkspaceId::from_name(&name),
                     name,
-                    root,
+                    root: root.clone(),
                     project_root: None,
                     kind: crate::workspace::WorkspaceKind::General,
-                    metadata: crate::workspace::WorkspaceMetadata::default(),
+                    metadata: crate::workspace::WorkspaceMetadata::new(
+                        crate::workspace::ProjectLocation::Local { path: root.clone() },
+                    ),
                     product_data_generation: String::new(),
                     created_at: Utc::now(),
                     last_active: Utc::now(),
@@ -846,6 +1020,65 @@ mod model_mutation_tests {
         let persisted = crate::config::load_config_file(&fixture.config_path)?;
         assert!(persisted.model_providers.is_empty());
         assert_no_live_generation(&fixture).await
+    }
+
+    #[tokio::test]
+    async fn depth_default_publishes_only_after_owned_config_persistence() -> Result<(), String> {
+        let next = crate::subagent_policy::SubagentDepthLimit::new(3)?;
+        for persistence_fails in [false, true] {
+            let fixture = fixture(valid_config()?, persistence_fails).await?;
+            let original_revision = fixture.state.config.configuration_snapshot().await.1;
+            let original = fixture
+                .state
+                .config
+                .app_config
+                .read()
+                .await
+                .max_subagent_depth;
+            let store = fixture
+                .state
+                .tasks
+                .runtime
+                .as_ref()
+                .ok_or_else(|| "TaskRuntime fixture missing".to_string())?;
+            assert_eq!(store.new_execution_subagent_depth(), original);
+            let result = fixture
+                .state
+                .update_app_config_owned(false, move |config| {
+                    config.max_subagent_depth = next;
+                    Ok(())
+                })
+                .await;
+            let expected = if persistence_fails {
+                assert!(matches!(result, Err(ModelMutationError::Persistence(_))));
+                original
+            } else {
+                result.map_err(|error| error.to_string())?;
+                assert_eq!(
+                    crate::config::load_config_file(&fixture.config_path)?.max_subagent_depth,
+                    next
+                );
+                next
+            };
+            assert_eq!(
+                fixture
+                    .state
+                    .config
+                    .app_config
+                    .read()
+                    .await
+                    .max_subagent_depth,
+                expected
+            );
+            assert_eq!(store.new_execution_subagent_depth(), expected);
+            let published_revision = fixture.state.config.configuration_snapshot().await.1;
+            if persistence_fails {
+                assert_eq!(published_revision, original_revision);
+            } else {
+                assert_ne!(published_revision, original_revision);
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -1756,7 +1989,7 @@ mod workspace_transition_tests {
     use super::*;
     use echo_agent::agent::ReactAgentBuilder;
     use echo_agent::llm::{ChatChunk, ChatRequest, ChatResponse, LlmClient};
-    use echo_agent::memory::{ConversationStore, FileConversationStore, StoredMessage};
+    use echo_agent::memory::{ConversationStore, FileConversationStore};
     use echo_agent::testing::MockLlmClient;
 
     /// Keep the real streaming turn open until the live delivery owns a mailbox receipt.
@@ -2188,11 +2421,17 @@ mod workspace_transition_tests {
             seed_pool: Arc::downgrade(&seed_pool),
             agent_router: router,
         };
-        let target = crate::tasks::task_runtime::TaskExecutionTarget {
+        let mut target = crate::tasks::task_runtime::TaskExecutionTarget {
             group_id: group.group_id,
             subagent_role: "explorer".to_string(),
             address: member_address,
+            project_binding: None,
         };
+        target.project_binding =
+            crate::tasks::task_runtime::TaskExecutionTargetResolver::bind_project(
+                &resolver, &target,
+            )
+            .await?;
         let lease = crate::tasks::task_runtime::TaskExecutionTargetResolver::acquire(
             &resolver, &leader, &target,
         )
@@ -2431,20 +2670,34 @@ mod workspace_transition_tests {
     }
 
     #[tokio::test]
-    async fn cold_delivery_original_cell_marks_only_its_exact_unknown_lease() -> anyhow::Result<()> {
+    async fn cold_delivery_original_cell_marks_only_its_exact_unknown_lease() -> anyhow::Result<()>
+    {
         let client = Arc::new(MockLlmClient::new().with_model_name("test-model"));
-        let agent = AgentHandle::new(ReactAgentBuilder::new().model("test-model").llm_client(client.clone()).build()?);
-        let pool = Arc::new(crate::agent_pool::AgentPool::new_for_test(agent, None, None, 2, false).await);
+        let agent = AgentHandle::new(
+            ReactAgentBuilder::new()
+                .model("test-model")
+                .llm_client(client.clone())
+                .build()?,
+        );
+        let pool =
+            Arc::new(crate::agent_pool::AgentPool::new_for_test(agent, None, None, 2, false).await);
         pool.set_llm_client_override_for_test(client).await;
         let original = pool.acquire("same-cold-target").await?;
         let ordinary = pool.acquire("same-cold-target").await?;
         let control = crate::foreground_turn::ForegroundTurnControl::default();
-        let lease = control.begin(crate::foreground_turn::ForegroundTurnSurface::Channel, "same-cold-target", "cold-original-turn")?;
+        let lease = control.begin(
+            crate::foreground_turn::ForegroundTurnSurface::Channel,
+            "same-cold-target",
+            "cold-original-turn",
+        )?;
         // Invoke the exact private binding used by deliver_agent_message_cold.
         let cell = AppState::retain_cold_delivery_execution(&lease, original);
         let (release, held) = tokio::sync::oneshot::channel();
         let backend = tokio::spawn(held);
-        lease.retain_observation(crate::chat_driver::ChatTurnError::Observation { run_id: "cold-original-run".into(), execution_id: Some("cold-original-execution".into()) });
+        lease.retain_observation(crate::chat_driver::ChatTurnError::Observation {
+            run_id: "cold-original-run".into(),
+            execution_id: Some("cold-original-execution".into()),
+        });
         drop(lease);
         {
             let normal_drain = pool.join_known_executions();
@@ -2453,14 +2706,31 @@ mod workspace_transition_tests {
         }
         assert_eq!(pool.active_execution_count(), 2);
         drop(ordinary);
-        let unknown = tokio::time::timeout(std::time::Duration::from_secs(2), pool.join_known_executions()).await?;
-        assert!(unknown.as_ref().err().is_some_and(|error| error.contains("cold-original-run")));
+        let unknown = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            pool.join_known_executions(),
+        )
+        .await?;
+        assert!(
+            unknown
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.contains("cold-original-run"))
+        );
         assert_eq!(pool.active_execution_count(), 1);
-        assert!(cell.lock().unwrap_or_else(|error| error.into_inner()).is_some());
+        assert!(
+            cell.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some()
+        );
         assert!(!backend.is_finished());
-        release.send(()).map_err(|_| anyhow::anyhow!("original cold backend vanished"))?;
+        release
+            .send(())
+            .map_err(|_| anyhow::anyhow!("original cold backend vanished"))?;
         backend.await??;
-        cell.lock().unwrap_or_else(|error| error.into_inner()).take();
+        cell.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
         assert_eq!(pool.active_execution_count(), 0);
         pool.shutdown().await.map_err(anyhow::Error::msg)?;
         Ok(())
@@ -2489,10 +2759,12 @@ mod workspace_transition_tests {
             .map_err(|error| error.to_string())?;
         let primary = ReactAgentBuilder::new()
             .llm_client(Arc::new(MockLlmClient::new().with_responses([
-                "target model preflight",
+                r#"{"intent":"FALLBACK","skill":null,"confidence":1.0}"#,
                 "target answer",
-                "source model preflight",
+                r#"{"score":9.0,"passed":true,"feedback":"Original reply verified","suggestions":[]}"#,
+                r#"{"intent":"FALLBACK","skill":null,"confidence":1.0}"#,
                 "source incorporated reply",
+                r#"{"score":9.0,"passed":true,"feedback":"Original reply verified","suggestions":[]}"#,
             ])))
             .system_prompt("Agent delivery integration test")
             .build()
@@ -2503,10 +2775,12 @@ mod workspace_transition_tests {
         );
         seed_pool
             .set_llm_client_override_for_test(Arc::new(MockLlmClient::new().with_responses([
-                "target model preflight",
+                r#"{"intent":"FALLBACK","skill":null,"confidence":1.0}"#,
                 "target answer",
-                "source model preflight",
+                r#"{"score":9.0,"passed":true,"feedback":"Original reply verified","suggestions":[]}"#,
+                r#"{"intent":"FALLBACK","skill":null,"confidence":1.0}"#,
                 "source incorporated reply",
+                r#"{"score":9.0,"passed":true,"feedback":"Original reply verified","suggestions":[]}"#,
             ])))
             .await;
         let mcp = Arc::new(crate::mcp_config_runtime::McpConfigRuntime::new(
@@ -2703,26 +2977,22 @@ mod workspace_transition_tests {
             .map_err(|error| error.to_string())?;
         let crash_instruction = render_agent_delivery_instruction(&crash_message);
         let created_at = Utc::now().to_rfc3339();
-        transcript.push(StoredMessage {
-            id: None,
-            conversation_id: target.conversation_id.clone(),
-            role: "user".to_string(),
-            content: Some(crash_instruction),
-            attachments_json: None,
-            tool_calls_json: None,
-            tool_result_json: None,
-            created_at: created_at.clone(),
-        });
-        transcript.push(StoredMessage {
-            id: None,
-            conversation_id: target.conversation_id.clone(),
-            role: "assistant".to_string(),
-            content: Some("unowned adjacent assistant text".to_string()),
-            attachments_json: None,
-            tool_calls_json: None,
-            tool_result_json: None,
-            created_at,
-        });
+        let mut crash_input = echo_agent::memory::project_message(
+            &target.conversation_id,
+            &echo_agent::llm::types::Message::user(crash_instruction),
+        )
+        .map_err(|error| error.to_string())?;
+        crash_input.created_at = created_at.clone();
+        let mut adjacent = echo_agent::memory::project_message(
+            &target.conversation_id,
+            &echo_agent::llm::types::Message::assistant(
+                "unowned adjacent assistant text".to_string(),
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        adjacent.created_at = created_at;
+        transcript.push(crash_input);
+        transcript.push(adjacent);
         let additions = transcript.split_off(transcript.len().saturating_sub(2));
         let authority = target_store
             .get_projection_authority(&target.conversation_id)
@@ -2809,13 +3079,30 @@ mod workspace_transition_tests {
         let active_agent = execution.agent();
         let active_model = Arc::new(ParkedReplyClient {
             inner: MockLlmClient::new()
-                .with_responses(["active turn draft", "active turn after steer"]),
+                .with_responses([
+                    r#"{"intent":"FALLBACK","skill":null,"confidence":1.0}"#,
+                    "active turn draft", "active turn after steer",
+                    r#"{"score":9.0,"passed":true,"feedback":"Original live reply verified","suggestions":[]}"#,
+                ]),
             entered: tokio::sync::Notify::new(),
             release: CancellationToken::new(),
         });
         active_agent
             .write(|agent| {
+                assert_eq!(
+                    agent.critic_owner(),
+                    Some(crate::infra::EKO_MODEL_CRITIC_OWNER)
+                );
                 agent.set_llm_client(active_model.clone());
+                // This fixture replaces the original transport while retaining the actual owned verifier.
+                agent.set_owned_critic(
+                    crate::infra::EKO_MODEL_CRITIC_OWNER,
+                    Arc::new(
+                        echo_agent::agent::critic::LlmCritic::new(active_model.clone())
+                            .with_pass_threshold(7.0),
+                    ),
+                );
+                crate::runtime::configure_intent_router(agent);
             })
             .await;
         let spill_dir = crate::prepared_turn::resolve_user_input_spill_dir(Some(
@@ -2929,18 +3216,61 @@ mod workspace_transition_tests {
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())?;
         assert_eq!(active_outcome, crate::chat_driver::TurnOutcome::Completed);
+        let active_calls = active_model.inner.all_calls();
+        println!(
+            "AGENT_DELIVERY_ORIGINAL_LIVE_REQUESTS:{}",
+            serde_json::json!({"calls":active_calls.len(),"formats":active_model.inner.all_response_formats(),"tool_counts":active_model.inner.all_tool_counts(),"remaining":active_model.inner.remaining()})
+        );
+        assert_eq!(active_calls.len(), 4);
+        assert_eq!(active_model.inner.remaining(), 0);
+        assert!(
+            active_calls
+                .first()
+                .is_some_and(|messages| messages.len() == 1
+                    && messages.first().is_some_and(|message| {
+                        message.text_content().is_some_and(|text| {
+                            text.starts_with("You are an intent classifier for an AI agent system.")
+                        })
+                    }))
+        );
+        assert!(
+            active_calls
+                .get(2)
+                .is_some_and(|messages| messages.iter().any(|message| {
+                    message
+                        .text_content()
+                        .is_some_and(|text| text.contains("Steer the active target turn"))
+                })),
+            "the next original model request must consume the live mailbox payload"
+        );
+        assert!(matches!(active_model.inner.all_response_formats().last(),
+            Some(Some(echo_agent::llm::ResponseFormat::JsonSchema { json_schema })) if json_schema.name == "critique_output"));
 
         let busy_execution = runtime
             .agent_for(&target.conversation_id)
             .await
             .map_err(|error| error.to_string())?;
+        let busy_model = Arc::new(MockLlmClient::new().with_responses([
+            r#"{"intent":"FALLBACK","skill":null,"confidence":1.0}"#,
+            "processed after busy turn",
+            r#"{"score":9.0,"passed":true,"feedback":"Original FIFO reply verified","suggestions":[]}"#,
+        ]));
         busy_execution
             .agent()
             .write(|agent| {
-                agent.set_llm_client(Arc::new(
-                    MockLlmClient::new()
-                        .with_responses(["busy turn preflight", "processed after busy turn"]),
-                ));
+                assert_eq!(
+                    agent.critic_owner(),
+                    Some(crate::infra::EKO_MODEL_CRITIC_OWNER)
+                );
+                agent.set_llm_client(busy_model.clone());
+                agent.set_owned_critic(
+                    crate::infra::EKO_MODEL_CRITIC_OWNER,
+                    Arc::new(
+                        echo_agent::agent::critic::LlmCritic::new(busy_model.clone())
+                            .with_pass_threshold(7.0),
+                    ),
+                );
+                crate::runtime::configure_intent_router(agent);
             })
             .await;
         drop(busy_execution);
@@ -3019,6 +3349,15 @@ mod workspace_transition_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         };
         assert!(resumed_record.attempt >= 2);
+        println!(
+            "AGENT_DELIVERY_ORIGINAL_FIFO_REQUESTS:{}",
+            serde_json::json!({"calls":busy_model.call_count(),"formats":busy_model.all_response_formats(),"tool_counts":busy_model.all_tool_counts(),"remaining":busy_model.remaining()})
+        );
+        assert_eq!(busy_model.call_count(), 3);
+        assert_eq!(busy_model.remaining(), 0);
+        assert!(matches!(busy_model.all_response_formats().last(),
+            Some(Some(echo_agent::llm::ResponseFormat::JsonSchema { json_schema })) if json_schema.name == "critique_output"));
+
         state
             .shutdown_agent_deliveries()
             .await
@@ -3036,10 +3375,12 @@ mod workspace_transition_tests {
         Workspace {
             id: crate::workspace::WorkspaceId::from_name(name),
             name: name.to_string(),
-            root,
+            root: root.clone(),
             project_root: None,
             kind: crate::workspace::WorkspaceKind::General,
-            metadata: crate::workspace::WorkspaceMetadata::default(),
+            metadata: crate::workspace::WorkspaceMetadata::new(
+                crate::workspace::ProjectLocation::Local { path: root.clone() },
+            ),
             product_data_generation: String::new(),
             created_at: Utc::now(),
             last_active: Utc::now(),
@@ -3136,6 +3477,89 @@ mod workspace_transition_tests {
         state.agent_router = Arc::new(crate::agent_router::AgentRouter::new(root.join("router")));
         state.set_pool(Arc::clone(&seed_pool));
         Ok((Arc::new(state), seed_pool, plugin_runtime))
+    }
+
+    #[tokio::test]
+    async fn reply_fork_native_switch_rejects_recreated_target_before_source_projection_changes()
+    -> Result<(), String> {
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let (state, _pool, _plugins) = extension_control_state(temporary.path()).await?;
+        let source = state
+            .workspace
+            .registry
+            .create_at(
+                "source",
+                crate::workspace::WorkspaceKind::General,
+                temporary.path().join("source"),
+            )
+            .map_err(|error| error.to_string())?;
+        state
+            .switch_workspace_registered(source.id.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        let old = state
+            .workspace
+            .registry
+            .create_at(
+                "target",
+                crate::workspace::WorkspaceKind::General,
+                temporary.path().join("old-target"),
+            )
+            .map_err(|error| error.to_string())?;
+        let expected = old.opaque_product_data_generation();
+        let transition = state.workspace.transition.write().await;
+        let pending_state = state.clone();
+        let target_id = old.id.clone();
+        let pending = tokio::spawn(async move {
+            pending_state
+                .switch_workspace_registered_with_connection(target_id, None, Some(expected))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!pending.is_finished());
+        state
+            .workspace
+            .registry
+            .delete(&old.id)
+            .map_err(|error| error.to_string())?;
+        let current = state
+            .workspace
+            .registry
+            .create_at(
+                "target",
+                crate::workspace::WorkspaceKind::General,
+                temporary.path().join("new-target"),
+            )
+            .map_err(|error| error.to_string())?;
+        assert_ne!(
+            current.opaque_product_data_generation(),
+            old.opaque_product_data_generation()
+        );
+        drop(transition);
+        assert!(pending.await.map_err(|error| error.to_string())?.is_err());
+        assert_eq!(
+            state
+                .current_workspace()
+                .await
+                .map(|workspace| workspace.id),
+            Some(source.id)
+        );
+        state
+            .switch_workspace_registered_with_connection(
+                current.id.clone(),
+                None,
+                Some(current.opaque_product_data_generation()),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            state
+                .current_workspace()
+                .await
+                .map(|workspace| workspace.id),
+            Some(current.id)
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -3924,17 +4348,16 @@ mod workspace_transition_tests {
             ("assistant", "internal result"),
         ]
         .into_iter()
-        .map(|(role, content)| echo_agent::memory::StoredMessage {
-            id: None,
-            conversation_id: "move-hidden".to_string(),
-            role: role.to_string(),
-            content: Some(content.to_string()),
-            attachments_json: None,
-            tool_calls_json: None,
-            tool_result_json: None,
-            created_at: Utc::now().to_rfc3339(),
+        .map(|(role, content)| {
+            let message = if role == "user" {
+                echo_agent::llm::types::Message::user(content.to_string())
+            } else {
+                echo_agent::llm::types::Message::assistant(content.to_string())
+            };
+            echo_agent::memory::project_message("move-hidden", &message)
+                .map_err(|error| error.to_string())
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, String>>()?;
         source_store
             .save_messages("move-hidden", &rows)
             .await
@@ -3983,7 +4406,7 @@ mod workspace_transition_tests {
             .deletions
             .install_before_lineage_barrier(entered_tx, release_rx);
         let handoff_state = Arc::clone(&state);
-        let handoff = tokio::spawn(async move {
+        let mut handoff = tokio::spawn(async move {
             let operation = AppStateAgentControlOps::new(&handoff_state);
             crate::agent_control::AgentControlAppOps::handoff_conversation(
                 &operation,
@@ -3996,10 +4419,18 @@ mod workspace_transition_tests {
             )
             .await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(10), entered_rx)
-            .await
-            .map_err(|_| "source retirement did not reach its lineage barrier".to_string())?
-            .map_err(|error| error.to_string())?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                entered = entered_rx => entered.map_err(|error| error.to_string()),
+                result = &mut handoff => Err(match result {
+                    Ok(Err(error)) => format!("handoff failed before the source lineage barrier: {error}"),
+                    Ok(Ok(_)) => "handoff completed without the source lineage barrier".to_string(),
+                    Err(error) => format!("handoff task failed before the source lineage barrier: {error}"),
+                }),
+            }
+        })
+        .await
+        .map_err(|_| "source retirement did not reach its lineage barrier".to_string())??;
         assert!(
             state
                 .session
@@ -4611,6 +5042,16 @@ mod workspace_transition_tests {
             0,
             &instruction,
         )?;
+        let mut prepared =
+            crate::prepared_turn::PreparedUserTurn::runtime_instruction(instruction.clone());
+        prepared
+            .bind_agent_input(
+                &delivery,
+                &temp.path().join("typed-recovery"),
+                "primary",
+                "turn-recovery",
+            )
+            .map_err(|error| error.to_string())?;
         store
             .apply_transcript_projection(
                 echo_agent::memory::TranscriptProjectionBatch::prepare(
@@ -4619,26 +5060,16 @@ mod workspace_transition_tests {
                     "primary",
                     0,
                     vec![
-                        echo_agent::memory::StoredMessage {
-                            id: None,
-                            conversation_id: "primary".to_string(),
-                            role: "user".to_string(),
-                            content: Some(instruction),
-                            attachments_json: None,
-                            tool_calls_json: None,
-                            tool_result_json: None,
-                            created_at: Utc::now().to_rfc3339(),
-                        },
-                        echo_agent::memory::StoredMessage {
-                            id: None,
-                            conversation_id: "primary".to_string(),
-                            role: "assistant".to_string(),
-                            content: Some("acknowledged".to_string()),
-                            attachments_json: None,
-                            tool_calls_json: None,
-                            tool_result_json: None,
-                            created_at: Utc::now().to_rfc3339(),
-                        },
+                        echo_agent::memory::project_message(
+                            "primary",
+                            &prepared.to_message().map_err(|error| error.to_string())?,
+                        )
+                        .map_err(|error| error.to_string())?,
+                        echo_agent::memory::project_message(
+                            "primary",
+                            &echo_agent::llm::types::Message::assistant("acknowledged".to_string()),
+                        )
+                        .map_err(|error| error.to_string())?,
                     ],
                 )
                 .map_err(|error| error.to_string())?,
@@ -4860,6 +5291,154 @@ mod workspace_transition_tests {
         .map_err(|error| error.to_string())?;
         // ADR 0041:首次加载只创建空配置，不隐式启用任何产品内置 Skill。
         assert!(enabled.skills.is_empty());
+        Ok(())
+    }
+
+    async fn relinked_task_control_fixture(
+        root: &std::path::Path,
+    ) -> Result<
+        (Arc<AppState>, crate::workspace::WorkspaceId, String, String),
+        Box<dyn std::error::Error>,
+    > {
+        let first_root = root.join("project-before");
+        let next_root = root.join("project-after");
+        std::fs::create_dir_all(&first_root)?;
+        std::fs::create_dir_all(&next_root)?;
+        let (state, _, _) = extension_control_state(root).await?;
+        let workspace = state.workspace.registry.create_at(
+            "generation-control",
+            crate::workspace::WorkspaceKind::General,
+            first_root,
+        )?;
+        let id = workspace.id.clone();
+        state.switch_workspace(workspace).await?;
+        let old_control = state.workspace_control_for_scope(id.as_str()).await?;
+        let old_generation = old_control.generation();
+        let old_store = old_control
+            .runtime()
+            .task_runtime()
+            .ok_or("old task runtime missing")?;
+        old_store.create_run(
+            "same-run",
+            id.as_str(),
+            "conversation",
+            "root",
+            crate::tasks::task_runtime::DomainProfile::General,
+            "preserve captured project",
+            "agent_task_plan",
+            crate::tasks::task_runtime::AttendedMode::Attended,
+        )?;
+        drop(old_store);
+        drop(old_control);
+        state.link_workspace_project_owned(&id, next_root).await?;
+        let current = state.workspace_control_for_scope(id.as_str()).await?;
+        let current_generation = current.generation();
+        assert_ne!(old_generation, current_generation);
+        let store = current
+            .runtime()
+            .task_runtime()
+            .ok_or("new task runtime missing")?;
+        store.transition_run(
+            "same-run",
+            crate::tasks::task_runtime::TaskRunStatus::Running,
+        )?;
+        drop(store);
+        drop(current);
+        Ok((state, id, old_generation, current_generation))
+    }
+
+    #[tokio::test]
+    async fn task_control_generation_rejects_relinked_workspace_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let (state, id, old_generation, current_generation) =
+            relinked_task_control_fixture(temp.path()).await?;
+        let current = state
+            .workspace_control_for_generation(id.as_str(), &current_generation)
+            .await?;
+        let store = current
+            .runtime()
+            .task_runtime()
+            .ok_or("new task runtime missing")?;
+        let before = store.get_run_state("same-run")?.ok_or("new run missing")?;
+        // These commands all use this production helper before mutation or launch.
+        for action in [
+            "pause", "cancel", "resume", "retry", "goal", "budget", "graph", "recovery", "skip",
+        ] {
+            let rejected = state
+                .workspace_control_for_generation(id.as_str(), &old_generation)
+                .await;
+            assert!(
+                rejected.is_err(),
+                "late {action} accepted a replacement generation"
+            );
+            let unchanged = store.get_run_state("same-run")?.ok_or("run disappeared")?;
+            assert_eq!(unchanged.journal_sequence, before.journal_sequence);
+            assert_eq!(unchanged.run.status, before.run.status);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_control_generation_current_token_mutates_the_captured_store()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let (state, id, _, generation) = relinked_task_control_fixture(temp.path()).await?;
+        let checked = state
+            .workspace_control_for_generation(id.as_str(), &generation)
+            .await?;
+        let store = checked
+            .runtime()
+            .task_runtime()
+            .ok_or("checked runtime missing")?;
+        let before = store
+            .get_run_state("same-run")?
+            .ok_or("running snapshot missing")?
+            .journal_sequence;
+        assert!(store.request_pause("same-run")?);
+        assert_eq!(
+            store
+                .get_run("same-run")?
+                .ok_or("paused run missing")?
+                .status,
+            crate::tasks::task_runtime::TaskRunStatus::Paused
+        );
+        assert!(
+            store
+                .get_run_state("same-run")?
+                .ok_or("paused snapshot missing")?
+                .journal_sequence
+                > before
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_control_generation_retains_its_original_control_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let (state, id, _, generation) = relinked_task_control_fixture(temp.path()).await?;
+        let checked = state
+            .workspace_control_for_generation(id.as_str(), &generation)
+            .await?;
+        let pinned_runtime = checked.runtime().clone();
+        drop(checked);
+        // The returned runtime clone still owns the original lease used by every command.
+        assert!(
+            state
+                .evict_workspace_runtime_if_idle_for_test(&id)
+                .await
+                .is_err_and(|error| error.to_string().contains("controls: 1"))
+        );
+        let store = pinned_runtime
+            .task_runtime()
+            .ok_or("pinned runtime missing")?;
+        assert!(store.request_pause("same-run")?);
+        drop(store);
+        drop(pinned_runtime);
+        // Once the captured operation releases its runtime clone, the original
+        // lifecycle may complete the same eviction path.
+        assert!(state.evict_workspace_runtime_if_idle_for_test(&id).await?);
         Ok(())
     }
 
@@ -5379,6 +5958,7 @@ mod workspace_transition_tests {
         );
         let linked_project = temp.path().join("workspace-b-project");
         std::fs::create_dir_all(&linked_project).map_err(|error| error.to_string())?;
+        std::fs::create_dir(linked_project.join(".git")).map_err(|error| error.to_string())?;
         std::fs::write(linked_project.join("same.txt"), "same bytes")
             .map_err(|error| error.to_string())?;
         let linked_skill = linked_project.join(".eko/skills/linked-review");
@@ -5421,7 +6001,7 @@ mod workspace_transition_tests {
             .map_err(|error| error.to_string())?;
         assert_eq!(
             execution_b.agent().read(|agent| agent.working_dir()).await,
-            Some(canonical_b.clone())
+            Some(canonical_linked_project.clone())
         );
         assert!(
             execution_b
@@ -5992,6 +6572,7 @@ mod service_bootstrap_tests {
             .map_err(|error| error.to_string())?;
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
                 plan_id: "healthy-plan".to_string(),
                 run_id: "healthy-global-run".to_string(),
                 revision: 1,
@@ -6183,6 +6764,312 @@ mod service_bootstrap_tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn generation_pending_reconnect_rejects_second_queued_candidate() -> anyhow::Result<()> {
+        use crate::workspace::{ProjectLocation, WorkspaceKind};
+        let directory = tempfile::tempdir()?;
+        let state = Arc::new(
+            boot_recovery_state(&directory.path().join("registry")).map_err(anyhow::Error::msg)?,
+        );
+        let location = ProjectLocation::Ssh {
+            host: "fixture.invalid".into(),
+            user: Some("fixture".into()),
+            port: Some(22),
+            path: "/fixture-remote".into(),
+        };
+        let target = state.workspace.registry.create_project(
+            "queued-generation-target",
+            WorkspaceKind::General,
+            location.clone(),
+            Some(location),
+        )?;
+        let original = state
+            .terminal
+            .test_install_project_generation("queued-original", 0, "original")
+            .await
+            .map_err(anyhow::Error::msg)?;
+        state
+            .terminal
+            .reassign_project_ssh_checked("queued-original", target.id.as_str(), &original)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let a = state
+            .terminal
+            .test_install_project_generation("queued-draft-a", 0, "a")
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let _b = state
+            .terminal
+            .test_install_project_generation("queued-draft-b", 0, "b")
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let focus = state
+            .workspace
+            .registry
+            .create("blocked-focus", WorkspaceKind::General)?;
+        let (entered, release) = state
+            .park_next_workspace_transition()
+            .map_err(anyhow::Error::msg)?;
+        let blocking = state
+            .run_owned_workspace_transition(WorkspaceTransitionRequest::Switch(Box::new(focus)));
+        tokio::pin!(blocking);
+        assert!(matches!(
+            futures::poll!(blocking.as_mut()),
+            std::task::Poll::Pending
+        ));
+        entered.await?;
+        let first = state.reconnect_workspace_project_owned(
+            target.id.clone(),
+            "queued-draft-a".into(),
+            Some(target.product_data_generation.clone()),
+        );
+        let second = state.reconnect_workspace_project_owned(
+            target.id.clone(),
+            "queued-draft-b".into(),
+            Some(target.product_data_generation.clone()),
+        );
+        tokio::pin!(first, second);
+        // 确认两个原入口都已实际入队，不能用sleep或仅“准备spawn”冒并发证据。
+        assert!(matches!(
+            futures::poll!(first.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(matches!(
+            futures::poll!(second.as_mut()),
+            std::task::Poll::Pending
+        ));
+        release
+            .send(())
+            .map_err(|_| anyhow::anyhow!("blocking transition vanished"))?;
+        let (focused, first_result, second_result) = tokio::join!(blocking, first, second);
+        let active = state
+            .terminal
+            .project_ssh(target.id.as_str())
+            .map_err(anyhow::Error::msg)?;
+        let second_kept = state.terminal.project_ssh("queued-draft-b").is_ok();
+        state
+            .terminal
+            .close_project_ssh(target.id.as_str())
+            .await
+            .map_err(anyhow::Error::msg)?;
+        state
+            .terminal
+            .close_project_ssh("queued-draft-a")
+            .await
+            .map_err(anyhow::Error::msg)?;
+        state
+            .terminal
+            .close_project_ssh("queued-draft-b")
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert!(focused.is_ok());
+        assert!(
+            first_result.is_ok(),
+            "first candidate failed: {first_result:?}"
+        );
+        assert!(
+            second_result.is_err(),
+            "queued candidate captured after first publication: {second_result:?}"
+        );
+        assert!(Arc::ptr_eq(&active, &a) && second_kept);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn generation_workspace_reconnect_preserves_host_store_and_old_unknown_guards()
+    -> anyhow::Result<()> {
+        use crate::workspace::{ProjectLocation, WorkspaceKind};
+        use echo_agent::sandbox::SandboxCommand;
+        let directory = tempfile::tempdir()?;
+        let state =
+            boot_recovery_state(&directory.path().join("registry")).map_err(anyhow::Error::msg)?;
+        let location = ProjectLocation::Ssh {
+            host: "fixture.invalid".into(),
+            user: Some("fixture".into()),
+            port: Some(22),
+            path: "/fixture-remote".into(),
+        };
+        let workspace = state.workspace.registry.create_project(
+            "generation-workspace",
+            WorkspaceKind::General,
+            location.clone(),
+            Some(location),
+        )?;
+        let original = state
+            .terminal
+            .test_install_project_generation("workspace-original-auth", 255, "original")
+            .await
+            .map_err(anyhow::Error::msg)?;
+        state
+            .terminal
+            .reassign_project_ssh_checked(
+                "workspace-original-auth",
+                workspace.id.as_str(),
+                &original,
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let (files, executor) = state
+            .terminal
+            .project_ssh_adapters(workspace.id.as_str(), "/fixture-remote".into())
+            .map_err(anyhow::Error::msg)?;
+        // 仅替换认证/目录验证的外部事实，Host及全部本机store走生产构造路径。
+        let host = state
+            .workspace
+            .runtimes
+            .test_bind_verified_project(
+                workspace.clone(),
+                (std::path::PathBuf::from("/fixture-remote"), files, executor),
+            )
+            .await?;
+        *state.workspace.current.write().await = Some(host.clone());
+        let store = host.task_runtime().await?;
+        let resources = state
+            .project_resources_for_workspace(
+                workspace.id.as_str(),
+                &workspace.product_data_generation,
+            )
+            .await?;
+        let original_files = resources.files.clone();
+        let original_executor = resources.executor.clone();
+        let failed = resources
+            .executor
+            .execute(
+                SandboxCommand::program("fixture-control", Vec::new())
+                    .with_working_dir(&resources.working_dir)
+                    .with_timeout(std::time::Duration::from_secs(1))
+                    .with_resource_guards(vec![echo_agent::tools::InvocationResourceGuard::new(
+                        resources.lifetime.clone(),
+                    )]),
+            )
+            .await;
+        drop(resources);
+        assert!(failed.is_err());
+        assert!(
+            state
+                .ensure_workspace_idle_for_delete(&workspace.id)
+                .await
+                .is_err(),
+            "old native fixture still holds its original Workspace guard"
+        );
+        state
+            .terminal
+            .test_disconnect_original_master(&original)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let draft = state
+            .terminal
+            .test_install_project_generation(
+                "workspace-successor-auth",
+                0,
+                "new target observation",
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let wrong = state
+            .reconnect_workspace_project_with_verifier(
+                &workspace.id,
+                "workspace-successor-auth",
+                Some(&workspace.product_data_generation),
+                Some(original.clone()),
+                |_, _, _| async { Ok("/different-directory".to_string()) },
+            )
+            .await;
+        assert!(wrong.is_err());
+        assert!(Arc::ptr_eq(
+            &state
+                .terminal
+                .project_ssh(workspace.id.as_str())
+                .map_err(anyhow::Error::msg)?,
+            &original
+        ));
+        let stale = state
+            .reconnect_workspace_project_with_verifier(
+                &workspace.id,
+                "workspace-successor-auth",
+                Some("stale-product-generation"),
+                Some(original.clone()),
+                |_, _, _| async { Err("verification must not be reached".to_string()) },
+            )
+            .await;
+        assert!(stale.is_err());
+        state
+            .reconnect_workspace_project_with_verifier(
+                &workspace.id,
+                "workspace-successor-auth",
+                Some(&workspace.product_data_generation),
+                Some(original.clone()),
+                |connection, target, path| async move {
+                    connection.verify_effective_target(&target)?;
+                    Ok(path)
+                },
+            )
+            .await?;
+        let current_host = state
+            .workspace
+            .runtimes
+            .loaded_host(&workspace.id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Host disappeared"))?;
+        assert!(Arc::ptr_eq(&host, &current_host));
+        assert!(Arc::ptr_eq(&store, &current_host.task_runtime().await?));
+        let current = state
+            .project_resources_for_workspace(
+                workspace.id.as_str(),
+                &workspace.product_data_generation,
+            )
+            .await?;
+        assert!(Arc::ptr_eq(&original_files, &current.files));
+        assert!(Arc::ptr_eq(&original_executor, &current.executor));
+        let observed = original_executor
+            .execute(
+                SandboxCommand::program("fixture-query", Vec::new())
+                    .with_working_dir("/fixture-remote")
+                    .with_timeout(std::time::Duration::from_secs(1)),
+            )
+            .await?;
+        assert_eq!(observed.stdout, "new target observation");
+        assert!(Arc::ptr_eq(
+            &state
+                .terminal
+                .project_ssh(workspace.id.as_str())
+                .map_err(anyhow::Error::msg)?,
+            &draft
+        ));
+        assert!(
+            state
+                .terminal
+                .project_ssh_uncertainty(workspace.id.as_str())
+                .is_some()
+        );
+        drop(current);
+        assert!(
+            state
+                .ensure_workspace_idle_for_delete(&workspace.id)
+                .await
+                .is_err(),
+            "successful new query must not clear old unknown or guard"
+        );
+        state
+            .terminal
+            .test_settle_local_unknown(&original)
+            .map_err(anyhow::Error::msg)?;
+        state
+            .terminal
+            .close_project_ssh(workspace.id.as_str())
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert!(
+            state
+                .ensure_workspace_idle_for_delete(&workspace.id)
+                .await
+                .is_ok()
+        );
+        Ok(())
+    }
+
     /// Boot-recovery AppState with an isolated workspace registry so the scan
     /// never touches the developer's real workspaces.
     fn boot_recovery_state(registry_root: &std::path::Path) -> Result<AppState, String> {
@@ -6241,6 +7128,7 @@ mod service_bootstrap_tests {
             .map_err(|error| error.to_string())?;
         store
             .attach_plan_for_test(&TaskPlan {
+                domain_binding: None,
                 plan_id: format!("{run_id}-plan"),
                 run_id: run_id.to_string(),
                 revision: 1,
@@ -6361,11 +7249,16 @@ mod service_bootstrap_tests {
             .await
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string());
-        assert!(observed.is_err(), "the driver must report the unsettled owner");
+        assert!(
+            observed.is_err(),
+            "the driver must report the unsettled owner"
+        );
         assert!(store.has_unsettled_driver_resources());
         // R1: the fence leaves the run Running and recovery settles nothing.
         assert_eq!(
-            store.recover_incomplete().map_err(|error| error.to_string())?,
+            store
+                .recover_incomplete()
+                .map_err(|error| error.to_string())?,
             0
         );
         assert_eq!(
@@ -6460,6 +7353,8 @@ mod permission_rule_tests {
         );
         let handle = runner.clone().spawn();
         let scheduler = SchedulerState {
+            #[cfg(feature = "channels")]
+            weixin_notifications: Arc::new(crate::weixin_cron::WeixinCronBinding::default()),
             runner: Some(runner),
             cancel_token,
             handle: Mutex::new(Some(handle)),

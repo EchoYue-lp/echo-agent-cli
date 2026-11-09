@@ -94,7 +94,7 @@ impl ContinuationLauncher {
                 sink,
                 webhook_emitter: self.resources.webhook_emitter.clone(),
                 conv_id: self.resources.conv_id.clone(),
-                root_message_id: String::new(),
+                root_message_id: self.resources.root_message_id.clone(),
                 attachments: self.resources.attachments.clone(),
                 cancel: CancellationToken::new(),
                 review_integration: self.resources.review_integration.clone(),
@@ -188,7 +188,7 @@ impl TaskContinuationRuntime {
         resources: Arc<ChatResources>,
         root_message_id: String,
         foreground: Option<crate::foreground_turn::ForegroundTurnProgress>,
-    ) {
+    ) -> ContinuationGenerationCut {
         // A launcher never retains a workspace generation. While a foreground
         // chain is active it carries only the non-owning progress capability;
         // deferred launchers replace that capability and renderer atomically.
@@ -204,7 +204,7 @@ impl TaskContinuationRuntime {
             sink: retained_sink,
             webhook_emitter: resources.webhook_emitter.clone(),
             conv_id: resources.conv_id.clone(),
-            root_message_id: String::new(),
+            root_message_id: resources.root_message_id.clone(),
             attachments: resources.attachments.clone(),
             cancel: CancellationToken::new(),
             review_integration: resources.review_integration.clone(),
@@ -229,6 +229,12 @@ impl TaskContinuationRuntime {
                 },
             },
         );
+        // 注册和回执在同一锁内完成，后继注册不能被旧回合的清理接管。
+        ContinuationGenerationCut {
+            launcher: Some(generation),
+            active: None,
+            owned: None,
+        }
     }
 
     fn request(self: &Arc<Self>, run_id: &str, origin: RunTurnOrigin) -> ContinueRequestOutcome {
@@ -566,6 +572,8 @@ impl TaskContinuationRuntime {
 
             let turn_id = uuid::Uuid::new_v4().to_string();
             let binding = RunTurnBinding {
+                domain_plugin: None,
+
                 run_id: Some(run_id.clone()),
                 turn_id: turn_id.clone(),
                 root_message_id: launcher.root_message_id.clone(),
@@ -906,6 +914,14 @@ impl TaskContinuationRuntime {
     }
 }
 
+/// 自动续接的输入指令：只指向权威 TaskRuntime 投影，不复制第二份 Goal、
+/// 总结或完成规则，也不重放用户原文。测试复用同一措辞，避免测试与生产漂移。
+pub(crate) fn continuation_turn_instruction(run_id: &str) -> String {
+    format!(
+        "Continue the existing TaskRun {run_id} toward its unchanged Goal. Reload the authoritative TaskRuntime projection, execute the next useful work, and use task_execute for the current revision when ready. This is internal continuation context, not a new user request."
+    )
+}
+
 async fn drive_continuation_turn(
     launcher: ContinuationLauncher,
     store: Arc<TaskRuntimeStore>,
@@ -913,7 +929,6 @@ async fn drive_continuation_turn(
     binding: RunTurnBinding,
     cancel: CancellationToken,
 ) -> Result<crate::chat_driver::RunTurnDriveOutcome, crate::chat_driver::ChatTurnError> {
-    let turn_id = binding.turn_id.clone();
     let resources = Arc::new(ChatResources {
         execution_scope: launcher.resources.execution_scope.clone(),
         workspace_io_receipt: launcher.resources.workspace_io_receipt.clone(),
@@ -922,7 +937,7 @@ async fn drive_continuation_turn(
         sink: launcher.resources.sink.clone(),
         webhook_emitter: launcher.resources.webhook_emitter.clone(),
         conv_id: launcher.resources.conv_id.clone(),
-        root_message_id: turn_id,
+        root_message_id: launcher.resources.root_message_id.clone(),
         attachments: launcher.resources.attachments.clone(),
         cancel,
         review_integration: launcher.resources.review_integration.clone(),
@@ -931,9 +946,7 @@ async fn drive_continuation_turn(
     });
     let progress = launcher.foreground.clone();
     let execute = move |resources: Arc<ChatResources>| async move {
-        let turn = PreparedUserTurn::runtime_instruction(format!(
-            "Continue the existing TaskRun {run_id} toward its unchanged Goal. Reload the authoritative TaskRuntime projection, execute the next useful work, and use task_execute for the current revision when ready. This is internal continuation context, not a new user request."
-        ));
+        let turn = PreparedUserTurn::runtime_instruction(continuation_turn_instruction(&run_id));
         let human_loop_provider = resources.human_loop_provider.clone();
         if let Some(pool) = resources.pool.clone() {
             let pool_key = resources
@@ -1250,14 +1263,14 @@ pub(crate) fn register_launcher(
     resources: Arc<ChatResources>,
     root_message_id: String,
     foreground: Option<crate::foreground_turn::ForegroundTurnProgress>,
-) {
+) -> ContinuationGenerationCut {
     runtime_for(store).register_launcher(
         run_id,
         fallback_agent,
         resources,
         root_message_id,
         foreground,
-    );
+    )
 }
 
 pub(crate) fn request_continue(
@@ -1337,6 +1350,438 @@ pub(crate) fn wake_deferred_when_runtime_quiet(store: &Arc<TaskRuntimeStore>, ru
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 先修三处launcher根身份与driver header，再把此case作为独立surface结果RED。
+    #[tokio::test]
+    async fn channel_foreground_completed_retry_returns_completed_without_erasing_first_failure()
+    -> anyhow::Result<()> {
+        use super::super::types::RuntimeEventKind;
+        use crate::chat_driver::{ChatDriverEvent, TurnOutcome};
+        use crate::chat_event_log::{
+            ChatEventLog, ChatEventRetention, ChatSurface, bind_surface_chat_sink,
+        };
+        use crate::foreground_turn::{
+            ForegroundTurnControl, ForegroundTurnSurface, drive_foreground_chat,
+        };
+        use echo_agent::agent::{AgentConfig, AgentEvent, ExecutionStatusKind, ReactAgent};
+
+        let directory = tempfile::tempdir()?;
+        let execution_scope = test_execution_scope();
+        let workspace_id = execution_scope.workspace_id().to_string();
+        let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+        let _resource_scope = store.test_resource_scope();
+        store
+            .rebind_shadow_root(directory.path().join("tasks"), workspace_id.clone())
+            .await?;
+        let root_message = "foreground-retry-surface-root";
+        let conversation = "channel:foreground-retry-history";
+        let run_id = super::super::task_tools::formal_run_id_for_turn(root_message);
+        let log = Arc::new(ChatEventLog::open(
+            directory.path().join("chat-events"),
+            ChatEventRetention::default(),
+        )?);
+        let sink = bind_surface_chat_sink(
+            ChatSurface::Channel,
+            Arc::new(DetachedContinuationSink),
+            log.clone(),
+            Arc::new(crate::tool_execution::ToolExecutionRepository::open(
+                directory.path().join("tools"),
+            )?),
+            workspace_id.clone(),
+            Some(conversation.to_string()),
+            root_message,
+        );
+        let model = Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .with_network_error("original foreground retry transport failure")
+                .with_response("前台真实续接完成后的回答。"),
+        );
+        let mut raw = ReactAgent::new(
+            AgentConfig::minimal("foreground-retry", "foreground-retry").llm_max_retries(0),
+        );
+        raw.set_llm_client(model.clone());
+        let agent = AgentHandle::new(raw);
+        let foreground = ForegroundTurnControl::default();
+        let lease = foreground.begin_scoped(
+            workspace_id.clone(),
+            ForegroundTurnSurface::Channel,
+            conversation,
+            root_message,
+        )?;
+        let cancel = lease.cancellation_token();
+        let resources = Arc::new(ChatResources {
+            execution_scope,
+            workspace_io_receipt: None,
+            pool: None,
+            store: Some(store.clone()),
+            sink,
+            webhook_emitter: None,
+            conv_id: Some(conversation.to_string()),
+            root_message_id: root_message.to_string(),
+            attachments: Vec::new(),
+            cancel: cancel.clone(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let input = PreparedUserTurn {
+            instruction: "经真实Channel前台owner等待原任务续接完成".into(),
+            resources: Vec::new(),
+            authorship: crate::prepared_turn::InstructionAuthorship::User,
+            agent_input: None,
+        };
+        // 原foreground入口自己wait原completion；不手工drive有限turn、不换launcher资源。
+        let outer = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            drive_foreground_chat(lease, &agent, &input, resources),
+        )
+        .await??;
+        // 先核真正的恢复成功及原记录，防未修root的断流RED冒充下方overlay RED。
+        let state = store
+            .get_run_state(&run_id)?
+            .ok_or_else(|| anyhow::anyhow!("原TaskRun丢失"))?;
+        assert_eq!(
+            state.run.status,
+            TaskRunStatus::Completed,
+            "此独立控制须先通过root/header修复"
+        );
+        assert_eq!(model.call_count(), 2);
+        let facts = store.list_events(&run_id, 0)?;
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact.event_type == RuntimeEventKind::RunProviderRetryScheduled)
+        );
+        assert!(
+            !facts
+                .iter()
+                .any(|fact| fact.event_type == RuntimeEventKind::RunCancelled)
+        );
+        let finished = facts
+            .iter()
+            .filter(|fact| fact.event_type == RuntimeEventKind::RunTurnFinished)
+            .collect::<Vec<_>>();
+        assert_eq!(finished.len(), 2);
+        let first = finished
+            .iter()
+            .find(|fact| {
+                fact.payload
+                    .get("turn_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(root_message)
+            })
+            .ok_or_else(|| anyhow::anyhow!("首有限turn原记录缺失"))?;
+        assert_eq!(
+            first
+                .payload
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("failed")
+        );
+        let first_failure: echo_agent::error::AgentFailure = serde_json::from_value(
+            first
+                .payload
+                .get("agent_failure")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("首typed failure缺失"))?,
+        )?;
+        assert_eq!(first_failure.code, "llm_network");
+        assert_eq!(
+            first_failure.category,
+            echo_agent::error::AgentFailureCategory::Llm
+        );
+        assert!(first_failure.retryable);
+        let replay = log.replay(&workspace_id, Some(conversation), root_message, 0)?;
+        assert!(!replay.truncated);
+        let mut statuses = std::collections::BTreeMap::<String, Vec<ExecutionStatusKind>>::new();
+        let mut original_failure_seen = false;
+        for event in &replay.events {
+            assert_eq!(event.root_turn_id, root_message);
+            assert_eq!(event.message_id, root_message);
+            if let ChatDriverEvent::Agent(envelope) = &event.payload {
+                assert_eq!(
+                    envelope.message_id.as_ref().map(|id| id.as_str()),
+                    Some(root_message)
+                );
+                if let AgentEvent::ExecutionStatus(status) = &envelope.payload {
+                    assert!(!status.adapter_generated);
+                    assert_eq!(
+                        envelope.execution_id.as_ref().map(|id| id.as_str()),
+                        Some(status.execution_id.as_str())
+                    );
+                    assert_ne!(status.status, ExecutionStatusKind::Cancelled);
+                    statuses
+                        .entry(envelope.turn_id.as_str().to_string())
+                        .or_default()
+                        .push(status.status.clone());
+                }
+                if let AgentEvent::Error { failure, .. } = &envelope.payload {
+                    assert_ne!(failure.code, "downstream_disconnect");
+                    if envelope.turn_id.as_str() == root_message {
+                        assert_eq!(failure, &first_failure);
+                        original_failure_seen = true;
+                    }
+                }
+            }
+        }
+        assert!(original_failure_seen);
+        assert_eq!(statuses.len(), 2, "必须有同root但不同有限turn的原生轨迹");
+        for (turn, actual) in &statuses {
+            assert_eq!(actual.first(), Some(&ExecutionStatusKind::Started));
+            let terminal = if turn == root_message {
+                ExecutionStatusKind::Failed
+            } else {
+                ExecutionStatusKind::Settled
+            };
+            assert_eq!(actual.last(), Some(&terminal));
+        }
+        assert!(statuses.contains_key(root_message));
+        assert!(!cancel.is_cancelled());
+        assert!(
+            foreground
+                .snapshot_scoped(&workspace_id, ForegroundTurnSurface::Channel, conversation)
+                .is_none()
+        );
+        store
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        // 这才是独立RED：实际Run与后继都成功，但旧overlay仍返回首Failed给channel Terminal。
+        assert_eq!(
+            outer,
+            TurnOutcome::Completed,
+            "原Run已Completed，手机Terminal不得沿用首有限Failed"
+        );
+        Ok(())
+    }
+
+    /// 走首次drive_chat自动注册的launcher，不能用手工续接资源掩盖根身份丢失。
+    #[tokio::test]
+    async fn channel_journal_root_survives_real_launcher_provider_retry() -> anyhow::Result<()> {
+        use super::super::types::RuntimeEventKind;
+        use crate::chat_driver::{ChatDriverEvent, ChatSink, TurnOutcome};
+        use crate::chat_event_log::{
+            ChatEventLog, ChatEventRetention, ChatSurface, bind_surface_chat_sink,
+        };
+        use echo_agent::agent::{AgentConfig, AgentEvent, ExecutionStatusKind, ReactAgent};
+
+        struct LauncherCompletionProbe {
+            store: Weak<TaskRuntimeStore>,
+            run_id: String,
+            request: Mutex<Option<tokio::sync::oneshot::Sender<ContinueRequestOutcome>>>,
+        }
+        impl ChatSink for LauncherCompletionProbe {
+            fn on_event(&self, event: ChatDriverEvent) -> bool {
+                let first_provider_failure = matches!(&event,
+                    ChatDriverEvent::Agent(envelope) if matches!(&envelope.payload,
+                        AgentEvent::Error { failure, .. } if failure.code == "llm_network" && failure.retryable));
+                // bind_surface_chat_sink已先写原journal；只取得真实completion，
+                // 不构造/修改launcher，不跳过原driver释放或provider retry期限。
+                if first_provider_failure
+                    && let Some(sender) = self
+                        .request
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take()
+                {
+                    let request = self
+                        .store
+                        .upgrade()
+                        .map_or(ContinueRequestOutcome::MissingLauncher, |store| {
+                            request_continue(&store, &self.run_id, RunTurnOrigin::Continuation)
+                        });
+                    let _sent = sender.send(request);
+                }
+                true
+            }
+        }
+
+        let directory = tempfile::tempdir()?;
+        let execution_scope = test_execution_scope();
+        let workspace_id = execution_scope.workspace_id().to_string();
+        let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+        let _resource_scope = store.test_resource_scope();
+        store
+            .rebind_shadow_root(directory.path().join("tasks"), &workspace_id)
+            .await?;
+        let root_message = "launcher-surface-root";
+        let conversation = "channel:launcher-history";
+        let run_id = super::super::task_tools::formal_run_id_for_turn(root_message);
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let probe = Arc::new(LauncherCompletionProbe {
+            store: Arc::downgrade(&store),
+            run_id: run_id.clone(),
+            request: Mutex::new(Some(request_tx)),
+        });
+        let log = Arc::new(ChatEventLog::open(
+            directory.path().join("chat-events"),
+            ChatEventRetention::default(),
+        )?);
+        let sink = bind_surface_chat_sink(
+            ChatSurface::Channel,
+            probe.clone(),
+            log.clone(),
+            Arc::new(crate::tool_execution::ToolExecutionRepository::open(
+                directory.path().join("tools"),
+            )?),
+            workspace_id.clone(),
+            Some(conversation.to_string()),
+            root_message,
+        );
+        let model = Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .with_network_error("original launcher retry transport failure")
+                .with_response("自动续接后的原回答。"),
+        );
+        let mut raw = ReactAgent::new(
+            AgentConfig::minimal("launcher-history", "launcher-history").llm_max_retries(0),
+        );
+        raw.set_llm_client(model.clone());
+        let agent = AgentHandle::new(raw);
+        let cancel = CancellationToken::new();
+        let resources = Arc::new(ChatResources {
+            execution_scope,
+            workspace_io_receipt: None,
+            pool: None,
+            store: Some(store.clone()),
+            sink,
+            webhook_emitter: None,
+            conv_id: Some(conversation.to_string()),
+            root_message_id: root_message.to_string(),
+            attachments: Vec::new(),
+            cancel: cancel.clone(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let input = PreparedUserTurn {
+            instruction: "经原launcher继续同一任务".into(),
+            resources: Vec::new(),
+            authorship: crate::prepared_turn::InstructionAuthorship::User,
+            agent_input: None,
+        };
+        let operation = async {
+            let observe_completion = async {
+                let request = request_rx.await?;
+                let ContinueRequestOutcome::Running(request) = request else {
+                    return Err(anyhow::anyhow!("真实首轮已投递但自动launcher缺失"));
+                };
+                Ok::<_, anyhow::Error>(request.completion.wait().await?)
+            };
+            let (first, completion) = tokio::join!(
+                crate::chat_driver::drive_chat(&agent, &input, resources),
+                observe_completion
+            );
+            Ok::<_, anyhow::Error>((first?, completion?))
+        };
+        // 只作既有30秒死锁保护，不缩短/绕过任何生产retry deadline。
+        let (first, completion) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), operation).await??;
+        let TurnOutcome::Failed(first_failure) = first else {
+            return Err(anyhow::anyhow!(
+                "首次有限turn没有保留typed provider failure"
+            ));
+        };
+        assert_eq!(first_failure.code, "llm_network");
+        assert_eq!(
+            first_failure.category,
+            echo_agent::error::AgentFailureCategory::Llm
+        );
+        assert!(first_failure.retryable);
+        assert_eq!(completion.terminal, TurnOutcome::Completed);
+        assert_eq!(completion.reason, ContinuationCompletionReason::Stopped);
+        assert_eq!(
+            model.call_count(),
+            2,
+            "必须真正执行失败首轮和成功续轮各一次"
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "真实provider failure不能冒成原用户取消"
+        );
+        let state = store
+            .get_run_state(&run_id)?
+            .ok_or_else(|| anyhow::anyhow!("原TaskRun丢失"))?;
+        assert_eq!(state.run.status, TaskRunStatus::Completed);
+        let facts = store.list_events(&run_id, 0)?;
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact.event_type == RuntimeEventKind::RunProviderRetryScheduled)
+        );
+        assert!(
+            !facts
+                .iter()
+                .any(|fact| fact.event_type == RuntimeEventKind::RunCancelled)
+        );
+        let finished = facts
+            .iter()
+            .filter(|fact| fact.event_type == RuntimeEventKind::RunTurnFinished)
+            .collect::<Vec<_>>();
+        assert_eq!(finished.len(), 2);
+        let original_failure = finished
+            .iter()
+            .find(|fact| {
+                fact.payload
+                    .get("turn_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(root_message)
+            })
+            .and_then(|fact| fact.payload.get("agent_failure"))
+            .ok_or_else(|| anyhow::anyhow!("首typed failure没有原样持久化"))?;
+        assert_eq!(original_failure, &serde_json::to_value(&first_failure)?);
+        let replay = log.replay(&workspace_id, Some(conversation), root_message, 0)?;
+        assert!(!replay.truncated);
+        let mut turns = std::collections::BTreeSet::new();
+        let mut statuses = std::collections::BTreeMap::<String, Vec<ExecutionStatusKind>>::new();
+        for event in &replay.events {
+            assert_eq!(event.root_turn_id, root_message);
+            assert_eq!(event.message_id, root_message);
+            if let ChatDriverEvent::Agent(envelope) = &event.payload {
+                turns.insert(envelope.turn_id.as_str().to_string());
+                assert_eq!(
+                    envelope.message_id.as_ref().map(|id| id.as_str()),
+                    Some(root_message)
+                );
+                if let AgentEvent::ExecutionStatus(status) = &envelope.payload {
+                    assert!(!status.adapter_generated);
+                    assert_eq!(
+                        envelope.execution_id.as_ref().map(|id| id.as_str()),
+                        Some(status.execution_id.as_str())
+                    );
+                    assert_ne!(status.status, ExecutionStatusKind::Cancelled);
+                    statuses
+                        .entry(envelope.turn_id.as_str().to_string())
+                        .or_default()
+                        .push(status.status.clone());
+                }
+                if let AgentEvent::Error { failure, .. } = &envelope.payload {
+                    assert_ne!(failure.code, "downstream_disconnect");
+                }
+            }
+        }
+        assert_eq!(turns.len(), 2);
+        assert!(turns.contains(root_message));
+        let continuation_turn = turns
+            .iter()
+            .find(|turn| turn.as_str() != root_message)
+            .ok_or_else(|| anyhow::anyhow!("没有真实新有限turn"))?;
+        for (turn, terminal) in [
+            (root_message, ExecutionStatusKind::Failed),
+            (continuation_turn.as_str(), ExecutionStatusKind::Settled),
+        ] {
+            let actual = statuses
+                .get(turn)
+                .ok_or_else(|| anyhow::anyhow!("原生status轨迹缺失"))?;
+            assert_eq!(actual.first(), Some(&ExecutionStatusKind::Started));
+            assert_eq!(actual.last(), Some(&terminal));
+        }
+        store
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        Ok(())
+    }
 
     struct DropTrackingSink(Arc<std::sync::atomic::AtomicBool>);
 
@@ -1438,6 +1883,37 @@ mod tests {
             human_loop_provider: None,
         });
         Ok((store, agent, resources))
+    }
+
+    #[tokio::test]
+    async fn registered_cut_cannot_retire_replacement_renderer() -> Result<(), String> {
+        let (store, agent, mut resources) = retry_wait_fixture("renderer-generation")?;
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Arc::get_mut(&mut resources)
+            .ok_or_else(|| "测试资源在注册前已有其它所有者".to_string())?
+            .sink = Arc::new(DropTrackingSink(dropped.clone()));
+        let first = register_launcher(
+            &store,
+            "renderer-generation",
+            agent.clone(),
+            resources.clone(),
+            "renderer-generation-root".to_string(),
+            None,
+        );
+        let replacement = register_launcher(
+            &store,
+            "renderer-generation",
+            agent,
+            resources.clone(),
+            "renderer-generation-root".to_string(),
+            None,
+        );
+        drop(resources);
+        clear_launcher_at_cut(&store, "renderer-generation", first);
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        clear_launcher_at_cut(&store, "renderer-generation", replacement);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        Ok(())
     }
 
     fn install_retry_wait_barrier(
@@ -2122,6 +2598,147 @@ mod tests {
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())?;
         assert_eq!(completion.reason, ContinuationCompletionReason::Deferred);
+        Ok(())
+    }
+
+    /// 自动续接的真实模型请求：唯一一次主模型调用必须携带共享 Goal 合同与
+    /// 轮次收尾要求，并且不能为“补总结”再发起独立请求。
+    #[tokio::test]
+    async fn continuation_model_request_carries_shared_goal_round_review() -> anyhow::Result<()> {
+        use super::super::types::{
+            AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, RunTurnOrigin,
+            TurnVisibility,
+        };
+        use crate::chat_driver::{RunTurnDriveOutcome, drive_chat_continuation_turn};
+        use crate::prepared_turn::PreparedUserTurn;
+        use crate::tasks::task_runtime::compact_context::{
+            RUNTIME_GOAL_MARKER, TaskRuntimeContextProjector, task_runtime_projection_registry,
+        };
+        use echo_agent::agent::{AgentHandle, ReactAgentBuilder};
+
+        let store = Arc::new(TaskRuntimeStore::new_in_memory()?);
+        let _resource_scope = store.test_resource_scope();
+        let workspace_id = store.active_workspace_id();
+        let execution_scope = crate::workspace::WorkspaceExecutionScope::workspace(
+            &crate::workspace::WorkspaceId::from_name(&workspace_id),
+            ".",
+        );
+        let run_id = "round-review-continuation";
+        let goal = "总Goal：A 导出数据；B 补齐回归验收；C 更新发布说明";
+        store.create_run(
+            run_id,
+            &workspace_id,
+            "round-review-conversation",
+            "round-review-root",
+            DomainProfile::General,
+            goal,
+            "agent_task_plan",
+            AttendedMode::Attended,
+        )?;
+        store.attach_plan_for_test(&super::super::types::TaskPlan {
+            domain_binding: None,
+            plan_id: "round-review-plan".to_string(),
+            run_id: run_id.to_string(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            goal_revision: 1,
+            goal_sha256: super::super::task_goal_sha256(goal),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![PlanTask {
+                id: "obligation-a".to_string(),
+                title: "推进 A".to_string(),
+                kind: PlanTaskKind::Implementation,
+                agent_role: "implementer".to_string(),
+                ..PlanTask::default()
+            }],
+        })?;
+        store.transition_run(run_id, TaskRunStatus::Running)?;
+        store.configure_run_continuation(run_id, true, false, None, None)?;
+        let _registration = task_runtime_projection_registry().register(run_id, store.clone());
+
+        let model = Arc::new(
+            echo_agent::testing::MockLlmClient::new().with_response("本轮推进 A，B/C 仍未完成。"),
+        );
+        let raw = ReactAgentBuilder::new()
+            .model("round-review-continuation")
+            .llm_client(model.clone())
+            .build()?;
+        raw.set_pre_model_context_projector(Some(Arc::new(TaskRuntimeContextProjector::new(
+            task_runtime_projection_registry(),
+        ))));
+        let agent = AgentHandle::new(raw);
+        let resources = Arc::new(ChatResources {
+            execution_scope,
+            workspace_io_receipt: None,
+            pool: None,
+            store: Some(store.clone()),
+            sink: Arc::new(DetachedContinuationSink),
+            webhook_emitter: None,
+            conv_id: Some("round-review-conversation".to_string()),
+            root_message_id: "round-review-root".to_string(),
+            attachments: Vec::new(),
+            cancel: CancellationToken::new(),
+            review_integration: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let turn = PreparedUserTurn::runtime_instruction(continuation_turn_instruction(run_id));
+        let outcome = drive_chat_continuation_turn(
+            &agent,
+            &turn,
+            resources,
+            RunTurnBinding {
+                domain_plugin: None,
+                run_id: Some(run_id.to_string()),
+                turn_id: "round-review-turn".to_string(),
+                root_message_id: "round-review-root".to_string(),
+                origin: RunTurnOrigin::Continuation,
+                transcript_visibility: TurnVisibility::Internal,
+                expected_resume: None,
+            },
+        )
+        .await?;
+        assert!(
+            matches!(outcome, RunTurnDriveOutcome::Driven(_)),
+            "续接必须真实到达模型而不是被拒绝或延后"
+        );
+
+        let calls = model.all_calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "续接只允许一次主模型请求，不能为了收尾总结再发一次调用"
+        );
+        let request = calls
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("续接请求缺失"))?;
+        let contracts = request
+            .iter()
+            .filter_map(|message| message.content.as_text_ref())
+            .filter(|text| text.contains(RUNTIME_GOAL_MARKER))
+            .collect::<Vec<_>>();
+        assert_eq!(contracts.len(), 1, "续接请求只允许一份共享 Goal 投影");
+        let contract = contracts
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("续接请求缺少共享 Goal 合同"))?;
+        assert!(contract.contains(goal), "续接必须引用当前 canonical Goal");
+        assert!(contract.contains("read-only for you"));
+        assert!(contract.contains("which Goal obligation this turn advanced"));
+        assert!(contract.contains("the obligations still open"));
+        assert!(contract.contains("does not modify the Goal"));
+        assert!(
+            request.iter().any(|message| message
+                .content
+                .as_text_ref()
+                .is_some_and(|text| text.contains("Continue the existing TaskRun"))),
+            "续接请求必须来自原有续接指令，而不是伪造的用户输入"
+        );
+        store
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         Ok(())
     }
 }

@@ -21,6 +21,7 @@
 //!   `.claude/worktrees/` sibling-directory convention, and the existing
 //!   `default_worktree_path` helper in `panels.rs`).
 
+use super::store::{ProjectExecutionEnvironment, TaskRuntimeStore};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -36,7 +37,9 @@ pub const BRANCH_PREFIX: &str = "eko-unattended-";
 /// worktrees apart from interactive Fork-subagent worktrees.
 pub const FORK_BRANCH_PREFIX: &str = "eko-fork-";
 
-static REPO_MERGE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<TokioMutex<()>>>>> = OnceLock::new();
+type RepositoryTargetKey = (String, PathBuf);
+static REPO_MERGE_LOCKS: OnceLock<Mutex<HashMap<RepositoryTargetKey, Weak<TokioMutex<()>>>>> =
+    OnceLock::new();
 
 /// Return the process-wide integration mutex for one repository.
 ///
@@ -44,15 +47,33 @@ static REPO_MERGE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<TokioMutex<()>>>>>
 /// finish isolated writers at the same time. Cross-process races still fail
 /// through Git's own lock files and are surfaced as integration failures.
 pub fn repo_merge_lock(repo_root: &Path) -> Arc<TokioMutex<()>> {
+    repo_merge_lock_in_environment(repo_root, None)
+}
+
+pub(crate) fn repo_merge_lock_in_environment(
+    repo_root: &Path,
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Arc<TokioMutex<()>> {
+    let key = (
+        environment
+            .map(|environment| match &environment.location {
+                crate::workspace::ProjectLocation::Local { .. } => "local".to_string(),
+                crate::workspace::ProjectLocation::Ssh {
+                    host, user, port, ..
+                } => format!("ssh:{host:?}:{user:?}:{port:?}"),
+            })
+            .unwrap_or_else(|| "local".to_string()),
+        repo_root.to_path_buf(),
+    );
     let locks = REPO_MERGE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut locks = locks
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(lock) = locks.get(repo_root).and_then(Weak::upgrade) {
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
         return lock;
     }
     let lock = Arc::new(TokioMutex::new(()));
-    locks.insert(repo_root.to_path_buf(), Arc::downgrade(&lock));
+    locks.insert(key, Arc::downgrade(&lock));
     lock
 }
 
@@ -146,8 +167,12 @@ impl From<std::io::Error> for WorktreeError {
 /// surface stderr as `WorktreeError` on failure. Uses `std::process::Command`
 /// (blocking) — suitable for short-lived git ops; callers needing async may
 /// wrap via `tokio::task::spawn_blocking`.
-pub fn run_git(repo: &Path, args: &[&str]) -> Result<String, WorktreeError> {
-    let output = git_output(repo, args)?;
+pub(crate) fn run_git_in_environment(
+    repo: &Path,
+    args: &[&str],
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Result<String, WorktreeError> {
+    let output = git_output_in_environment(repo, args, environment)?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
@@ -155,13 +180,91 @@ pub fn run_git(repo: &Path, args: &[&str]) -> Result<String, WorktreeError> {
     }
 }
 
-fn git_output(repo: &Path, args: &[&str]) -> Result<Output, WorktreeError> {
+fn git_output_in_environment(
+    repo: &Path,
+    args: &[&str],
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Result<Output, WorktreeError> {
+    if let Some(environment) = environment {
+        let runtime = environment.runtime.as_ref().ok_or_else(|| {
+            WorktreeError::new("project Git requires the original application runtime")
+        })?;
+        let command = echo_agent::sandbox::SandboxCommand::program(
+            "git",
+            args.iter()
+                .map(|argument| (*argument).to_string())
+                .collect(),
+        )
+        .with_working_dir(repo.to_path_buf());
+        // IsolationProvider has a synchronous public contract. The scoped
+        // bridge stays joined to that original call and never drops a remote
+        // mutation future or invents a second process/settlement owner.
+        let result = std::thread::scope(|scope| {
+            scope
+                .spawn(|| runtime.block_on(environment.executor.execute(command)))
+                .join()
+        })
+        .map_err(|_| WorktreeError::new("project Git execution bridge failed"))?
+        .map_err(|error| WorktreeError::new(error.to_string()))?;
+        if result.timed_out || result.cancelled || result.output_truncated {
+            return Err(WorktreeError::new(format!(
+                "project Git has no complete execution receipt (timed_out={}, cancelled={}, truncated={}); work is retained for observation",
+                result.timed_out, result.cancelled, result.output_truncated
+            )));
+        }
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            let code = if (0..=255).contains(&result.exit_code) {
+                result.exit_code
+            } else {
+                1
+            };
+            std::process::ExitStatus::from_raw(code.saturating_mul(256))
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(u32::try_from(result.exit_code).unwrap_or(1))
+        };
+        return Ok(Output {
+            status,
+            stdout: result.stdout.into_bytes(),
+            stderr: result.stderr.into_bytes(),
+        });
+    }
     Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(args)
         .output()
         .map_err(WorktreeError::from)
+}
+
+fn canonicalize_target(
+    path: &Path,
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Result<PathBuf, WorktreeError> {
+    match environment {
+        Some(environment) => environment
+            .files
+            .canonicalize(path)
+            .map_err(|error| WorktreeError::new(error.to_string())),
+        None => path.canonicalize().map_err(WorktreeError::from),
+    }
+}
+
+fn target_exists(
+    path: &Path,
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Result<bool, WorktreeError> {
+    match environment {
+        Some(environment) => environment
+            .files
+            .exists(path)
+            .map_err(|error| WorktreeError::new(error.to_string())),
+        None => path.try_exists().map_err(WorktreeError::from),
+    }
 }
 
 fn output_error(args: &[&str], output: &Output) -> WorktreeError {
@@ -191,15 +294,22 @@ fn bounded_output(output: &Output, max_chars: usize) -> String {
 
 /// Resolve the repository root (`git rev-parse --show-toplevel`) from any
 /// path inside a git checkout. Returns the root as a `PathBuf`.
-pub fn git_repo_root(start: &Path) -> Result<PathBuf, WorktreeError> {
-    let root = run_git(start, &["rev-parse", "--show-toplevel"])?;
+pub(crate) fn git_repo_root_in_environment(
+    start: &Path,
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Result<PathBuf, WorktreeError> {
+    let root = run_git_in_environment(start, &["rev-parse", "--show-toplevel"], environment)?;
     Ok(PathBuf::from(root))
 }
 
 /// Validate that `branch` is a legal git branch name. Delegates to
 /// `git check-ref-format --branch`, with a fast reject for empty /
 /// dash-prefix / whitespace inputs.
-pub fn validate_branch_name(repo: &Path, branch: &str) -> Result<(), WorktreeError> {
+pub(crate) fn validate_branch_name_in_environment(
+    repo: &Path,
+    branch: &str,
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Result<(), WorktreeError> {
     if branch.trim().is_empty() {
         return Err(WorktreeError::new("Branch name cannot be empty"));
     }
@@ -208,7 +318,7 @@ pub fn validate_branch_name(repo: &Path, branch: &str) -> Result<(), WorktreeErr
             "Branch name cannot start with '-' or contain whitespace",
         ));
     }
-    run_git(repo, &["check-ref-format", "--branch", branch]).map(|_| ())
+    run_git_in_environment(repo, &["check-ref-format", "--branch", branch], environment).map(|_| ())
 }
 
 /// Compute a sensible filesystem path for a new worktree branched from
@@ -242,22 +352,28 @@ pub fn default_worktree_path(repo_root: &Path, branch: &str) -> Result<PathBuf, 
 /// Reject worktree target paths that do not live under the repository's
 /// parent directory, or that already exist. Protects against worktree
 /// paths escaping the repository neighborhood.
-pub fn validate_worktree_target(repo_root: &Path, target: &Path) -> Result<(), WorktreeError> {
-    let repo_parent = repo_root
-        .parent()
-        .ok_or_else(|| WorktreeError::new("Repository root has no parent directory"))?
-        .canonicalize()?;
+pub(crate) fn validate_worktree_target_in_environment(
+    repo_root: &Path,
+    target: &Path,
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Result<(), WorktreeError> {
+    let repo_parent = canonicalize_target(
+        repo_root
+            .parent()
+            .ok_or_else(|| WorktreeError::new("Repository root has no parent directory"))?,
+        environment,
+    )?;
     let target_parent = target
         .parent()
         .ok_or_else(|| WorktreeError::new("Worktree path has no parent directory"))?;
-    let canonical_parent = target_parent.canonicalize()?;
+    let canonical_parent = canonicalize_target(target_parent, environment)?;
     if !canonical_parent.starts_with(&repo_parent) {
         return Err(WorktreeError::new(format!(
             "Worktree path must stay under repository parent: {}",
             repo_parent.display()
         )));
     }
-    if target.exists() {
+    if target_exists(target, environment)? {
         return Err(WorktreeError::new(format!(
             "Worktree path already exists: {}",
             target.display()
@@ -269,10 +385,13 @@ pub fn validate_worktree_target(repo_root: &Path, target: &Path) -> Result<(), W
 /// Parse `git worktree list --porcelain` output into [`WorktreeInfo`] entries.
 /// The parser is line-based; entries are separated by blank lines, and each
 /// entry consists of `worktree <path>`, `HEAD <sha>`, `branch <ref>`.
-pub fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
-    let canonical_repo = repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.to_path_buf());
+pub(crate) fn parse_worktree_list_in_environment(
+    output: &str,
+    repo_root: &Path,
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Vec<WorktreeInfo> {
+    let canonical_repo =
+        canonicalize_target(repo_root, environment).unwrap_or_else(|_| repo_root.to_path_buf());
     let mut items = Vec::new();
     let mut current_path: Option<PathBuf> = None;
     let mut current_head = String::new();
@@ -289,7 +408,8 @@ pub fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> 
         let Some(path_buf) = path.take() else {
             return;
         };
-        let canonical = path_buf.canonicalize().unwrap_or_else(|_| path_buf.clone());
+        let canonical =
+            canonicalize_target(&path_buf, environment).unwrap_or_else(|_| path_buf.clone());
         let display_branch = if branch.is_empty() {
             "(detached)".to_string()
         } else {
@@ -362,6 +482,7 @@ pub fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> 
 /// the worktree after execution.
 #[derive(Debug)]
 pub struct RunWorktree {
+    environment: Option<Arc<ProjectExecutionEnvironment>>,
     /// Canonical repository checkout used for shared Git operations.
     pub repo_root: PathBuf,
     /// Absolute path to the worktree checkout.
@@ -379,10 +500,20 @@ impl RunWorktree {
     /// branch whose checkout was pruned is materialized again. A locked
     /// checkout is treated as active and is never shared concurrently.
     pub fn acquire_fork(label: &str, repo_root: &Path) -> Result<Self, WorktreeError> {
-        let branch = fork_branch_name(label);
-        validate_branch_name(repo_root, &branch)?;
+        Self::acquire_fork_in_environment(label, repo_root, None)
+    }
 
-        if let Some(existing) = find_worktree_info(repo_root, &branch)? {
+    fn acquire_fork_in_environment(
+        label: &str,
+        repo_root: &Path,
+        resources: Option<Arc<ProjectExecutionEnvironment>>,
+    ) -> Result<Self, WorktreeError> {
+        let environment = resources.as_deref();
+        let branch = fork_branch_name(label);
+        validate_branch_name_in_environment(repo_root, &branch, environment)?;
+
+        if let Some(existing) = find_worktree_info_in_environment(repo_root, &branch, environment)?
+        {
             if existing.locked {
                 return Err(WorktreeError::new(format!(
                     "worktree for logical task {label} is already active at {}",
@@ -390,30 +521,41 @@ impl RunWorktree {
                 )));
             }
             let path = PathBuf::from(existing.path);
-            if path.exists() {
-                let base = run_git(repo_root, &["merge-base", "HEAD", &branch])?;
-                lock_worktree(repo_root, &path, label)?;
+            if target_exists(&path, environment)? {
+                let base = run_git_in_environment(
+                    repo_root,
+                    &["merge-base", "HEAD", &branch],
+                    environment,
+                )?;
+                lock_worktree_in_environment(repo_root, &path, label, environment)?;
                 return Ok(Self {
+                    environment: resources.clone(),
                     repo_root: repo_root.to_path_buf(),
                     path,
                     branch,
                     base,
                 });
             }
-            run_git(repo_root, &["worktree", "prune"])?;
+            run_git_in_environment(repo_root, &["worktree", "prune"], environment)?;
         }
 
-        if branch_exists(repo_root, &branch)? {
+        if branch_exists_in_environment(repo_root, &branch, environment)? {
             let path = default_worktree_path(repo_root, &branch)?;
-            validate_worktree_target(repo_root, &path)?;
+            validate_worktree_target_in_environment(repo_root, &path, environment)?;
             let path_text = path
                 .to_str()
                 .ok_or_else(|| WorktreeError::new("worktree path is not valid UTF-8"))?;
-            run_git(repo_root, &["worktree", "add", path_text, &branch])?;
-            let path = path.canonicalize().unwrap_or(path);
-            let base = run_git(repo_root, &["merge-base", "HEAD", &branch])?;
-            lock_worktree(repo_root, &path, label)?;
+            run_git_in_environment(
+                repo_root,
+                &["worktree", "add", path_text, &branch],
+                environment,
+            )?;
+            let path = canonicalize_target(&path, environment)?;
+            let base =
+                run_git_in_environment(repo_root, &["merge-base", "HEAD", &branch], environment)?;
+            lock_worktree_in_environment(repo_root, &path, label, environment)?;
             return Ok(Self {
+                environment: resources.clone(),
                 repo_root: repo_root.to_path_buf(),
                 path,
                 branch,
@@ -421,7 +563,7 @@ impl RunWorktree {
             });
         }
 
-        Self::create_fork(label, repo_root)
+        Self::create_fork_in_environment(label, repo_root, resources)
     }
 
     /// Create a worktree for a Fork-dispatched subagent (Sprint 8).
@@ -429,26 +571,37 @@ impl RunWorktree {
     /// Uses the [`FORK_BRANCH_PREFIX`] namespace. `label` identifies the
     /// logical task (e.g. `"{agent_name}-{run_id}:{task_id}"`).
     pub fn create_fork(label: &str, repo_root: &Path) -> Result<Self, WorktreeError> {
+        Self::create_fork_in_environment(label, repo_root, None)
+    }
+
+    fn create_fork_in_environment(
+        label: &str,
+        repo_root: &Path,
+        resources: Option<Arc<ProjectExecutionEnvironment>>,
+    ) -> Result<Self, WorktreeError> {
+        let environment = resources.as_deref();
         let branch = fork_branch_name(label);
-        validate_branch_name(repo_root, &branch)?;
+        validate_branch_name_in_environment(repo_root, &branch, environment)?;
         let path = default_worktree_path(repo_root, &branch)?;
-        validate_worktree_target(repo_root, &path)?;
-        let base = run_git(repo_root, &["rev-parse", "HEAD"])?;
+        validate_worktree_target_in_environment(repo_root, &path, environment)?;
+        let base = run_git_in_environment(repo_root, &["rev-parse", "HEAD"], environment)?;
         let path_str = path
             .to_str()
             .ok_or_else(|| WorktreeError::new("worktree path is not valid UTF-8"))?;
 
         // Create worktree + branch in one step (matches panels.rs convention).
-        run_git(
+        run_git_in_environment(
             repo_root,
             &["worktree", "add", "-b", &branch, path_str, &base],
+            environment,
         )?;
-        let path = path.canonicalize().unwrap_or(path);
+        let path = canonicalize_target(&path, environment)?;
 
         // Lock so concurrent cleanup won't touch it (Claude Code pattern).
-        lock_worktree(repo_root, &path, label)?;
+        lock_worktree_in_environment(repo_root, &path, label, environment)?;
 
         Ok(Self {
+            environment: resources.clone(),
             repo_root: repo_root.to_path_buf(),
             path,
             branch,
@@ -460,32 +613,27 @@ impl RunWorktree {
     /// the base ref. Committed worktree changes are diffed against `base`;
     /// if there are no commits yet, working-tree changes are diffed.
     pub fn diff_summary(&self) -> Result<String, WorktreeError> {
-        let committed = run_git(
+        let environment = self.environment.as_deref();
+        let committed = run_git_in_environment(
             &self.path,
             &["rev-list", "--count", &format!("{}..HEAD", self.base)],
-        )
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(0);
-
-        let (stat, full) = if committed > 0 {
-            let stat = run_git(
-                &self.path,
-                &["diff", "--stat", &format!("{}..HEAD", self.base)],
-            )
-            .unwrap_or_else(|_| "(diff unavailable)".to_string());
-            let full = run_git(&self.path, &["diff", &format!("{}..HEAD", self.base)])
-                .unwrap_or_else(|_| "(full diff unavailable)".to_string());
-            (stat, full)
+            environment,
+        )?
+        .parse::<u32>()
+        .map_err(|error| WorktreeError::new(format!("invalid Git revision count: {error}")))?;
+        let reference = if committed > 0 {
+            format!("{}..HEAD", self.base)
         } else {
-            let stat = run_git(&self.path, &["diff", "--stat", self.base.as_str()])
-                .unwrap_or_else(|_| "(diff unavailable)".to_string());
-            let full = run_git(&self.path, &["diff", self.base.as_str()])
-                .unwrap_or_else(|_| "(full diff unavailable)".to_string());
-            (stat, full)
+            self.base.clone()
         };
-        let untracked = run_git(&self.path, &["ls-files", "--others", "--exclude-standard"])
-            .unwrap_or_else(|_| "(untracked file listing unavailable)".to_string());
+        let stat =
+            run_git_in_environment(&self.path, &["diff", "--stat", &reference], environment)?;
+        let full = run_git_in_environment(&self.path, &["diff", &reference], environment)?;
+        let untracked = run_git_in_environment(
+            &self.path,
+            &["ls-files", "--others", "--exclude-standard"],
+            environment,
+        )?;
         Ok(format!(
             "=== Stat ===\n{stat}\n\n=== Full diff ===\n{full}\n\n=== Untracked files ===\n{untracked}"
         ))
@@ -494,17 +642,26 @@ impl RunWorktree {
     /// Whether the checkout contains uncommitted files or commits not yet
     /// reachable from the authoritative checkout.
     pub fn has_changes(&self) -> Result<bool, WorktreeError> {
-        Ok(worktree_has_uncommitted_changes(&self.path)?
-            || branch_ahead_of_head(&self.repo_root, &self.branch)? > 0)
+        let environment = self.environment.as_deref();
+        Ok(
+            worktree_has_uncommitted_changes_in_environment(&self.path, environment)?
+                || branch_ahead_of_head_in_environment(&self.repo_root, &self.branch, environment)?
+                    > 0,
+        )
     }
 
     /// Release the lifecycle lock after the subagent has stopped.
     pub fn unlock(&self) -> Result<(), WorktreeError> {
+        let environment = self.environment.as_deref();
         let wt_path = self
             .path
             .to_str()
             .ok_or_else(|| WorktreeError::new("worktree path is not valid UTF-8"))?;
-        let output = git_output(&self.repo_root, &["worktree", "unlock", wt_path])?;
+        let output = git_output_in_environment(
+            &self.repo_root,
+            &["worktree", "unlock", wt_path],
+            environment,
+        )?;
         if output.status.success() {
             return Ok(());
         }
@@ -566,21 +723,23 @@ impl WorktreeIntegrationOutcome {
 /// Integrate one completed/reviewed Fork writer into the authoritative local
 /// checkout. This function is blocking; async callers must use
 /// `tokio::task::spawn_blocking` and hold [`repo_merge_lock`].
-pub fn integrate_fork_worktree(
+pub(crate) fn integrate_fork_worktree_in_environment(
     repo_root: &Path,
     label: &str,
     task_id: &str,
     execution_id: &str,
     ownership: &super::planner::FileOwnership,
+    environment: Option<&ProjectExecutionEnvironment>,
 ) -> Result<WorktreeIntegrationOutcome, WorktreeError> {
     let branch = fork_branch_name(label);
     let trailer = format!("EKO-Execution-Id: {execution_id}");
 
-    if let Some(commit) = find_integration_commit(repo_root, &trailer)? {
-        let path = find_worktree_path(repo_root, &branch)?;
-        let cleanup_warning = path
-            .as_deref()
-            .and_then(|path| cleanup_managed_worktree(repo_root, path, &branch).err());
+    if let Some(commit) = find_integration_commit_in_environment(repo_root, &trailer, environment)?
+    {
+        let path = find_worktree_path_in_environment(repo_root, &branch, environment)?;
+        let cleanup_warning = path.as_deref().and_then(|path| {
+            cleanup_managed_worktree_in_environment(repo_root, path, &branch, environment).err()
+        });
         return Ok(WorktreeIntegrationOutcome {
             status: WorktreeIntegrationStatus::AlreadyIntegrated,
             branch,
@@ -591,8 +750,8 @@ pub fn integrate_fork_worktree(
         });
     }
 
-    let path = find_worktree_path(repo_root, &branch)?;
-    let branch_exists = branch_exists(repo_root, &branch)?;
+    let path = find_worktree_path_in_environment(repo_root, &branch, environment)?;
+    let branch_exists = branch_exists_in_environment(repo_root, &branch, environment)?;
     if !branch_exists && path.is_none() {
         return Ok(WorktreeIntegrationOutcome {
             status: WorktreeIntegrationStatus::NoChanges,
@@ -608,27 +767,40 @@ pub fn integrate_fork_worktree(
         Some(path) => path,
         None => {
             let path = default_worktree_path(repo_root, &branch)?;
-            validate_worktree_target(repo_root, &path)?;
+            validate_worktree_target_in_environment(repo_root, &path, environment)?;
             let path_text = path
                 .to_str()
                 .ok_or_else(|| WorktreeError::new("worktree path is not valid UTF-8"))?;
-            run_git(repo_root, &["worktree", "add", path_text, &branch])?;
-            path.canonicalize().unwrap_or(path)
+            run_git_in_environment(
+                repo_root,
+                &["worktree", "add", path_text, &branch],
+                environment,
+            )?;
+            canonicalize_target(&path, environment)?
         }
     };
-    integrate_existing_worktree(repo_root, branch, path, task_id, &trailer, ownership)
+    integrate_existing_worktree_in_environment(
+        repo_root,
+        branch,
+        path,
+        task_id,
+        &trailer,
+        ownership,
+        environment,
+    )
 }
 
-fn integrate_existing_worktree(
+fn integrate_existing_worktree_in_environment(
     repo_root: &Path,
     branch: String,
     path: PathBuf,
     task_id: &str,
     trailer: &str,
     ownership: &super::planner::FileOwnership,
+    environment: Option<&ProjectExecutionEnvironment>,
 ) -> Result<WorktreeIntegrationOutcome, WorktreeError> {
     let preserve_error = |message: String| {
-        let _ = unlock_worktree(repo_root, &path);
+        let _ = unlock_worktree_in_environment(repo_root, &path, environment);
         WorktreeError::new(format!(
             "{message}; isolated work preserved at {} on branch {branch}",
             path.display()
@@ -641,22 +813,27 @@ fn integrate_existing_worktree(
         ));
     }
 
-    run_git(&path, &["add", "-A"])
+    run_git_in_environment(&path, &["add", "-A"], environment)
         .map_err(|error| preserve_error(format!("failed to stage writer changes: {error}")))?;
-    let merge_base = run_git(repo_root, &["merge-base", "HEAD", &branch])
-        .map_err(|error| preserve_error(format!("failed to resolve merge base: {error}")))?;
-    let changed_files = git_nul_paths(
+    let merge_base =
+        run_git_in_environment(repo_root, &["merge-base", "HEAD", &branch], environment)
+            .map_err(|error| preserve_error(format!("failed to resolve merge base: {error}")))?;
+    let changed_files = git_nul_paths_in_environment(
         &path,
         &["diff", "--cached", "--name-only", "-z", &merge_base],
+        environment,
     )
     .map_err(|error| preserve_error(format!("failed to inspect writer changes: {error}")))?;
     validate_changed_files(ownership, &changed_files).map_err(preserve_error)?;
 
-    let staged_against_head = git_output(&path, &["diff", "--cached", "--quiet", "HEAD"])
-        .map_err(|error| preserve_error(format!("failed to inspect staged changes: {error}")))?;
+    let staged_against_head =
+        git_output_in_environment(&path, &["diff", "--cached", "--quiet", "HEAD"], environment)
+            .map_err(|error| {
+                preserve_error(format!("failed to inspect staged changes: {error}"))
+            })?;
     match staged_against_head.status.code() {
         Some(0) => {}
-        Some(1) => commit_writer_changes(&path, task_id, trailer)
+        Some(1) => commit_writer_changes_in_environment(&path, task_id, trailer, environment)
             .map_err(|error| preserve_error(format!("failed to commit writer changes: {error}")))?,
         _ => {
             return Err(preserve_error(format!(
@@ -667,7 +844,8 @@ fn integrate_existing_worktree(
     }
 
     if changed_files.is_empty() {
-        let cleanup_warning = cleanup_managed_worktree(repo_root, &path, &branch).err();
+        let cleanup_warning =
+            cleanup_managed_worktree_in_environment(repo_root, &path, &branch, environment).err();
         return Ok(WorktreeIntegrationOutcome {
             status: WorktreeIntegrationStatus::NoChanges,
             branch,
@@ -678,12 +856,19 @@ fn integrate_existing_worktree(
         });
     }
 
-    let ancestor = git_output(repo_root, &["merge-base", "--is-ancestor", &branch, "HEAD"])
-        .map_err(|error| preserve_error(format!("failed to inspect ancestry: {error}")))?;
+    let ancestor = git_output_in_environment(
+        repo_root,
+        &["merge-base", "--is-ancestor", &branch, "HEAD"],
+        environment,
+    )
+    .map_err(|error| preserve_error(format!("failed to inspect ancestry: {error}")))?;
     match ancestor.status.code() {
         Some(0) => {
-            let commit = run_git(repo_root, &["rev-parse", "HEAD"]).ok();
-            let cleanup_warning = cleanup_managed_worktree(repo_root, &path, &branch).err();
+            let commit =
+                run_git_in_environment(repo_root, &["rev-parse", "HEAD"], environment).ok();
+            let cleanup_warning =
+                cleanup_managed_worktree_in_environment(repo_root, &path, &branch, environment)
+                    .err();
             return Ok(WorktreeIntegrationOutcome {
                 status: WorktreeIntegrationStatus::AlreadyIntegrated,
                 branch,
@@ -702,16 +887,20 @@ fn integrate_existing_worktree(
         }
     }
 
-    reject_active_git_operation(repo_root).map_err(preserve_error)?;
-    let staged = git_nul_paths(repo_root, &["diff", "--cached", "--name-only", "-z"])
-        .map_err(|error| preserve_error(format!("failed to inspect staged changes: {error}")))?;
+    reject_active_git_operation_in_environment(repo_root, environment).map_err(preserve_error)?;
+    let staged = git_nul_paths_in_environment(
+        repo_root,
+        &["diff", "--cached", "--name-only", "-z"],
+        environment,
+    )
+    .map_err(|error| preserve_error(format!("failed to inspect staged changes: {error}")))?;
     if !staged.is_empty() {
         return Err(preserve_error(format!(
             "local checkout index is not clean; refusing to include user-staged files in an EKO merge commit: {}",
             staged.join(", ")
         )));
     }
-    let dirty = main_dirty_paths(repo_root)
+    let dirty = main_dirty_paths_in_environment(repo_root, environment)
         .map_err(|error| preserve_error(format!("failed to inspect local changes: {error}")))?;
     let dirty_overlap: Vec<String> = changed_files
         .iter()
@@ -725,7 +914,7 @@ fn integrate_existing_worktree(
         )));
     }
 
-    let preflight = git_output(
+    let preflight = git_output_in_environment(
         repo_root,
         &[
             "merge-tree",
@@ -735,6 +924,7 @@ fn integrate_existing_worktree(
             "HEAD",
             &branch,
         ],
+        environment,
     )
     .map_err(|error| preserve_error(format!("failed to start merge preflight: {error}")))?;
     match preflight.status.code() {
@@ -754,7 +944,7 @@ fn integrate_existing_worktree(
     }
 
     let message = format!("Merge EKO task {task_id}\n\n{trailer}");
-    let merge = git_output(
+    let merge = git_output_in_environment(
         repo_root,
         &[
             "-c",
@@ -770,11 +960,12 @@ fn integrate_existing_worktree(
             &message,
             &branch,
         ],
+        environment,
     )
     .map_err(|error| preserve_error(format!("failed to start worktree merge: {error}")))?;
     if !merge.status.success() {
         let diagnostic = bounded_output(&merge, 4_000);
-        let abort_error = abort_own_merge(repo_root).err();
+        let abort_error = abort_own_merge_in_environment(repo_root, environment).err();
         let abort_suffix = abort_error
             .map(|error| format!("; merge abort also failed: {error}"))
             .unwrap_or_default();
@@ -783,8 +974,9 @@ fn integrate_existing_worktree(
         )));
     }
 
-    let merge_commit = run_git(repo_root, &["rev-parse", "HEAD"]);
-    let mut cleanup_warning = cleanup_managed_worktree(repo_root, &path, &branch).err();
+    let merge_commit = run_git_in_environment(repo_root, &["rev-parse", "HEAD"], environment);
+    let mut cleanup_warning =
+        cleanup_managed_worktree_in_environment(repo_root, &path, &branch, environment).err();
     let merge_commit = match merge_commit {
         Ok(commit) => Some(commit),
         Err(error) => {
@@ -828,13 +1020,14 @@ fn validate_changed_files(
     }
 }
 
-fn commit_writer_changes(
+fn commit_writer_changes_in_environment(
     worktree: &Path,
     task_id: &str,
     trailer: &str,
+    environment: Option<&ProjectExecutionEnvironment>,
 ) -> Result<(), WorktreeError> {
     let message = format!("EKO task {task_id}\n\n{trailer}");
-    run_git(
+    run_git_in_environment(
         worktree,
         &[
             "-c",
@@ -847,12 +1040,17 @@ fn commit_writer_changes(
             "-m",
             &message,
         ],
+        environment,
     )
     .map(|_| ())
 }
 
-fn git_nul_paths(repo: &Path, args: &[&str]) -> Result<Vec<String>, WorktreeError> {
-    let output = git_output(repo, args)?;
+fn git_nul_paths_in_environment(
+    repo: &Path,
+    args: &[&str],
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Result<Vec<String>, WorktreeError> {
+    let output = git_output_in_environment(repo, args, environment)?;
     if !output.status.success() {
         return Err(output_error(args, &output));
     }
@@ -870,34 +1068,56 @@ fn git_nul_paths(repo: &Path, args: &[&str]) -> Result<Vec<String>, WorktreeErro
     Ok(paths)
 }
 
-fn main_dirty_paths(repo_root: &Path) -> Result<std::collections::BTreeSet<String>, WorktreeError> {
+fn main_dirty_paths_in_environment(
+    repo_root: &Path,
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Result<std::collections::BTreeSet<String>, WorktreeError> {
     let mut dirty = std::collections::BTreeSet::new();
     for args in [
         vec!["diff", "--name-only", "-z"],
         vec!["ls-files", "--others", "--exclude-standard", "-z"],
     ] {
-        dirty.extend(git_nul_paths(repo_root, &args)?);
+        dirty.extend(git_nul_paths_in_environment(repo_root, &args, environment)?);
     }
     Ok(dirty)
 }
 
-fn find_worktree_path(repo_root: &Path, branch: &str) -> Result<Option<PathBuf>, WorktreeError> {
-    Ok(find_worktree_info(repo_root, branch)?.map(|worktree| PathBuf::from(worktree.path)))
-}
-
-fn find_worktree_info(
+fn find_worktree_path_in_environment(
     repo_root: &Path,
     branch: &str,
-) -> Result<Option<WorktreeInfo>, WorktreeError> {
-    let output = run_git(repo_root, &["worktree", "list", "--porcelain"])?;
-    Ok(parse_worktree_list(&output, repo_root)
-        .into_iter()
-        .find(|worktree| worktree.branch == branch))
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Result<Option<PathBuf>, WorktreeError> {
+    Ok(
+        find_worktree_info_in_environment(repo_root, branch, environment)?
+            .map(|worktree| PathBuf::from(worktree.path)),
+    )
 }
 
-fn branch_exists(repo_root: &Path, branch: &str) -> Result<bool, WorktreeError> {
+fn find_worktree_info_in_environment(
+    repo_root: &Path,
+    branch: &str,
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Result<Option<WorktreeInfo>, WorktreeError> {
+    let output =
+        run_git_in_environment(repo_root, &["worktree", "list", "--porcelain"], environment)?;
+    Ok(
+        parse_worktree_list_in_environment(&output, repo_root, environment)
+            .into_iter()
+            .find(|worktree| worktree.branch == branch),
+    )
+}
+
+fn branch_exists_in_environment(
+    repo_root: &Path,
+    branch: &str,
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Result<bool, WorktreeError> {
     let reference = format!("refs/heads/{branch}");
-    let output = git_output(repo_root, &["show-ref", "--verify", "--quiet", &reference])?;
+    let output = git_output_in_environment(
+        repo_root,
+        &["show-ref", "--verify", "--quiet", &reference],
+        environment,
+    )?;
     match output.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
@@ -908,11 +1128,16 @@ fn branch_exists(repo_root: &Path, branch: &str) -> Result<bool, WorktreeError> 
     }
 }
 
-fn lock_worktree(repo_root: &Path, path: &Path, label: &str) -> Result<(), WorktreeError> {
+fn lock_worktree_in_environment(
+    repo_root: &Path,
+    path: &Path,
+    label: &str,
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Result<(), WorktreeError> {
     let path = path
         .to_str()
         .ok_or_else(|| WorktreeError::new("worktree path is not valid UTF-8"))?;
-    run_git(
+    run_git_in_environment(
         repo_root,
         &[
             "worktree",
@@ -921,15 +1146,17 @@ fn lock_worktree(repo_root: &Path, path: &Path, label: &str) -> Result<(), Workt
             "--reason",
             &format!("fork subagent logical task {label} in progress"),
         ],
+        environment,
     )
     .map(|_| ())
 }
 
-fn find_integration_commit(
+fn find_integration_commit_in_environment(
     repo_root: &Path,
     trailer: &str,
+    environment: Option<&ProjectExecutionEnvironment>,
 ) -> Result<Option<String>, WorktreeError> {
-    let output = run_git(
+    let output = run_git_in_environment(
         repo_root,
         &[
             "log",
@@ -941,12 +1168,16 @@ fn find_integration_commit(
             "-n",
             "1",
         ],
+        environment,
     )?;
     let commit = output.trim();
     Ok((!commit.is_empty()).then(|| commit.to_string()))
 }
 
-fn reject_active_git_operation(repo_root: &Path) -> Result<(), String> {
+fn reject_active_git_operation_in_environment(
+    repo_root: &Path,
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Result<(), String> {
     for marker in [
         "MERGE_HEAD",
         "CHERRY_PICK_HEAD",
@@ -954,15 +1185,16 @@ fn reject_active_git_operation(repo_root: &Path) -> Result<(), String> {
         "rebase-merge",
         "rebase-apply",
     ] {
-        let marker_path = run_git(repo_root, &["rev-parse", "--git-path", marker])
-            .map_err(|error| format!("failed to inspect Git operation state: {error}"))?;
+        let marker_path =
+            run_git_in_environment(repo_root, &["rev-parse", "--git-path", marker], environment)
+                .map_err(|error| format!("failed to inspect Git operation state: {error}"))?;
         let path = PathBuf::from(marker_path);
         let path = if path.is_absolute() {
             path
         } else {
             repo_root.join(path)
         };
-        if path.exists() {
+        if target_exists(&path, environment).map_err(|error| error.to_string())? {
             return Err(format!(
                 "repository already has an active Git operation ({marker}); integration refused"
             ));
@@ -971,26 +1203,37 @@ fn reject_active_git_operation(repo_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn abort_own_merge(repo_root: &Path) -> Result<(), WorktreeError> {
-    let marker = run_git(repo_root, &["rev-parse", "--git-path", "MERGE_HEAD"])?;
+fn abort_own_merge_in_environment(
+    repo_root: &Path,
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Result<(), WorktreeError> {
+    let marker = run_git_in_environment(
+        repo_root,
+        &["rev-parse", "--git-path", "MERGE_HEAD"],
+        environment,
+    )?;
     let marker = PathBuf::from(marker);
     let marker = if marker.is_absolute() {
         marker
     } else {
         repo_root.join(marker)
     };
-    if marker.exists() {
-        run_git(repo_root, &["merge", "--abort"]).map(|_| ())
+    if target_exists(&marker, environment)? {
+        run_git_in_environment(repo_root, &["merge", "--abort"], environment).map(|_| ())
     } else {
         Ok(())
     }
 }
 
-fn unlock_worktree(repo_root: &Path, path: &Path) -> Result<(), WorktreeError> {
+fn unlock_worktree_in_environment(
+    repo_root: &Path,
+    path: &Path,
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Result<(), WorktreeError> {
     let path = path
         .to_str()
         .ok_or_else(|| WorktreeError::new("worktree path is not valid UTF-8"))?;
-    let output = git_output(repo_root, &["worktree", "unlock", path])?;
+    let output = git_output_in_environment(repo_root, &["worktree", "unlock", path], environment)?;
     if output.status.success() || bounded_output(&output, 2_000).contains("not locked") {
         Ok(())
     } else {
@@ -998,20 +1241,28 @@ fn unlock_worktree(repo_root: &Path, path: &Path) -> Result<(), WorktreeError> {
     }
 }
 
-fn cleanup_managed_worktree(repo_root: &Path, path: &Path, branch: &str) -> Result<(), String> {
+fn cleanup_managed_worktree_in_environment(
+    repo_root: &Path,
+    path: &Path,
+    branch: &str,
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Result<(), String> {
     let path_text = path
         .to_str()
         .ok_or_else(|| "worktree path is not valid UTF-8".to_string())?;
-    let _ = unlock_worktree(repo_root, path);
-    run_git(repo_root, &["worktree", "remove", path_text]).map_err(|error| error.to_string())?;
-    let ahead = branch_ahead_of_head(repo_root, branch).map_err(|error| error.to_string())?;
+    let _ = unlock_worktree_in_environment(repo_root, path, environment);
+    run_git_in_environment(repo_root, &["worktree", "remove", path_text], environment)
+        .map_err(|error| error.to_string())?;
+    let ahead = branch_ahead_of_head_in_environment(repo_root, branch, environment)
+        .map_err(|error| error.to_string())?;
     if ahead > 0 {
         return Err(format!(
             "worktree removed but branch {branch} retained because it has {ahead} unique commit(s)"
         ));
     }
-    run_git(repo_root, &["branch", "-D", branch]).map_err(|error| error.to_string())?;
-    run_git(repo_root, &["worktree", "prune"])
+    run_git_in_environment(repo_root, &["branch", "-D", branch], environment)
+        .map_err(|error| error.to_string())?;
+    run_git_in_environment(repo_root, &["worktree", "prune"], environment)
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
@@ -1043,18 +1294,20 @@ pub struct UnattendedCleanupResult {
     pub errors: Vec<String>,
 }
 
-fn list_prefixed_branches(
+fn list_prefixed_branches_in_environment(
     repo_root: &Path,
     prefix: &str,
+    environment: Option<&ProjectExecutionEnvironment>,
 ) -> Result<Vec<(String, String)>, WorktreeError> {
     let pattern = format!("refs/heads/{prefix}*");
-    let output = run_git(
+    let output = run_git_in_environment(
         repo_root,
         &[
             "for-each-ref",
             "--format=%(refname:short)%00%(objectname)",
             &pattern,
         ],
+        environment,
     )?;
     let mut branches = Vec::new();
     for line in output.lines().filter(|line| !line.trim().is_empty()) {
@@ -1069,15 +1322,27 @@ fn list_prefixed_branches(
     Ok(branches)
 }
 
-fn worktree_has_uncommitted_changes(path: &Path) -> Result<bool, WorktreeError> {
-    let status = run_git(path, &["status", "--porcelain=v1", "--untracked-files=all"])?;
+fn worktree_has_uncommitted_changes_in_environment(
+    path: &Path,
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Result<bool, WorktreeError> {
+    let status = run_git_in_environment(
+        path,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+        environment,
+    )?;
     Ok(!status.trim().is_empty())
 }
 
-fn branch_ahead_of_head(repo_root: &Path, branch: &str) -> Result<u32, WorktreeError> {
-    let count = run_git(
+fn branch_ahead_of_head_in_environment(
+    repo_root: &Path,
+    branch: &str,
+    environment: Option<&ProjectExecutionEnvironment>,
+) -> Result<u32, WorktreeError> {
+    let count = run_git_in_environment(
         repo_root,
         &["rev-list", "--count", &format!("HEAD..{branch}")],
+        environment,
     )?;
     count.trim().parse::<u32>().map_err(|error| {
         WorktreeError::new(format!(
@@ -1090,17 +1355,21 @@ fn branch_ahead_of_head(repo_root: &Path, branch: &str) -> Result<u32, WorktreeE
 /// whose worktree directory is already gone. A branch is considered to hold
 /// work when its checkout is dirty or it contains commits not reachable from
 /// the authoritative checkout's current `HEAD`.
-pub fn list_unattended_worktrees(
+pub(crate) fn list_unattended_worktrees_in_environment(
     repo_root: &Path,
     store: Option<&crate::tasks::task_runtime::TaskRuntimeStore>,
+    environment: Option<&ProjectExecutionEnvironment>,
 ) -> Result<Vec<UnattendedWorktreeInfo>, WorktreeError> {
-    let output = run_git(repo_root, &["worktree", "list", "--porcelain"])?;
-    let worktrees = parse_worktree_list(&output, repo_root)
+    let output =
+        run_git_in_environment(repo_root, &["worktree", "list", "--porcelain"], environment)?;
+    let worktrees = parse_worktree_list_in_environment(&output, repo_root, environment)
         .into_iter()
         .map(|worktree| (worktree.branch.clone(), worktree))
         .collect::<HashMap<_, _>>();
     let mut unattended = Vec::new();
-    for (branch, full_head) in list_prefixed_branches(repo_root, BRANCH_PREFIX)? {
+    for (branch, full_head) in
+        list_prefixed_branches_in_environment(repo_root, BRANCH_PREFIX, environment)?
+    {
         let run_id = branch
             .strip_prefix(BRANCH_PREFIX)
             .unwrap_or(branch.as_str())
@@ -1108,10 +1377,10 @@ pub fn list_unattended_worktrees(
         let worktree = worktrees.get(&branch);
         let path = worktree.map(|item| PathBuf::from(&item.path));
         let uncommitted_changes = match path.as_deref() {
-            Some(path) => worktree_has_uncommitted_changes(path)?,
+            Some(path) => worktree_has_uncommitted_changes_in_environment(path, environment)?,
             None => false,
         };
-        let ahead_commits = branch_ahead_of_head(repo_root, &branch)?;
+        let ahead_commits = branch_ahead_of_head_in_environment(repo_root, &branch, environment)?;
         let status = store
             .and_then(|store| store.get_run(&run_id).ok().flatten())
             .map(|run| run.status.as_str().to_string())
@@ -1139,8 +1408,9 @@ fn unattended_worktree(
     repo_root: &Path,
     run_id: &str,
     store: Option<&crate::tasks::task_runtime::TaskRuntimeStore>,
+    environment: Option<&ProjectExecutionEnvironment>,
 ) -> Result<UnattendedWorktreeInfo, WorktreeError> {
-    list_unattended_worktrees(repo_root, store)?
+    list_unattended_worktrees_in_environment(repo_root, store, environment)?
         .into_iter()
         .find(|worktree| worktree.run_id == run_id)
         .ok_or_else(|| {
@@ -1150,23 +1420,25 @@ fn unattended_worktree(
 
 /// Merge a retained legacy unattended worktree through the same safe
 /// integration boundary used by formal writer Subagents.
-pub fn merge_unattended_worktree(
+pub(crate) fn merge_unattended_worktree_in_environment(
     repo_root: &Path,
     run_id: &str,
     store: Option<&crate::tasks::task_runtime::TaskRuntimeStore>,
+    environment: Option<&ProjectExecutionEnvironment>,
 ) -> Result<WorktreeIntegrationOutcome, WorktreeError> {
-    let worktree = unattended_worktree(repo_root, run_id, store)?;
+    let worktree = unattended_worktree(repo_root, run_id, store, environment)?;
     if worktree.active {
         return Err(WorktreeError::new(format!(
             "run {run_id} is still active; refusing to integrate its worktree"
         )));
     }
     let trailer = format!("EKO-Unattended-Run: {run_id}");
-    if let Some(commit) = find_integration_commit(repo_root, &trailer)? {
-        let cleanup_warning = worktree
-            .path
-            .as_deref()
-            .and_then(|path| cleanup_managed_worktree(repo_root, path, &worktree.branch).err());
+    if let Some(commit) = find_integration_commit_in_environment(repo_root, &trailer, environment)?
+    {
+        let cleanup_warning = worktree.path.as_deref().and_then(|path| {
+            cleanup_managed_worktree_in_environment(repo_root, path, &worktree.branch, environment)
+                .err()
+        });
         return Ok(WorktreeIntegrationOutcome {
             status: WorktreeIntegrationStatus::AlreadyIntegrated,
             branch: worktree.branch,
@@ -1180,15 +1452,19 @@ pub fn merge_unattended_worktree(
         Some(path) => path,
         None => {
             let path = default_worktree_path(repo_root, &worktree.branch)?;
-            validate_worktree_target(repo_root, &path)?;
+            validate_worktree_target_in_environment(repo_root, &path, environment)?;
             let path_text = path
                 .to_str()
                 .ok_or_else(|| WorktreeError::new("worktree path is not valid UTF-8"))?;
-            run_git(repo_root, &["worktree", "add", path_text, &worktree.branch])?;
+            run_git_in_environment(
+                repo_root,
+                &["worktree", "add", path_text, &worktree.branch],
+                environment,
+            )?;
             path
         }
     };
-    integrate_existing_worktree(
+    integrate_existing_worktree_in_environment(
         repo_root,
         worktree.branch,
         path,
@@ -1197,49 +1473,57 @@ pub fn merge_unattended_worktree(
         &super::planner::FileOwnership::Unknown {
             reason: "legacy unattended worktree",
         },
+        environment,
     )
 }
 
-fn remove_unattended_worktree(
+fn remove_unattended_worktree_in_environment(
     repo_root: &Path,
     worktree: &UnattendedWorktreeInfo,
+    environment: Option<&ProjectExecutionEnvironment>,
 ) -> Result<(), WorktreeError> {
     if let Some(path) = worktree.path.as_deref() {
-        unlock_worktree(repo_root, path)?;
+        unlock_worktree_in_environment(repo_root, path, environment)?;
         let path = path
             .to_str()
             .ok_or_else(|| WorktreeError::new("worktree path is not valid UTF-8"))?;
-        run_git(repo_root, &["worktree", "remove", "--force", path])?;
+        run_git_in_environment(
+            repo_root,
+            &["worktree", "remove", "--force", path],
+            environment,
+        )?;
     }
-    run_git(repo_root, &["branch", "-D", &worktree.branch])?;
-    run_git(repo_root, &["worktree", "prune"])?;
+    run_git_in_environment(repo_root, &["branch", "-D", &worktree.branch], environment)?;
+    run_git_in_environment(repo_root, &["worktree", "prune"], environment)?;
     Ok(())
 }
 
 /// Discard an unattended worktree and its branch after an explicit user
 /// decision. Active runs are never removed.
-pub fn discard_unattended_worktree(
+pub(crate) fn discard_unattended_worktree_in_environment(
     repo_root: &Path,
     run_id: &str,
     store: Option<&crate::tasks::task_runtime::TaskRuntimeStore>,
+    environment: Option<&ProjectExecutionEnvironment>,
 ) -> Result<(), WorktreeError> {
-    let worktree = unattended_worktree(repo_root, run_id, store)?;
+    let worktree = unattended_worktree(repo_root, run_id, store, environment)?;
     if worktree.active {
         return Err(WorktreeError::new(format!(
             "run {run_id} is still active; refusing to discard its worktree"
         )));
     }
-    remove_unattended_worktree(repo_root, &worktree)
+    remove_unattended_worktree_in_environment(repo_root, &worktree, environment)
 }
 
 /// Unlock all inactive legacy worktrees and remove only those that provably
 /// contain no uncommitted files and no commits ahead of the authoritative
 /// checkout. Changed worktrees remain available for review.
-pub fn cleanup_unattended_worktrees(
+pub(crate) fn cleanup_unattended_worktrees_in_environment(
     repo_root: &Path,
     store: Option<&crate::tasks::task_runtime::TaskRuntimeStore>,
+    environment: Option<&ProjectExecutionEnvironment>,
 ) -> Result<UnattendedCleanupResult, WorktreeError> {
-    let worktrees = list_unattended_worktrees(repo_root, store)?;
+    let worktrees = list_unattended_worktrees_in_environment(repo_root, store, environment)?;
     let mut result = UnattendedCleanupResult::default();
     for worktree in worktrees {
         if worktree.active {
@@ -1249,7 +1533,7 @@ pub fn cleanup_unattended_worktrees(
         if worktree.locked
             && let Some(path) = worktree.path.as_deref()
         {
-            match unlock_worktree(repo_root, path) {
+            match unlock_worktree_in_environment(repo_root, path, environment) {
                 Ok(()) => result.unlocked.push(worktree.run_id.clone()),
                 Err(error) => {
                     result.errors.push(format!(
@@ -1265,7 +1549,7 @@ pub fn cleanup_unattended_worktrees(
             result.kept.push(worktree.run_id);
             continue;
         }
-        match remove_unattended_worktree(repo_root, &worktree) {
+        match remove_unattended_worktree_in_environment(repo_root, &worktree, environment) {
             Ok(()) => result.removed.push(worktree.run_id),
             Err(error) => result
                 .errors
@@ -1285,8 +1569,9 @@ pub fn cleanup_unattended_worktrees(
 /// Used by [`EkoIsolationProvider`]; the framework does not know about git.
 #[derive(Debug, Clone)]
 pub struct EkoWorktreeFactory {
+    environment: Option<Arc<ProjectExecutionEnvironment>>,
     /// Repository root the worktrees branch from. Resolved by the application
-    /// (e.g. `git_repo_root(cwd)`); `None` makes `create` fail fast.
+    /// (e.g. `git_repo_root_in_environment(cwd, environment)`); `None` makes `create` fail fast.
     pub repo_root: PathBuf,
 }
 
@@ -1300,8 +1585,13 @@ impl EkoWorktreeFactory {
         // `tokio::spawn`, but the git ops themselves are short and synchronous
         // — acceptable. (If they ever block the runtime, wrap in
         // spawn_blocking inside the factory.)
-        let wt = RunWorktree::acquire_fork(label, &self.repo_root)
+        let environment = self.environment.as_deref();
+        let repo_root = git_repo_root_in_environment(&self.repo_root, environment)
             .map_err(|error| echo_agent::subagent::IsolationError::new(error.message))?;
+        let wt =
+            RunWorktree::acquire_fork_in_environment(label, &repo_root, self.environment.clone())
+                .map_err(|error| echo_agent::subagent::IsolationError::new(error.message))?;
+        let resources = self.environment.clone();
         let path = wt.path.clone();
         let evidence_subject = path.to_string_lossy().to_string();
         tracing::info!(
@@ -1317,6 +1607,7 @@ impl EkoWorktreeFactory {
             path,
             observed: echo_agent::subagent::ObservedIsolation::new("worktree"),
             finalize: Box::new(move || {
+                let environment = resources.as_deref();
                 let has_changes = match wt.has_changes() {
                     Ok(has_changes) => has_changes,
                     Err(error) => {
@@ -1325,8 +1616,13 @@ impl EkoWorktreeFactory {
                     }
                 };
                 if !has_changes {
-                    cleanup_managed_worktree(&wt.repo_root, &wt.path, &wt.branch)
-                        .map_err(echo_agent::subagent::IsolationError::new)?;
+                    cleanup_managed_worktree_in_environment(
+                        &wt.repo_root,
+                        &wt.path,
+                        &wt.branch,
+                        environment,
+                    )
+                    .map_err(echo_agent::subagent::IsolationError::new)?;
                     tracing::info!(
                         worktree = %wt.path.display(),
                         branch = %wt.branch,
@@ -1371,11 +1667,106 @@ impl EkoWorktreeFactory {
 
 impl EkoWorktreeFactory {
     /// Construct a factory bound to the given repo root. The caller resolves
-    /// the root (typically `git_repo_root(cwd)`); pass `None` up-front by not
+    /// the root (typically `git_repo_root_in_environment(cwd, environment)`); pass `None` up-front by not
     /// constructing a factory at all if isolation is unavailable.
     pub fn new(repo_root: PathBuf) -> Self {
-        Self { repo_root }
+        Self {
+            repo_root,
+            environment: None,
+        }
     }
+}
+
+pub fn run_git(repo: &Path, args: &[&str]) -> Result<String, WorktreeError> {
+    run_git_in_environment(repo, args, None)
+}
+
+pub fn git_repo_root(start: &Path) -> Result<PathBuf, WorktreeError> {
+    git_repo_root_in_environment(start, None)
+}
+
+pub fn validate_branch_name(repo: &Path, branch: &str) -> Result<(), WorktreeError> {
+    validate_branch_name_in_environment(repo, branch, None)
+}
+
+pub fn validate_worktree_target(repo_root: &Path, target: &Path) -> Result<(), WorktreeError> {
+    validate_worktree_target_in_environment(repo_root, target, None)
+}
+
+pub fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
+    parse_worktree_list_in_environment(output, repo_root, None)
+}
+
+pub fn integrate_fork_worktree(
+    repo_root: &Path,
+    label: &str,
+    task_id: &str,
+    execution_id: &str,
+    ownership: &super::planner::FileOwnership,
+) -> Result<WorktreeIntegrationOutcome, WorktreeError> {
+    integrate_fork_worktree_in_environment(repo_root, label, task_id, execution_id, ownership, None)
+}
+
+#[cfg(test)]
+fn find_worktree_path(repo_root: &Path, branch: &str) -> Result<Option<PathBuf>, WorktreeError> {
+    find_worktree_path_in_environment(repo_root, branch, None)
+}
+
+#[cfg(test)]
+fn find_worktree_info(
+    repo_root: &Path,
+    branch: &str,
+) -> Result<Option<WorktreeInfo>, WorktreeError> {
+    find_worktree_info_in_environment(repo_root, branch, None)
+}
+
+#[cfg(test)]
+fn branch_exists(repo_root: &Path, branch: &str) -> Result<bool, WorktreeError> {
+    branch_exists_in_environment(repo_root, branch, None)
+}
+
+#[cfg(test)]
+fn unlock_worktree(repo_root: &Path, path: &Path) -> Result<(), WorktreeError> {
+    unlock_worktree_in_environment(repo_root, path, None)
+}
+
+#[cfg(test)]
+fn cleanup_managed_worktree(repo_root: &Path, path: &Path, branch: &str) -> Result<(), String> {
+    cleanup_managed_worktree_in_environment(repo_root, path, branch, None)
+}
+
+pub fn list_unattended_worktrees(
+    repo_root: &Path,
+    store: Option<&crate::tasks::task_runtime::TaskRuntimeStore>,
+) -> Result<Vec<UnattendedWorktreeInfo>, WorktreeError> {
+    let environment = store.and_then(TaskRuntimeStore::project_environment);
+    list_unattended_worktrees_in_environment(repo_root, store, environment.as_ref())
+}
+
+pub fn merge_unattended_worktree(
+    repo_root: &Path,
+    run_id: &str,
+    store: Option<&crate::tasks::task_runtime::TaskRuntimeStore>,
+) -> Result<WorktreeIntegrationOutcome, WorktreeError> {
+    let environment = store.and_then(TaskRuntimeStore::project_environment);
+    merge_unattended_worktree_in_environment(repo_root, run_id, store, environment.as_ref())
+}
+
+pub fn discard_unattended_worktree(
+    repo_root: &Path,
+    run_id: &str,
+    store: Option<&crate::tasks::task_runtime::TaskRuntimeStore>,
+) -> Result<(), WorktreeError> {
+    let environment = store.and_then(TaskRuntimeStore::project_environment);
+    discard_unattended_worktree_in_environment(repo_root, run_id, store, environment.as_ref())
+}
+
+pub fn cleanup_unattended_worktrees(
+    repo_root: &Path,
+    store: Option<&crate::tasks::task_runtime::TaskRuntimeStore>,
+) -> Result<UnattendedCleanupResult, WorktreeError> {
+    let environment = store.and_then(TaskRuntimeStore::project_environment);
+    cleanup_unattended_worktrees_in_environment(repo_root, store, environment.as_ref())
 }
 
 // ── Data-subagent workspace factory (Sprint 10) ──────────────────────────
@@ -1395,6 +1786,7 @@ impl EkoWorktreeFactory {
 /// Used by [`EkoIsolationProvider`]; the framework does not know about tmpdirs.
 #[derive(Debug, Clone)]
 pub struct EkoDataWorkspaceFactory {
+    environment: Option<Arc<ProjectExecutionEnvironment>>,
     /// Optional parent dir under which subagent tmpdirs are created. `None`
     /// uses the OS temp dir (`std::env::temp_dir()`). Keeping workspaces under
     /// a known parent aids debugging/cleanup.
@@ -1422,21 +1814,31 @@ impl EkoDataWorkspaceFactory {
         let prefix = format!("eko-data-{safe_label}-");
 
         // Create the tmpdir (under base_dir if given, else OS temp).
-        let dir = match &self.base_dir {
-            Some(base) => tempfile::Builder::new().prefix(&prefix).tempdir_in(base),
-            None => tempfile::Builder::new().prefix(&prefix).tempdir(),
-        }
-        .map_err(|e| {
-            echo_agent::subagent::IsolationError::new(format!(
-                "failed to create data workspace tmpdir ({prefix}): {e}"
-            ))
-        })?;
-
-        // KEEP the tmpdir from auto-cleanup: a downstream analyst subagent may
-        // need to read this subagent's output shards after this dispatch returns.
-        // `keep()` consumes the TempDir without removing it; cleanup is then
-        // the application/user's responsibility (or a future sweep).
-        let final_path = dir.keep();
+        let final_path = match self.environment.as_ref() {
+            Some(environment) => {
+                let base = match self.base_dir.as_ref() {
+                    Some(base) => base.clone(),
+                    None => environment.files.current_dir().map_err(|error| {
+                        echo_agent::subagent::IsolationError::new(error.to_string())
+                    })?,
+                };
+                let path = base.join(format!("{prefix}{}", uuid::Uuid::new_v4()));
+                environment.files.create_dir(&path).map_err(|error| {
+                    echo_agent::subagent::IsolationError::new(error.to_string())
+                })?;
+                path
+            }
+            None => {
+                let dir = match &self.base_dir {
+                    Some(base) => tempfile::Builder::new().prefix(&prefix).tempdir_in(base),
+                    None => tempfile::Builder::new().prefix(&prefix).tempdir(),
+                }
+                .map_err(|error| echo_agent::subagent::IsolationError::new(error.to_string()))?;
+                // Existing retained output policy: downstream collect may still
+                // need these shards. Never delete another invocation's files.
+                dir.keep()
+            }
+        };
 
         tracing::info!(
             subagent_label = label,
@@ -1445,6 +1847,7 @@ impl EkoDataWorkspaceFactory {
         );
 
         let path_for_finalize = final_path.clone();
+        let resources = self.environment.clone();
         Ok(echo_agent::subagent::IsolationHandle {
             path: final_path,
             observed: echo_agent::subagent::ObservedIsolation::new("workspace"),
@@ -1453,18 +1856,30 @@ impl EkoDataWorkspaceFactory {
                 // entries; data tools typically write flat outputs). The
                 // orchestrator/analyst reads this to find each subagent's shards
                 // for concat+synthesize.
-                let mut entries: Vec<String> = std::fs::read_dir(&path_for_finalize)
-                    .map_err(|e| {
-                        echo_agent::subagent::IsolationError::new(format!(
-                            "workspace finalize read_dir failed: {e}"
-                        ))
-                    })?
-                    .filter_map(|e| e.ok())
-                    .filter_map(|e| {
-                        let name = e.file_name().to_string_lossy().to_string();
-                        if name.is_empty() { None } else { Some(name) }
-                    })
-                    .collect();
+                let mut entries: Vec<String> = if let Some(environment) = resources.as_ref() {
+                    environment
+                        .files
+                        .read_dir(&path_for_finalize)
+                        .map_err(|error| {
+                            echo_agent::subagent::IsolationError::new(error.to_string())
+                        })?
+                        .into_iter()
+                        .map(|entry| entry.file_name.to_string_lossy().to_string())
+                        .collect()
+                } else {
+                    std::fs::read_dir(&path_for_finalize)
+                        .map_err(|e| {
+                            echo_agent::subagent::IsolationError::new(format!(
+                                "workspace finalize read_dir failed: {e}"
+                            ))
+                        })?
+                        .filter_map(|e| e.ok())
+                        .filter_map(|e| {
+                            let name = e.file_name().to_string_lossy().to_string();
+                            if name.is_empty() { None } else { Some(name) }
+                        })
+                        .collect()
+                };
                 entries.sort();
                 let summary = if entries.is_empty() {
                     "(no output files generated)".to_string()
@@ -1473,13 +1888,35 @@ impl EkoDataWorkspaceFactory {
                 };
                 let artifacts = entries
                     .into_iter()
-                    .map(|entry| echo_agent::subagent::SubagentArtifact {
-                        path: path_for_finalize.join(&entry).to_string_lossy().to_string(),
-                        kind: "workspace_output".to_string(),
-                        bytes: None,
-                        sha256: None,
-                        producer_execution_id: None,
-                        available: path_for_finalize.join(entry).is_file(),
+                    .map(|entry| {
+                        let path = path_for_finalize.join(entry);
+                        let fingerprint = match resources.as_ref() {
+                            Some(environment) => environment
+                                .files
+                                .metadata(&path)
+                                .ok()
+                                .filter(|metadata| metadata.is_file())
+                                .and_then(|_| environment.files.open_read(&path).ok())
+                                .and_then(|mut reader| {
+                                    super::completion_gate::artifact_fingerprint(reader.as_mut())
+                                        .ok()
+                                }),
+                            None => std::fs::metadata(&path)
+                                .ok()
+                                .filter(|metadata| metadata.is_file())
+                                .and_then(|_| std::fs::File::open(&path).ok())
+                                .and_then(|mut reader| {
+                                    super::completion_gate::artifact_fingerprint(&mut reader).ok()
+                                }),
+                        };
+                        echo_agent::subagent::SubagentArtifact {
+                            path: path.to_string_lossy().to_string(),
+                            kind: "workspace_output".to_string(),
+                            bytes: fingerprint.as_ref().map(|(_, bytes)| *bytes),
+                            sha256: fingerprint.as_ref().map(|(digest, _)| digest.clone()),
+                            producer_execution_id: None,
+                            available: fingerprint.is_some(),
+                        }
                     })
                     .collect();
                 Ok(echo_agent::subagent::IsolationOutcome {
@@ -1505,10 +1942,31 @@ impl EkoIsolationProvider {
             workspace: EkoDataWorkspaceFactory::new(),
         }
     }
-}
 
-impl echo_agent::subagent::IsolationProvider for EkoIsolationProvider {
-    fn isolate(
+    pub(crate) fn for_environment(
+        repo_root: Option<PathBuf>,
+        environment: Option<Arc<ProjectExecutionEnvironment>>,
+    ) -> Self {
+        let Some(environment) = environment else {
+            return Self::new(repo_root);
+        };
+        let root = repo_root.unwrap_or_else(|| match &environment.location {
+            crate::workspace::ProjectLocation::Local { path } => path.clone(),
+            crate::workspace::ProjectLocation::Ssh { path, .. } => PathBuf::from(path),
+        });
+        Self {
+            worktree: Some(EkoWorktreeFactory {
+                repo_root: root,
+                environment: Some(environment.clone()),
+            }),
+            workspace: EkoDataWorkspaceFactory {
+                base_dir: None,
+                environment: Some(environment),
+            },
+        }
+    }
+
+    fn isolate_owned(
         &self,
         request: &echo_agent::subagent::IsolationRequest,
     ) -> Result<echo_agent::subagent::IsolationHandle, echo_agent::subagent::IsolationError> {
@@ -1530,10 +1988,44 @@ impl echo_agent::subagent::IsolationProvider for EkoIsolationProvider {
     }
 }
 
+impl echo_agent::subagent::IsolationProvider for EkoIsolationProvider {
+    fn isolate(
+        &self,
+        request: &echo_agent::subagent::IsolationRequest,
+    ) -> Result<echo_agent::subagent::IsolationHandle, echo_agent::subagent::IsolationError> {
+        // FileSystem is synchronous and remote adapters enter the original
+        // Tokio runtime. Run the existing call on a joined blocking bridge;
+        // neither a transport future nor its resource guard is detached.
+        let handle = std::thread::scope(|scope| scope.spawn(|| self.isolate_owned(request)).join())
+            .map_err(|_| {
+                echo_agent::subagent::IsolationError::new("project isolation bridge failed")
+            })??;
+        let echo_agent::subagent::IsolationHandle {
+            path,
+            observed,
+            finalize,
+        } = handle;
+        Ok(echo_agent::subagent::IsolationHandle {
+            path,
+            observed,
+            finalize: Box::new(move || {
+                std::thread::scope(|scope| scope.spawn(finalize).join()).map_err(|_| {
+                    echo_agent::subagent::IsolationError::new(
+                        "project isolation finalization bridge failed",
+                    )
+                })?
+            }),
+        })
+    }
+}
+
 impl EkoDataWorkspaceFactory {
     /// Construct a factory that creates subagent tmpdirs under the OS temp dir.
     pub fn new() -> Self {
-        Self { base_dir: None }
+        Self {
+            base_dir: None,
+            environment: None,
+        }
     }
 
     /// Create subagent tmpdirs under the given base directory (for debuggable
@@ -1541,6 +2033,7 @@ impl EkoDataWorkspaceFactory {
     pub fn with_base_dir(base_dir: PathBuf) -> Self {
         Self {
             base_dir: Some(base_dir),
+            environment: None,
         }
     }
 }
@@ -1557,6 +2050,165 @@ mod tests {
 
     use super::*;
     use std::path::PathBuf;
+
+    fn init_named_fixture_repo(root: &Path, contents: &str) -> Result<(), String> {
+        run_git(root, &["init", "-b", "main"]).map_err(|error| error.to_string())?;
+        run_git(root, &["config", "user.name", "EKO routing test"])
+            .map_err(|error| error.to_string())?;
+        run_git(root, &["config", "user.email", "routing@local"])
+            .map_err(|error| error.to_string())?;
+        std::fs::write(root.join("shared.txt"), contents).map_err(|error| error.to_string())?;
+        run_git(root, &["add", "shared.txt"]).map_err(|error| error.to_string())?;
+        run_git(
+            root,
+            &["-c", "commit.gpgsign=false", "commit", "-m", "initial"],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn commit_fixture_change(root: &Path, contents: &str) -> Result<(), String> {
+        std::fs::write(root.join("shared.txt"), contents).map_err(|error| error.to_string())?;
+        run_git(root, &["add", "shared.txt"]).map_err(|error| error.to_string())?;
+        run_git(
+            root,
+            &["-c", "commit.gpgsign=false", "commit", "-m", "change"],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn merge_abort_checks_target_marker_and_preserves_target_stat_errors()
+    -> Result<(), String> {
+        // 同步 Git 在阻塞池执行，原 current_thread 继续驱动真实 Local owner。
+        tokio::task::spawn_blocking(|| -> std::result::Result<(), String> {
+            let fixture = super::super::project_environment_tests::EnvironmentFixture::new()?;
+            init_named_fixture_repo(&fixture.visible_root, "LOCAL\n")?;
+            init_named_fixture_repo(&fixture.target_root, "BASE\n")?;
+            run_git(&fixture.target_root, &["checkout", "-b", "conflict-side"])
+                .map_err(|error| error.to_string())?;
+            commit_fixture_change(&fixture.target_root, "SIDE\n")?;
+            run_git(&fixture.target_root, &["checkout", "main"])
+                .map_err(|error| error.to_string())?;
+            commit_fixture_change(&fixture.target_root, "MAIN\n")?;
+            assert!(
+                run_git(
+                    &fixture.target_root,
+                    &["merge", "--no-gpg-sign", "conflict-side"]
+                )
+                .is_err()
+            );
+            let marker = fixture.visible_root.join(".git/MERGE_HEAD");
+            assert!(!marker.exists());
+            assert!(
+                fixture
+                    .files
+                    .exists(&marker)
+                    .map_err(|error| error.to_string())?
+            );
+            let store = fixture.open("target.invalid", 1)?;
+            let environment = store
+                .project_environment()
+                .ok_or_else(|| "project environment missing".to_string())?;
+            abort_own_merge_in_environment(&fixture.visible_root, Some(&environment))
+                .map_err(|error| error.to_string())?;
+            assert!(
+                !fixture
+                    .files
+                    .exists(&marker)
+                    .map_err(|error| error.to_string())?
+            );
+            assert_eq!(
+                std::fs::read_to_string(fixture.target_root.join("shared.txt"))
+                    .map_err(|error| error.to_string())?,
+                "MAIN\n"
+            );
+            // A marker on the local decoy must not trigger an abort elsewhere.
+            std::fs::write(&marker, b"LOCAL MARKER").map_err(|error| error.to_string())?;
+            abort_own_merge_in_environment(&fixture.visible_root, Some(&environment))
+                .map_err(|error| error.to_string())?;
+            assert_eq!(
+                std::fs::read(&marker).map_err(|error| error.to_string())?,
+                b"LOCAL MARKER"
+            );
+            fixture
+                .fail_metadata
+                .store(true, std::sync::atomic::Ordering::Release);
+            let error = abort_own_merge_in_environment(&fixture.visible_root, Some(&environment))
+                .err()
+                .ok_or_else(|| "target metadata failure was hidden".to_string())?;
+            assert!(
+                error
+                    .to_string()
+                    .contains("fixture target metadata is unavailable")
+            );
+            Ok(())
+        })
+        .await
+        .map_err(|error| format!("failed to join blocking Git fixture: {error}"))?
+    }
+
+    #[tokio::test]
+    async fn retained_legacy_merge_and_discard_use_the_same_target_environment()
+    -> Result<(), String> {
+        // 同步 Git 在阻塞池执行，原 current_thread 继续驱动真实 Local owner。
+        tokio::task::spawn_blocking(|| -> std::result::Result<(), String> {
+            let fixture = super::super::project_environment_tests::EnvironmentFixture::new()?;
+            init_named_fixture_repo(&fixture.visible_root, "LOCAL\n")?;
+            init_named_fixture_repo(&fixture.target_root, "TARGET\n")?;
+            let local_merge =
+                create_legacy_unattended_worktree(&fixture.visible_root, "local-merge-decoy")?;
+            let target_merge =
+                create_legacy_unattended_worktree(&fixture.target_root, "legacy-merge")?;
+            std::fs::write(local_merge.join("merged.txt"), b"LOCAL CHANGE")
+                .map_err(|error| error.to_string())?;
+            std::fs::write(target_merge.join("merged.txt"), b"TARGET CHANGE")
+                .map_err(|error| error.to_string())?;
+            let store = fixture.open("target.invalid", 1)?;
+            let outcome =
+                merge_unattended_worktree(&fixture.visible_root, "legacy-merge", Some(&store))
+                    .map_err(|error| error.to_string())?;
+            assert_eq!(outcome.status, WorktreeIntegrationStatus::Merged);
+            assert_eq!(
+                std::fs::read(fixture.target_root.join("merged.txt"))
+                    .map_err(|error| error.to_string())?,
+                b"TARGET CHANGE"
+            );
+            assert!(!fixture.visible_root.join("merged.txt").exists());
+            assert_eq!(
+                std::fs::read(local_merge.join("merged.txt")).map_err(|error| error.to_string())?,
+                b"LOCAL CHANGE"
+            );
+            let local_discard =
+                create_legacy_unattended_worktree(&fixture.visible_root, "local-discard-decoy")?;
+            let target_discard =
+                create_legacy_unattended_worktree(&fixture.target_root, "legacy-discard")?;
+            std::fs::write(local_discard.join("retain.txt"), b"KEEP LOCAL")
+                .map_err(|error| error.to_string())?;
+            std::fs::write(target_discard.join("discard.txt"), b"DISCARD TARGET")
+                .map_err(|error| error.to_string())?;
+            discard_unattended_worktree(&fixture.visible_root, "legacy-discard", Some(&store))
+                .map_err(|error| error.to_string())?;
+            assert!(!target_discard.exists());
+            assert_eq!(
+                std::fs::read(local_discard.join("retain.txt"))
+                    .map_err(|error| error.to_string())?,
+                b"KEEP LOCAL"
+            );
+            assert!(
+                branch_exists_in_environment(
+                    &fixture.visible_root,
+                    &format!("{BRANCH_PREFIX}local-discard-decoy"),
+                    None
+                )
+                .map_err(|error| error.to_string())?
+            );
+            Ok(())
+        })
+        .await
+        .map_err(|error| format!("failed to join blocking Git fixture: {error}"))?
+    }
 
     fn init_repo() -> Result<(tempfile::TempDir, PathBuf), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
@@ -2173,15 +2825,51 @@ mod tests {
     }
 
     #[test]
-    fn eko_worktree_factory_create_fails_outside_git_repo() {
-        // Sprint 8: EkoWorktreeFactory implements the framework trait; on a
-        // non-git directory, create() must surface an error (RunWorktree::create_fork
-        // → git rev-parse fails). This guards the trait wiring without needing
-        // a real git repo (which CI/sandbox may not have).
-        let tmp = std::env::temp_dir();
-        let factory = EkoWorktreeFactory::new(tmp.clone());
-        let res = factory.isolate("writer-run1");
-        assert!(res.is_err(), "expected error outside a git repo");
+    fn eko_worktree_factory_create_fails_outside_git_repo() -> Result<(), String> {
+        const NAME: &str = "tasks::task_runtime::worktree::tests::eko_worktree_factory_create_fails_outside_git_repo";
+        let Some(nonrepo) = std::env::var_os("EKO_WORKTREE_NONREPO_FIXTURE") else {
+            let fixture = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let nonrepo = fixture.path().join("nonrepo");
+            std::fs::create_dir(&nonrepo).map_err(|error| error.to_string())?;
+            let output = std::process::Command::new(
+                std::env::current_exe().map_err(|error| error.to_string())?,
+            )
+            .args(["--exact", NAME, "--nocapture"])
+            .env("EKO_WORKTREE_NONREPO_FIXTURE", &nonrepo)
+            .env("GIT_CEILING_DIRECTORIES", fixture.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .map_err(|error| error.to_string())?;
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        };
+        let nonrepo = std::path::PathBuf::from(nonrepo);
+        let git = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&nonrepo)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .map_err(|error| error.to_string())?;
+        assert!(!git.status.success());
+        assert!(String::from_utf8_lossy(&git.stderr).contains("not a git repository"));
+        let factory = EkoWorktreeFactory::new(nonrepo.clone());
+        assert!(
+            factory.isolate("writer-run1").is_err(),
+            "expected error outside a git repo"
+        );
+        assert!(
+            std::fs::read_dir(&nonrepo)
+                .map_err(|error| error.to_string())?
+                .next()
+                .is_none()
+        );
+        Ok(())
     }
 
     #[test]

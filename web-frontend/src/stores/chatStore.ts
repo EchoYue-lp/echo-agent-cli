@@ -1,11 +1,40 @@
+import type { AgentCommunicationInput } from '../lib/agentCommunication';
 import { create } from 'zustand';
-import type { ChatMessage, ApprovalRequest, ExecutionRound, ChatRunStatus } from '../types/api';
+import { isHitlRequestIdentity, isNativeTurnSource, sameHitlIdentity } from '../types/api';
+import type { HitlRequestIdentity } from '../types/api';
+import type {
+  AssistantMessageBlock,
+  NativeExecutionStatus,
+  NativeFinalAnswerSource,
+  NativeTurnSource,
+  NativeJournalCursor,
+  NativePresentationRecord,
+  ChatMessage,
+  ApprovalRequest,
+  ChatRunStatus,
+  TranscriptProjectionSettlement,
+} from '../types/api';
+import {
+  earliestNativeJournalCursor,
+  recordBelongsToTurn,
+  uniquePresentationRecords,
+} from '../lib/nativePresentation';
 import { useConversationStore } from './conversationStore';
 
-/** In-progress round being built during streaming */
-interface CurrentRound {
-  thinking?: { content: string };
-  toolCallIds: string[];
+export interface ChatActivity {
+  key: string;
+  label: string;
+  startedAt: number;
+  lastEventAt: number;
+  scope?: string;
+}
+
+/** 原journal的临时保存观察；不写canonical正文，也不参与TaskRun结算。 */
+export interface TranscriptSaveObservation {
+  eventId: string;
+  sequence: number;
+  timestamp: number;
+  receipt: TranscriptProjectionSettlement;
 }
 
 /** 当前上下文窗口占用快照（对齐 Claude Code statusline 语义）。 */
@@ -28,7 +57,7 @@ export interface ContextUsageAccumulator {
   totalCached: number;
 }
 
-export type PendingHitlRequest =
+export type PendingHitlRequest = { identity: HitlRequestIdentity } & (
   | ({ kind: 'approval' } & ApprovalRequest)
   | { kind: 'input'; requestId: string; prompt?: string }
   | {
@@ -39,7 +68,8 @@ export type PendingHitlRequest =
       taskId?: string;
       context?: unknown;
       phase?: string;
-    };
+    }
+);
 
 function waitingStatus(request: PendingHitlRequest): ChatRunStatus {
   return request.kind === 'approval' ? 'waiting_approval' : 'waiting_input';
@@ -51,18 +81,33 @@ export function cacheHitRate(acc: ContextUsageAccumulator): number | null {
 }
 
 interface ChatState {
+  agentInputs: AgentCommunicationInput[];
+  agentInputsBinding: string | null;
+  agentInputReadError: { binding: string; message: string } | null;
+  noteAgentInputReadError: (binding: string, message: string) => void;
+  observeAgentInputs: (
+    workspaceId: string,
+    conversationId: string,
+    records: AgentCommunicationInput[],
+    binding: string
+  ) => void;
   messages: ChatMessage[];
   isStreaming: boolean;
   isCancelled: boolean;
   isThinking: boolean;
   runStatus: ChatRunStatus;
+  /** 仅来自实际运行事件；计时刷新不产生新事件或发现。 */
+  activity: ChatActivity | null;
+  transcriptSaves: Record<string, TranscriptSaveObservation[]>;
+  observeTranscriptSave: (scope: string, observation: TranscriptSaveObservation) => void;
+  observeActivity: (key: string, label: string, at?: number, scope?: string) => void;
+  noteActivityEvent: (at?: number) => void;
   pendingHitlRequests: PendingHitlRequest[];
   /** True when viewing a loaded historical conversation (agent has no context) */
   isHistoryView: boolean;
-  /** Current round being built during streaming */
-  currentRound: CurrentRound | null;
   /** 当前上下文窗口占用（来自最近一次 llm_usage 事件的真实 prompt_tokens）。null = 首次响应前 / 刚压缩后。 */
   contextWindow: ContextWindowUsage | null;
+  contextInvalidated: boolean;
   /** 会话级缓存命中率累加器（压缩保留，clear/replace 清零）。 */
   usageAccumulator: ContextUsageAccumulator;
 
@@ -75,25 +120,32 @@ interface ChatState {
     attachments?: ChatMessage['attachments']
   ) => string;
   appendToken: (id: string, token: string) => void;
-  appendThinking: (id: string, token: string) => void;
-  startThinkingSegment: (id: string) => void;
+  appendAssistantBlock: (
+    id: string,
+    block: AssistantMessageBlock,
+    executionId?: string | null,
+    publicationEventId?: string | null,
+    journalSource?: NativeJournalCursor
+  ) => void;
+  observeExecutionStatus: (id: string, status: NativeExecutionStatus) => void;
+  observeTurnSource: (id: string, source: NativeTurnSource) => void;
+  recordNativePresentation: (record: NativePresentationRecord) => void;
   recordToolStart: (messageId: string, toolExecutionId: string) => void;
-  startToolBatch: (toolCount: number) => void;
-  endToolBatch: () => void;
-  applyFinalAnswer: (id: string, content: string) => void;
+  applyFinalAnswer: (id: string, content: string, executionId?: string | null) => void;
+  applyFinalAnswerSource: (id: string, source: NativeFinalAnswerSource) => void;
   settleAssistantMessage: (id: string) => void;
   projectAssistantError: (id: string, error: string) => void;
   handoffToTaskRuntime: (id: string, content: string, isRunning: boolean) => void;
   /** Insert a non-streaming assistant note (e.g. background subagent finished). */
-  appendLocalAssistantNote: (content: string) => void;
+  appendLocalAssistantNote: (content: string, source?: { id: string; timestamp: number }) => void;
   setStreaming: (v: boolean) => void;
   setThinking: (v: boolean) => void;
   setRunStatus: (status: ChatRunStatus) => void;
   clearInactiveTurnProjection: () => void;
   enqueueHitlRequest: (request: PendingHitlRequest) => void;
-  removeHitlRequest: (requestId: string) => void;
+  removeHitlRequest: (identity: HitlRequestIdentity) => void;
   clearHitlRequests: () => void;
-  addChartMessage: (spec: unknown) => void;
+  addChartMessage: (spec: unknown, messageId?: string | null) => void;
   clearMessages: () => void;
   replaceMessages: (messages: ChatMessage[]) => void;
   setHistoryView: (v: boolean) => void;
@@ -120,6 +172,40 @@ function trimToMax(msgs: ChatMessage[]): ChatMessage[] {
 let msgCounter = 0;
 const nextId = () => `msg-${++msgCounter}-${Date.now()}`;
 
+function transcriptSaveNotes(observations: TranscriptSaveObservation[]): ChatMessage[] {
+  const notes: ChatMessage[] = [];
+  const unconfirmed = new Set<string>();
+  let lastConfirmed: TranscriptSaveObservation | undefined;
+  for (const observation of observations) {
+    const receipt = observation.receipt;
+    const operation = receipt.operation_id
+      ? JSON.stringify([receipt.operation_id, receipt.generation_id])
+      : null;
+    let content: string;
+    if (receipt.status === 'settled') {
+      lastConfirmed = observation;
+      if (!operation || !unconfirmed.delete(operation)) continue;
+      content = '此前未确认的会话保存操作现已收到确认。任务执行状态仍以原运行结果为准。';
+    } else {
+      if (operation) unconfirmed.add(operation);
+      content = `会话保存尚未确认（${receipt.status}）：${
+        receipt.error_class ?? '未提供错误分类'
+      }${receipt.detail ? `；${receipt.detail}` : ''}\n\n最后收到的保存确认：${
+        lastConfirmed ? new Date(lastConfirmed.timestamp).toISOString() : '暂无可核验的确认回执'
+      }。此前的确认不代表本次内容已经保存。`;
+    }
+    notes.push({
+      id: `journal-save:${observation.eventId}`,
+      role: 'assistant',
+      content,
+      finalAnswerConfirmed: false,
+      isStreaming: false,
+      timestamp: observation.timestamp,
+    });
+  }
+  return notes;
+}
+
 /** Auto-save to conversationStore after state changes that add messages. */
 function autoSave() {
   const state = useChatStore.getState();
@@ -140,16 +226,79 @@ function scheduleAutoSave() {
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
+  agentInputs: [],
+  agentInputsBinding: null,
+  agentInputReadError: null,
+  noteAgentInputReadError: (binding, message) => set({ agentInputReadError: { binding, message } }),
+  observeAgentInputs: (workspaceId, conversationId, records, binding) => {
+    const view = useConversationStore.getState();
+    if (view.workspaceId !== workspaceId || view.activeId !== conversationId) return;
+    set({ agentInputs: records, agentInputsBinding: binding, agentInputReadError: null });
+  },
   messages: [],
   isStreaming: false,
   isCancelled: false,
   isThinking: false,
   runStatus: 'idle',
+  activity: null,
+  transcriptSaves: {},
   pendingHitlRequests: [],
   isHistoryView: false,
-  currentRound: null,
   contextWindow: null,
+  contextInvalidated: false,
   usageAccumulator: { totalInput: 0, totalCached: 0 },
+
+  observeTranscriptSave: (scope, observation) =>
+    set((state) => {
+      if (!Number.isFinite(observation.timestamp) || observation.sequence < 1) return state;
+      const previous = state.transcriptSaves[scope] ?? [];
+      if (previous.some((entry) => entry.eventId === observation.eventId)) return state;
+      const confirmed =
+        observation.receipt.status === 'settled' &&
+        Boolean(observation.receipt.operation_id) &&
+        observation.receipt.attempt > 0;
+      // no-op/旧checkpoint的Settled没有新batch回执，不能覆盖未确认的内容保存。
+      if (observation.receipt.status === 'settled' && !confirmed) return state;
+      // 尾部可以先到；按原序号重投影，不能用“最新观察”丢弃随后补读的历史确认。
+      const observations = [...previous, observation].sort((a, b) => a.sequence - b.sequence);
+      const notes = transcriptSaveNotes(observations);
+      const sourceIds = new Set(observations.map((entry) => `journal-save:${entry.eventId}`));
+      const messages = state.messages.filter((message) => !sourceIds.has(message.id));
+      for (const note of notes) {
+        const next = messages.findIndex((message) => message.timestamp > note.timestamp);
+        messages.splice(next < 0 ? messages.length : next, 0, note);
+      }
+      return {
+        transcriptSaves: { ...state.transcriptSaves, [scope]: observations },
+        messages: trimToMax(messages),
+      };
+    }),
+
+  observeActivity: (key, label, at = Date.now(), scope) =>
+    set((state) => {
+      if (!state.isStreaming || !Number.isFinite(at)) return state;
+      const previous = state.activity;
+      if (previous && at < previous.lastEventAt) return state;
+      return {
+        activity: {
+          key,
+          label,
+          startedAt: previous?.key === key ? previous.startedAt : at,
+          lastEventAt: Math.max(previous?.lastEventAt ?? at, at),
+          scope,
+        },
+      };
+    }),
+  noteActivityEvent: (at = Date.now()) =>
+    set((state) => ({
+      activity:
+        state.isStreaming && state.activity && Number.isFinite(at)
+          ? {
+              ...state.activity,
+              lastEventAt: Math.max(state.activity.lastEventAt, at),
+            }
+          : state.activity,
+    })),
 
   addUserMessage: (content, attachments) => {
     const id = nextId();
@@ -174,6 +323,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       messages: state.messages.filter((message) => !removed.has(message.id)),
       isStreaming: false,
       isThinking: false,
+      activity: null,
     }));
     scheduleAutoSave();
   },
@@ -187,9 +337,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
           id,
           role: 'assistant',
           content: '',
-          thinkingSegments: [],
+          finalAnswerConfirmed: false,
           executionSteps: [],
-          executionRounds: [],
           isStreaming: true,
           timestamp: Date.now(),
         },
@@ -197,6 +346,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isStreaming: true,
       isCancelled: false,
       runStatus: 'running',
+      activity: null,
     }));
     return id;
   },
@@ -211,7 +361,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         .filter((message) => {
           if (message.id !== assistantId || message.role !== 'assistant') return true;
           return Boolean(
-            message.content || message.thinkingSegments?.length || message.executionSteps?.length
+            message.content || message.assistantBlocks?.length || message.executionSteps?.length
           );
         });
       return {
@@ -228,9 +378,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
             id: nextAssistantId,
             role: 'assistant' as const,
             content: '',
-            thinkingSegments: [],
+            finalAnswerConfirmed: false,
             executionSteps: [],
-            executionRounds: [],
             isStreaming: true,
             timestamp: Date.now(),
           },
@@ -238,6 +387,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         isStreaming: true,
         isCancelled: false,
         runStatus: 'running' as const,
+        activity: null,
       };
     });
     scheduleAutoSave();
@@ -254,42 +404,74 @@ export const useChatStore = create<ChatState>((set, get) => ({
     });
   },
 
-  appendThinking: (id, token) => {
-    set((s) => {
-      const idx = s.messages.findIndex((m) => m.id === id);
-      if (idx === -1) return { messages: s.messages };
-      const m = s.messages[idx];
-      const segments = [...(m.thinkingSegments || [])];
-      if (segments.length === 0) {
-        segments.push({ content: token });
-      } else {
-        const last = { ...segments[segments.length - 1] };
-        segments[segments.length - 1] = { ...last, content: last.content + token };
-      }
-      const updated = [...s.messages];
-      updated[idx] = { ...m, thinkingSegments: segments };
-      return { messages: updated };
-    });
-  },
-
-  startThinkingSegment: (id) => {
-    set((s) => {
-      const messages = s.messages.map((m) => {
-        if (m.id !== id) return m;
-        const thinkingSegments = [...(m.thinkingSegments || []), { content: '' }];
-        const executionSteps = [
-          ...(m.executionSteps || []),
-          { type: 'thinking' as const, index: thinkingSegments.length - 1 },
-        ];
-        return { ...m, thinkingSegments, executionSteps };
-      });
-      // If there's an in-progress round, it's now complete (thinking→tools→done),
-      // so start a fresh round for this new thinking phase.
-      return { messages };
-    });
+  appendAssistantBlock: (id, block, executionId, publicationEventId, journalSource) => {
+    set((state) => ({
+      messages: state.messages.map((message) => {
+        if (message.id !== id || !message.isStreaming) return message;
+        const blocks = [...(message.assistantBlocks ?? [])];
+        const index = blocks.findIndex(
+          (entry) =>
+            (entry.execution_id ?? null) === (executionId ?? null) &&
+            entry.block.request_id === block.request_id &&
+            entry.block.block_id === block.block_id
+        );
+        if (index >= 0) {
+          const previous = blocks[index];
+          if (!previous) return message;
+          const firstCursor = earliestNativeJournalCursor(previous.journal_source, journalSource);
+          if (previous.block.complete || block.sequence < previous.block.sequence) {
+            if (firstCursor === previous.journal_source) return message;
+            blocks[index] = { ...previous, journal_source: firstCursor };
+            return { ...message, assistantBlocks: blocks };
+          }
+          if (previous.block.phase !== 'unknown' && previous.block.phase !== block.phase)
+            return message;
+          blocks[index] = {
+            block,
+            content: previous.content + block.delta,
+            execution_id: executionId ?? previous.execution_id,
+            publication_event_id: publicationEventId ?? previous.publication_event_id,
+            journal_source: firstCursor,
+          };
+          return { ...message, assistantBlocks: blocks };
+        }
+        blocks.push({
+          block,
+          content: block.delta,
+          execution_id: executionId,
+          publication_event_id: publicationEventId,
+          journal_source: journalSource,
+        });
+        return {
+          ...message,
+          assistantBlocks: blocks,
+          executionSteps: [
+            ...(message.executionSteps ?? []),
+            { type: 'assistant' as const, index: blocks.length - 1 },
+          ],
+        };
+      }),
+    }));
   },
 
   setThinking: (v) => set({ isThinking: v, runStatus: v ? 'thinking' : get().runStatus }),
+
+  recordNativePresentation: (record) =>
+    set((state) => {
+      const owns = (message: ChatMessage) =>
+        isNativeTurnSource(message.turnSource) && recordBelongsToTurn(record, message.turnSource);
+      const owners = state.messages.filter(owns);
+      if (owners.length === 0) return state;
+      const records = uniquePresentationRecords([
+        ...owners.flatMap((message) => message.presentationRecords ?? []),
+        record,
+      ]);
+      return {
+        messages: state.messages.map((message) =>
+          owns(message) ? { ...message, presentationRecords: records } : message
+        ),
+      };
+    }),
 
   recordToolStart: (messageId, toolExecutionId) => {
     set((s) => {
@@ -306,61 +488,64 @@ export const useChatStore = create<ChatState>((set, get) => ({
         ];
         return { ...m, executionSteps };
       });
-      const currentRound = s.currentRound
-        ? {
-            ...s.currentRound,
-            toolCallIds: s.currentRound.toolCallIds.includes(toolExecutionId)
-              ? s.currentRound.toolCallIds
-              : [...s.currentRound.toolCallIds, toolExecutionId],
-          }
-        : { toolCallIds: [toolExecutionId] };
-      return { messages, currentRound, runStatus: 'using_tool' };
+      return { messages, runStatus: 'using_tool' };
     });
     scheduleAutoSave();
   },
 
-  /** Start a new tool batch (received tool_batch_start event from backend) */
-  startToolBatch: () => {
-    const state = get();
-    // Capture the last thinking segment from the streaming message.
-    // During streaming, thinking content is accumulated on message.thinkingSegments,
-    // not on currentRound. When a tool batch starts, we must explicitly associate
-    // the preceding thinking with the upcoming tools to form a complete ExecutionRound.
-    const streamingMsg = state.messages.find((m) => m.isStreaming);
-    const segments = streamingMsg?.thinkingSegments;
-    const lastSegment = segments && segments.length > 0 ? segments[segments.length - 1] : null;
-    set({
-      currentRound: {
-        thinking: lastSegment?.content ? { content: lastSegment.content } : undefined,
-        toolCallIds: [],
-      },
-    });
-  },
-
-  /** End current tool batch (received tool_batch_end event from backend).
-   *  Push the current round into the streaming message's executionRounds. */
-  endToolBatch: () => {
-    const { currentRound } = get();
-    if (!currentRound) return;
-    const round: ExecutionRound = {
-      thinking: currentRound.thinking,
-      toolCallIds: [...currentRound.toolCallIds],
-    };
-    set((s) => ({
-      currentRound: null,
-      messages: s.messages.map((m) => {
-        if (!m.isStreaming) return m;
-        const executionRounds = [...(m.executionRounds || []), round];
-        return { ...m, executionRounds };
+  // 原生终态仅提供消息来源坐标，不更新 TaskRun/TurnStatus 或最终发布标记。
+  observeTurnSource: (id, source) => {
+    if (!isNativeTurnSource(source)) return;
+    set((state) => ({
+      messages: state.messages.map((message) => {
+        if (message.id !== id || message.turnSource === null) return message;
+        const previous = message.turnSource;
+        if (!previous) return { ...message, turnSource: source };
+        const matches = (Object.keys(source) as (keyof NativeTurnSource)[]).every(
+          (key) => previous[key] === source[key]
+        );
+        return matches ? message : { ...message, turnSource: null };
       }),
     }));
-    scheduleAutoSave();
   },
 
-  applyFinalAnswer: (id, content) => {
+  // 原生终态仅提供消息来源坐标，不更新 TaskRun/TurnStatus 或最终发布标记。
+  observeExecutionStatus: (id, status) => {
+    if (!['settled', 'failed', 'cancelled'].includes(status.status)) return;
     set((state) => ({
       messages: state.messages.map((message) =>
-        message.id === id ? { ...message, content: content || message.content } : message
+        message.id === id && !message.executionStatus
+          ? { ...message, executionStatus: status }
+          : message
+      ),
+    }));
+  },
+
+  // 只薄接后端已校验的呈现关联；不写正文、phase、完成标记或运行状态。
+  applyFinalAnswerSource: (id, source) => {
+    set((state) => ({
+      messages: state.messages.map((message) => {
+        const status = message.executionStatus;
+        return message.id === id &&
+          message.finalAnswerConfirmed &&
+          status?.status === 'settled' &&
+          message.finalAnswerExecutionId === source.execution_id &&
+          status.execution_id === source.execution_id &&
+          status.request_id === source.request_id &&
+          status.sequence === source.sequence
+          ? { ...message, finalAnswerSource: source }
+          : message;
+      }),
+    }));
+  },
+
+  applyFinalAnswer: (id, content, executionId) => {
+    if (!content.trim()) return;
+    set((state) => ({
+      messages: state.messages.map((message) =>
+        message.id === id && !message.finalAnswerConfirmed
+          ? { ...message, content, finalAnswerConfirmed: true, finalAnswerExecutionId: executionId }
+          : message
       ),
     }));
     scheduleAutoSave();
@@ -371,6 +556,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isStreaming: false,
       isThinking: false,
       pendingHitlRequests: [],
+      activity: null,
       messages: state.messages.map((message) =>
         message.id === id ? { ...message, isStreaming: false } : message
       ),
@@ -385,6 +571,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         const errorNote = `[Error] ${error}`;
         return {
           ...message,
+          failureNotice: error,
           content: message.content ? `${message.content}\n\n${errorNote}` : errorNote,
         };
       }),
@@ -397,31 +584,43 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isStreaming: false,
       isThinking: false,
       runStatus: isRunning ? 'running' : 'waiting_approval',
+      activity: null,
       messages: s.messages.map((m) => (m.id === id ? { ...m, content, isStreaming: false } : m)),
     }));
     scheduleAutoSave();
   },
 
-  appendLocalAssistantNote: (content) => {
-    set((s) => ({
-      messages: trimToMax([
-        ...s.messages,
-        {
-          id: nextId(),
-          role: 'assistant',
-          content,
-          isStreaming: false,
-          timestamp: Date.now(),
-        },
-      ]),
-    }));
-    scheduleAutoSave();
+  appendLocalAssistantNote: (content, source) => {
+    const id = source?.id ?? nextId();
+    set((s) => {
+      if (s.messages.some((message) => message.id === id)) return s;
+      const note: ChatMessage = {
+        id,
+        role: 'assistant',
+        content,
+        finalAnswerConfirmed: false,
+        isStreaming: false,
+        timestamp: source?.timestamp ?? Date.now(),
+      };
+      const messages = [...s.messages];
+      const next = source
+        ? messages.findIndex((message) => message.timestamp > source.timestamp)
+        : -1;
+      // 只把原错误放回其历史时间位置，不重排canonical消息；否则重试会误取后一轮输入。
+      messages.splice(next < 0 ? messages.length : next, 0, note);
+      return { messages: trimToMax(messages) };
+    });
+    // 显式源ID是原journal的只读投影，不重写canonical历史或会话元数据。
+    if (!source) scheduleAutoSave();
   },
 
-  setStreaming: (v) => set({ isStreaming: v }),
+  setStreaming: (v) => set((state) => ({ isStreaming: v, activity: v ? state.activity : null })),
   setRunStatus: (status) =>
     set((state) => ({
       runStatus: status,
+      activity: ['idle', 'completed', 'failed', 'cancelled'].includes(status)
+        ? null
+        : state.activity,
       isStreaming: !['idle', 'completed', 'failed', 'cancelled'].includes(status),
       isCancelled: status === 'cancelled',
       isThinking: status === 'thinking',
@@ -436,6 +635,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isThinking: false,
       isCancelled: false,
       runStatus: 'idle',
+      activity: null,
       pendingHitlRequests: [],
       messages: state.messages.map((message) =>
         message.isStreaming ? { ...message, isStreaming: false } : message
@@ -446,7 +646,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   enqueueHitlRequest: (request) =>
     set((state) => {
-      if (state.pendingHitlRequests.some((pending) => pending.requestId === request.requestId)) {
+      if (
+        !isHitlRequestIdentity(request.identity) ||
+        request.identity.request_id !== request.requestId ||
+        request.identity.kind !== request.kind
+      )
+        return state;
+      if (
+        state.pendingHitlRequests.some((pending) =>
+          sameHitlIdentity(pending.identity, request.identity)
+        )
+      ) {
         return state;
       }
       const pendingHitlRequests = [...state.pendingHitlRequests, request];
@@ -456,10 +666,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
         runStatus: front ? waitingStatus(front) : state.runStatus,
       };
     }),
-  removeHitlRequest: (requestId) =>
+  removeHitlRequest: (identity) =>
     set((state) => {
+      if (!isHitlRequestIdentity(identity)) return state;
       const pendingHitlRequests = state.pendingHitlRequests.filter(
-        (request) => request.requestId !== requestId
+        (request) => !sameHitlIdentity(request.identity, identity)
       );
       if (pendingHitlRequests.length === state.pendingHitlRequests.length) {
         return state;
@@ -472,46 +683,60 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }),
   clearHitlRequests: () => set({ pendingHitlRequests: [] }),
 
-  addChartMessage: (spec) => {
-    set((s) => ({
-      messages: s.messages.map((m) =>
-        m.isStreaming ? { ...m, chartSpecs: [...(m.chartSpecs || []), spec] } : m
-      ),
-    }));
-  },
+  addChartMessage: (spec, messageId) =>
+    set((state) => {
+      const streaming = state.messages.filter((message) => message.isStreaming);
+      const target = messageId ?? (streaming.length === 1 ? streaming.at(0)?.id : undefined);
+      if (!target) return state;
+      return {
+        messages: state.messages.map((message) =>
+          message.id === target
+            ? { ...message, chartSpecs: [...(message.chartSpecs ?? []), spec] }
+            : message
+        ),
+      };
+    }),
 
   clearMessages: () =>
     set({
       messages: [],
+      transcriptSaves: {},
+      agentInputs: [],
+      agentInputsBinding: null,
+      agentInputReadError: null,
       isStreaming: false,
       isCancelled: false,
       isThinking: false,
       isHistoryView: false,
       pendingHitlRequests: [],
-      currentRound: null,
       contextWindow: null,
+      contextInvalidated: false,
       usageAccumulator: { totalInput: 0, totalCached: 0 },
       runStatus: 'idle',
+      activity: null,
     }),
 
   replaceMessages: (messages) =>
     set({
       messages: trimToMax(messages),
+      transcriptSaves: {},
       isStreaming: false,
       isCancelled: false,
       isHistoryView: true,
       pendingHitlRequests: [],
       // 加载历史会话时清空实时上下文占用（历史视图无 live llm_usage，显示旧值会误导）。
       contextWindow: null,
+      contextInvalidated: false,
       usageAccumulator: { totalInput: 0, totalCached: 0 },
       runStatus: 'idle',
+      activity: null,
     }),
 
   setHistoryView: (v) => set({ isHistoryView: v }),
 
-  setContextWindow: (usage) => set({ contextWindow: usage }),
+  setContextWindow: (usage) => set({ contextWindow: usage, contextInvalidated: false }),
 
-  clearContextWindow: () => set({ contextWindow: null }),
+  clearContextWindow: () => set({ contextWindow: null, contextInvalidated: true }),
 
   recordUsage: (input, cached) =>
     set((s) => ({

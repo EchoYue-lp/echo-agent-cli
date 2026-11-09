@@ -140,15 +140,6 @@ impl ExtensionControlService {
         runtime.rebind_workspace(root).await
     }
 
-    pub async fn reload_plugin_lsp(
-        &self,
-        runtime: Arc<crate::plugin_runtime::PluginRuntimeService>,
-        root: PathBuf,
-    ) -> anyhow::Result<usize> {
-        let _mutation = self.mutation.lock().await;
-        runtime.reload_lsp_generation(root).await
-    }
-
     pub async fn reload_plugins(
         self: &Arc<Self>,
         state: &Arc<AppState>,
@@ -854,8 +845,8 @@ impl ExtensionControlService {
             let outcome = async {
                 let mut config =
                     read_enabled_skills_config(&flow, service.enabled_config_path.clone()).await?;
-                let idempotent = config.is_enabled(&name) == enabled
-                    && config.skills.contains_key(&name);
+                let idempotent =
+                    config.is_enabled(&name) == enabled && config.skills.contains_key(&name);
                 if enabled || !config.skills.contains_key(&name) {
                     ensure_skill_installed(&state, &name)
                         .await
@@ -864,13 +855,15 @@ impl ExtensionControlService {
                 config.set_enabled(&name, enabled);
                 write_enabled_skills_config(&flow, service.enabled_config_path.clone(), config)
                     .await?;
-                service.reconcile_skill_runtimes(&state, &flow, operation_id, idempotent).await
+                service
+                    .reconcile_skill_runtimes(&state, &flow, operation_id, idempotent)
+                    .await
             }
             .await;
             let failure = match &outcome {
-                Ok(receipt) if receipt.status == SkillSettlementStatus::Degraded => {
-                    Some("skill policy committed but runtime reconciliation is degraded".to_string())
-                }
+                Ok(receipt) if receipt.status == SkillSettlementStatus::Degraded => Some(
+                    "skill policy committed but runtime reconciliation is degraded".to_string(),
+                ),
                 Ok(_) => None,
                 Err(error) => Some(error.to_string()),
             };
@@ -1073,19 +1066,14 @@ impl ExtensionControlService {
                     .map_err(SkillInstallError::Install)?
                 };
                 // 安装即启用:写入 enabled 条目并 reconcile 运行时。
-                let mut config = read_enabled_skills_config(
-                    &flow,
-                    service.enabled_config_path.clone(),
-                )
-                .await
-                .map_err(SkillInstallError::Enable)?;
+                let mut config =
+                    read_enabled_skills_config(&flow, service.enabled_config_path.clone())
+                        .await
+                        .map_err(SkillInstallError::Enable)?;
                 for installed_name in &installed.installed_names {
-                    config.skills.insert(
-                        installed_name.clone(),
-                        SkillEnableEntry {
-                            enabled: true,
-                        },
-                    );
+                    config
+                        .skills
+                        .insert(installed_name.clone(), SkillEnableEntry { enabled: true });
                 }
                 write_enabled_skills_config(&flow, service.enabled_config_path.clone(), config)
                     .await
@@ -1263,15 +1251,15 @@ impl ExtensionControlService {
                     .collect::<Vec<_>>();
                 if !failures.is_empty() {
                     receipt.status = SkillSettlementStatus::Degraded;
-                    receipt.target_receipts.extend(
-                        failures.iter().map(|result| SkillTargetSettlementReceipt {
+                    receipt
+                        .target_receipts
+                        .extend(failures.iter().map(|result| SkillTargetSettlementReceipt {
                             target: format!("skill-artifact-sync:{}", result.name),
                             workspace_generation: "global".to_string(),
                             status: SkillTargetSettlementStatus::Degraded,
                             changed_entries: Vec::new(),
                             error: Some(result.message.clone()),
-                        }),
-                    );
+                        }));
                 }
                 Ok((results, receipt))
             }
@@ -1349,7 +1337,7 @@ impl ExtensionControlService {
             .as_ref()
             .and_then(|watcher| watcher.config_path())
             .unwrap_or_else(|| state.config.config_path.clone());
-        let project_root = context.project_root().to_path_buf();
+        let project_root = context.runtime().execution_scope().root().to_path_buf();
         let agent = context.runtime().primary_agent();
         let flow = state
             .session
@@ -1391,11 +1379,19 @@ impl ExtensionControlService {
         preserve_on_error: bool,
     ) -> anyhow::Result<HookReloadReceipt> {
         let load_config = config_path.clone();
-        let load_root = project_root.clone();
+        let load_root = project_root;
+        let files = agent
+            .read(|agent| {
+                agent
+                    .file_system()
+                    .unwrap_or_else(|| Arc::new(echo_agent::tools::files::LocalFileSystem))
+            })
+            .await;
         let mut loaded = tokio::task::spawn_blocking(move || {
-            HookConfigLoader::load_merged_from_disk_for_workspace(
+            HookConfigLoader::load_merged_from_disk_with_file_system(
                 load_config.as_deref(),
                 Some(load_root.as_path()),
+                files.as_ref(),
             )
         })
         .await
@@ -1414,26 +1410,19 @@ impl ExtensionControlService {
             .map_err(|error| anyhow::anyhow!("Hook fallback loader task failed: {error}"))?;
             if fallback.errors.is_empty() {
                 loaded.definition = fallback.definition;
+                loaded.origins = fallback.origins;
                 loaded.loaded_from = fallback.loaded_from;
             } else {
                 loaded.definition = Default::default();
+                loaded.origins.clear();
                 degraded_errors.extend(fallback.errors);
             }
         }
         ensure_hook_load_succeeded(&loaded)?;
         let rule_count = loaded.definition.rules.values().map(Vec::len).sum();
-        let definition = loaded.definition;
-        agent
-            .write_async(|agent| {
-                Box::pin(async move {
-                    let mut registry = agent.hook_registry().write().await;
-                    registry.clear_user_hooks();
-                    if !definition.is_empty() {
-                        registry.register_user_hooks(definition);
-                    }
-                })
-            })
-            .await;
+        crate::infra::install_loaded_user_hooks(&agent, &loaded)
+            .await
+            .map_err(anyhow::Error::msg)?;
         let receipt = HookReloadReceipt {
             loaded_from: loaded.loaded_from,
             rule_count,
@@ -1618,93 +1607,6 @@ impl ExtensionControlService {
         }
         state.plugins.mcp_health.write().await.insert(scope, scoped);
         Ok(())
-    }
-
-    pub async fn lsp_command(
-        self: &Arc<Self>,
-        state: &AppState,
-        action: &str,
-        language: Option<&str>,
-    ) -> anyhow::Result<String> {
-        self.lsp_command_scoped(state, None, action, language).await
-    }
-
-    pub async fn lsp_command_scoped(
-        self: &Arc<Self>,
-        state: &AppState,
-        runtime: Option<&ScopedChatRuntime>,
-        action: &str,
-        language: Option<&str>,
-    ) -> anyhow::Result<String> {
-        let context = self.scoped_context(state, runtime).await?;
-        let specialist = context.plugin_runtime();
-        match action {
-            "list" | "ls" => {
-                let _read = self.mutation.lock().await;
-                let languages = specialist.lsp_configured_languages().await;
-                Ok(if languages.is_empty() {
-                    "No language servers are configured.".to_string()
-                } else {
-                    languages.join("\n")
-                })
-            }
-            "status" | "" => {
-                let _read = self.mutation.lock().await;
-                let statuses = specialist.lsp_status().await;
-                Ok(if statuses.is_empty() {
-                    "No language servers are configured.".to_string()
-                } else {
-                    statuses
-                        .into_iter()
-                        .map(|status| {
-                            let state = if status.running && status.initialized {
-                                "ready"
-                            } else if status.running {
-                                "starting"
-                            } else {
-                                "stopped"
-                            };
-                            status.last_error.map_or_else(
-                                || format!("{}: {state}", status.language),
-                                |error| format!("{}: {state} ({error})", status.language),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-            }
-            "start" | "stop" | "restart" => {
-                let language = language
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("lsp {action} requires a language"))?
-                    .to_string();
-                let action = action.to_string();
-                let flow = state
-                    .session
-                    .product_data_io
-                    .begin_owned_flow("settle LSP control mutation")
-                    .map_err(anyhow::Error::new)?;
-                let service = Arc::clone(self);
-                await_owned_extension_settlement(
-                    flow,
-                    async move {
-                        let _mutation = service.mutation.lock().await;
-                        let _control = context;
-                        if action == "start" {
-                            specialist.lsp_start(language.clone()).await?;
-                        } else if action == "stop" {
-                            specialist.lsp_stop(language.clone()).await?;
-                        } else {
-                            specialist.lsp_restart(language.clone()).await?;
-                        }
-                        Ok(format!("Language server '{language}' {action}ed."))
-                    },
-                    |error| anyhow::anyhow!("LSP settlement task failed: {error}"),
-                )
-                .await
-            }
-            _ => anyhow::bail!("usage: lsp <list|status|start|stop|restart> [language]"),
-        }
     }
 
     pub async fn browser_command(

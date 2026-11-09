@@ -7,7 +7,12 @@
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
+use std::sync::Arc;
+
+use echo_agent::sandbox::{SandboxCommand, SandboxExecutor};
+use echo_agent::tools::InvocationResourceGuard;
+use echo_agent::tools::filesystem::FileSystem;
 
 const WORKSPACE_DIFF_CONTEXT_LINES: usize = 3;
 
@@ -146,16 +151,143 @@ pub enum WorkspaceDiffError {
 /// The caller resolves and pins the workspace generation. This service owns
 /// path/ref validation, Git reads, and structured diff generation so surfaces
 /// do not implement their own TextDiff algorithms.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WorkspaceDiffService {
     project_root: PathBuf,
+    file_system: Arc<dyn FileSystem>,
+    execution: Option<WorkspaceGitExecution>,
+}
+
+#[derive(Clone)]
+struct WorkspaceGitExecution {
+    executor: Arc<dyn SandboxExecutor>,
+    runtime: tokio::runtime::Handle,
+    resource_guards: Vec<InvocationResourceGuard>,
+}
+
+struct WorkspaceGitOutput {
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl std::fmt::Debug for WorkspaceDiffService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkspaceDiffService")
+            .field("project_root", &self.project_root)
+            .field("project_execution", &self.execution.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl WorkspaceDiffService {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         Self {
             project_root: project_root.into(),
+            file_system: Arc::new(echo_agent::tools::files::LocalFileSystem),
+            execution: None,
         }
+    }
+
+    /// Use the same immutable project target for file bytes and Git objects.
+    /// This synchronous service runs inside the caller's existing I/O owner;
+    /// the command also carries its original physical resource guards.
+    pub fn with_project_resources(
+        project_root: impl Into<PathBuf>,
+        file_system: Arc<dyn FileSystem>,
+        executor: Arc<dyn SandboxExecutor>,
+        runtime: tokio::runtime::Handle,
+        resource_guards: Vec<InvocationResourceGuard>,
+    ) -> Self {
+        Self {
+            project_root: project_root.into(),
+            file_system,
+            execution: Some(WorkspaceGitExecution {
+                executor,
+                runtime,
+                resource_guards,
+            }),
+        }
+    }
+
+    fn run_git(
+        &self,
+        args: &[&str],
+        operation: &str,
+    ) -> Result<WorkspaceGitOutput, WorkspaceDiffError> {
+        if let Some(execution) = &self.execution {
+            let command =
+                SandboxCommand::program("git", args.iter().map(|arg| (*arg).to_string()).collect())
+                    .with_working_dir(self.project_root.clone())
+                    .with_resource_guards(execution.resource_guards.clone());
+            // Keep the original synchronous service safe for callers already
+            // inside a runtime as well as the GUI's blocking I/O boundary.
+            // Join the existing executor call; cancelling an outer observer
+            // does not discard its command/guards or authorize a retry.
+            let output = std::thread::scope(|scope| {
+                let invocation = std::thread::Builder::new()
+                    .name("eko-project-diff-git".into())
+                    .spawn_scoped(scope, || {
+                        execution
+                            .runtime
+                            .block_on(execution.executor.execute(command))
+                    })
+                    .map_err(|error| {
+                        WorkspaceDiffError::Operation(format!("{operation} bridge failed: {error}"))
+                    })?;
+                invocation
+                    .join()
+                    .map_err(|_| {
+                        WorkspaceDiffError::Operation(format!(
+                            "{operation} execution bridge failed"
+                        ))
+                    })?
+                    .map_err(|error| {
+                        WorkspaceDiffError::Operation(format!("{operation} failed: {error}"))
+                    })
+            })?;
+            if output.timed_out || output.cancelled || output.output_truncated {
+                return Err(WorkspaceDiffError::Operation(format!(
+                    "{operation} did not produce a complete settled result (timeout={}, cancelled={}, truncated={})",
+                    output.timed_out, output.cancelled, output.output_truncated
+                )));
+            }
+            Ok(WorkspaceGitOutput {
+                success: output.success(),
+                stdout: output.stdout.into_bytes(),
+                stderr: output.stderr.into_bytes(),
+            })
+        } else {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&self.project_root)
+                .output()
+                .map_err(|error| {
+                    WorkspaceDiffError::Operation(format!("{operation} failed: {error}"))
+                })?;
+            Ok(WorkspaceGitOutput {
+                success: output.status.success(),
+                stdout: output.stdout,
+                stderr: output.stderr,
+            })
+        }
+    }
+
+    /// Preserve porcelain's exact whitespace/NUL framing in this same target.
+    pub fn changes_porcelain(&self) -> Result<String, WorkspaceDiffError> {
+        let output = self.run_git(
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            "git status",
+        )?;
+        if !output.success {
+            return Err(WorkspaceDiffError::Operation(format!(
+                "git status failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        String::from_utf8(output.stdout).map_err(|error| {
+            WorkspaceDiffError::Validation(format!("git paths are not UTF-8: {error}"))
+        })
     }
 
     pub fn diff_file(
@@ -164,9 +296,14 @@ impl WorkspaceDiffService {
         git_ref: &str,
     ) -> Result<WorkspaceFileDiff, WorkspaceDiffError> {
         validate_git_ref(git_ref)?;
-        let (target, repository_path) = resolve_workspace_path(&self.project_root, path)?;
-        let new_content = if target.exists() {
-            std::fs::read_to_string(&target).map_err(|error| {
+        let (target, repository_path) =
+            resolve_workspace_path(self.file_system.as_ref(), &self.project_root, path)?;
+        let new_content = if self
+            .file_system
+            .exists(&target)
+            .map_err(project_file_error)?
+        {
+            self.file_system.read_to_string(&target).map_err(|error| {
                 WorkspaceDiffError::Operation(format!(
                     "failed to read workspace text file '{}': {error}",
                     target.display()
@@ -176,12 +313,11 @@ impl WorkspaceDiffService {
             String::new()
         };
 
-        let commit = run_git(
-            &self.project_root,
-            ["rev-parse", "--verify", &format!("{git_ref}^{{commit}}")],
+        let commit = self.run_git(
+            &["rev-parse", "--verify", &format!("{git_ref}^{{commit}}")],
             "git rev-parse",
         )?;
-        if !commit.status.success() {
+        if !commit.success {
             return Err(WorkspaceDiffError::Validation(format!(
                 "invalid git reference: {}",
                 String::from_utf8_lossy(&commit.stderr).trim()
@@ -189,14 +325,10 @@ impl WorkspaceDiffService {
         }
 
         let object = format!("{git_ref}:{repository_path}");
-        let exists = run_git(
-            &self.project_root,
-            ["cat-file", "-e", object.as_str()],
-            "git cat-file",
-        )?;
-        let old_content = if exists.status.success() {
-            let output = run_git(&self.project_root, ["show", object.as_str()], "git show")?;
-            if !output.status.success() {
+        let exists = self.run_git(&["cat-file", "-e", object.as_str()], "git cat-file")?;
+        let old_content = if exists.success {
+            let output = self.run_git(&["show", object.as_str()], "git show")?;
+            if !output.success {
                 return Err(WorkspaceDiffError::Operation(format!(
                     "git show failed: {}",
                     String::from_utf8_lossy(&output.stderr).trim()
@@ -247,55 +379,62 @@ fn validate_git_ref(git_ref: &str) -> Result<(), WorkspaceDiffError> {
     Ok(())
 }
 
+fn project_file_error(error: echo_agent::error::ReactError) -> WorkspaceDiffError {
+    WorkspaceDiffError::Operation(error.to_string())
+}
+
+/// Resolve in the selected provider's namespace, including symlink checks.
+/// A failed remote canonicalize is never tested against a local same-name path.
+pub fn resolve_project_file_path(
+    file_system: &dyn FileSystem,
+    project_root: &Path,
+    path: &str,
+) -> Result<PathBuf, WorkspaceDiffError> {
+    let requested = project_root.join(path);
+    echo_agent::tools::security::PathValidator::new()
+        .validate_within_base_with_file_system(
+            &requested.to_string_lossy(),
+            project_root,
+            file_system,
+        )
+        .map_err(|error| WorkspaceDiffError::Validation(error.to_string()))
+}
+
 fn resolve_workspace_path(
+    file_system: &dyn FileSystem,
     project_root: &Path,
     path: &str,
 ) -> Result<(PathBuf, String), WorkspaceDiffError> {
     if path.trim().is_empty() {
         return Err(WorkspaceDiffError::Validation(
-            "workspace diff path cannot be empty".to_string(),
+            "workspace diff path cannot be empty".into(),
         ));
     }
-    let canonical_root = project_root.canonicalize().map_err(|error| {
-        WorkspaceDiffError::Operation(format!(
-            "failed to resolve workspace root '{}': {error}",
-            project_root.display()
-        ))
-    })?;
+    let target = resolve_project_file_path(file_system, project_root, path)?;
+    let canonical_root = file_system
+        .canonicalize(project_root)
+        .map_err(project_file_error)?;
+    // Git addresses the requested repository entry, even when the working
+    // file is a validated in-project symlink to a different physical path.
     let requested = canonical_root.join(path);
-    echo_agent::tools::security::PathValidator::new()
-        .validate_within_base(&requested.to_string_lossy(), &canonical_root)
-        .map_err(|error| WorkspaceDiffError::Validation(error.to_string()))?;
     let relative = requested.strip_prefix(&canonical_root).map_err(|_| {
-        WorkspaceDiffError::Validation("workspace diff path escapes project root".to_string())
+        WorkspaceDiffError::Validation("workspace diff path escapes project root".into())
     })?;
     let repository_path = relative
         .components()
         .map(|component| {
             component.as_os_str().to_str().ok_or_else(|| {
-                WorkspaceDiffError::Validation("workspace diff path is not valid UTF-8".to_string())
+                WorkspaceDiffError::Validation("workspace diff path is not valid UTF-8".into())
             })
         })
         .collect::<Result<Vec<_>, _>>()?
         .join("/");
     if repository_path.is_empty() {
         return Err(WorkspaceDiffError::Validation(
-            "workspace diff path must identify a file".to_string(),
+            "workspace diff path must identify a file".into(),
         ));
     }
-    Ok((requested, repository_path))
-}
-
-fn run_git<const N: usize>(
-    project_root: &Path,
-    args: [&str; N],
-    operation: &str,
-) -> Result<Output, WorkspaceDiffError> {
-    Command::new("git")
-        .args(args)
-        .current_dir(project_root)
-        .output()
-        .map_err(|error| WorkspaceDiffError::Operation(format!("{operation} failed: {error}")))
+    Ok((target, repository_path))
 }
 
 // ── Diff Generation ──────────────────────────────────────────────────────

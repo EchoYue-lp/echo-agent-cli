@@ -1,3 +1,56 @@
+# 2026-10-27：GUI 产品收敛的当前源码与有限验证
+
+本节以本地 EKO `75fdab8fa38218d164171d1733307435e4dedfdf` 为当前源码切点，
+框架对应本地 `f3c5af6443fff36dd7088dcb32a665b5fc173489`。这是任务内里程碑，不代表
+main 发布或完整产品验收；下方2026-08-31全文保留为历史，其旧SHA、Complete与资格范围
+不自动适用于本节。
+
+## 当前产品与权威
+
+- GUI 是推荐主入口，IM 与 cron 保留。独立 TUI、REPL、CLI/JSONL 仍在实现中，已进入
+  退役范围；GUI 内置终端、Agent shell、MCP、Task/Subagent 和共享恢复不随之删除。
+- IM handler、session coordinator、input pump 已归 app-core `channel_runtime`，GUI 和
+  保留的 channel bin 使用原 `ApplicationServices`/ChannelRuntime/生命周期 owner，旧
+  `src/cli/channels.rs` 仅转发。完整收发、退出与恢复结果仍须按各自范围验收。
+- Workspace 是项目与执行位置权威，本机产品数据和远端项目位置分离；GUI 的“新建任务”
+  只在所选工作空间打开会话草稿。个人微信配置、鉴权 Ready、发送 Accepted 与手机收件
+  是不同事实，未知副作用不自动重放。
+- EKO 的 LSP 消费路径已退出；框架 A2A/LSP 物理删除与其它消费者分别验收。
+  领域方法使用固定插件绑定。Subagent 新运行默认总层数1：主Agent为第0层，可派发首层
+  子Agent；子Agent默认不能再派发，额外嵌套为0。GUI可选总层数1—3，原运行保留原绑定。
+
+## 已具名的有限验证
+
+- 9bcc1fc 集成输入的 epoch15：渠道组合68例、无渠道37例，均零失败/零忽略/零编译
+  warning；GUI caller 和无渠道生产检查退出0。输入持久接受先于GUI/IM投递、固定任务
+  去向、微信恢复与原文有界投影的回归只证明各自已选择范围，不是完整要求链验收。
+- 同一前端切点75文件／465输入上的580例、Tauri前端构建、lint及格式检查通过。
+  TaskRun GUI 历史的直接Rust控制为 `task_history_` 5例与 `control_generation_` 3例，
+  不能以其代替完整原生分页/性能验收。
+- `75fdab8` 与框架 `f3c5af64` 的嵌套策略桥里程碑：EKO8例＋框架7例通过，覆盖真实
+  TaskRun readonly/writer文本和附件消费者、绑定后默认值改变、默认1层及上限2/3，
+  并保留旧生产的真实业务反例。生产EKO接线未因该测试提交改变；通用框架可独立选择上限。
+- 上述构建批次均先保全必要制品和原始失败，再准确清理自有 target；清理回执不等于运行时
+  功能验收。历史误报及原失败保留，不把后继绿色改写成首次即通过。
+- 用户已确认 `ubuntu@111.229.245.175` 的登录测试及 `/home/ubuntu/ssh-test` 项目创建成功。
+  这是有限人工成功，不改写为 epoch14 后继新窗口或本轮源码的完整验收。
+
+## 仍未完成
+
+独立终端入口和框架 A2A/LSP 的物理退役、完整版本化有效要求及Applied证据、原生GUI与
+真实微信扫码/手机收件、完整SSH终端/项目矩阵及原Goal的 `echo@111.229.245.175` 支持、
+性能与完整工程矩阵、精确main CI及发布
+仍需独立结算。源码可达、mock、局部通过或输入“已收到”不代表这些结果已完成。
+外部 echo-semantic 工具合同修复继续排除。官网当前仍为旧EKO审阅投影，语言与单pin八页
+同步由网站后继处理，不在本次五份中文源文档修正中推进。
+
+长期产品边界见 [ADR0050](./adr/0050-gui-product-convergence.md)，嵌套策略见
+[ADR0052](./adr/0052-gui-subagent-depth-policy.md)，共享IM/cron owner见
+[ADR0053](./adr/0053-im-cron-gui-control.md)；当前输入和恢复边界见
+[运行时说明](./architecture/runtime.md)。
+
+---
+
 # EKO 应用当前状态（MASTER-PLAN）
 
 > 本文是 `echo-agent-cli` 应用层的跨会话事实源，只记录 EKO 的权威路径、当前阶段状态、未完成工作和验收入口。

@@ -28,7 +28,7 @@ vi.mock('../../stores/workspaceStore', async () => {
 });
 
 import { useWorkspaceStore } from '../../stores/workspaceStore';
-import type { Workspace } from '../../api/endpoints';
+import type { ProductDataScope, Workspace } from '../../api/endpoints';
 import { WorktreePanel } from './WorktreePanel';
 
 function workspace(id: string): Workspace {
@@ -37,7 +37,7 @@ function workspace(id: string): Workspace {
     name: id,
     root: `/${id}`,
     kind: { type: 'general' },
-    metadata: { tags: [] },
+    metadata: { tags: [], project_location: { kind: 'local' as const, path: `/${id}` } },
     product_data_generation: 'workspace-1-generation',
     created_at: '2026-08-24T00:00:00Z',
     last_active: '2026-08-24T00:00:00Z',
@@ -70,7 +70,7 @@ describe('WorktreePanel workspace projection', () => {
       errors: string[];
     }>();
     api.list.mockResolvedValue([]);
-    api.listUnattended.mockImplementation((workspaceId: string) =>
+    api.listUnattended.mockImplementation(({ workspaceId }: ProductDataScope) =>
       Promise.resolve([
         {
           run_id: `${workspaceId}-run`,
@@ -148,7 +148,55 @@ describe('WorktreePanel workspace projection', () => {
     });
     expect(screen.queryByText('a-old')).toBeNull();
     expect(screen.queryByText('eko-unattended-old')).toBeNull();
-    expect(api.list).toHaveBeenCalledWith('workspace-a');
-    expect(api.list).toHaveBeenCalledWith('workspace-b');
+    expect(api.list).toHaveBeenCalledWith({
+      workspaceId: 'workspace-a',
+      workspaceGeneration: 'workspace-1-generation',
+    });
+    expect(api.list).toHaveBeenCalledWith({
+      workspaceId: 'workspace-b',
+      workspaceGeneration: 'workspace-1-generation',
+    });
+  });
+  it('pins same-id location generations and drops the old project late result', async () => {
+    const previous = deferred<Array<Record<string, unknown>>>();
+    api.list
+      .mockReturnValueOnce(previous.promise)
+      .mockResolvedValueOnce([
+        { path: '/same/project', branch: 'new-target', managed: true, head: 'new' },
+      ]);
+    api.listUnattended.mockResolvedValue([]);
+    render(<WorktreePanel />);
+    act(() =>
+      useWorkspaceStore.setState({
+        current: {
+          ...workspace('workspace-a'),
+          product_data_generation: 'new-location-generation',
+        },
+      })
+    );
+    expect(await screen.findByText('new-target')).toBeTruthy();
+    await act(async () =>
+      previous.resolve([
+        { path: '/same/project', branch: 'wrong-old-target', managed: true, head: 'old' },
+      ])
+    );
+    expect(screen.queryByText('wrong-old-target')).toBeNull();
+    expect(api.list).toHaveBeenCalledWith({
+      workspaceId: 'workspace-a',
+      workspaceGeneration: 'workspace-1-generation',
+    });
+    expect(api.list).toHaveBeenCalledWith({
+      workspaceId: 'workspace-a',
+      workspaceGeneration: 'new-location-generation',
+    });
+  });
+
+  it('keeps the legitimate global view explicitly scoped', async () => {
+    useWorkspaceStore.setState({ current: null });
+    api.list.mockResolvedValue([]);
+    api.listUnattended.mockResolvedValue([]);
+    render(<WorktreePanel />);
+    await screen.findByText('No worktrees found');
+    expect(api.list).toHaveBeenCalledWith({ workspaceId: 'global', workspaceGeneration: 'global' });
   });
 });

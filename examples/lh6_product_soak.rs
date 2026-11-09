@@ -385,7 +385,7 @@ async fn main() -> Result<()> {
     );
 
     let config_path = args.config.to_string_lossy().to_string();
-    let mut app_config = config::load_config(Some(&config_path));
+    let mut app_config = config::load_config(Some(&config_path)).map_err(anyhow::Error::msg)?;
     config::apply_env_overrides(&mut app_config);
     let runtime_model =
         echo_agent_app_core::api::model_config::resolve_runtime_model(&app_config, None)
@@ -568,6 +568,7 @@ async fn bootstrap(
         command_cell_runtime: None,
         product_data_io: None,
         execution_scope: None,
+        ..Default::default()
     };
     let mcp_path =
         echo_agent_app_core::api::mcp_config_runtime::resolve_mcp_config_path(None, app_config);
@@ -743,7 +744,7 @@ async fn drive_one(
             turn_id.clone(),
         )
         .await?;
-    let pool_execution = scoped.agent_for(&address.conversation_id).await?;
+    let pool_execution = scoped.agent_for_turn(&address.conversation_id).await?;
     let agent = pool_execution.agent();
     let metrics = Arc::new(Mutex::new(SinkMetrics::default()));
     let renderer: Arc<dyn ChatSink> = Arc::new(MetricsSink {
@@ -792,13 +793,21 @@ async fn drive_one(
         memory_generation: None,
         human_loop_provider: Some(context.runtime.hitl_dispatcher.clone()),
     });
-    let outcome = echo_agent_app_core::api::foreground_turn::drive_foreground_chat(
-        lease, &agent, &turn, resources,
+    // 与GUI保持同一原lease/driver路径，性能探针不重复支付工厂上下文准备。
+    let held_execution = Arc::new(Mutex::new(Some(pool_execution)));
+    lease.retain_execution(held_execution.clone());
+    let outcome = echo_agent_app_core::api::chat_driver::with_foreground_pool_execution(
+        Arc::downgrade(&held_execution),
+        Box::pin(
+            echo_agent_app_core::api::foreground_turn::drive_foreground_chat(
+                lease, &agent, &turn, resources,
+            ),
+        ),
     )
     .await
     .map_err(anyhow::Error::msg)?;
     ensure!(matches!(outcome, TurnOutcome::Completed));
-    drop(pool_execution);
+    drop(held_execution);
 
     if require_command_cell_watch {
         let typed_watch_receipts = metrics
@@ -1001,6 +1010,7 @@ async fn inject_control_events(
         commit_task_plan(
             store.clone(),
             TaskPlan {
+                domain_binding: None,
                 plan_id: "lh6-control-plan".to_string(),
                 run_id: run_id.to_string(),
                 revision: 1,

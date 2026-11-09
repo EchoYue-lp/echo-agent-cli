@@ -1,13 +1,18 @@
 import { useEffect, useRef, useState } from 'react';
 import { GitFork, Loader2, X } from 'lucide-react';
-import { providerApi } from '../../api/endpoints';
-import { useConversationStore } from '../../stores/conversationStore';
-import type { ConfiguredModel } from '../../generated';
+import { useConversationStore, type SideConversationSource } from '../../stores/conversationStore';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
+import { useUiStore } from '../../stores/uiStore';
+import { productDataScope, sameProductDataScope } from '../../lib/productDataScope';
+import type { ConfiguredModel, ModelProviderView } from '../../generated';
 import { Modal } from '../common/Modal';
+import { configuredModelPresentation, modelLabel } from '../../lib/modelPresentation';
 
 interface SideConversationDialogProps {
   isOpen: boolean;
   onClose: () => void;
+  source?: SideConversationSource;
+  initialPrompt?: string;
 }
 
 function newSideConversationRequestId(): string {
@@ -16,7 +21,12 @@ function newSideConversationRequestId(): string {
     : `side-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-export function SideConversationDialog({ isOpen, onClose }: SideConversationDialogProps) {
+export function SideConversationDialog({
+  isOpen,
+  onClose,
+  source,
+  initialPrompt = '',
+}: SideConversationDialogProps) {
   const createSideConversation = useConversationStore((state) => state.createSideConversation);
   const promptRef = useRef<HTMLTextAreaElement>(null);
   const requestIdRef = useRef(newSideConversationRequestId());
@@ -24,21 +34,33 @@ export function SideConversationDialog({ isOpen, onClose }: SideConversationDial
   const [title, setTitle] = useState('');
   const [modelId, setModelId] = useState('');
   const [models, setModels] = useState<ConfiguredModel[]>([]);
+  const [modelProviders, setModelProviders] = useState<ModelProviderView[]>([]);
   const [submitting, setSubmitting] = useState(false);
+  const pending = useRef(false);
+  const mounted = useRef(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!isOpen) return;
     let active = true;
-    setPrompt('');
+    setPrompt(initialPrompt);
     setTitle('');
     setModelId('');
     setError(null);
     requestIdRef.current = newSideConversationRequestId();
-    providerApi
-      .listConfigured()
+    configuredModelPresentation()
       .then((response) => {
-        if (active) setModels(response.models.filter((model) => model.enabled));
+        if (active) {
+          setModels(response.models.filter((model) => model.enabled));
+          setModelProviders(response.providers);
+        }
       })
       .catch((cause) => {
         if (active) setError(cause instanceof Error ? cause.message : String(cause));
@@ -46,13 +68,34 @@ export function SideConversationDialog({ isOpen, onClose }: SideConversationDial
     return () => {
       active = false;
     };
-  }, [isOpen]);
+  }, [isOpen, initialPrompt]);
 
   if (!isOpen) return null;
 
   const handleSubmit = async () => {
     const text = prompt.trim();
-    if (!text || submitting) return;
+    if (!text || pending.current) return;
+    if (source) {
+      const workspace = useWorkspaceStore.getState();
+      const conversation = useConversationStore.getState();
+      if (
+        workspace.isLoading ||
+        conversation.isLoading ||
+        !sameProductDataScope(source.scope, productDataScope(workspace.current)) ||
+        conversation.workspaceId !== source.scope.workspaceId ||
+        conversation.activeId !== source.conversationId ||
+        conversation.newConversationEpoch !== source.conversationEpoch ||
+        useUiStore.getState().navigationEpoch !== source.navigationEpoch
+      ) {
+        setError('支线所属的主对话或工作空间已变化，请重新打开');
+        return;
+      }
+    }
+    if (!models.length) {
+      setError('请先配置可用模型，再创建支线对话');
+      return;
+    }
+    pending.current = true;
     setSubmitting(true);
     setError(null);
     try {
@@ -61,12 +104,28 @@ export function SideConversationDialog({ isOpen, onClose }: SideConversationDial
         prompt: text,
         title: title.trim() || undefined,
         modelId: modelId || undefined,
+        ...(source ? { source } : {}),
+        ...(source
+          ? {
+              canProject: () => {
+                const workspace = useWorkspaceStore.getState();
+                const conversation = useConversationStore.getState();
+                return (
+                  !workspace.isLoading &&
+                  sameProductDataScope(source.scope, productDataScope(workspace.current)) &&
+                  conversation.newConversationEpoch === source.conversationEpoch &&
+                  useUiStore.getState().navigationEpoch === source.navigationEpoch
+                );
+              },
+            }
+          : {}),
       });
-      onClose();
+      if (mounted.current) onClose();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      setSubmitting(false);
+      pending.current = false;
+      if (mounted.current) setSubmitting(false);
     }
   };
 
@@ -129,7 +188,7 @@ export function SideConversationDialog({ isOpen, onClose }: SideConversationDial
               <option value="">继承主对话</option>
               {models.map((model) => (
                 <option key={model.id} value={model.id}>
-                  {model.display_name || model.model}
+                  {modelLabel(model, modelProviders)}
                 </option>
               ))}
             </select>

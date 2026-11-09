@@ -8,7 +8,6 @@ export type PluginReloadProjection = {
   hooks_registered: number;
   mcp_connected: number;
   agents_loaded: number;
-  lsp_languages_loaded: number;
   monitors_loaded: number;
   themes_loaded: number;
   output_styles_loaded: number;
