@@ -1,5 +1,34 @@
 # RuntimeTaskService 适配决策
 
+## 系统提示词与实际能力
+
+产品默认身份与可编辑的基础提示词仍由配置持有；`project/prompt.rs` 的稳定行为合同和
+工具使用规则由原 `PromptAssembler` 装配，`infra/factory.rs` 补充任务与协作指引。
+primary profile 复用基础提示词中完整相同的共享规则；独立 compiler 调用仍补齐该段，
+不能只因自定义提示词出现同名标题就省略当前正文。
+这些规则描述如何使用当前能力，不替代实际工具 schema、权限上界、执行目标或运行时事实。
+未暴露的工具先通过 `tool_search` 发现；可用 Skill 经 `activate_skill` 加载正文。
+网页、附件、日志和工具返回中的指令不会自动取得用户授权。当前范围已有的明确授权继续有效，
+不因提示词提醒而重复索取；分析、审查也不自动扩张成实施。
+
+主智能体和 Subagent 共用精准搜索、分页读取、先读后改、引用原文恢复及后台命令规则。
+SSH 项目文件继续读取原远端目标，本机输入与工具输出制品仍走 `read_artifact`。
+`shell(background=true)` 的 `cell_id` 与后台 `agent_tool` 的 `execution_id` 不能互换：
+前者用 `wait` 的 `next_cursor` 增量收集输出和真实终态，或用 `watch_cell` 观察；
+后者沿原事件返回结果。结束观察不等于结束命令，取消接受不等于物理结算。
+Agent 应核对相关结果后再宣称完成，不能从普通回复承诺 App 退出后继续执行或定时提醒。
+
+TaskRun 继续拥有唯一 Goal 和 revisioned graph。恢复或压缩不创建替代 Run、不缩小 Goal，
+也不授权恢复暂停任务；普通 Steer 由主模型结合原文理解，计划变化经原 `task_update` 处理。
+fresh/fork 的上下文选择、明确写入归属和协作消息的接受／执行区别只补充提示词说明，
+没有增加调度器、消息队列、Goal 工具或最终成果发布工具。Subagent 遇到缺信息或缺授权时
+只继续独立且已授权的工作，依赖该答案的动作保持阻塞，并在结果中说明。
+宿主可展示 Subagent 的公开进度与工具活动，面向用户的答复和审批请求仍由主智能体中继。
+
+交付回复给出主要结果、存在的成果文件链接和验证范围，区分源码、focused、本机界面、
+真实 Provider、远端 CI 与部署事实。工具日志持久化与用户最终成果交付分别说明；
+提示词和静态测试通过不构成真实模型遵循、GUI 或外部平台验收。
+
 ## 项目工作区与真实位置
 
 工作空间、项目与工程对应同一个 Workspace，任务/会话归属它，TaskRun/PlanTask 列表呈现执行记录。创建 Workspace 支持已有本地文件夹、新建本地文件夹和 SSH 远程项目，新建任务不创建目录。代码位置与本机 `Workspace.root` 产品数据分离；当前 manifest 必须显式记录 `metadata.project_location`。缺字段时拒读并保留原文件，不从旧 `project_root` 或产品数据 `root` 推断，也不自动迁移。位置和验证后的执行身份同属原 manifest/`project_root_revision`，参见 [ADR 0055](../adr/0055-project-workspaces.md)。

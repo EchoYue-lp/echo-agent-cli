@@ -452,30 +452,24 @@ pub(crate) const TASK_MANAGEMENT_GUIDE: &str = r#"
 
 ## Task And Delegation Tools
 
-Choose the lightest reliable mechanism:
-- Direct work: simple questions, narrow edits, short tool sequences.
-- `agent_tool`: one bounded Chat subtask with no TaskRuntime entry.
-- `task_create` + `task_list` + `task_execute({revision: N})`: one visible task or a dependency DAG. Use it for delegation, parallel work, writers, or verification.
-- `create_complex_task`: a long-lived Run for cross-turn or substantial orchestration.
+Use the lightest available mechanism:
+- Direct work for simple questions, narrow edits, or short tool sequences.
+- `agent_tool` for one bounded subtask: fresh context by default, `mode=fork` for filtered parent history. Supply boundaries and expected evidence.
+- `task_create/task_update/task_list` + `task_execute({revision: N})` for visible tasks or a dependency DAG.
+- `create_complex_task` for a separate long-lived Run when needed.
 
 ### Task Graph Contract
-- Use the user's language for task titles and Subagent briefs; preserve technical identifiers. Give each task a concrete outcome, role, targets, dependencies, and verification.
-- `execution_checks` require an observed command pass; `acceptance_criteria` are semantic reviewer judgments. Never declare acceptance passed yourself.
-- A completed Subagent is not a completed Task. Acceptance failure blocks for an explicit retry.
-- TaskRun already represents the goal. Do not create a wrapper or prose-only summary task; materialize only executable work.
-- `task_create` always accepts one atomic `tasks` array, including for a single task. Give every task a stable ID, declare dependencies when they exist, and pass the returned revision to `task_execute`.
-- Read-only tasks may run in parallel. Writers must declare owned files or artifacts.
-- Keep the graph truthful with `task_update` and `task_list`. Existing graphs require the latest `base_revision`; only the runtime marks completion.
-- Fold user-added constraints into the graph via `task_update`; the bounded recent-steer capsule does not replace graph authority.
-- Do not claim dispatch before `task_execute` accepts the committed revision.
-- Background `agent_tool` finishes through events. Never poll its `execution_id` with task-status tools.
-- After execution, synthesize evidence and answer the original goal.
+- Use the user's language for briefs; declare outcome, role, targets, dependencies, artifacts, and verification. Parallel writers must own distinct files or artifacts.
+- Submit executable nodes with stable IDs in one atomic `task_create` `tasks` array, even for one task. Do not add a wrapper task for the Run's existing goal.
+- Updates require the latest `base_revision`; execute only the returned revision. Do not claim dispatch before acceptance. Use `task_update` when follow-up input changes planned work; recent-steer previews are not full history.
+- `execution_checks` need observed command passes; `acceptance_criteria` need reviewer judgment. Subagent completion is not Task completion; only runtime marks completion. Acceptance failure needs explicit retry.
+- Background `agent_tool` returns `execution_id` and completes through events. It is not a command `cell_id`; do not poll it with task-status tools. Verify and synthesize its result.
+- Discover coordination tools as needed: `agent_message` delivers information, `agent_followup` requests a Conversation follow-up, `agent_wait` observes exact targets with cursors. Acceptance is not execution success.
 
 ### Complex Run Contract
-Use `create_complex_task` only for expensive multi-step work, architectural/multi-file implementation, cross-turn state, or multi-source synthesis. Explain why in `reason`.
-- Prefer background unless the current reply needs a prompt result.
-- Do not use it for ordinary Q&A, a narrow edit, or one lookup.
-- Use `check_run_status` only when requested; use `cancel_run` when no longer needed. Do not busy-poll.
+- Explain a separate Run in `reason`; prefer background. Ordinary Q&A or one lookup needs no complex Run.
+- Use `check_run_status` when requested; `cancel_run` requests cancellation, not confirmed settlement. Do not busy-poll.
+- On admitted continuation, use the existing Goal, source references, budget, and blockers. Compaction is not permission to replace the Run or resume paused work. Existing Goal changes require the user's explicit update path; ordinary Steer does not rewrite it.
 "#;
 
 /// Agent creation parameters (extracted from CLI args or config).
