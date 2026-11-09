@@ -2287,8 +2287,39 @@ mod tests {
         )?;
         let linked_project = temp.path().join("linked-project");
         let explicit_project = temp.path().join("explicit-project");
-        std::fs::create_dir_all(linked_project.join(".git"))?;
-        std::fs::create_dir_all(explicit_project.join(".git"))?;
+        for directory in [&linked_project, &explicit_project] {
+            // 真实 Git 准备不能借用夹具父目录中的仓库；在本目录初始化并核对根。
+            let directory = directory.as_path();
+            std::fs::create_dir_all(directory)?;
+            let initialized = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(directory)
+                .output()?;
+            if !initialized.status.success() {
+                return Err(anyhow::anyhow!(
+                    "fixture git init failed ({}): {}",
+                    initialized.status,
+                    String::from_utf8_lossy(&initialized.stderr),
+                ));
+            }
+            let toplevel = std::process::Command::new("git")
+                .args(["rev-parse", "--show-toplevel"])
+                .current_dir(directory)
+                .output()?;
+            if !toplevel.status.success() {
+                return Err(anyhow::anyhow!(
+                    "fixture git root discovery failed ({}): {}",
+                    toplevel.status,
+                    String::from_utf8_lossy(&toplevel.stderr),
+                ));
+            }
+            let reported_root = String::from_utf8(toplevel.stdout)?;
+            assert_eq!(
+                std::path::Path::new(reported_root.trim()).canonicalize()?,
+                directory.canonicalize()?,
+                "fixture git must use its own project root",
+            );
+        }
         std::fs::write(
             linked_project.join("AGENTS.md"),
             "LINKED_PROJECT_P_INSTRUCTION",

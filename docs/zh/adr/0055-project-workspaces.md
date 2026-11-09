@@ -93,9 +93,11 @@ executor 的 `ssh` 名称仅选择模型行为要求，不证明认证、主机�
 
 ## 2026-11-07：SSH 命令包装的输入与观察边界
 
-远端命令的POSIX异步列表显式继承原stdin；否则未启用job control时会得到空输入。看门狗对子进程sleep承担回收责任，收到停止请求后终止并wait该原child，parent再wait看门狗。不能仅关闭外层subshell或重定向管道来隐藏残留；payload的stdout、stderr和正常退出码仍应保留。目标timer以秒为粒度时向上取整，避免早于原Duration发送信号；本机仍使用原精确观察预算。
+远端命令的POSIX异步列表须从父shell预先保存的独立fd继承原stdin；只在后台命令上写`<&0`会在dash中复制已经置空的fd0。父shell先保存fd3，负载从fd3取输入后关闭副本，父shell也立即关闭副本，避免泄漏描述符。看门狗对子进程sleep承担回收责任，收到停止请求后终止并wait该原child，parent再wait看门狗。不能仅关闭外层subshell或重定向管道来隐藏残留；payload的stdout、stderr和正常退出码仍应保留。目标timer以秒为粒度时向上取整，避免早于原Duration发送信号；本机仍使用原精确观察预算。
 
 取消或本机预算到达后，观察沿既有CLOSE_OBSERVATION_TIMEOUT有界返回；原物理任务、child与invocation guards继续由原连接持有，不abort或清除unknown。等待原物理观察丢失后的结算也受同一观察期限约束。原SSH非255退出已经确认时，结果观察失败与停止未知分别表达；未知副作用仍不自动重放。
+
+None的旧POSIX看门狗只监督原直接PID；用户Shell脚本的后代可能继续存活并持有输出管道，不能把124或直接PID退出当成整组结束。原观察预算到期须有界返回Unknown并保留原物理owner，直到原wait及管道实际结算。直接PID期限测试必须使用exec负载，Shell后代负控单独检查Unknown及资源保留；不能靠改成exec掩盖后代仍存活的事实。需要整组物理结束证明的Some继续使用[ADR0064](0064-background-cell-receipt-ownership.md)的同一原owned-group控制器；本修正不增加None的Python运行时前置。
 
 OpenSSH的退出状态可以直接来自payload。124可能是程序自然返回，也可能与看门狗有关，不能据此声称“实际被杀掉”；timed_out只表示本机观察预算到达，取消也不证明被操作服务停止。需要目标状态时沿原管理器或工具再查，退出原因缺证据就保留未知。
 

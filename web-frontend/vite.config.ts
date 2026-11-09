@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite';
+import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 
@@ -7,6 +7,9 @@ export default defineConfig(({ mode }) => {
 
   return {
     plugins: [react(), tailwindcss()],
+    test: {
+      setupFiles: ['./src/testing/setup.ts'],
+    },
     build: {
       // Tauri v2 frontend plugins must be bundled by Vite — they are NOT
       // available as global scripts in the webview. Do NOT externalize them.
