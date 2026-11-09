@@ -1,5 +1,17 @@
 # echo-agent-cli(Eclip)AGENTS.md
 
+## 2026-11-09 CLI consumer95b 的最终精确绑定
+
+用户对本次具体问题直接回答：“同意，仅本次精确绑定（推荐）”。原问题与回答保存在主根 `.echo-semantic/local/dependency-exact-binding-20261109-r02/authorization.json`，SHA256 `3e394dd4404cb529b1ae8a4f461eda57696fac65b720b985d2007d94a66f18f3`。
+
+本次仅将 CLI 原五项完整风险身份绑定到 consumer `95b7d02ad130a5bbb886183e9c365d780b36ad35a7f9256163375d42cc744a97`（283输入）及原锁 `48eece730daaa9eff539e416861454441c23c54abf02bacaa2c3bdb375bd6329`（769包）。相对554仅六Rust文件变化：生产增量仅SSH POSIX包装保存、传递并关闭独立stdin fd；其余为真实Git/cwd夹具、精确cfg及None后代资源负控。所有依赖/features、五项完整name/version/source/checksum/advisory/kind、原checker/collector/八控制和扫描设置均保持。policy仅机械更新consumer，SHA256 `d65ffe6697a3f799cb7ff4f0d762239d639a27ac3906b7ed3ba965d79b264f11`。
+
+当前源码原完整Rust/GUI八项自然0、两版Node前端验证通过；两次最新default fresh官方scanner各自然1、零漏洞、仅原五项warning，候选严格比较各0。旧两次fetch失败原件与UNKNOWN保留；网络恢复使用当前官方DNS默认直连，未增加ignore、no-fetch、过滤、强制协议或全局网络配置。正式采用后仍须原八控制与actual-lock/canonical-origin两项fresh正式精确门禁实际通过；候选比较不冒作正式gate。
+
+原glib0.18.5 unsound及proc-macro-error1.0.4、zvariant5.13.1、zbus_names4.3.4、zvariant_derive5.14.0 unmaintained未修复。本次不是零warning审计，不接受未来源码、锁、版本、来源或新风险，不向Framework/SDK继承；App、GUI/手机、真实provider与精确main CI独立验收。下方554和旧授权/失败保留其原历史事实。
+
+正式采用后原8项控制实际自然0；恢复后的actual-lock和canonical-origin两项default fresh正式gate/caller各自然0，两个原官方scanner各自然1、0漏洞、精确原5完整warning、769包、ignore=[]、noFetch=false。DB为 `7a40350e1b8ba5b656d909f88222a8059a83d88d`／1422条，两份独立原JSON均10795B／SHA256 `c89fea7b249432cbb925ea45458a3a12ad16c31a9634c22439b1b5e00dd301d9`。原8控制沿首次采用后同切点实际0原件保留，未重复；首次正式POST fetch失败未被追改，成功后继单独记录。完整实际执行为主根 `.echo-semantic/local/dependency-exact-binding-20261109-r02/formal-cli-r02/execution.json`，SHA256 `4fb2e3c90fc8b80accb467fd03190dd5a113c28344c4fef0eabdd5605dd3132f`；handoff SHA256 `e218bde7eba2559cf3dfa0615ba4d414be3f1f556c87c022ed91cf86ed3b6dc2`。283源码、正式d65 policy及工具无漂移，临时透明连接与scanners/readers均已退出；原风险未修复，本事实不替代App/手机和精确main CI。
+
 ## 2026-11-09 CLI consumer554 的本次精确绑定
 
 用户对本次具体问题直接回答：“同意，仅本次精确绑定（推荐）”。原问题与回答保存在主根 `.echo-semantic/local/dependency-exact-binding-20261109-r01/authorization.json`，SHA256 `b940901e6c755ea39725be1ad184c6713aa6c9c388f9c29e8d1b4d2ffd305733`。

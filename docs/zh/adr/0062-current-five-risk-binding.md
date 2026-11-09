@@ -2,6 +2,10 @@
 
 ## 状态
 
+当前最终来源为经用户本次精确批准的95b／283与原48ee／769，policy为d65ffe66；原五完整风险身份不变，采用后的正式门禁仍按实际原件验收。原问题/回答与绑定范围见[中文风险决定](../../supreme/specs/cancellation-observation-consumer/dependency-risk-decision.md)的2026-11-09后继。原历史状态按其日期保留，不自动续票。
+
+以下首段为旧HookTest阶段原文：
+
 已批准。当前 HookTest 单 cfg(test) 增量的 525f／274 精确绑定及 2026-10-31 两次 fresh 风险门禁实际结果以[原中文风险决定](../../supreme/specs/cancellation-observation-consumer/dependency-risk-decision.md)本日 HookTest 后继为准；原 f173／bc08 历史保留，本 ADR 五身份合同与原人类接受范围不变，不授未来输入。Source／final 和其它验收仍独立。
 
 以下为原阶段状态，保留其当时语义：
@@ -58,3 +62,8 @@ checker固定当前five并要求实际warning集合完整相等。少项、增�
 原 actual/canonical `.audit.json`、`.audit.stderr`、`.gate.json`、`.caller-run.json`，以及 DB 三个状态快照和实核汇总，均保存在 CLI 仓内 `.echo-semantic/local/eko-appcore-fixture-resume-20261029/fresh-exact5-gates-20261029/`。Root 的独立 raw／gate／输入复核保存在顶层 `.echo-semantic/local/controlled-goal-resume-20261029/root-cli-fresh5-gates-readback.json`。官方自然 1 与精确 gate 0 分列，不用旧 raw 或合同控制测试替代本次 fresh 执行。
 
 本后继事实只覆盖当前精确 consumer／lock／完整五身份和设置。任何后继源码、锁、consumer、身份、advisory、漏洞或 settings 变化仍先拒绝并复核，不给未来来源永久签票，也不向 Framework／SDK 继承；Rust、文档、原生、全矩阵、SDK 来源、main CI、发布与完整 Goal 仍分别验收。此次只追加非 consumer 采用／扫描事实，不重复 Rust／GUI／前端验证。
+
+
+### 2026-11-09 最终95切点的实际验证后继
+
+正式采用后原8项控制实际自然0；恢复后的actual-lock和canonical-origin两项default fresh正式gate/caller各自然0，两个原官方scanner各自然1、0漏洞、精确原5完整warning、769包、ignore=[]、noFetch=false。DB为 `7a40350e1b8ba5b656d909f88222a8059a83d88d`／1422条，两份独立原JSON均10795B／SHA256 `c89fea7b249432cbb925ea45458a3a12ad16c31a9634c22439b1b5e00dd301d9`。原8控制沿首次采用后同切点实际0原件保留，未重复；首次正式POST fetch失败未被追改，成功后继单独记录。完整实际执行为主根 `.echo-semantic/local/dependency-exact-binding-20261109-r02/formal-cli-r02/execution.json`，SHA256 `4fb2e3c90fc8b80accb467fd03190dd5a113c28344c4fef0eabdd5605dd3132f`；handoff SHA256 `e218bde7eba2559cf3dfa0615ba4d414be3f1f556c87c022ed91cf86ed3b6dc2`。283源码、正式d65 policy及工具无漂移，临时透明连接与scanners/readers均已退出；原风险未修复，本事实不替代App/手机和精确main CI。
