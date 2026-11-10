@@ -2905,9 +2905,10 @@ mod tests {
                             "accepted interruption not persisted on original claim".to_string(),
                         ));
                     }
-                    std::fs::write(
-                        ready,
-                        serde_json::to_vec(&claim)
+                    // 父进程以文件存在作为就绪信号；完整写入后原子发布，避免读到空 JSON。
+                    echo_agent::utils::fs::atomic_write(
+                        std::path::Path::new(&ready),
+                        &serde_json::to_vec(&claim)
                             .map_err(|error| RunDriverFailure::from(error.to_string()))?,
                     )
                     .map_err(|error| RunDriverFailure::from(error.to_string()))?;

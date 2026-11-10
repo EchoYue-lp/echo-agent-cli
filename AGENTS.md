@@ -1,5 +1,19 @@
 # echo-agent-cli(Eclip)AGENTS.md
 
+## 2026-11-10 提示词与夹具后继 bb038 的 CLI 精确绑定
+
+用户对本次列明最终源码、原锁和五项风险的问题直接回答：“同意，仅此次 bb038fb1 最终绑定（推荐）”。原问题与回答保存在主根 `.echo-semantic/local/eclip-system-prompt-merge-20261110-r01/fixture-repair-r03/authorization.json`，SHA256 `d44624f59b007839790ea11275018bf273b1163042993f0ec5c114ce11d6f2b3`。此前8c批准保留原切点，未冒作本后继授权或正式采用。
+
+本次只将CLI原五项完整风险身份绑定到consumer `bb038fb1c8e6f864f837b201e40e4f03c5fb19aead5028b9a47258ca1cd7e4c7`（283输入），原锁仍为 `48eece730daaa9eff539e416861454441c23c54abf02bacaa2c3bdb375bd6329`（769包）。相对95b，生产增量仅为提示词与共享正文去重；另有既有装配测试和两个cfg(test)夹具的原子就绪发布修复。集成测试同步当前提示词断言，不改变consumer输入。无新依赖、features、平台调用或原五风险显式消费API。policy仅更新consumer，SHA256 `43a1d6c32c84b0036678141a3b3844f37612525eb678d818a96895dd7b85ccba`；原五项完整name/version/source/checksum/advisory/kind、collector、checker、原8控制和扫描设置保持。
+
+批准前actual-lock/canonical-origin两项fresh官方扫描各自然1、0漏洞、仅原五项完整warning，候选严格比较均0；原8控制在明确候选policy上实际通过。直连fetch失败与空JSON原件保留；后继仅为该进程使用透明CONNECT，官方URL、TLS验证、fetch、yanked和协商不变，未增加ignore/过滤或修改全局网络配置，临时连接已退出。候选结果不代替批准后的原8控制及两项default fresh正式gate，scanner与gate出口分别记录。
+
+首轮全量测试遗漏独立EKO_DATA_DIR并使用macOS临时路径别名，真实101保留；隔离后两个就绪文件竞态的自然101、后继集成旧文字断言的101也保留。两个夹具只改完整内容发布时点，不改生产实现、断言、超时或轮询预算。原15项显式ignored保留，未用单项通过替代完整命令。运行证据位于主根 `.echo-semantic/local/eclip-system-prompt-merge-20261110-r01/`，最终完整门禁和精确main CI仍须实际取得。
+
+原glib0.18.5 unsound及proc-macro-error1.0.4、zvariant5.13.1、zbus_names4.3.4、zvariant_derive5.14.0 unmaintained仍未修复。本次不是零warning审计，不接受未来源码、锁、版本、来源或新风险，不向Framework/SDK继承；App、GUI/手机、真实模型和精确main CI分别验收。下方95b与历史授权、失败保留原切点语义。
+
+正式采用后原8项控制自然0；actual-lock与canonical-origin两项default fresh正式gate/caller均自然0，两个原官方scanner各自然1、0漏洞、恰原5项完整warning、769包，ignore=[]、noFetch=false。数据库为 `d9cb059f3217db87aeccd190b81eaffe8cc29cb9`／1430条；两份独立完整原JSON均10795B／SHA256 `90cdcbd7417299c7989caa0a1529fd90421eae000fbaf12f1753ed63d3a67596`。完整正式记录为主根 `.echo-semantic/local/eclip-system-prompt-merge-20261110-r01/fixture-repair-r03/formal-audit.json`，SHA256 `5ff399c3e2738240b92939e1500ca880d56d5f379e30819588a2ee5cea03c747`。原网络/环境/夹具/旧文字断言失败均保留；临时CONNECT已关闭、scanner及连接读取者归零。最终完整Rust命令及最小feature自然0，core2371通过/0失败/15原有ignored；其它target和doctest分别保留各自原结果，不能把本地门禁当作App、真实模型或精确main CI。
+
 ## 2026-11-09 CLI consumer95b 的最终精确绑定
 
 用户对本次具体问题直接回答：“同意，仅本次精确绑定（推荐）”。原问题与回答保存在主根 `.echo-semantic/local/dependency-exact-binding-20261109-r02/authorization.json`，SHA256 `3e394dd4404cb529b1ae8a4f461eda57696fac65b720b985d2007d94a66f18f3`。
