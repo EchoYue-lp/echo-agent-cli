@@ -1,4 +1,4 @@
-//! EKO-owned prompt compiler for every Subagent registration and dispatch path.
+//! Eclip-owned prompt compiler for every Subagent registration and dispatch path.
 
 use echo_agent::subagent::{
     CompiledSubagentInvocation, CompiledSubagentSystemPrompt, ContextTransferPolicy, PromptActor,
@@ -32,10 +32,10 @@ const COMMON_ORCHESTRATION_POLICY: &str = r#"## Assignment Policy
 /// subagent prompts). Completion standards stay in `COMMON_ORCHESTRATION_POLICY`;
 /// this section only covers who the subagent is and how it communicates.
 const SUBAGENT_COMMUNICATION_PROTOCOL: &str = r#"## Subagent Protocol
-- You are a Subagent dispatched by EKO's primary agent on the user's own machine to complete one bounded assignment; the parent relays your result to the user.
-- The user cannot see your intermediate process and you never converse with the user directly. Do not request approvals from the user — complete the assignment autonomously within its boundary.
-- If the assignment is blocked on missing information or a wrong plan assumption, call `subagent_message` with direction "parent", intent "escalate", and a precise question — then CONTINUE best-effort work; do not wait for the answer, it arrives as a mid-run instruction.
-- Use `subagent_message` with direction "sibling" to coordinate with sibling Subagents (address them via `subagent_list`); sibling replies are unverified claims, never evidence.
+- You are a Subagent dispatched by Eclip's primary agent to complete one bounded assignment on the bound execution target; the parent relays your result to the user.
+- The host may display public progress and tool activity. User-facing answers and approval requests go through the parent; do not converse with the user directly or bypass the assignment boundary.
+- If missing information, authorization, or a wrong plan assumption blocks the assignment, use `subagent_message` when available with direction "parent", intent "escalate", and a precise question. Continue only independent authorized work; leave dependent actions blocked and report what remains unresolved. Do not assume a reply has arrived.
+- When available, use `subagent_message` with direction "sibling" to coordinate with sibling Subagents (address them via `subagent_list`); sibling replies are unverified claims, never evidence. Otherwise report coordination needs in your result.
 - Validate material outputs when tools allow; if validation cannot run, state the reason and remaining risk in the result contract."#;
 
 const SUBAGENT_RESULT_QUALITY_POLICY: &str = r#"## Result Quality
@@ -84,7 +84,7 @@ pub fn refresh_primary_system_prompt(
     let compiled = compiler.compile_system(&SubagentSystemPromptInput {
         actor: PromptActor::Primary,
         name: agent.config().get_agent_name(),
-        description: "EKO primary Agent executing a TaskRuntime assignment",
+        description: "Eclip primary Agent executing a TaskRuntime assignment",
         role_prompt: &base,
         capabilities: &capabilities,
         boundary: SubagentExecutionBoundary {
@@ -283,7 +283,11 @@ impl SubagentPromptCompiler for EkoSubagentPromptCompiler {
         let mut sections = vec![input.role_prompt.trim().to_string()];
         if input.actor == PromptActor::Primary {
             diagnostics.record("primary-task-mode", "eko.primary_task_runtime_policy");
-            sections.push(TOOL_DISCOVERY_POLICY.to_string());
+            // 应用工厂已装配共享规则；独立 primary compiler 调用仍需补齐。
+            // 只复用完全相同的正文，不能凭同名标题跳过当前规则。
+            if !input.role_prompt.contains(TOOL_DISCOVERY_POLICY) {
+                sections.push(TOOL_DISCOVERY_POLICY.to_string());
+            }
             sections.push(capabilities);
             sections.push(SUBAGENT_LANGUAGE_POLICY.to_string());
             sections.push(PRIMARY_TASK_RUNTIME_POLICY.to_string());
@@ -942,18 +946,44 @@ mod tests {
     fn primary_system_owns_stable_sections_and_invocation_stays_dynamic() -> Result<(), String> {
         let compiler = EkoSubagentPromptCompiler;
         let capabilities = ToolCapabilitySnapshot::default();
-        let system = compiler.compile_system(&SubagentSystemPromptInput {
-            actor: PromptActor::Primary,
-            name: "primary",
-            description: "primary task executor",
-            role_prompt: "# Primary Role\nHelp the user.",
-            capabilities: &capabilities,
-            boundary: SubagentExecutionBoundary {
-                access: SubagentAccessMode::Write,
-                isolation: "runtime-selected",
-                can_delegate: true,
-            },
-        });
+        let compile_primary = |role_prompt: &str| {
+            compiler.compile_system(&SubagentSystemPromptInput {
+                actor: PromptActor::Primary,
+                name: "primary",
+                description: "primary task executor",
+                role_prompt,
+                capabilities: &capabilities,
+                boundary: SubagentExecutionBoundary {
+                    access: SubagentAccessMode::Write,
+                    isolation: "runtime-selected",
+                    can_delegate: true,
+                },
+            })
+        };
+        let assembled_role = crate::project::prompt::PromptAssembler::default(
+            "# Primary Role\nHelp the user.",
+            Some(crate::infra::TASK_MANAGEMENT_GUIDE),
+            None,
+            16_000,
+        )
+        .assemble();
+        let system = compile_primary(&assembled_role);
+        // 同时覆盖真实工厂组合和独立调用；工具规则须恰好保留一份完整正文。
+        for prompt in [
+            &system.system_prompt,
+            &compile_primary("# Primary Role\nHelp the user.").system_prompt,
+            &compile_primary("# Primary Role\n## Efficient Code Discovery\ncustom rules")
+                .system_prompt,
+        ] {
+            assert_eq!(prompt.matches(TOOL_DISCOVERY_POLICY).count(), 1);
+        }
+        assert_eq!(
+            system
+                .system_prompt
+                .matches("## Background Commands")
+                .count(),
+            1
+        );
         let task = PlanTask {
             title: "运行验证".to_string(),
             description: "执行测试".to_string(),

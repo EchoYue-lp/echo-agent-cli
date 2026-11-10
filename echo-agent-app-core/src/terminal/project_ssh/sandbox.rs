@@ -1353,7 +1353,8 @@ except OSError as error:
             ProjectSshSandbox::execute_with_launcher(owner, command, ResourceLimits::unrestricted(), None, move |_, _script| {
                 // 故意模拟丢失控制凭据的transport：实际本机root退出0/EOF，原组后代仍活；不是正常controller输入。
                 let mut command = tokio::process::Command::new("/bin/sh");
-                command.args(["-c", "echo $$ > leader.pid; sh -c 'while [ ! -e release ]; do sleep 0.02; done' >/dev/null 2>&1 & echo $! > descendant.pid; exit 0"])
+                // 消费者按文件存在判断就绪；同目录 rename 只发布已完整写入的 PID。
+                command.args(["-c", "echo $$ > leader.pid.tmp; mv leader.pid.tmp leader.pid; sh -c 'while [ ! -e release ]; do sleep 0.02; done' >/dev/null 2>&1 & echo $! > descendant.pid.tmp; mv descendant.pid.tmp descendant.pid; exit 0"])
                     .current_dir(cwd).process_group(0);
                 Ok(command)
             }).await

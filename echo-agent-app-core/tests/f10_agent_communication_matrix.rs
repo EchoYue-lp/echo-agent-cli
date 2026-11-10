@@ -48,9 +48,13 @@ fn production_paths_wire_the_full_matrix() {
     assert!(UNATTENDED.contains("subagent_lineage"));
     assert!(UPLINK.contains("paused_needs_input"));
     assert!(UPLINK.contains("queued_for_next_attempt"));
-    // prompt 协议允许向 run driver 升级、禁止直接对话用户。
+    // 公开活动可由宿主呈现；答复和审批仍由主智能体中继，禁止直接对话用户。
     assert!(SUBAGENT_PROMPT.contains("intent \"escalate\""));
-    assert!(SUBAGENT_PROMPT.contains("never converse with the user"));
+    assert!(SUBAGENT_PROMPT.contains("host may display public progress and tool activity"));
+    assert!(
+        SUBAGENT_PROMPT.contains("User-facing answers and approval requests go through the parent")
+    );
+    assert!(SUBAGENT_PROMPT.contains("do not converse with the user directly"));
     // 内置子智能体获得树内通信工具。
     assert!(FACTORY.contains("register_subagent_message_tools"));
     // 会话面控制工具禁止委派给子智能体。
